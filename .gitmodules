@@ -1,0 +1,25 @@
+[submodule "third_party/glfw-3.3-stable"]
+	path = third_party/glfw-3.3-stable
+	url = https://gh-proxy.org/https://gh-proxy.com/https://github.com/glfw/glfw.git
+	branch = 3.3-stable
+[submodule "third_party/glm-1.0.2"]
+	path = third_party/glm-1.0.2
+	url = https://gh-proxy.org/https://gh-proxy.com/https://github.com/g-truc/glm.git
+[submodule "third_party/stb"]
+	path = third_party/stb
+	url = https://gh-proxy.org/https://gh-proxy.com/https://github.com/nothings/stb
+[submodule "third_party/tinygltf"]
+	path = third_party/tinygltf
+	url = https://gh-proxy.org/https://gh-proxy.com/https://github.com/syoyo/tinygltf
+[submodule "third_party/tinyobjloader"]
+	path = third_party/tinyobjloader
+	url = https://gh-proxy.org/https://gh-proxy.org/https://github.com/tinyobjloader/tinyobjloader.git
+[submodule "third_party/ktx"]
+	path = third_party/ktx
+	url = https://gh-proxy.org/https://gh-proxy.org/https://github.com/KhronosGroup/KTX-Software.git
+[submodule "third_party/volk"]
+	path = third_party/volk
+	url = https://gh-proxy.org/https://github.com/zeux/volk
+[submodule "third_party/vma"]
+	path = third_party/vma
+	url = https://gh-proxy.org/https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git

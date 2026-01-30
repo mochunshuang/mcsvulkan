@@ -1,0 +1,65 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 30,
+        "patch": 0
+    },
+    "include": [
+        "CMakeUserPresets.json"
+    ],
+    "configurePresets": [
+        {
+            "name": "windows-g++",
+            "inherits": [
+                "impl_windows-g++"
+            ],
+            "displayName": "windows-g++",
+            "description": "This is available after impl_windows-g++ implemented",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
+            "name": "windows-clang++",
+            "inherits": [
+                "impl_windows-clang++"
+            ],
+            "displayName": "windows-clang++",
+            "description": "This is available after impl_windows-clang++ implemented",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
+            "name": "windows-mys32-g++",
+            "inherits": [
+                "impl_windows-mys32-g++"
+            ],
+            "displayName": "windows-mys32-g++",
+            "description": "This is available after impl_windows-mys32-g++ implemented",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
+            "name": "windows-msvc",
+            "inherits": [
+                "impl_windows-msvc"
+            ],
+            "displayName": "windows-msvc",
+            "description": "This is available after impl_windows-msvc implemented",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        }
+    ]
+}

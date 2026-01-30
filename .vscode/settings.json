@@ -1,0 +1,511 @@
+{
+    "editor.formatOnPaste": true,
+    "editor.formatOnSave": true,
+    "editor.formatOnType": true,
+    "terminal.integrated.profiles.windows": {
+        "PowerShell -NoProfile": {
+            "source": "PowerShell",
+            "args": [
+                "-NoProfile",
+                "-NoExit",
+                "-Command",
+                "chcp 65001"
+            ]
+        }
+    },
+    "terminal.integrated.defaultProfile.windows": "PowerShell -NoProfile",
+    // clangd 也有差距。请使用和编译期绑定的
+    // "clangd.path": "D:/mysoftware/clangd_20.1.8/bin/clangd.exe",
+    "clangd.path": "E:/mysoftware/llvm-mingw-20250910-ucrt-x86_64/bin/clangd.exe",
+    "clangd.arguments": [
+        "--compile-commands-dir=${workspaceFolder}/build",
+        "--log=verbose",
+        "--pretty",
+        "-j=8",
+        "--pch-storage=disk",
+        "--experimental-modules-support"
+    ],
+    "cmake.generator": "Ninja",
+    // cmake-tool 自己选择更好
+    // "cmake.debugConfig": {
+    //     "type": "lldb",
+    //     "miDebuggerPath": "D:/mysoftware/gcc-14.1.0-llvm-18.1.7-mingw-w64ucrt-12.0.0/mingw32/bin/lldb.exe",
+    // },
+    // "cmake.debugConfig": {
+    //     "type": "cppdbg",
+    //     "miDebuggerPath": "D:/mysoftware/x86_64-14.2.0-release-posix-seh-ucrt-rt_v12/mingw64/bin/gdb.exe"
+    // },
+    // clangd 或 c_cpp
+    "C_Cpp.intelliSenseEngine": "disabled",
+    "C_Cpp.default.cppStandard": "gnu++20",
+    "editor.semanticTokenColorCustomizations": {
+        "enabled": true,
+        "[Default Dark Modern]": {
+            "enabled": true,
+            "rules": {
+                "operator": "#dd1735"
+            }
+        }
+    },
+    // 允许灰色擦拭提示
+    "editor.inlayHints.enabled": "on",
+    "editor.bracketPairColorization.enabled": true,
+    "editor.bracketPairColorization.independentColorPoolPerBracketType": true,
+    // 高亮的对括号
+    "[cpp]": {
+        // "editor.language.brackets": [
+        //     ["(",")"],
+        //     ["{","}"],
+        //     ["[","]"],
+        //     ["<",">"]
+        // ],
+        "editor.language.colorizedBracketPairs": [
+            [
+                "(",
+                ")"
+            ],
+            [
+                "{",
+                "}"
+            ],
+            [
+                "[",
+                "]"
+            ],
+            [
+                "<",
+                ">"
+            ]
+        ]
+    },
+    "editor.tokenColorCustomizations": {
+        "textMateRules": [
+            {
+                "scope": "markup.other.log.error",
+                "settings": {
+                    "foreground": "#FF0000"
+                }
+            },
+            {
+                "scope": "markup.other.log.warn",
+                "settings": {
+                    "foreground": "#c500f7cc"
+                }
+            },
+            {
+                "scope": "markup.other.log.info",
+                "settings": {
+                    "foreground": "#2cd0d3"
+                }
+            },
+            {
+                "scope": "markup.other.log.debug",
+                "settings": {
+                    "foreground": "#888585"
+                }
+            },
+            {
+                "scope": "markup.other.log.highlight",
+                "settings": {
+                    "foreground": "#19ff04"
+                }
+            }
+        ],
+        "[Default Dark Modern]": {
+            "textMateRules": [
+                {
+                    "scope": "entity.name.namespace.cpp",
+                    "settings": {
+                        "foreground": "#d4d3d3"
+                    }
+                },
+                // :: 命名空间
+                {
+                    "scope": "punctuation.separator.scope-resolution.cpp",
+                    "settings": {
+                        "foreground": "#d4d3d3"
+                    }
+                },
+                {
+                    "scope": "punctuation.separator.scope-resolution.function.call.cpp",
+                    "settings": {
+                        "foreground": "#d4d3d3"
+                    }
+                },
+                // 参数
+                {
+                    "scope": "entity.name.type.parameter",
+                    "settings": {
+                        "foreground": "#f66ecd"
+                    }
+                },
+                // 函数部分
+                {
+                    "scope": "entity.name.function.cpp",
+                    "settings": {
+                        "foreground": "#e3e775"
+                    }
+                },
+                {
+                    "scope": "entity.name.function.member.cpp",
+                    "settings": {
+                        "foreground": "#e3e775"
+                    }
+                }
+                // 概念，结构化绑定部分
+                // {
+                //     "scope": "meta.block.cpp",
+                //     "settings": {
+                //         "foreground": "#9CDCFE"
+                //     }
+                // }
+            ]
+        }
+    },
+    "better-comments.tags": [
+        {
+            "tag": "Note:",
+            "color": "#00cc44", // 你可以选择任何你喜欢的颜色
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": true
+        },
+        // https://www.sojson.com/rgb.html
+        {
+            "tag": "c0:",
+            "color": "#FF6B6B",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c1:",
+            "color": "#4ECDC4",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c2:",
+            "color": "#45B7D1",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c3:",
+            "color": "#96CEB4",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c4:",
+            "color": "#FECA57",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c5:",
+            "color": "#FF9FF3",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c6:",
+            "color": "#54A0FF",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c7:",
+            "color": "#5F27CD",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c8:",
+            "color": "#00D2D3",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c9:",
+            "color": "#FF9F43",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c10:",
+            "color": "#10AC84",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c11:",
+            "color": "#EE5A24",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c12:",
+            "color": "#9980FA",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c13:",
+            "color": "#5758BB",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c14:",
+            "color": "#F368E0",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c15:",
+            "color": "#FF9FEC",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c16:",
+            "color": "#48DBFB",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c17:",
+            "color": "#00B894",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c18:",
+            "color": "#E84393",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c19:",
+            "color": "#6C5CE7",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c20:",
+            "color": "#FDCB6E",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c21:",
+            "color": "#E17055",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c22:",
+            "color": "#81ECEC",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c23:",
+            "color": "#FDA7DF",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c24:",
+            "color": "#D980FA",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c25:",
+            "color": "#B53471",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c26:",
+            "color": "#EE5A24",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c27:",
+            "color": "#009432",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c28:",
+            "color": "#0652DD",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c29:",
+            "color": "#9980FA",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c30:",
+            "color": "#833471",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c31:",
+            "color": "#F79F1F",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c32:",
+            "color": "#A3CB38",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c33:",
+            "color": "#1289A7",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c34:",
+            "color": "#D980FA",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "c35:",
+            "color": "#B53471",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        },
+        {
+            "tag": "diff:",
+            "color": "#FFFFFF",
+            "strikethrough": false,
+            "underline": false,
+            "backgroundColor": "transparent",
+            "bold": true,
+            "italic": false
+        }
+    ],
+    "liveServer.settings.port": 5501
+}
