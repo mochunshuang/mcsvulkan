@@ -2,7 +2,7 @@
 
 #include "Instance.hpp"
 
-namespace mcs::vulkan::core
+namespace mcs::vulkan
 {
     class PhysicalDevice
     {
@@ -24,7 +24,8 @@ namespace mcs::vulkan::core
             return value_;
         }
         PhysicalDevice() = default;
-        constexpr PhysicalDevice(Instance &instance, VkPhysicalDevice value) noexcept
+        constexpr PhysicalDevice(const Instance &instance,
+                                 VkPhysicalDevice value) noexcept
             : instance_{&instance}, value_{value}
         {
         }
@@ -79,4 +80,4 @@ namespace mcs::vulkan::core
             return Instance::getPhysicalDeviceSurfacePresentModesKHR(value_, surface);
         }
     };
-}; // namespace mcs::vulkan::core
+}; // namespace mcs::vulkan

@@ -43,3 +43,12 @@ set(Vulkan_Include_DIR "$ENV{VULKAN_SDK}/Include")
 message(STATUS "Vulkan_Include_DIR: ${Vulkan_Include_DIR}")
 
 message(STATUS ".................................vulakn exec check: [end].................................")
+
+add_library(vulkan STATIC IMPORTED)
+set_target_properties(vulkan PROPERTIES
+    IMPORTED_LOCATION "$ENV{VULKAN_SDK}/Lib/vulkan-1.lib"
+    INTERFACE_INCLUDE_DIRECTORIES "$ENV{VULKAN_SDK}/Include"
+)
+target_compile_definitions(vulkan INTERFACE
+    VULKAN_HPP_NO_STRUCT_CONSTRUCTORS
+)

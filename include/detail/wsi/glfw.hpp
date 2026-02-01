@@ -350,7 +350,8 @@ namespace mcs::vulkan::wsi::glfw
         [[nodiscard]] VkExtent2D chooseSwapExtent(
             const VkSurfaceCapabilitiesKHR &capabilities) const noexcept
         {
-            if (capabilities.currentExtent.width != std::numeric_limits<uint32_t>::max())
+            if (capabilities.currentExtent.width !=
+                (std::numeric_limits<uint32_t>::max)())
                 return capabilities.currentExtent;
 
             auto [width, height] = getFramebufferSize();

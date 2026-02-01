@@ -91,11 +91,11 @@ namespace mcs::vulkan::tool
                     .pfnUserCallback = &defaultDebugCallback};
         }
 
-        [[nodiscard]] auto &createInfo() const noexcept
+        [[nodiscard]] constexpr auto &createInfo() const noexcept
         {
             return createInfo_;
         }
-        auto &setCreateInfo(create_info &&createInfo) noexcept
+        constexpr auto &setCreateInfo(create_info &&createInfo) noexcept
         {
             createInfo_ = std::move(createInfo);
             return *this;

@@ -4,10 +4,11 @@
 
 #include "../utils/make_vk_exception.hpp"
 #include <algorithm>
+#include <print>
 
 namespace mcs::vulkan::tool
 {
-    struct enable_bulid
+    struct enable_intance_bulid
     {
         static constexpr auto checkExtensionSupport(
             const std::vector<const char *> &required,
@@ -17,8 +18,8 @@ namespace mcs::vulkan::tool
             {
                 bool found = std::ranges::any_of(
                     available, [&](auto const &available_extension) noexcept {
-                        return ::strcmp(available_extension.extensionName,
-                                        extension_name) == 0;
+                        return std::strcmp(available_extension.extensionName,
+                                           extension_name) == 0;
                     });
                 if (!found)
                     throw make_vk_exception(
@@ -31,11 +32,11 @@ namespace mcs::vulkan::tool
         {
             for (const auto *layer_name : required)
             {
-                if (bool found = std::ranges::any_of(available,
-                                                     [&](auto const &lp) noexcept {
-                                                         return ::strcmp(lp.layerName,
-                                                                         layer_name) == 0;
-                                                     });
+                if (bool found = std::ranges::any_of(
+                        available,
+                        [&](auto const &lp) noexcept {
+                            return std::strcmp(lp.layerName, layer_name) == 0;
+                        });
                     not found)
                     // Output an error message for the missing extension
                     throw make_vk_exception(
@@ -43,57 +44,68 @@ namespace mcs::vulkan::tool
             }
         }
 
+        constexpr auto layerContains(const char *const LAYER) const noexcept
+        {
+            return std::ranges::find(enabledLayer_, LAYER) != enabledLayer_.end();
+        }
+        constexpr auto extensionContains(const char *const EXTENSION) const noexcept
+        {
+            return std::ranges::find(enabledExtension_, EXTENSION) !=
+                   enabledExtension_.end();
+        }
+
         //-------------------------------get-------------------------
-        [[nodiscard]] auto &enabledLayers() noexcept
+        [[nodiscard]] constexpr auto &enabledLayers() noexcept
         {
             return enabledLayer_;
         }
 
-        [[nodiscard]] auto &enabledExtensions() noexcept
+        [[nodiscard]] constexpr auto &enabledExtensions() noexcept
         {
             return enabledExtension_;
         }
 
-        [[nodiscard]] auto &enabledLayers() const noexcept
+        [[nodiscard]] constexpr auto &enabledLayers() const noexcept
         {
             return enabledLayer_;
         }
 
-        [[nodiscard]] auto &enabledExtensions() const noexcept
+        [[nodiscard]] constexpr auto &enabledExtensions() const noexcept
         {
             return enabledExtension_;
         }
 
         //-------------------------------update-------------------------
-        auto &addEnableExtension(const char *const EXTENSION)
+        constexpr auto &addEnableExtension(const char *const EXTENSION)
         {
             enabledExtension_.emplace_back(EXTENSION);
             return *this;
         }
-        auto &addEnableLayer(const char *const LAYER)
+        constexpr auto &addEnableLayer(const char *const LAYER)
         {
             enabledLayer_.emplace_back(LAYER);
             return *this;
         }
-        auto &enableDebugExtension()
+        constexpr auto &enableDebugExtension()
         {
             addEnableExtension(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
             return *this;
         }
-        auto &enableValidationLayer()
+        constexpr auto &enableValidationLayer()
         {
             addEnableLayer("VK_LAYER_KHRONOS_validation");
             return *this;
         }
         template <typename surface>
-        auto &enableSurfaceExtension()
+        constexpr auto &enableSurfaceExtension()
         {
-            addEnableExtension(VK_KHR_SURFACE_EXTENSION_NAME);
             enabledExtension_.append_range(surface::requiredVulkanInstanceExtensions());
+            if (not extensionContains(VK_KHR_SURFACE_EXTENSION_NAME))
+                addEnableExtension(VK_KHR_SURFACE_EXTENSION_NAME);
             return *this;
         }
 
-        void check() const
+        constexpr void check() const
         {
             const auto &enabledLayer = enabledLayers();
             const auto &enabledExtension = enabledExtensions();
@@ -102,14 +114,18 @@ namespace mcs::vulkan::tool
             checkLayerSupport(enabledLayer, Initialization::instanceLayerProperties());
         }
 
-        auto layerContains(const char *const LAYER) const noexcept
+        constexpr void print()
         {
-            return std::ranges::find(enabledLayer_, LAYER) != enabledLayer_.end();
-        }
-        auto extensionContains(const char *const EXTENSION) const noexcept
-        {
-            return std::ranges::find(enabledExtension_, EXTENSION) !=
-                   enabledExtension_.end();
+            std::println("enabledLayers: ");
+            for (auto &layer : enabledLayer_)
+            {
+                std::println("  {}", layer);
+            }
+            std::println("enabledExtensions: ");
+            for (auto &extension : enabledExtension_)
+            {
+                std::println("  {}", extension);
+            }
         }
 
       private:

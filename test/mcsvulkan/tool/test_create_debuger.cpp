@@ -11,7 +11,7 @@ using create_debuger = mcs::vulkan::tool::create_debuger;
 using mcs::vulkan::vkMakeVersion;
 using mcs::vulkan::vkApiVersion;
 
-using mcs::vulkan::tool::enable_bulid;
+using mcs::vulkan::tool::enable_intance_bulid;
 
 using mcs::vulkan::raii_vulkan;
 
@@ -22,7 +22,7 @@ try
     raii_vulkan ctx{};
 
     constexpr auto APIVERSION = vkApiVersion(0, 1, 4, 0);
-    auto enables = enable_bulid{}.enableDebugExtension().enableValidationLayer();
+    auto enables = enable_intance_bulid{}.enableDebugExtension().enableValidationLayer();
     enables.check();
     Instance instance =
         create_instance{}

@@ -16,7 +16,7 @@ using mcs::vulkan::tool::sType;
 
 using mcs::vulkan::MCS_ASSERT;
 
-using mcs::vulkan::tool::enable_bulid;
+using mcs::vulkan::tool::enable_intance_bulid;
 
 using mcs::vulkan::raii_vulkan;
 
@@ -75,7 +75,7 @@ try
         MCS_ASSERT(layers2.data() != nullptr); // NOTE: 这里需要注意
     }
 
-    auto enables = enable_bulid{}.enableDebugExtension().enableValidationLayer();
+    auto enables = enable_intance_bulid{}.enableDebugExtension().enableValidationLayer();
     enables.check();
 
     {

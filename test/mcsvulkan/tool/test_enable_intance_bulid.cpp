@@ -7,7 +7,7 @@
 
 using Instance = mcs::vulkan::Instance;
 using create_instance = mcs::vulkan::tool::create_instance;
-using mcs::vulkan::tool::enable_bulid;
+using mcs::vulkan::tool::enable_intance_bulid;
 
 using mcs::vulkan::MCS_ASSERT;
 
@@ -17,7 +17,7 @@ try
     using mcs::vulkan::check_vkresult;
     check_vkresult(::volkInitialize());
 
-    auto enables = enable_bulid{}.enableDebugExtension().enableValidationLayer();
+    auto enables = enable_intance_bulid{}.enableDebugExtension().enableValidationLayer();
     MCS_ASSERT(enables.extensionContains(VK_EXT_DEBUG_UTILS_EXTENSION_NAME));
     MCS_ASSERT(enables.layerContains("VK_LAYER_KHRONOS_validation"));
     enables.check();

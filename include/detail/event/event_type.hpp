@@ -6,8 +6,8 @@
 
 namespace mcs::vulkan::event
 {
-    constexpr auto UNDEFINED_double = std::numeric_limits<double>::max(); // NOLINT
-    constexpr auto UNDEFINED_int = std::numeric_limits<int>::max();       // NOLINT
+    constexpr auto UNDEFINED_double = (std::numeric_limits<double>::max)(); // NOLINT
+    constexpr auto UNDEFINED_int = (std::numeric_limits<int>::max)();       // NOLINT
 
     enum class MouseButtons : std::uint8_t
     {

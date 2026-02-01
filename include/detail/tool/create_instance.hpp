@@ -73,15 +73,15 @@ namespace mcs::vulkan::tool
                 {
                     result_type(VkApplicationInfo app,
                                 VkInstanceCreateInfo create) noexcept
-                        : app{app}, create_info{create}
+                        : app_info{app}, create_info{create}
                     {
-                        create_info.pApplicationInfo = &app;
+                        create_info.pApplicationInfo = &app_info;
                     }
                     auto &createInfo() &
                     {
                         return create_info;
                     }
-                    VkApplicationInfo app;
+                    VkApplicationInfo app_info;
                     VkInstanceCreateInfo create_info;
                 };
                 return result_type{
