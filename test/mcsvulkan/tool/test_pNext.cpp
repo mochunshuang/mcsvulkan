@@ -4,7 +4,6 @@
 #include <print>
 
 #include "../head.hpp"
-#include "vulkan/vulkan_core.h"
 
 using pNext = mcs::vulkan::tool::pNext;
 using mcs::vulkan::tool::structure_chain;

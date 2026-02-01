@@ -7,7 +7,6 @@
 #include <vector>
 
 #include "../head.hpp"
-#include "vulkan/vulkan_core.h"
 
 using Instance = mcs::vulkan::Instance;
 using create_instance = mcs::vulkan::tool::create_instance;

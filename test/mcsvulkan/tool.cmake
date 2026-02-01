@@ -17,6 +17,7 @@ endmacro()
 add_vulkan_tool_test(test_pNext)
 add_vulkan_tool_test(test_create_instance)
 add_vulkan_tool_test(test_enable_bulid)
+add_vulkan_tool_test(test_create_debuger)
 
 # end
 unset(BASE_LIBS)
