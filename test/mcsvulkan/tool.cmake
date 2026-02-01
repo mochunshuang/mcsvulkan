@@ -8,7 +8,9 @@ macro(add_vulkan_tool_test fileName)
     set(TAGET_NAME "${PREFIX_NAME}-${fileName}")
     add_executable(${TAGET_NAME} "${EXE_DIR}/${fileName}.cpp")
     target_link_libraries(${TAGET_NAME} PRIVATE ${BASE_LIBS})
-    target_include_directories(${TAGET_NAME} PRIVATE ${Vulkan_Include_DIR})
+
+    # NOTE: 不再需要。因为 volk 暴露传递了
+    # target_include_directories(${TAGET_NAME} PRIVATE ${Vulkan_Include_DIR})
 
     # 添加测试
     add_test(NAME "${TAGET_NAME}" COMMAND $<TARGET_FILE:${TAGET_NAME}>)

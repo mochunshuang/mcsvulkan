@@ -35,7 +35,40 @@
 # NOTE: 查看当前所在的提交和标签.最近的提交
 # git log --oneline -3
 
-# https://github.com/zeux/volk/tree/master 使用第三种方式引入的项目
-# 您可以仅以头文件的方式使用volk。在任何您想使用Vulkan函数的地方都包括volk. h。在一个源文件中，在包括volk.h之前定义VOLK_IMPLEMENTATION。在这种情况下，根本不要构建volk.c——但是，volk.c必须仍然与volk.h位于同一目录中。这种集成volk的方法使得在代码中使用任意（预处理器）逻辑设置上面提到的平台定义成为可能。
-add_library(volk INTERFACE)
-target_include_directories(volk SYSTEM INTERFACE "${CMAKE_SOURCE_DIR}/third_party/volk")
+# NOTE: 优先静态库。 宏就不暴露了。 INTERFACE 的库会传递宏就恶心了
+set(VOLK_DIR "${CMAKE_SOURCE_DIR}/third_party/volk")
+set(VOLK_FILES
+    "${VOLK_DIR}/volk.c"
+    "${VOLK_DIR}/volk.h")
+add_library(volk STATIC ${VOLK_FILES})
+
+# c_std_17 需要注意LANGUAGES 得包含C。不然就玩玩。 project("mcsvulkan"
+# LANGUAGES CXX C
+# )
+target_compile_features(volk PRIVATE c_std_17)
+target_include_directories(volk SYSTEM PUBLIC "${VOLK_DIR}" ${Vulkan_Include_DIR})
+
+if(WIN32)
+    # VK_USE_PLATFORM_WIN32_KHR 会引入很多 windows 的头文件
+    target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+
+# Linux (X11)
+elseif(UNIX AND NOT APPLE)
+    target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_XLIB_KHR)
+
+# Linux (Wayland)
+elseif(UNIX AND NOT APPLE AND USE_WAYLAND) # 如果需要 Wayland
+    target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_WAYLAND_KHR)
+
+# macOS
+elseif(APPLE)
+    target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_MACOS_MVK)
+
+# Android
+elseif(ANDROID)
+    target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
+
+# iOS
+elseif(IOS)
+    target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_IOS_MVK)
+endif()

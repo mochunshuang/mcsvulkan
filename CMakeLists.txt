@@ -1,8 +1,9 @@
 cmake_minimum_required(VERSION 4.2.0)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# NOTE: volk 是 C 项目，有C的静态库的，必须这样做
 project("mcsvulkan"
-    LANGUAGES CXX
+    LANGUAGES CXX C
 )
 
 # Set language version used
