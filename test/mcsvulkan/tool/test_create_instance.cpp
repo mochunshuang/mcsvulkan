@@ -120,7 +120,7 @@ try
         MCS_ASSERT(createInfo.applicationInfo.apiVersion == app.apiVersion);
 
         auto CI2 = create.createInfo()();
-        MCS_ASSERT(CI2.app.apiVersion == app.apiVersion);
+        MCS_ASSERT(CI2.app_info.apiVersion == app.apiVersion);
     }
 
     Instance instance =
