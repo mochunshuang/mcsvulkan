@@ -1,7 +1,6 @@
 #include <cassert>
 #include <exception>
 #include <iostream>
-#include <memory>
 #include <print>
 
 #include "../head.hpp"
@@ -15,35 +14,21 @@ using mcs::vulkan::vkApiVersion;
 
 using mcs::vulkan::tool::enable_intance_bulid;
 using mcs::vulkan::tool::structure_chain;
+using mcs::vulkan::tool::queue_family_index_selector;
 
 using mcs::vulkan::raii_vulkan;
 using mcs::vulkan::PhysicalDevice;
-
+using mcs::vulkan::surface_impl;
+using mcs::vulkan::surface_interface;
 using surface = mcs::vulkan::wsi::glfw::Window;
 
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
 constexpr auto TITLE = "test_my_triangle";
 
-using mcs::vulkan::MCS_ASSERT;
-
 int main()
 try
 {
-    {
-        // NOTE: 大胆使用 value.get()
-        std::unique_ptr<int> value;
-        MCS_ASSERT(value == nullptr);
-        MCS_ASSERT(value.get() == nullptr); // NOLINT
-        value = std::make_unique<int>(1);
-
-        MCS_ASSERT(value != nullptr);
-        MCS_ASSERT(value.get() != nullptr); // NOLINT
-
-        auto b = std::move(value);
-        MCS_ASSERT(value == nullptr);
-        MCS_ASSERT(value.get() == nullptr); // NOLINT
-    }
     using mcs::vulkan::check_vkresult;
     raii_vulkan ctx{};
 
@@ -59,7 +44,6 @@ try
                        .enableValidationLayer()
                        .enableSurfaceExtension<surface>();
     enables.check();
-
     enables.print();
 
     Instance instance =
@@ -87,11 +71,6 @@ try
         enablefeatureChain = {{},
                               {.synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE},
                               {.extendedDynamicState = VK_TRUE}};
-    // NOTE: ok的
-    static_assert(sizeof(enablefeatureChain) ==
-                  sizeof(VkPhysicalDeviceFeatures2) +
-                      sizeof(VkPhysicalDeviceVulkan13Features) +
-                      sizeof(VkPhysicalDeviceExtendedDynamicStateFeaturesEXT));
 
     auto [id [[maybe_unused]], physical_device [[maybe_unused]]] =
         physical_device_selector{instance}
@@ -116,17 +95,22 @@ try
                     query.template get<VkPhysicalDeviceVulkan13Features>();
                 auto &query_extended_dynamic_state_features =
                     query.template get<VkPhysicalDeviceExtendedDynamicStateFeaturesEXT>();
-                MCS_ASSERT(query_vulkan13_features.dynamicRendering &&
-                           query_vulkan13_features.synchronization2 &&
-                           query_extended_dynamic_state_features.extendedDynamicState);
-                std::print(
-                    "requiredFeatures: {}",
-                    query_vulkan13_features.dynamicRendering &&
-                        query_vulkan13_features.synchronization2 &&
-                        query_extended_dynamic_state_features.extendedDynamicState);
                 return query_vulkan13_features.dynamicRendering &&
                        query_vulkan13_features.synchronization2 &&
                        query_extended_dynamic_state_features.extendedDynamicState;
+            })
+            .select()[0];
+
+    // VkSurfaceKHR surface = window.createVkSurfaceKHR(*instance);
+    auto surface = surface_impl(instance, window);
+    [[maybe_unused]] surface_interface *si = &surface;
+
+    const uint32_t GRAPHICS_QUEUE_FAMILY_IDX =
+        queue_family_index_selector{physical_device}
+            .requiredQueueFamily([&](const VkQueueFamilyProperties &qfp,
+                                     uint32_t queueFamilyIndex) -> bool {
+                return (qfp.queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+                       physical_device.getSurfaceSupportKHR(queueFamilyIndex, *surface);
             })
             .select()[0];
 

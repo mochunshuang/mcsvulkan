@@ -51,6 +51,7 @@ target_include_directories(volk SYSTEM PUBLIC "${VOLK_DIR}" ${Vulkan_Include_DIR
 if(WIN32)
     # VK_USE_PLATFORM_WIN32_KHR 会引入很多 windows 的头文件
     target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+    target_compile_definitions(volk PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 
 # Linux (X11)
 elseif(UNIX AND NOT APPLE)
@@ -72,3 +73,6 @@ elseif(ANDROID)
 elseif(IOS)
     target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_IOS_MVK)
 endif()
+
+# NOTE: 可以分离宏
+target_compile_definitions(volk PUBLIC MY_VOLK_DEFINITION)

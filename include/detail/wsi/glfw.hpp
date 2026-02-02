@@ -42,7 +42,7 @@ namespace mcs::vulkan::wsi::glfw
     class GlfwException : public std::runtime_error
     {
       public:
-        explicit GlfwException(std::string_view msg, int errorCode = 0)
+        constexpr explicit GlfwException(std::string_view msg, int errorCode = 0)
             : std::runtime_error(std::format("[GLFW Error: {}]: {}", errorCode, msg))
         {
         }
@@ -82,15 +82,16 @@ namespace mcs::vulkan::wsi::glfw
             destroy();
         }
 
-        void setup(Size size, const char *title, ::GLFWmonitor *monitor = nullptr,
-                   ::GLFWwindow *share = nullptr)
+        constexpr void setup(Size size, const char *title,
+                             ::GLFWmonitor *monitor = nullptr,
+                             ::GLFWwindow *share = nullptr)
         {
 
             setup(size.width, size.height, title, monitor, share);
         }
 
-        void setup(int width, int height, const char *title, ::GLFWmonitor *monitor,
-                   ::GLFWwindow *share) noexcept
+        constexpr void setup(int width, int height, const char *title,
+                             ::GLFWmonitor *monitor, ::GLFWwindow *share) noexcept
         {
             width_ = width;
             height_ = height;
@@ -117,13 +118,13 @@ namespace mcs::vulkan::wsi::glfw
             ::glfwSetCursorEnterCallback(window_, &cursorEnterCallback);
             ::glfwSetFramebufferSizeCallback(window_, &framebufferResizeCallback);
         }
-        void teardown() noexcept
+        constexpr void teardown() noexcept
         {
             destroy();
         }
 
         //
-        void toCenter()
+        constexpr void toCenter()
         {
             const GLFWvidmode *mode = ::glfwGetVideoMode(::glfwGetPrimaryMonitor());
             int centeredX = (mode->width - width_) / 2;
@@ -133,15 +134,15 @@ namespace mcs::vulkan::wsi::glfw
             y_ = centeredY;
         }
 
-        int shouldClose() noexcept
+        constexpr int shouldClose() noexcept
         {
             return ::glfwWindowShouldClose(window_);
         }
-        static void pollEvents() noexcept
+        constexpr static void pollEvents() noexcept
         {
             ::glfwPollEvents();
         }
-        void waitGoodFramebufferSize()
+        constexpr void waitGoodFramebufferSize() const
         {
             int width, height; // NOLINT
             ::glfwGetFramebufferSize(window_, &width, &height);
@@ -339,7 +340,7 @@ namespace mcs::vulkan::wsi::glfw
             return std::vector<const char *>{names, names + glfw_extension_count};
         }
 
-        constexpr VkSurfaceKHR createVkSurfaceKHR(VkInstance &instance) const
+        constexpr VkSurfaceKHR createVkSurfaceKHR(VkInstance instance) const
         {
             VkSurfaceKHR surface; // NOLINT
             if (::glfwCreateWindowSurface(instance, data(), nullptr, &surface) !=

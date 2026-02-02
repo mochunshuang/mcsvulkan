@@ -7,3 +7,4 @@
 
 #include "detail/raii_vulkan.hpp"
 #include "detail/Instance.hpp"
+#include "detail/surface_impl.hpp"

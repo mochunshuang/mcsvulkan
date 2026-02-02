@@ -24,5 +24,14 @@
 # NOTE: 查看项目的所有子模块
 # git submodule status
 
-add_library(vma INTERFACE)
-target_include_directories(vma SYSTEM INTERFACE "${CMAKE_SOURCE_DIR}/third_party/vma/include")
+# add_library(vma INTERFACE)
+# target_include_directories(vma SYSTEM INTERFACE "${CMAKE_SOURCE_DIR}/third_party/vma/include")
+
+set(VMA_DIR "${CMAKE_SOURCE_DIR}/third_party/vma/include")
+set(VMA_FILES
+    "${VMA_DIR}/vk_mem_alloc.h")
+add_library(vma STATIC ${VOLK_FILES})
+target_compile_features(vma PRIVATE cxx_std_23)
+target_include_directories(vma SYSTEM PUBLIC "${VMA_DIR}")
+target_link_libraries(vma PRIVATE volk)
+target_compile_definitions(vma PUBLIC VMA_STATIC_VULKAN_FUNCTIONS=0 VMA_DYNAMIC_VULKAN_FUNCTIONS=0)

@@ -91,8 +91,8 @@ namespace mcs::vulkan
             MCS_ASSERT(vkDestroyDebugUtilsMessengerEXT != nullptr);
             vkDestroyDebugUtilsMessengerEXT(value_, debug_, pAllocator);
         }
-        constexpr void destroySurfaceKHR(VkSurfaceKHR surface,
-                                         const VkAllocationCallbacks *pAllocator) noexcept
+        constexpr void destroySurfaceKHR(
+            VkSurfaceKHR surface, const VkAllocationCallbacks *pAllocator) const noexcept
         {
             MCS_ASSERT(vkDestroySurfaceKHR != nullptr);
             vkDestroySurfaceKHR(value_, surface, pAllocator);

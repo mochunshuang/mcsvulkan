@@ -63,6 +63,8 @@ namespace mcs::vulkan::tool
     {
         using T = structure_chain<N...>;
 
+        static_assert(sizeof(T) == (sizeof(N) + ...));
+
         auto storage = std::make_unique_for_overwrite<uint8_t[]>(sizeof(T)); // NOLINT
 
         T *ptr = reinterpret_cast<T *>(storage.get()); // NOLINT

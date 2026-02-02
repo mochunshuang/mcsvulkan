@@ -38,7 +38,7 @@ namespace mcs::vulkan
         {
             return Instance::getPhysicalDeviceProperties(value_);
         }
-        [[nodiscard]] auto getQueueFamilyProperties() const noexcept
+        [[nodiscard]] auto getQueueFamilyProperties() const
         {
             return Instance::getPhysicalDeviceQueueFamilyProperties(value_);
         }

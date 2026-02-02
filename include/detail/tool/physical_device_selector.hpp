@@ -56,7 +56,7 @@ namespace mcs::vulkan::tool
             size_t id{};
             PhysicalDevice physical_device;
         };
-        constexpr auto select()
+        [[nodiscard]] constexpr auto select()
         {
             std::vector<result> ret;
 
