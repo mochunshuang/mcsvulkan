@@ -10,3 +10,4 @@
 #include "detail/surface_impl.hpp"
 #include "detail/Queue.hpp"
 #include "detail/raii_vma.hpp"
+#include "detail/surface.hpp"

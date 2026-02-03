@@ -20,7 +20,7 @@ using mcs::vulkan::tool::create_logical_device;
 using mcs::vulkan::raii_vulkan;
 using mcs::vulkan::PhysicalDevice;
 using mcs::vulkan::surface_impl;
-using mcs::vulkan::surface_interface;
+using mcs::vulkan::surface_base;
 using surface = mcs::vulkan::wsi::glfw::Window;
 using mcs::vulkan::Queue;
 
@@ -107,8 +107,8 @@ try
             .select()[0];
 
     // VkSurfaceKHR surface = window.createVkSurfaceKHR(*instance);
-    auto surface = surface_impl(instance, window);
-    [[maybe_unused]] surface_interface *si = &surface;
+    mcs::vulkan::surface auto surface = surface_impl(physical_device, window);
+    [[maybe_unused]] surface_base *si = &surface;
 
     const uint32_t GRAPHICS_QUEUE_FAMILY_IDX =
         queue_family_index_selector{physical_device}

@@ -37,6 +37,15 @@ namespace mcs::vulkan
         {
             return instance_->allocator();
         }
+        [[nodiscard]] auto *instance() const noexcept
+        {
+            return instance_;
+        }
+        void destroySurfaceKHR(VkSurfaceKHR surface,
+                               const VkAllocationCallbacks *pAllocator) const noexcept
+        {
+            instance_->destroySurfaceKHR(surface, pAllocator);
+        }
         [[nodiscard]] auto getProperties() const noexcept
         {
             return Instance::getPhysicalDeviceProperties(value_);

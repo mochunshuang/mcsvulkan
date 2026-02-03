@@ -1,7 +1,6 @@
 #pragma once
 
 #include "PhysicalDevice.hpp"
-#include <utility>
 
 namespace mcs::vulkan
 {
@@ -24,6 +23,10 @@ namespace mcs::vulkan
         constexpr const value_type &operator*() const noexcept
         {
             return value_;
+        }
+        [[nodiscard]] auto allocator() const noexcept
+        {
+            return physicalDevice_->allocator();
         }
         LogicalDevice(const LogicalDevice &) = delete;
         constexpr LogicalDevice(LogicalDevice &&o) noexcept

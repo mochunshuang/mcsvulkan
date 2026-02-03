@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cstdint>
 #include <exception>
 #include <iostream>
 #include <print>
@@ -16,15 +17,13 @@ using mcs::vulkan::tool::enable_intance_bulid;
 using mcs::vulkan::tool::structure_chain;
 using mcs::vulkan::tool::queue_family_index_selector;
 using mcs::vulkan::tool::create_logical_device;
+using mcs::vulkan::tool::create_swap_chain;
 
 using mcs::vulkan::raii_vulkan;
 using mcs::vulkan::PhysicalDevice;
 using mcs::vulkan::surface_impl;
-using mcs::vulkan::surface_base;
 using surface = mcs::vulkan::wsi::glfw::Window;
 using mcs::vulkan::Queue;
-
-using raii_vma = mcs::vulkan::raii_vma;
 
 using mcs::vulkan::LogicalDevice;
 
@@ -32,19 +31,6 @@ constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
 constexpr auto TITLE = "test_my_triangle";
 using mcs::vulkan::MCS_ASSERT;
-
-static bool isAMDGPU(VkPhysicalDevice physicalDevice)
-{
-    VkPhysicalDeviceProperties properties;
-    vkGetPhysicalDeviceProperties(physicalDevice, &properties);
-
-    // AMD 的 vendor ID 是 0x1002
-    return properties.vendorID == 0x1002;
-}
-
-constexpr auto VMA_USE_BIND_MEMORY2 = true;
-constexpr auto VMA_USE_MEMORY_BUDGET = true;
-constexpr auto VMA_USE_BUFFER_DEVICE_ADDRESS = true;
 
 int main()
 try
@@ -86,32 +72,6 @@ try
         VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_SPIRV_1_4_EXTENSION_NAME,
         VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
         VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME}; // NOLINTEND
-
-    // NOTE: 配置 vma 的 flags
-    VmaAllocatorCreateFlags vma_flags = 0;
-    // @see
-    // https://gpuopen-librariesandsdks.github.io/VulkanMemoryAllocator/html/quick_start.html#:~:text=of%20this%20function.-,Enabling%20extensions,-VMA%20can%20automatically
-#if VK_USE_PLATFORM_WIN32_KHR
-    std::cout << "WIN32 \n";
-    requiredDeviceExtension.emplace_back("VK_KHR_external_memory_win32");
-    vma_flags |= VMA_ALLOCATOR_CREATE_KHR_EXTERNAL_MEMORY_WIN32_BIT;
-#endif
-    if constexpr (VMA_USE_BIND_MEMORY2)
-    {
-        requiredDeviceExtension.emplace_back("VK_KHR_bind_memory2");
-        vma_flags |= VMA_ALLOCATOR_CREATE_KHR_BIND_MEMORY2_BIT;
-    }
-    if constexpr (VMA_USE_MEMORY_BUDGET)
-    {
-        requiredDeviceExtension.emplace_back("VK_EXT_memory_budget");
-        vma_flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
-    }
-    if constexpr (VMA_USE_BUFFER_DEVICE_ADDRESS)
-    {
-        requiredDeviceExtension.emplace_back("VK_KHR_buffer_device_address");
-        vma_flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
-    }
-
     structure_chain<VkPhysicalDeviceFeatures2, VkPhysicalDeviceVulkan13Features,
                     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT>
         enablefeatureChain = {{},
@@ -147,17 +107,8 @@ try
             })
             .select()[0];
 
-    if (isAMDGPU(*physical_device))
-    {
-        std::cout << "amd gpu \n";
-        requiredDeviceExtension.emplace_back(
-            VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME);
-        vma_flags |= VMA_ALLOCATOR_CREATE_AMD_DEVICE_COHERENT_MEMORY_BIT;
-    }
-
     // VkSurfaceKHR surface = window.createVkSurfaceKHR(*instance);
     mcs::vulkan::surface auto surface = surface_impl(physical_device, window);
-    [[maybe_unused]] surface_base *si = &surface;
 
     const uint32_t GRAPHICS_QUEUE_FAMILY_IDX =
         queue_family_index_selector{physical_device}
@@ -187,11 +138,37 @@ try
     const auto GRAPHICS_AND_PRESENT = Queue(
         device, {.queue_family_index = GRAPHICS_QUEUE_FAMILY_IDX, .queue_index = 0});
 
-    raii_vma vma{{.flags = vma_flags,
-                  .physicalDevice = *physical_device,
-                  .device = *device,
-                  .instance = *instance,
-                  .vulkanApiVersion = APIVERSION}};
+    auto swapchainBuild =
+        create_swap_chain{surface, device}
+            .setCreateInfo(
+                {.changeMinImageCount =
+                     [](uint32_t minImageCount) noexcept { return minImageCount + 1; },
+                 .candidateSurfaceFormats = {{.format = VK_FORMAT_B8G8R8A8_SRGB,
+                                              .colorSpace =
+                                                  VK_COLOR_SPACE_SRGB_NONLINEAR_KHR}},
+                 .imageArrayLayers = 1,
+                 .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                 .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                 .queueFamilyIndices = {},
+                 .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+                 .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+                 .candidatePresentModes = {VK_PRESENT_MODE_MAILBOX_KHR,
+                                           VK_PRESENT_MODE_IMMEDIATE_KHR},
+                 .clipped = VK_TRUE})
+            .setViewCreateInfo(
+                {.viewType = VK_IMAGE_VIEW_TYPE_2D,
+                 .components = {.r = VK_COMPONENT_SWIZZLE_IDENTITY,
+                                .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+                                .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+                                .a = VK_COMPONENT_SWIZZLE_IDENTITY},
+                 .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                      .baseMipLevel = 0,
+                                      .levelCount = 1,
+                                      .baseArrayLayer = 0,
+                                      .layerCount = 1}});
+    auto swapchain = swapchainBuild.build();
+
+    swapchain = swapchainBuild.rebuild();
 
     while (window.shouldClose() == 0)
     {
