@@ -198,13 +198,13 @@ namespace mcs::vulkan::event
         using store_type = std::uint8_t;
         enum Value : store_type
         {
-            NONE = 0,
-            SHIFT = 0x01,
-            CONTROL = 0x02,
-            ALT = 0x04,
-            SUPER = 0x08,
-            CAPS_LOCK = 0x10,
-            NUM_LOCK = 0x20
+            eNONE = 0,
+            eSHIFT = 0x01,
+            eCONTROL = 0x02,
+            eALT = 0x04,
+            eSUPER = 0x08,
+            eCAPS_LOCK = 0x10,
+            eNUM_LOCK = 0x20
         };
 
         template <typename OutputIt>
@@ -216,8 +216,8 @@ namespace mcs::vulkan::event
             }
             // NOLINTNEXTLINE
             constexpr std::pair<const char *, Value> KEYS[] = {
-                {"SHIFT", SHIFT}, {"CONTROL", CONTROL},     {"ALT", ALT},
-                {"SUPER", SUPER}, {"CAPS_LOCK", CAPS_LOCK}, {"NUM_LOCK", NUM_LOCK}};
+                {"SHIFT", eSHIFT}, {"CONTROL", eCONTROL},     {"ALT", eALT},
+                {"SUPER", eSUPER}, {"CAPS_LOCK", eCAPS_LOCK}, {"NUM_LOCK", eNUM_LOCK}};
 
             bool first = true;
             for (const auto &[name, value] : KEYS)
@@ -240,7 +240,7 @@ namespace mcs::vulkan::event
 
       public:
         // 构造函数
-        constexpr ModifierKey() noexcept : value_(NONE) {}
+        constexpr ModifierKey() noexcept : value_(eNONE) {}
         constexpr explicit ModifierKey(Value v) noexcept
             : value_(static_cast<store_type>(v))
         {
@@ -274,13 +274,13 @@ namespace mcs::vulkan::event
         // 检查是否为空
         [[nodiscard]] constexpr bool empty() const noexcept
         {
-            return value_ == NONE;
+            return value_ == eNONE;
         }
 
         // 清除所有修饰键
         constexpr void clear() noexcept
         {
-            value_ = NONE;
+            value_ = eNONE;
         }
 
         // 添加修饰键
@@ -349,31 +349,31 @@ namespace mcs::vulkan::event
         // NOLINTBEGIN
         static constexpr ModifierKey None() noexcept
         {
-            return ModifierKey(NONE);
+            return ModifierKey(eNONE);
         }
         static constexpr ModifierKey Shift() noexcept
         {
-            return ModifierKey(SHIFT);
+            return ModifierKey(eSHIFT);
         }
         static constexpr ModifierKey Control() noexcept
         {
-            return ModifierKey(CONTROL);
+            return ModifierKey(eCONTROL);
         }
         static constexpr ModifierKey Alt() noexcept
         {
-            return ModifierKey(ALT);
+            return ModifierKey(eALT);
         }
         static constexpr ModifierKey Super() noexcept
         {
-            return ModifierKey(SUPER);
+            return ModifierKey(eSUPER);
         }
         static constexpr ModifierKey CapsLock() noexcept
         {
-            return ModifierKey(CAPS_LOCK);
+            return ModifierKey(eCAPS_LOCK);
         }
         static constexpr ModifierKey NumLock() noexcept
         {
-            return ModifierKey(NUM_LOCK);
+            return ModifierKey(eNUM_LOCK);
         }
 
         // 常用组合
