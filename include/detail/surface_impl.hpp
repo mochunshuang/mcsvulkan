@@ -1,10 +1,23 @@
 #pragma once
 
 #include "surface_base.hpp"
+#include <concepts>
 
 namespace mcs::vulkan
 {
-    template <typename Impl>
+    namespace detail
+    {
+        template <typename Window>
+        concept surface_impl =
+            requires(const Window &window, const VkSurfaceCapabilitiesKHR &capabilities,
+                     VkInstance instance) {
+                { window.createVkSurfaceKHR(instance) } -> std::same_as<VkSurfaceKHR>;
+                { window.chooseSwapExtent(capabilities) } -> std::same_as<VkExtent2D>;
+                { window.waitGoodFramebufferSize() } -> std::same_as<void>;
+            };
+    }; // namespace detail
+
+    template <detail::surface_impl Impl>
     struct surface_impl : surface_base
     {
         using base_type = surface_base;
