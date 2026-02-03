@@ -71,13 +71,13 @@ namespace mcs::vulkan::tool
             {
                 struct result_type
                 {
-                    result_type(VkApplicationInfo app,
-                                VkInstanceCreateInfo create) noexcept
+                    constexpr result_type(VkApplicationInfo app,
+                                          VkInstanceCreateInfo create) noexcept
                         : app_info{app}, create_info{create}
                     {
                         create_info.pApplicationInfo = &app_info;
                     }
-                    auto &createInfo() &
+                    [[nodiscard]] constexpr auto &createInfo() const & noexcept
                     {
                         return create_info;
                     }

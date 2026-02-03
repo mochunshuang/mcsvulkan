@@ -34,4 +34,32 @@ add_library(vma STATIC ${VOLK_FILES})
 target_compile_features(vma PRIVATE cxx_std_23)
 target_include_directories(vma SYSTEM PUBLIC "${VMA_DIR}")
 target_link_libraries(vma PRIVATE volk)
-target_compile_definitions(vma PUBLIC VMA_STATIC_VULKAN_FUNCTIONS=0 VMA_DYNAMIC_VULKAN_FUNCTIONS=0)
+
+# NOTE: 宏的定义顺序 很重要。平台配置应该放到前面
+if(WIN32)
+    # VK_USE_PLATFORM_WIN32_KHR 会引入很多 windows 的头文件
+    target_compile_definitions(vma PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+    target_compile_definitions(vma PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+
+# Linux (X11)
+elseif(UNIX AND NOT APPLE)
+    target_compile_definitions(vma PRIVATE VK_USE_PLATFORM_XLIB_KHR)
+
+# Linux (Wayland)
+elseif(UNIX AND NOT APPLE AND USE_WAYLAND) # 如果需要 Wayland
+    target_compile_definitions(vma PRIVATE VK_USE_PLATFORM_WAYLAND_KHR)
+
+# macOS
+elseif(APPLE)
+    target_compile_definitions(vma PRIVATE VK_USE_PLATFORM_MACOS_MVK)
+
+# Android
+elseif(ANDROID)
+    target_compile_definitions(vma PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
+
+# iOS
+elseif(IOS)
+    target_compile_definitions(vma PRIVATE VK_USE_PLATFORM_IOS_MVK)
+endif()
+
+target_compile_definitions(vma PUBLIC VMA_STATIC_VULKAN_FUNCTIONS=0 VMA_DYNAMIC_VULKAN_FUNCTIONS=0 VMA_IMPLEMENTATION)

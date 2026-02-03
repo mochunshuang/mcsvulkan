@@ -22,6 +22,7 @@ add_vulkan_tool_test(test_enable_intance_bulid)
 add_vulkan_tool_test(test_create_debuger)
 add_vulkan_tool_test(test_physical_device_selector)
 add_vulkan_tool_test(test_queue_family_index_selector)
+add_vulkan_tool_test(test_create_logical_device)
 
 # end
 unset(BASE_LIBS)

@@ -15,16 +15,21 @@ using mcs::vulkan::vkApiVersion;
 using mcs::vulkan::tool::enable_intance_bulid;
 using mcs::vulkan::tool::structure_chain;
 using mcs::vulkan::tool::queue_family_index_selector;
+using mcs::vulkan::tool::create_logical_device;
 
 using mcs::vulkan::raii_vulkan;
 using mcs::vulkan::PhysicalDevice;
 using mcs::vulkan::surface_impl;
 using mcs::vulkan::surface_interface;
 using surface = mcs::vulkan::wsi::glfw::Window;
+using mcs::vulkan::Queue;
+
+using mcs::vulkan::LogicalDevice;
 
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
 constexpr auto TITLE = "test_my_triangle";
+using mcs::vulkan::MCS_ASSERT;
 
 int main()
 try
@@ -105,7 +110,7 @@ try
     auto surface = surface_impl(instance, window);
     [[maybe_unused]] surface_interface *si = &surface;
 
-    [[maybe_unused]] const uint32_t GRAPHICS_QUEUE_FAMILY_IDX =
+    const uint32_t GRAPHICS_QUEUE_FAMILY_IDX =
         queue_family_index_selector{physical_device}
             .requiredQueueFamily([&](const VkQueueFamilyProperties &qfp,
                                      uint32_t queueFamilyIndex) -> bool {
@@ -113,6 +118,25 @@ try
                        physical_device.getSurfaceSupportKHR(queueFamilyIndex, *surface);
             })
             .select()[0];
+
+    LogicalDevice device =
+        create_logical_device{}
+            .setCreateInfo({
+                .queueCreateInfos = create_logical_device::makeQueueCreateInfos(
+                    create_logical_device::queue_create_info{
+                        .queueFamilyIndex = GRAPHICS_QUEUE_FAMILY_IDX,
+                        .queueCount = 1,
+                        .queuePrioritie = 1.0}),
+                .enabledExtensions = requiredDeviceExtension,
+                .enabledFeatures2 = &enablefeatureChain.head(),
+            })
+            .build(physical_device);
+    requiredDeviceExtension.clear();
+
+    MCS_ASSERT(device);
+
+    const auto GRAPHICS_AND_PRESENT = Queue(
+        device, {.queue_family_index = GRAPHICS_QUEUE_FAMILY_IDX, .queue_index = 0});
 
     while (window.shouldClose() == 0)
     {

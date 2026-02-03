@@ -63,9 +63,10 @@ Diagnostics:
       readability-identifier-naming.ValueTemplateParameterSuffix.VariableHungarianPrefix: _
       # 常量
       readability-identifier-naming.ConstantCase: UPPER_CASE
-      ; readability-identifier-naming.ConstantPrefix: k_
+      # readability-identifier-naming.ConstantPrefix: k_
       readability-identifier-naming.EnumCase: UPPER_CASE,lower_case
       readability-identifier-naming.EnumConstantCase: UPPER_CASE
+      readability-identifier-naming.EnumConstantPrefix: e
       # 宏定义
       readability-identifier-naming.MacroDefinitionCase: UPPER_CASE
       # 类

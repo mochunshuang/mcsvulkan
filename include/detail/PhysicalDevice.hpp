@@ -33,7 +33,10 @@ namespace mcs::vulkan
         {
             return instance_->enumeratePhysicalDevices();
         }
-
+        [[nodiscard]] VkAllocationCallbacks *allocator() const noexcept
+        {
+            return instance_->allocator();
+        }
         [[nodiscard]] auto getProperties() const noexcept
         {
             return Instance::getPhysicalDeviceProperties(value_);

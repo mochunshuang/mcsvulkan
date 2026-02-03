@@ -8,3 +8,5 @@
 #include "detail/raii_vulkan.hpp"
 #include "detail/Instance.hpp"
 #include "detail/surface_impl.hpp"
+#include "detail/Queue.hpp"
+#include "detail/raii_vma.hpp"

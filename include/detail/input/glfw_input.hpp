@@ -146,8 +146,8 @@ namespace mcs::vulkan::input
 
       private:
         bool acceptNewEvent_{};
-        std::array<keyboard_event, static_cast<uint8_t>(event::Key::SIZE)> keyboards_;
-        std::array<mousebutton_event, static_cast<uint8_t>(event::MouseButtons::SIZE)>
+        std::array<keyboard_event, static_cast<uint8_t>(event::Key::eSIZE)> keyboards_;
+        std::array<mousebutton_event, static_cast<uint8_t>(event::MouseButtons::eSIZE)>
             mousebuttons_;
         scroll_event scroll_;
         position2d_event cursorPos_;

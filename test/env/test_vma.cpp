@@ -2,7 +2,10 @@
 #define VOLK_IMPLEMENTATION
 #include <volk.h>
 
+#ifndef VMA_IMPLEMENTATION
 #define VMA_IMPLEMENTATION
+
+#endif //! VMA_IMPLEMENTATION
 #include <vk_mem_alloc.h>
 
 #include <iostream>
