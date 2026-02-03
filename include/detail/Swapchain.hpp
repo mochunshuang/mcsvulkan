@@ -42,7 +42,7 @@ namespace mcs::vulkan
             return imageExtent_;
         }
 
-        Swapchain(const Swapchain &) = default;
+        Swapchain(const Swapchain &) = delete;
         constexpr Swapchain(Swapchain &&o) noexcept
             : device_{std::exchange(o.device_, {})},
               swapchain_{std::exchange(o.swapchain_, {})},
@@ -51,7 +51,7 @@ namespace mcs::vulkan
               imageExtent_{std::exchange(o.imageExtent_, {})}
         {
         }
-        Swapchain &operator=(const Swapchain &) = default;
+        Swapchain &operator=(const Swapchain &) = delete;
         constexpr Swapchain &operator=(Swapchain &&o) noexcept
         {
             if (&o != this)

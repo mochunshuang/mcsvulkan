@@ -27,11 +27,11 @@ namespace mcs::vulkan
             // NOTE: load fun_ptr
             ::volkLoadInstanceOnly(value_);
         }
-        Instance(const Instance &) = default;
+        Instance(const Instance &) = delete;
         constexpr Instance(Instance &&o) noexcept
             : value_(std::exchange(o.value_, {})),
               allocator_{std::exchange(o.allocator_, {})} {};
-        Instance &operator=(const Instance &) = default;
+        Instance &operator=(const Instance &) = delete;
         constexpr Instance &operator=(Instance &&o) noexcept
         {
             if (&o != this)
