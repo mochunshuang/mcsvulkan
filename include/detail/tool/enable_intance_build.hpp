@@ -8,7 +8,7 @@
 
 namespace mcs::vulkan::tool
 {
-    struct enable_intance_bulid
+    struct enable_intance_build
     {
         static constexpr auto checkExtensionSupport(
             const std::vector<const char *> &required,

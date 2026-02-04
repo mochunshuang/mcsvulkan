@@ -5,7 +5,7 @@
 
 namespace mcs::vulkan
 {
-    class Debuger
+    class Debugger
     {
         using value_type = VkDebugUtilsMessengerEXT;
         const Instance *instance_{};
@@ -29,15 +29,15 @@ namespace mcs::vulkan
             return instance_;
         }
 
-        constexpr Debuger() = default;
-        Debuger(const Debuger &) = delete;
-        constexpr Debuger(Debuger &&o) noexcept
+        constexpr Debugger() = default;
+        Debugger(const Debugger &) = delete;
+        constexpr Debugger(Debugger &&o) noexcept
             : instance_{std::exchange(o.instance_, {})},
               value_{std::exchange(o.value_, {})}
         {
         }
-        Debuger &operator=(const Debuger &) = delete;
-        constexpr Debuger &operator=(Debuger &&o) noexcept
+        Debugger &operator=(const Debugger &) = delete;
+        constexpr Debugger &operator=(Debugger &&o) noexcept
         {
             if (&o != this)
             {
@@ -47,7 +47,7 @@ namespace mcs::vulkan
             }
             return *this;
         }
-        constexpr Debuger(const Instance &instance, value_type value) noexcept
+        constexpr Debugger(const Instance &instance, value_type value) noexcept
             : instance_{&instance}, value_{value}
         {
         }
@@ -60,7 +60,7 @@ namespace mcs::vulkan
                 value_ = {};
             }
         }
-        constexpr ~Debuger() noexcept
+        constexpr ~Debugger() noexcept
         {
             destroy();
         }

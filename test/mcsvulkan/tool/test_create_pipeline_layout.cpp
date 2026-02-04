@@ -8,12 +8,12 @@
 
 using Instance = mcs::vulkan::Instance;
 using create_instance = mcs::vulkan::tool::create_instance;
-using create_debuger = mcs::vulkan::tool::create_debuger;
+using create_debugger = mcs::vulkan::tool::create_debugger;
 using physical_device_selector = mcs::vulkan::tool::physical_device_selector;
 using mcs::vulkan::vkMakeVersion;
 using mcs::vulkan::vkApiVersion;
 
-using mcs::vulkan::tool::enable_intance_bulid;
+using mcs::vulkan::tool::enable_intance_build;
 using mcs::vulkan::tool::structure_chain;
 using mcs::vulkan::tool::queue_family_index_selector;
 using mcs::vulkan::tool::create_logical_device;
@@ -36,6 +36,12 @@ using mcs::vulkan::MCS_ASSERT;
 int main()
 try
 {
+#ifdef VERT_SHADER_PATH
+    std::cout << "VERT_SHADER_PATH: " << VERT_SHADER_PATH << '\n';
+#endif
+#ifdef FRAG_SHADER_PATH
+    std::cout << "FRAG_SHADER_PATH: " << FRAG_SHADER_PATH << '\n';
+#endif
     raii_vulkan ctx{};
 
     surface window{};
@@ -45,7 +51,7 @@ try
     static_assert(vkApiVersion(1, 4, 0) == VK_API_VERSION_1_4);
     static_assert(vkApiVersion(0, 1, 4, 0) == VK_API_VERSION_1_4);
 
-    auto enables = enable_intance_bulid{}
+    auto enables = enable_intance_build{}
                        .enableDebugExtension()
                        .enableValidationLayer()
                        .enableSurfaceExtension<surface>();
@@ -64,8 +70,8 @@ try
                  .enabledLayers = enables.enabledLayers(),
                  .enabledExtensions = enables.enabledExtensions()})
             .build();
-    auto debuger = create_debuger{}
-                       .setCreateInfo(create_debuger::defaultCreateInfo())
+    auto debuger = create_debugger{}
+                       .setCreateInfo(create_debugger::defaultCreateInfo())
                        .build(instance);
 
     std::vector<const char *> requiredDeviceExtension = {

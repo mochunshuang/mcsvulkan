@@ -60,6 +60,8 @@ namespace mcs::vulkan::to_string
             STR(VK_PIPELINE_BINARY_MISSING_KHR)
             STR(VK_ERROR_NOT_ENOUGH_SPACE_KHR)
             STR(VK_RESULT_MAX_ENUM)
+            // TODO(mcs): 还得看版本哦 可能加字段哦
+            STR(VK_ERROR_PRESENT_TIMING_QUEUE_FULL_EXT)
         }
         return ERROR_MAP(VkResult);
     }

@@ -8,7 +8,7 @@
 
 using Instance = mcs::vulkan::Instance;
 using create_instance = mcs::vulkan::tool::create_instance;
-using create_debuger = mcs::vulkan::tool::create_debuger;
+using create_debugger = mcs::vulkan::tool::create_debugger;
 using physical_device_selector = mcs::vulkan::tool::physical_device_selector;
 
 using mcs::vulkan::raii_vulkan;

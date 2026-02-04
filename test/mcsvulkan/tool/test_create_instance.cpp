@@ -1,8 +1,10 @@
 #include <cassert>
+#include <chrono>
 #include <exception>
 #include <iostream>
 #include <print>
 #include <span>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -16,7 +18,7 @@ using mcs::vulkan::tool::sType;
 
 using mcs::vulkan::MCS_ASSERT;
 
-using mcs::vulkan::tool::enable_intance_bulid;
+using mcs::vulkan::tool::enable_intance_build;
 
 using mcs::vulkan::raii_vulkan;
 
@@ -75,7 +77,7 @@ try
         MCS_ASSERT(layers2.data() != nullptr); // NOTE: 这里需要注意
     }
 
-    auto enables = enable_intance_bulid{}.enableDebugExtension().enableValidationLayer();
+    auto enables = enable_intance_build{}.enableDebugExtension().enableValidationLayer();
     enables.check();
 
     {
@@ -138,6 +140,9 @@ try
 
     MCS_ASSERT(*instance != nullptr);
     MCS_ASSERT(instance);
+
+    // NOTE: 太快 可能不提供测试
+    std::this_thread::sleep_for(std::chrono::microseconds(50)); // NOLINT
 
     std::cout << "main done\n";
     return 0;

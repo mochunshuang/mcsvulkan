@@ -7,11 +7,11 @@
 
 using Instance = mcs::vulkan::Instance;
 using create_instance = mcs::vulkan::tool::create_instance;
-using create_debuger = mcs::vulkan::tool::create_debuger;
+using create_debugger = mcs::vulkan::tool::create_debugger;
 using mcs::vulkan::vkMakeVersion;
 using mcs::vulkan::vkApiVersion;
 
-using mcs::vulkan::tool::enable_intance_bulid;
+using mcs::vulkan::tool::enable_intance_build;
 
 using mcs::vulkan::raii_vulkan;
 
@@ -31,7 +31,7 @@ try
     window.setup({.width = WIDTH, .height = HEIGHT}, TITLE); // NOLINT
 
     constexpr auto APIVERSION = vkApiVersion(0, 1, 4, 0);
-    auto enables = enable_intance_bulid{}
+    auto enables = enable_intance_build{}
                        .enableDebugExtension()
                        .enableValidationLayer()
                        .enableSurfaceExtension<surface>();
@@ -48,8 +48,8 @@ try
                  .enabledLayers = enables.enabledLayers(),
                  .enabledExtensions = enables.enabledExtensions()})
             .build();
-    auto debuger = create_debuger{}
-                       .setCreateInfo(create_debuger::defaultCreateInfo())
+    auto debuger = create_debugger{}
+                       .setCreateInfo(create_debugger::defaultCreateInfo())
                        .build(instance);
 
     while (window.shouldClose() == 0)

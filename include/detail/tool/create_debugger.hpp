@@ -4,12 +4,12 @@
 #include "pNext.hpp"
 #include "Flags.hpp"
 #include "../Instance.hpp"
-#include "../Debuger.hpp"
+#include "../Debugger.hpp"
 #include "../utils/mcslog.hpp"
 
 namespace mcs::vulkan::tool
 {
-    struct create_debuger
+    struct create_debugger
     {
         /// @brief A debug callback called from Vulkan validation layers.
         static VKAPI_ATTR VkBool32 VKAPI_CALL
@@ -100,12 +100,12 @@ namespace mcs::vulkan::tool
             createInfo_ = std::move(createInfo);
             return *this;
         }
-        constexpr Debuger build(const Instance &instance)
+        constexpr Debugger build(const Instance &instance)
         {
             auto CI = createInfo_();
             VkDebugUtilsMessengerEXT messenger =
                 instance.createDebugUtilsMessengerEXT(&CI, instance.allocator());
-            return Debuger{instance, messenger};
+            return Debugger{instance, messenger};
         }
 
       private:
