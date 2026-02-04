@@ -99,7 +99,8 @@ namespace mcs::vulkan::tool
             }
         }; // NOLINTEND
 
-        constexpr Instance build(VkAllocationCallbacks *pAllocator = nullptr)
+        [[nodiscard]] constexpr Instance build(
+            VkAllocationCallbacks *pAllocator = nullptr) const
         {
             auto result = createInfo_();
             VkInstance instance; // NOLINT

@@ -171,13 +171,15 @@ try
     LogicalDevice device =
         create_logical_device{}
             .setCreateInfo({
+                .pNext = make_pNext(enablefeatureChain), // NOTE: 这个替代
                 .queueCreateInfos = create_logical_device::makeQueueCreateInfos(
                     create_logical_device::queue_create_info{
                         .queueFamilyIndex = GRAPHICS_QUEUE_FAMILY_IDX,
                         .queueCount = 1,
                         .queuePrioritie = 1.0}),
                 .enabledExtensions = requiredDeviceExtension,
-                .enabledFeatures2 = &enablefeatureChain.head(),
+                // NOTE: 下面的方式是错误的。因为 features.next=nullptr
+                //  .pEnabledFeatures = &enablefeatureChain.head().features,
             })
             .build(physical_device);
     requiredDeviceExtension.clear();

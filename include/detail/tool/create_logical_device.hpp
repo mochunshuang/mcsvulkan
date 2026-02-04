@@ -5,7 +5,6 @@
 #include "Flags.hpp"
 #include "../LogicalDevice.hpp"
 
-#include <concepts>
 #include <optional>
 #include <ranges>
 #include <span>
@@ -83,9 +82,7 @@ namespace mcs::vulkan::tool
                           .ppEnabledExtensionNames = info.enabledExtensions.empty()
                                                          ? nullptr
                                                          : info.enabledExtensions.data(),
-                          .pEnabledFeatures = info.enabledFeatures2
-                                                  ? &info.enabledFeatures2->features
-                                                  : nullptr}
+                          .pEnabledFeatures = info.pEnabledFeatures}
                 {
                 }
 
@@ -107,7 +104,7 @@ namespace mcs::vulkan::tool
             std::vector<queue_create_info> queueCreateInfos;
             std::span<const char *const> enabledExtensions;
             // NOTE: 这里不一样。不过不影响
-            const VkPhysicalDeviceFeatures2 *enabledFeatures2{};
+            const VkPhysicalDeviceFeatures *pEnabledFeatures{};
         }; // NOLINTEND
 
         [[nodiscard]] constexpr LogicalDevice build(const PhysicalDevice &physicalDevice)

@@ -278,6 +278,11 @@ namespace mcs::vulkan::tool
         {
         }
 
+        const VkFormat &refImageFormat() noexcept
+        {
+            return swapchainCreateInfo_.imageFormat;
+        };
+
       private:
         const Surface *surfaceInterface_{};
         const LogicalDevice *device_{};

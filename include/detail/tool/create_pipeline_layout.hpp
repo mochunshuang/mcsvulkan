@@ -43,7 +43,7 @@ namespace mcs::vulkan::tool
             std::vector<VkPushConstantRange> pushConstantRanges;
         }; // NOLINTEND
 
-        [[nodiscard]] auto build(const LogicalDevice &device)
+        [[nodiscard]] auto build(const LogicalDevice &device) const
         {
             return PipelineLayout(
                 device, device.createPipelineLayout(createInfo_(), device.allocator()));

@@ -100,7 +100,7 @@ namespace mcs::vulkan::tool
             createInfo_ = std::move(createInfo);
             return *this;
         }
-        constexpr Debugger build(const Instance &instance)
+        [[nodiscard]] constexpr Debugger build(const Instance &instance) const
         {
             auto CI = createInfo_();
             VkDebugUtilsMessengerEXT messenger =

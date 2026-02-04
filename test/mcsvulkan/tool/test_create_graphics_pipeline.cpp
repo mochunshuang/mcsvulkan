@@ -19,6 +19,7 @@ using mcs::vulkan::tool::queue_family_index_selector;
 using mcs::vulkan::tool::create_logical_device;
 using mcs::vulkan::tool::create_swap_chain;
 using mcs::vulkan::tool::create_pipeline_layout;
+using mcs::vulkan::tool::create_graphics_pipeline;
 
 using mcs::vulkan::raii_vulkan;
 using mcs::vulkan::PhysicalDevice;
@@ -27,6 +28,8 @@ using surface = mcs::vulkan::wsi::glfw::Window;
 using mcs::vulkan::Queue;
 
 using mcs::vulkan::LogicalDevice;
+
+using mcs::vulkan::tool::make_pNext;
 
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
@@ -127,14 +130,14 @@ try
     LogicalDevice device =
         create_logical_device{}
             .setCreateInfo({
-                .pNext = make_pNext(enablefeatureChain), // NOTE: 这个替代
+                .pNext = make_pNext(enablefeatureChain),
                 .queueCreateInfos = create_logical_device::makeQueueCreateInfos(
                     create_logical_device::queue_create_info{
                         .queueFamilyIndex = GRAPHICS_QUEUE_FAMILY_IDX,
                         .queueCount = 1,
                         .queuePrioritie = 1.0}),
                 .enabledExtensions = requiredDeviceExtension,
-                // NOTE: 下面的方式是错误的。因为 features.next=nullptr
+                // NOTE: 下面的方式是错误的。因为 features.next=null
                 //  .pEnabledFeatures = &enablefeatureChain.head().features,
             })
             .build(physical_device);
@@ -178,6 +181,54 @@ try
     auto pipelineLayout = create_pipeline_layout{}
                               .setCreateInfo({.setLayouts = {}, .pushConstantRanges = {}})
                               .build(device);
+
+    using stage_info = create_graphics_pipeline::stage_info;
+    auto graphicsPipeline =
+        create_graphics_pipeline{}
+            .setCreateInfo(
+                {.pNext = make_pNext(structure_chain<VkPipelineRenderingCreateInfo>{
+                     {.colorAttachmentCount = 1,
+                      .pColorAttachmentFormats = &swapchainBuild.refImageFormat()}}),
+                 .stages = create_graphics_pipeline::makeStages(
+                     stage_info{.stage = VK_SHADER_STAGE_VERTEX_BIT,
+                                .filePath = VERT_SHADER_PATH,
+                                .pName = "main"},
+                     stage_info{.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                                .filePath = FRAG_SHADER_PATH,
+                                .pName = "main"}),
+                 .vertexInputState = {},
+                 .inputAssemblyState = {.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                                        .primitiveRestartEnable = VK_FALSE},
+                 .tessellationState = {},
+                 .viewportState = {.viewports = {VkViewport{}}, .scissors = {VkRect2D{}}},
+                 .rasterizationState = {.depthClampEnable = VK_FALSE,
+                                        .rasterizerDiscardEnable = VK_FALSE,
+                                        .polygonMode = VK_POLYGON_MODE_FILL,
+                                        .cullMode = VK_CULL_MODE_BACK_BIT,
+                                        .frontFace = VK_FRONT_FACE_CLOCKWISE,
+                                        // .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+                                        .depthBiasEnable = VK_FALSE,
+                                        .lineWidth = 1.0F},
+                 .multisampleState =
+                     {
+                         // 没有硬件采样配置
+                         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+                         // NOTE: 9. 这里可以改进内部颜色质量
+                         .sampleShadingEnable = VK_FALSE,
+                     },
+                 .depthStencilState = {},
+                 .colorBlendState = {.logicOpEnable = VK_FALSE,
+                                     .logicOp = VkLogicOp::VK_LOGIC_OP_COPY,
+                                     .attachments = {{.blendEnable = VK_FALSE, // 关闭混合
+                                                      .colorWriteMask =
+                                                          VK_COLOR_COMPONENT_R_BIT |
+                                                          VK_COLOR_COMPONENT_G_BIT |
+                                                          VK_COLOR_COMPONENT_B_BIT |
+                                                          VK_COLOR_COMPONENT_A_BIT}}},
+                 .dynamicState = {.dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT,
+                                                    VK_DYNAMIC_STATE_SCISSOR}},
+                 .layout = *pipelineLayout})
+            .build(device);
 
     while (window.shouldClose() == 0)
     {

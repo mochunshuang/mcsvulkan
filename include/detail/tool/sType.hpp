@@ -138,6 +138,8 @@ namespace mcs::vulkan::tool
             std::is_same_v<T,
                            VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT>)
             return VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT;
+        else if constexpr (std::is_same_v<T, VkPipelineTessellationStateCreateInfo>)
+            return VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
         else
             // static_assert(false, "Unknown Vulkan structure type");
             std::terminate();

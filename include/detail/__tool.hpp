@@ -8,3 +8,4 @@
 #include "tool/create_logical_device.hpp"
 #include "tool/create_swap_chain.hpp"
 #include "tool/create_pipeline_layout.hpp"
+#include "tool/create_graphics_pipeline.hpp"
