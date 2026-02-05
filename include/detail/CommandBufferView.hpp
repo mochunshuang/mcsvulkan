@@ -126,11 +126,11 @@ namespace mcs::vulkan
         {
             pool_->device()->beginCommandBuffer(value_, beginInfo);
         }
-        constexpr void begin(const begin_info &beginInfo) const
-        {
-            auto ret = beginInfo();
-            pool_->device()->beginCommandBuffer(value_, ret.beginInfo());
-        }
+        // constexpr void begin(const begin_info &beginInfo) const
+        // {
+        //     auto ret = beginInfo();
+        //     pool_->device()->beginCommandBuffer(value_, ret.beginInfo());
+        // }
 
         /*
         typedef struct VkRenderingInfo {
@@ -210,24 +210,24 @@ namespace mcs::vulkan
         {
             pool_->device()->cmdBeginRendering(value_, info);
         }
-        constexpr void beginRendering(const rendering_info &info) const noexcept
-        {
-            auto base = info();
-            auto colorAttachments =
-                info.colorAttachments |
-                std::views::transform(
-                    [](const rendering_info::rendering_attachment
-                           &create) constexpr noexcept { return create(); }) |
-                std::ranges::to<std::vector<VkRenderingAttachmentInfo>>();
-            base.colorAttachmentCount = colorAttachments.size();
-            base.pColorAttachments =
-                colorAttachments.empty() ? nullptr : colorAttachments.data();
-            auto depthAttachment = info.depthAttachment();
-            base.pDepthAttachment = &depthAttachment;
-            auto stencilAttachment = info.stencilAttachment();
-            base.pStencilAttachment = &stencilAttachment;
-            beginRendering(base);
-        }
+        // constexpr void beginRendering(const rendering_info &info) const noexcept
+        // {
+        //     auto base = info();
+        //     auto colorAttachments =
+        //         info.colorAttachments |
+        //         std::views::transform(
+        //             [](const rendering_info::rendering_attachment
+        //                    &create) constexpr noexcept { return create(); }) |
+        //         std::ranges::to<std::vector<VkRenderingAttachmentInfo>>();
+        //     base.colorAttachmentCount = colorAttachments.size();
+        //     base.pColorAttachments =
+        //         colorAttachments.empty() ? nullptr : colorAttachments.data();
+        //     auto depthAttachment = info.depthAttachment();
+        //     base.pDepthAttachment = &depthAttachment;
+        //     auto stencilAttachment = info.stencilAttachment();
+        //     base.pStencilAttachment = &stencilAttachment;
+        //     beginRendering(base);
+        // }
         constexpr void bindPipeline(VkPipelineBindPoint pipelineBindPoint,
                                     VkPipeline pipeline) const noexcept
         {

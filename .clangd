@@ -42,7 +42,9 @@ Diagnostics:
       # 允许位运算
       hicpp-signed-bitwise,
       # 允许双下划线开头
-      cert-dcl37-c,bugprone-reserved-identifier,cert-dcl51-cpp
+      cert-dcl37-c,bugprone-reserved-identifier,cert-dcl51-cpp,
+      # 避免[] 数组警告
+      cppcoreguidelines-pro-bounds-constant-array-index
     ]
     CheckOptions:
       readability-identifier-length.MinimumParameterNameLength: 1

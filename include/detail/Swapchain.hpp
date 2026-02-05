@@ -1,6 +1,7 @@
 #pragma once
 
 #include "LogicalDevice.hpp"
+#include <cstddef>
 
 namespace mcs::vulkan
 {
@@ -44,6 +45,19 @@ namespace mcs::vulkan
         [[nodiscard]] constexpr auto imagesSize() const noexcept
         {
             return swapChainImages_.size();
+        }
+        [[nodiscard]] constexpr auto image(size_t idx) const noexcept
+        {
+            return swapChainImages_[idx];
+        }
+        [[nodiscard]] constexpr auto imageView(size_t idx) const noexcept
+        {
+            return swapChainImageViews_[idx];
+        }
+        auto acquireNextImage(uint64_t timeout, VkSemaphore semaphore,
+                              VkFence fence) const noexcept
+        {
+            return device_->acquireNextImageKHR(swapchain_, timeout, semaphore, fence);
         }
 
         Swapchain(const Swapchain &) = delete;

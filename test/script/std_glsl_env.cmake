@@ -8,7 +8,7 @@ macro(std_glsl_env_init TEST_SUB_DIR)
     set(BASE_LIBS volk vma glfw glm)
 endmacro()
 
-macro(add_std_glsl_target fileName vertName fragName)
+macro(std_glsl_target fileName vertName fragName)
     string(REPLACE "/" "-" PREFIX_NAME ${DIR_NAME})
     set(TARGET_NAME "${PREFIX_NAME}-${fileName}")
     set(VERT_TAGET "${GLSL_SHADERS_NAME}-${vertName}")
@@ -37,6 +37,10 @@ macro(add_std_glsl_target fileName vertName fragName)
         VERT_SHADER_PATH="${SHADER_OUTPUT_DIR}/${vertName}.spv"
         FRAG_SHADER_PATH="${SHADER_OUTPUT_DIR}/${fragName}.spv"
     )
+endmacro()
+
+macro(add_std_glsl_target fileName vertName fragName)
+    std_glsl_target(${fileName} ${vertName} ${fragName})
 
     # 添加测试
     add_test(NAME "${TARGET_NAME}" COMMAND $<TARGET_FILE:${TARGET_NAME}>)
