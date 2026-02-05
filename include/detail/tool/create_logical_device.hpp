@@ -5,7 +5,6 @@
 #include "Flags.hpp"
 #include "../LogicalDevice.hpp"
 
-#include <optional>
 #include <ranges>
 #include <span>
 #include <utility>
@@ -120,7 +119,7 @@ namespace mcs::vulkan::tool
             return *this;
         }
 
-        template <typename... Args>
+        template <std::same_as<queue_create_info>... Args>
         static constexpr auto makeQueueCreateInfos(Args &&...args)
         {
             std::vector<queue_create_info> result;

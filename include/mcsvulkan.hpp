@@ -11,3 +11,5 @@
 #include "detail/Queue.hpp"
 #include "detail/raii_vma.hpp"
 #include "detail/surface.hpp"
+#include "detail/CommandBuffer.hpp"
+#include "detail/CommandBuffers.hpp"

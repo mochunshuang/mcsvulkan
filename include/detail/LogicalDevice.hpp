@@ -228,13 +228,18 @@ namespace mcs::vulkan
             return commandBuffer;
         }
 
-        constexpr void freeCommandBuffers(
-            VkCommandPool commandPool, uint32_t commandBufferCount,
-            const VkCommandBuffer &commandBuffers) const noexcept
+        constexpr void freeCommandBuffers(VkCommandPool commandPool,
+                                          uint32_t commandBufferCount,
+                                          const VkCommandBuffer *data) const noexcept
         {
             MCS_ASSERT(table_.vkFreeCommandBuffers != nullptr);
-            table_.vkFreeCommandBuffers(value_, commandPool, commandBufferCount,
-                                        &commandBuffers);
+            table_.vkFreeCommandBuffers(value_, commandPool, commandBufferCount, data);
+        }
+        constexpr void freeOneCommandBuffer(
+            VkCommandPool commandPool,
+            const VkCommandBuffer &commandBuffers) const noexcept
+        {
+            freeCommandBuffers(commandPool, 1, &commandBuffers);
         }
 
         [[nodiscard]] constexpr auto createSemaphore(
@@ -457,13 +462,12 @@ namespace mcs::vulkan
             table_.vkCmdPipelineBarrier2(commandBuffer, &dependencyInfo);
         }
 
-        constexpr void cmdCopyBuffer(
-            VkCommandBuffer commandBuffer, VkBuffer srcBuffer, VkBuffer dstBuffer,
-            const std::vector<VkBufferCopy> &regions) const noexcept
+        constexpr void cmdCopyBuffer(VkCommandBuffer commandBuffer, VkBuffer srcBuffer,
+                                     VkBuffer dstBuffer, uint32_t count,
+                                     const VkBufferCopy *regions) const noexcept
         {
             MCS_ASSERT(table_.vkCmdCopyBuffer != nullptr);
-            table_.vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, regions.size(),
-                                   regions.data());
+            table_.vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, count, regions);
         }
 
         constexpr void queueWaitIdle(VkQueue queue) const noexcept
