@@ -25,21 +25,25 @@ namespace mcs::vulkan
         {
             return swapchain_;
         }
-        [[nodiscard]] auto *device() const noexcept
+        [[nodiscard]] constexpr auto *device() const noexcept
         {
             return device_;
         }
-        [[nodiscard]] auto &swapChainImages() const noexcept
+        [[nodiscard]] constexpr auto &swapChainImages() const noexcept
         {
             return swapChainImages_;
         }
-        [[nodiscard]] auto &swapChainImageViews() const noexcept
+        [[nodiscard]] constexpr auto &swapChainImageViews() const noexcept
         {
             return swapChainImageViews_;
         }
-        [[nodiscard]] VkExtent2D imageExtent() const noexcept
+        [[nodiscard]] constexpr VkExtent2D imageExtent() const noexcept
         {
             return imageExtent_;
+        }
+        [[nodiscard]] constexpr auto imagesSize() const noexcept
+        {
+            return swapChainImages_.size();
         }
 
         Swapchain(const Swapchain &) = delete;
