@@ -152,13 +152,13 @@ namespace mcs::vulkan
         [[nodiscard]] void *map() const
         {
             void *data; // NOLINT
-            vmaMapMemory(allocator_, allocation_, &data);
+            ::vmaMapMemory(allocator_, allocation_, &data);
             return data;
         }
 
         void unmap() const noexcept
         {
-            vmaUnmapMemory(allocator_, allocation_);
+            ::vmaUnmapMemory(allocator_, allocation_);
         }
 
         void copyDataToBuffer(const void *src, size_t size) const
@@ -182,7 +182,7 @@ namespace mcs::vulkan
         {
             if (buffer_ != nullptr)
             {
-                vmaDestroyBuffer(allocator_, buffer_, allocation_);
+                ::vmaDestroyBuffer(allocator_, buffer_, allocation_);
                 buffer_ = {};
                 allocator_ = {};
                 allocation_ = {};
@@ -199,8 +199,8 @@ namespace mcs::vulkan
         VmaAllocation allocation = nullptr;
         VmaAllocationInfo allocInfo;
 
-        vmaCreateBuffer(allocator, &bufferInfo, &allocCreateInfo, &buffer, &allocation,
-                        &allocInfo);
+        check_vkresult(::vmaCreateBuffer(allocator, &bufferInfo, &allocCreateInfo,
+                                         &buffer, &allocation, &allocInfo));
 
         buffer_base result{buffer, allocator, allocation};
 
@@ -312,7 +312,7 @@ struct mesh_base
     // NOTE: 不再需要重复设置下面的内存配置
     //  static constexpr auto REQUIRE_MEMORY_FLAG = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
 
-    constexpr void createVertexBufferForFrame(VmaAllocator allocator_, FrameBuffers &fb)
+    constexpr void createVertexBufferForFrame(VmaAllocator allocator, FrameBuffers &fb)
     {
         auto &vertices = queue_data.vertices;
         const VkDeviceSize BUFFER_SIZE = sizeof(vertices[0]) * vertices.size();
@@ -321,7 +321,7 @@ struct mesh_base
 
         // 直接使用重构后的 create_buffer 函数
         destBuffer = mcs::vulkan::create_buffer(
-            allocator_,
+            allocator,
             {.sType = sType<VkBufferCreateInfo>(),
              .size = BUFFER_SIZE,
              .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | USAGE | REQUIRE_BUFFER_USAGE,
@@ -332,7 +332,7 @@ struct mesh_base
             });
 
         // 创建暂存缓冲区并复制数据
-        const auto STAGING_BUFFER = mcs::vulkan::staging_buffer(allocator_, BUFFER_SIZE);
+        const auto STAGING_BUFFER = mcs::vulkan::staging_buffer(allocator, BUFFER_SIZE);
         STAGING_BUFFER.copyDataToBuffer(vertices.data(), BUFFER_SIZE);
 
         mcs::vulkan::simple_copy_buffer(*commandpool, *queue, STAGING_BUFFER.buffer(),
@@ -340,7 +340,7 @@ struct mesh_base
                                         {VkBufferCopy{.size = BUFFER_SIZE}});
     }
 
-    void createIndexBufferForFrame(VmaAllocator allocator_, FrameBuffers &fb)
+    void createIndexBufferForFrame(VmaAllocator allocator, FrameBuffers &fb)
     {
         auto &indices = queue_data.indices;
         const VkDeviceSize BUFFER_SIZE = sizeof(indices[0]) * indices.size();
@@ -349,7 +349,7 @@ struct mesh_base
 
         // 直接使用重构后的 create_buffer 函数
         destBuffer = mcs::vulkan::create_buffer(
-            allocator_,
+            allocator,
             {.sType = sType<VkBufferCreateInfo>(),
              .size = BUFFER_SIZE,
              .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | USAGE | REQUIRE_BUFFER_USAGE,
@@ -358,7 +358,7 @@ struct mesh_base
              .usage = VMA_MEMORY_USAGE_AUTO});
 
         // 创建暂存缓冲区并复制数据
-        const auto STAGING_BUFFER = mcs::vulkan::staging_buffer(allocator_, BUFFER_SIZE);
+        const auto STAGING_BUFFER = mcs::vulkan::staging_buffer(allocator, BUFFER_SIZE);
         STAGING_BUFFER.copyDataToBuffer(indices.data(), BUFFER_SIZE);
 
         mcs::vulkan::simple_copy_buffer(*commandpool, *queue, STAGING_BUFFER.buffer(),
@@ -391,7 +391,7 @@ struct mesh_base
         count = 2;
     }
 
-    void applyQueuedUpdate(VmaAllocator allocator_, uint32_t currentFrame)
+    void applyQueuedUpdate(VmaAllocator allocator, uint32_t currentFrame)
     {
         if (count == 0)
         {
@@ -402,8 +402,8 @@ struct mesh_base
 
         // 更新GPU缓冲区（这个帧当前没有被GPU使用）
         auto &fb = frameBuffers[currentFrame];
-        createVertexBufferForFrame(allocator_, fb);
-        createIndexBufferForFrame(allocator_, fb);
+        createVertexBufferForFrame(allocator, fb);
+        createIndexBufferForFrame(allocator, fb);
         getBufferDeviceAddresses(fb);
     }
 
@@ -729,10 +729,15 @@ try
     auto &indexs = input_mesh.queue_data.indices;
 
     // diff: end // NOLINTEND
-
+    struct record_info
+    {
+        uint32_t current_frame;
+        uint32_t image_index;
+    };
     // NOLINTNEXTLINE
     const auto recordCommandBuffer = [&](const CommandBufferView &commandBuffer,
-                                         uint32_t currentFrame, uint32_t imageIndex) {
+                                         record_info info) {
+        auto [currentFrame, imageIndex] = info;
         VkImage image = swapchain.image(imageIndex);
         VkImageView imageView = swapchain.imageView(imageIndex);
         auto imageExtent = swapchain.imageExtent();
@@ -843,7 +848,8 @@ try
         // diff: vkResetFences 之后更新顶点. 仅仅更新飞行的帧
         input_mesh.applyQueuedUpdate(allocator, currentFrame);
         // diff: end
-        recordCommandBuffer(commandBuffer, currentFrame, imageIndex);
+        recordCommandBuffer(commandBuffer,
+                            {.current_frame = currentFrame, .image_index = imageIndex});
 
         // NOLINTNEXTLINE
         VkPipelineStageFlags waitDestinationStageMask[] = {
