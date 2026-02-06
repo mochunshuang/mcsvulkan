@@ -750,15 +750,13 @@ try
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
 
-        VkClearValue clearColor = {.color = {.float32 = {0.0F, 0.0F, 0.0F, 1.0F}}};
-
         VkRenderingAttachmentInfo colorAttachment = {
             .sType = sType<VkRenderingAttachmentInfo>(),
             .imageView = imageView,
             .imageLayout = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-            .clearValue = clearColor};
+            .clearValue = {.color = {.float32 = {0.0F, 0.0F, 0.0F, 1.0F}}}};
 
         commandBuffer.beginRendering(
             {.sType = sType<VkRenderingInfo>(),
@@ -768,18 +766,17 @@ try
              .pColorAttachments = &colorAttachment,
              .pDepthAttachment = nullptr});
         commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *graphicsPipeline);
-        std::array<VkViewport, 1> viewport = {
-            VkViewport{.x = 0.0F,
-                       .y = 0.0F,
-                       .width = static_cast<float>(imageExtent.width),
-                       .height = static_cast<float>(imageExtent.height),
-                       .minDepth = 0.0F,
-                       .maxDepth = 1.0F}};
-        commandBuffer.setViewport(0, viewport);
+        commandBuffer.setViewport(0, std::array<VkViewport, 1>{VkViewport{
+                                         .x = 0.0F,
+                                         .y = 0.0F,
+                                         .width = static_cast<float>(imageExtent.width),
+                                         .height = static_cast<float>(imageExtent.height),
+                                         .minDepth = 0.0F,
+                                         .maxDepth = 1.0F}});
 
-        std::array<VkRect2D, 1> scissors = {
-            VkRect2D{.offset = {.x = 0, .y = 0}, .extent = imageExtent}};
-        commandBuffer.setScissor(0, scissors);
+        commandBuffer.setScissor(
+            0, std::array<VkRect2D, 1>{
+                   VkRect2D{.offset = {.x = 0, .y = 0}, .extent = imageExtent}});
         {
             // diff: [new] 即使使用设备地址，Vulkan仍需要绑定索引缓冲区.来变量顶点数组
             uint64_t vertexBufferDeviceAddress =
