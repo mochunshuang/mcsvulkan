@@ -28,6 +28,10 @@ namespace mcs::vulkan
         {
             return physicalDevice_->allocator();
         }
+        [[nodiscard]] auto *physicalDevice() const
+        {
+            return physicalDevice_;
+        }
         LogicalDevice(const LogicalDevice &) = delete;
         constexpr LogicalDevice(LogicalDevice &&o) noexcept
             : physicalDevice_{std::exchange(o.physicalDevice_, {})},

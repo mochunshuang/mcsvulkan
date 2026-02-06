@@ -507,5 +507,13 @@
             "italic": false
         }
     ],
-    "liveServer.settings.port": 5501
+    "liveServer.settings.port": 5501,
+    //glsl lint
+    "glsllint.additionalStageAssociations": {
+        ".fs": "frag",
+        ".vs": "vert"
+    },
+    "glsllint.glslangValidatorArgs": [
+        "-V"
+    ]
 }

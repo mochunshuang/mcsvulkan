@@ -202,7 +202,7 @@ namespace mcs::vulkan
             VkRect2D renderArea{};
             uint32_t layerCount{};
             uint32_t viewMask{};
-            std::span<rendering_attachment> colorAttachments;
+            std::span<const rendering_attachment> colorAttachments;
             rendering_attachment depthAttachment;
             rendering_attachment stencilAttachment;
         }; // NOLINTEND
@@ -234,13 +234,13 @@ namespace mcs::vulkan
             pool_->device()->cmdBindPipeline(value_, pipelineBindPoint, pipeline);
         }
         constexpr void setViewport(uint32_t firstViewport,
-                                   std::span<VkViewport> viewports) const noexcept
+                                   std::span<const VkViewport> viewports) const noexcept
         {
             pool_->device()->cmdSetViewport(value_, firstViewport, viewports.size(),
                                             viewports.data());
         }
         constexpr void setScissor(uint32_t firstScissor,
-                                  std::span<VkRect2D> scissors) const noexcept
+                                  std::span<const VkRect2D> scissors) const noexcept
         {
             pool_->device()->cmdSetScissor(value_, firstScissor, scissors.size(),
                                            scissors.data());
@@ -268,8 +268,9 @@ namespace mcs::vulkan
         {
             pool_->device()->cmdPipelineBarrier2(value_, dependencyInfo);
         }
-        constexpr void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer,
-                                  const std::span<VkBufferCopy> &regions) const noexcept
+        constexpr void copyBuffer(
+            VkBuffer srcBuffer, VkBuffer dstBuffer,
+            const std::span<const VkBufferCopy> &regions) const noexcept
         {
             pool_->device()->cmdCopyBuffer(value_, srcBuffer, dstBuffer, regions.size(),
                                            regions.data());

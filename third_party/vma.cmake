@@ -38,28 +38,33 @@ target_link_libraries(vma PRIVATE volk)
 # NOTE: 宏的定义顺序 很重要。平台配置应该放到前面
 if(WIN32)
     # VK_USE_PLATFORM_WIN32_KHR 会引入很多 windows 的头文件
-    target_compile_definitions(vma PRIVATE VK_USE_PLATFORM_WIN32_KHR)
-    target_compile_definitions(vma PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_definitions(vma PUBLIC VK_USE_PLATFORM_WIN32_KHR)
+    target_compile_definitions(vma PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX)
+    message(STATUS "vma config with WIN32")
+
+# NOTE: 代理走自定义配置，可能有运行时错误。总之跨平台设计得直面出现的重定义和冲突
+# VK_USE_PLATFORM_WIN32_KHR 用 VMA_USE_PLATFORM_WIN32 代理
+# target_compile_definitions(vma PUBLIC VMA_USE_PLATFORM_WIN32)
 
 # Linux (X11)
 elseif(UNIX AND NOT APPLE)
-    target_compile_definitions(vma PRIVATE VK_USE_PLATFORM_XLIB_KHR)
+    target_compile_definitions(vma PUBLIC VK_USE_PLATFORM_XLIB_KHR)
 
 # Linux (Wayland)
 elseif(UNIX AND NOT APPLE AND USE_WAYLAND) # 如果需要 Wayland
-    target_compile_definitions(vma PRIVATE VK_USE_PLATFORM_WAYLAND_KHR)
+    target_compile_definitions(vma PUBLIC VK_USE_PLATFORM_WAYLAND_KHR)
 
 # macOS
 elseif(APPLE)
-    target_compile_definitions(vma PRIVATE VK_USE_PLATFORM_MACOS_MVK)
+    target_compile_definitions(vma PUBLIC VK_USE_PLATFORM_MACOS_MVK)
 
 # Android
 elseif(ANDROID)
-    target_compile_definitions(vma PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
+    target_compile_definitions(vma PUBLIC VK_USE_PLATFORM_ANDROID_KHR)
 
 # iOS
 elseif(IOS)
-    target_compile_definitions(vma PRIVATE VK_USE_PLATFORM_IOS_MVK)
+    target_compile_definitions(vma PUBLIC VK_USE_PLATFORM_IOS_MVK)
 endif()
 
 target_compile_definitions(vma PUBLIC VMA_STATIC_VULKAN_FUNCTIONS=0 VMA_DYNAMIC_VULKAN_FUNCTIONS=0 VMA_IMPLEMENTATION)

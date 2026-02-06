@@ -26,7 +26,8 @@ try
 #ifdef VK_USE_PLATFORM_WIN32_KHR
     std::cout << "define : VK_USE_PLATFORM_WIN32_KHR\n";
     // NOTE: 问题是链接有问题，还是public好一点
-    static_assert(false, "should not match.");
+    // NOTE: 这个宏可能很重要，用其他宏代理有运行时错误
+    // static_assert(false, "should not match.");
 #endif // VK_USE_PLATFORM_WIN32_KHR
 
 #ifdef MY_VOLK_DEFINITION

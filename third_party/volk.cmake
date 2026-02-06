@@ -50,28 +50,28 @@ target_include_directories(volk SYSTEM PUBLIC "${VOLK_DIR}" ${Vulkan_Include_DIR
 
 if(WIN32)
     # VK_USE_PLATFORM_WIN32_KHR 会引入很多 windows 的头文件
-    target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_WIN32_KHR)
-    target_compile_definitions(volk PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_definitions(volk PUBLIC VK_USE_PLATFORM_WIN32_KHR)
+    target_compile_definitions(volk PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX)
 
 # Linux (X11)
 elseif(UNIX AND NOT APPLE)
-    target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_XLIB_KHR)
+    target_compile_definitions(volk PUBLIC VK_USE_PLATFORM_XLIB_KHR)
 
 # Linux (Wayland)
 elseif(UNIX AND NOT APPLE AND USE_WAYLAND) # 如果需要 Wayland
-    target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_WAYLAND_KHR)
+    target_compile_definitions(volk PUBLIC VK_USE_PLATFORM_WAYLAND_KHR)
 
 # macOS
 elseif(APPLE)
-    target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_MACOS_MVK)
+    target_compile_definitions(volk PUBLIC VK_USE_PLATFORM_MACOS_MVK)
 
 # Android
 elseif(ANDROID)
-    target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_ANDROID_KHR)
+    target_compile_definitions(volk PUBLIC VK_USE_PLATFORM_ANDROID_KHR)
 
 # iOS
 elseif(IOS)
-    target_compile_definitions(volk PRIVATE VK_USE_PLATFORM_IOS_MVK)
+    target_compile_definitions(volk PUBLIC VK_USE_PLATFORM_IOS_MVK)
 endif()
 
 # NOTE: 可以分离宏

@@ -13,3 +13,4 @@
 #include "detail/surface.hpp"
 #include "detail/CommandBuffer.hpp"
 #include "detail/CommandBuffers.hpp"
+#include "detail/Fence.hpp"

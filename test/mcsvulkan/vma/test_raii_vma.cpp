@@ -33,18 +33,54 @@ constexpr uint32_t HEIGHT = 600;
 constexpr auto TITLE = "test_my_triangle";
 using mcs::vulkan::MCS_ASSERT;
 
-static bool isAMDGPU(VkPhysicalDevice physicalDevice)
-{
-    VkPhysicalDeviceProperties properties;
-    vkGetPhysicalDeviceProperties(physicalDevice, &properties);
-
-    // AMD 的 vendor ID 是 0x1002
-    return properties.vendorID == 0x1002;
-}
-
 constexpr auto VMA_USE_BIND_MEMORY2 = true;
 constexpr auto VMA_USE_MEMORY_BUDGET = true;
 constexpr auto VMA_USE_BUFFER_DEVICE_ADDRESS = true;
+
+static auto initVmaFlag(std::vector<const char *> &requiredDeviceExtension)
+{
+    // NOTE: 配置 vma 的 flags
+    VmaAllocatorCreateFlags vma_flags = 0;
+    // @see
+    // https://gpuopen-librariesandsdks.github.io/VulkanMemoryAllocator/html/quick_start.html#:~:text=of%20this%20function.-,Enabling%20extensions,-VMA%20can%20automatically
+#if VK_USE_PLATFORM_WIN32_KHR
+    std::cout << "vma_flags config with WIN32 \n";
+    requiredDeviceExtension.emplace_back("VK_KHR_external_memory_win32");
+    vma_flags |= VMA_ALLOCATOR_CREATE_KHR_EXTERNAL_MEMORY_WIN32_BIT;
+#endif
+    if constexpr (VMA_USE_BIND_MEMORY2)
+    {
+        std::cout << "vma_flags config with VK_KHR_bind_memory2 \n";
+        requiredDeviceExtension.emplace_back("VK_KHR_bind_memory2");
+        vma_flags |= VMA_ALLOCATOR_CREATE_KHR_BIND_MEMORY2_BIT;
+    }
+    if constexpr (VMA_USE_MEMORY_BUDGET)
+    {
+        std::cout << "vma_flags config with VK_EXT_memory_budget \n";
+        requiredDeviceExtension.emplace_back("VK_EXT_memory_budget");
+        vma_flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+    }
+    if constexpr (VMA_USE_BUFFER_DEVICE_ADDRESS)
+    {
+        std::cout << "vma_flags config with VK_KHR_buffer_device_address \n";
+        requiredDeviceExtension.emplace_back("VK_KHR_buffer_device_address");
+        vma_flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    }
+    return vma_flags;
+}
+static void updateVmaFlag(VmaAllocatorCreateFlags &vma_flags,
+                          PhysicalDevice &physicalDevice,
+                          std::vector<const char *> &requiredDeviceExtension)
+{
+    VkPhysicalDeviceProperties properties = physicalDevice.getProperties();
+    if (properties.vendorID == 0x1002)
+    {
+        std::cout << "vma_flags config with amd gpu \n";
+        requiredDeviceExtension.emplace_back(
+            VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME);
+        vma_flags |= VMA_ALLOCATOR_CREATE_AMD_DEVICE_COHERENT_MEMORY_BIT;
+    }
+}
 
 int main()
 try
@@ -88,30 +124,7 @@ try
         VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME}; // NOLINTEND
 
     // NOTE: 配置 vma 的 flags
-    VmaAllocatorCreateFlags vma_flags = 0;
-    // @see
-    // https://gpuopen-librariesandsdks.github.io/VulkanMemoryAllocator/html/quick_start.html#:~:text=of%20this%20function.-,Enabling%20extensions,-VMA%20can%20automatically
-#if VK_USE_PLATFORM_WIN32_KHR
-    std::cout << "WIN32 \n";
-    requiredDeviceExtension.emplace_back("VK_KHR_external_memory_win32");
-    vma_flags |= VMA_ALLOCATOR_CREATE_KHR_EXTERNAL_MEMORY_WIN32_BIT;
-#endif
-    if constexpr (VMA_USE_BIND_MEMORY2)
-    {
-        requiredDeviceExtension.emplace_back("VK_KHR_bind_memory2");
-        vma_flags |= VMA_ALLOCATOR_CREATE_KHR_BIND_MEMORY2_BIT;
-    }
-    if constexpr (VMA_USE_MEMORY_BUDGET)
-    {
-        requiredDeviceExtension.emplace_back("VK_EXT_memory_budget");
-        vma_flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
-    }
-    if constexpr (VMA_USE_BUFFER_DEVICE_ADDRESS)
-    {
-        requiredDeviceExtension.emplace_back("VK_KHR_buffer_device_address");
-        vma_flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
-    }
-
+    VmaAllocatorCreateFlags vma_flags = initVmaFlag(requiredDeviceExtension);
     structure_chain<VkPhysicalDeviceFeatures2, VkPhysicalDeviceVulkan13Features,
                     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT>
         enablefeatureChain = {{},
@@ -146,14 +159,7 @@ try
                        query_extended_dynamic_state_features.extendedDynamicState;
             })
             .select()[0];
-
-    if (isAMDGPU(*physical_device))
-    {
-        std::cout << "amd gpu \n";
-        requiredDeviceExtension.emplace_back(
-            VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME);
-        vma_flags |= VMA_ALLOCATOR_CREATE_AMD_DEVICE_COHERENT_MEMORY_BIT;
-    }
+    updateVmaFlag(vma_flags, physical_device, requiredDeviceExtension);
 
     // VkSurfaceKHR surface = window.createVkSurfaceKHR(*instance);
     mcs::vulkan::surface auto surface = surface_impl(physical_device, window);
@@ -194,6 +200,7 @@ try
                   .device = *device,
                   .instance = *instance,
                   .vulkanApiVersion = APIVERSION}};
+    [[maybe_unused]] VmaAllocator allocator = vma.allocator();
 
     while (window.shouldClose() == 0)
     {
