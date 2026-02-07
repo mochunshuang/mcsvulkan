@@ -1,6 +1,4 @@
 #pragma once
-// #include <vulkan/vulkan_core.h>
-// #define VOLK_IMPLEMENTATION
-#include <volk.h>
 
-#include "./__vma.hpp"
+#include "./__volk_import.hpp"
+#include "./__vma_import.hpp"

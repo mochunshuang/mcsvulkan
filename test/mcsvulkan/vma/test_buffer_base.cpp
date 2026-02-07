@@ -43,6 +43,12 @@ using mcs::vulkan::Fence;
 
 using raii_vma = mcs::vulkan::raii_vma;
 
+using buffer_base = mcs::vulkan::vma::buffer_base;
+using mcs::vulkan::vma::create_buffer;
+using mcs::vulkan::vma::staging_buffer;
+
+using mcs::vulkan::tool::simple_copy_buffer;
+
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
 constexpr auto TITLE = "test_my_triangle";
@@ -98,156 +104,6 @@ struct my_render
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtx/hash.hpp>
 
-namespace mcs::vulkan
-{
-    struct buffer_base
-    {
-        buffer_base() = default;
-        constexpr buffer_base(VkBuffer buffer, VmaAllocator allocator,
-                              VmaAllocation allocation) noexcept
-            : buffer_{buffer}, allocator_{allocator}, allocation_{allocation}
-        {
-        }
-        constexpr ~buffer_base() noexcept
-        {
-            destroy();
-        }
-        buffer_base(const buffer_base &) = delete;
-        buffer_base &operator=(const buffer_base &) = delete;
-
-        constexpr buffer_base(buffer_base &&other) noexcept
-            : buffer_{std::exchange(other.buffer_, {})},
-              allocator_{std::exchange(other.allocator_, {})},
-              allocation_{std::exchange(other.allocation_, {})}
-        {
-        }
-
-        constexpr buffer_base &operator=(buffer_base &&other) noexcept
-        {
-            if (&other != this)
-            {
-                this->destroy();
-                buffer_ = std::exchange(other.buffer_, {});
-                allocator_ = std::exchange(other.allocator_, {});
-                allocation_ = std::exchange(other.allocation_, {});
-            }
-            return *this;
-        }
-
-        [[nodiscard]] constexpr VkBuffer buffer() const noexcept
-        {
-            return buffer_;
-        }
-
-        [[nodiscard]] constexpr VmaAllocation allocation() const noexcept
-        {
-            return allocation_;
-        }
-
-        [[nodiscard]] constexpr bool valid() const noexcept
-        {
-            return buffer_ != nullptr;
-        }
-
-        [[nodiscard]] void *map() const
-        {
-            void *data; // NOLINT
-            ::vmaMapMemory(allocator_, allocation_, &data);
-            return data;
-        }
-
-        void unmap() const noexcept
-        {
-            ::vmaUnmapMemory(allocator_, allocation_);
-        }
-
-        void copyDataToBuffer(const void *src, size_t size) const
-        {
-            void *data = map();
-            ::memcpy(data, src, size);
-            unmap();
-        }
-
-        void clear()
-        {
-            destroy();
-        }
-
-      private:
-        VkBuffer buffer_{};
-        VmaAllocator allocator_{};
-        VmaAllocation allocation_{};
-
-        constexpr void destroy() noexcept
-        {
-            if (buffer_ != nullptr)
-            {
-                ::vmaDestroyBuffer(allocator_, buffer_, allocation_);
-                buffer_ = {};
-                allocator_ = {};
-                allocation_ = {};
-            }
-        }
-    };
-
-    // 修改 create_buffer 函数，移除 properties 参数
-    [[nodiscard]] static constexpr buffer_base create_buffer(
-        VmaAllocator allocator, const VkBufferCreateInfo &bufferInfo,
-        const VmaAllocationCreateInfo &allocCreateInfo)
-    {
-        VkBuffer buffer = nullptr;
-        VmaAllocation allocation = nullptr;
-        VmaAllocationInfo allocInfo;
-
-        check_vkresult(::vmaCreateBuffer(allocator, &bufferInfo, &allocCreateInfo,
-                                         &buffer, &allocation, &allocInfo));
-
-        buffer_base result{buffer, allocator, allocation};
-
-        return result;
-    }
-
-    // 修改 staging_buffer 函数，直接使用 VMA 的便利标志
-    static constexpr auto staging_buffer(VmaAllocator allocator, size_t buffer_size)
-    {
-        // https://gpuopen-librariesandsdks.github.io/VulkanMemoryAllocator/html/memory_mapping.html#:~:text=Persistently%20mapped%20memory
-        VmaAllocationCreateInfo allocCreateInfo = {};
-        allocCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
-        allocCreateInfo.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
-
-        return create_buffer(allocator,
-                             {.sType = sType<VkBufferCreateInfo>(),
-                              .size = buffer_size,
-                              .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                             allocCreateInfo);
-    }
-
-    static constexpr auto simple_copy_buffer(const CommandPool &commandpool,
-                                             const Queue &queue, VkBuffer srcBuffer,
-                                             VkBuffer dstBuffer,
-                                             const VkBufferCopy &regions)
-    {
-        const auto *logicalDevice = commandpool.device();
-        CommandBuffer commandCopyBuffer = commandpool.allocateOneCommandBuffer(
-            {.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY});
-
-        commandCopyBuffer.begin({.sType = sType<VkCommandBufferBeginInfo>(),
-                                 .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT});
-        commandCopyBuffer.copyBuffer(srcBuffer, dstBuffer, {&regions, 1});
-        commandCopyBuffer.end();
-
-        Fence fence{*logicalDevice, {.sType = sType<VkFenceCreateInfo>(), .flags = 0}};
-        queue.submit(1,
-                     {.sType = sType<VkSubmitInfo>(),
-                      .commandBufferCount = 1,
-                      .pCommandBuffers = &*commandCopyBuffer},
-                     *fence);
-        check_vkresult(logicalDevice->waitForFences(1, *fence, VK_TRUE, UINT64_MAX));
-    }
-
-}; // namespace mcs::vulkan
-
 struct PushConstants
 {
     uint64_t vertexBufferAddress; // 使用uint64_t而不是VkDeviceAddress
@@ -266,8 +122,8 @@ struct mesh_base
     // 双缓冲顶点数据：每个飞行帧都有自己的缓冲区
     struct FrameBuffers
     {
-        mcs::vulkan::buffer_base vertexBuffer;
-        mcs::vulkan::buffer_base indexBuffer;
+        buffer_base vertexBuffer;
+        buffer_base indexBuffer;
         VkDeviceAddress vertexBufferAddress = 0;
     };
 
@@ -308,8 +164,6 @@ struct mesh_base
     // buffer 内存要求
     static constexpr auto REQUIRE_BUFFER_USAGE =
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    // NOTE: 不再需要重复设置下面的内存配置
-    //  static constexpr auto REQUIRE_MEMORY_FLAG = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
 
     constexpr void createVertexBufferForFrame(VmaAllocator allocator, FrameBuffers &fb)
     {
@@ -319,7 +173,7 @@ struct mesh_base
         constexpr auto USAGE = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
 
         // 直接使用重构后的 create_buffer 函数
-        destBuffer = mcs::vulkan::create_buffer(
+        destBuffer = create_buffer(
             allocator,
             {.sType = sType<VkBufferCreateInfo>(),
              .size = BUFFER_SIZE,
@@ -331,12 +185,11 @@ struct mesh_base
             });
 
         // 创建暂存缓冲区并复制数据
-        const auto STAGING_BUFFER = mcs::vulkan::staging_buffer(allocator, BUFFER_SIZE);
+        const auto STAGING_BUFFER = staging_buffer(allocator, BUFFER_SIZE);
         STAGING_BUFFER.copyDataToBuffer(vertices.data(), BUFFER_SIZE);
 
-        mcs::vulkan::simple_copy_buffer(*commandpool, *queue, STAGING_BUFFER.buffer(),
-                                        destBuffer.buffer(),
-                                        VkBufferCopy{.size = BUFFER_SIZE});
+        simple_copy_buffer(*commandpool, *queue, STAGING_BUFFER.buffer(),
+                           destBuffer.buffer(), VkBufferCopy{.size = BUFFER_SIZE});
     }
 
     void createIndexBufferForFrame(VmaAllocator allocator, FrameBuffers &fb)
@@ -347,7 +200,7 @@ struct mesh_base
         constexpr auto USAGE = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
 
         // 直接使用重构后的 create_buffer 函数
-        destBuffer = mcs::vulkan::create_buffer(
+        destBuffer = create_buffer(
             allocator,
             {.sType = sType<VkBufferCreateInfo>(),
              .size = BUFFER_SIZE,
@@ -357,15 +210,14 @@ struct mesh_base
              .usage = VMA_MEMORY_USAGE_AUTO});
 
         // 创建暂存缓冲区并复制数据
-        const auto STAGING_BUFFER = mcs::vulkan::staging_buffer(allocator, BUFFER_SIZE);
+        const auto STAGING_BUFFER = staging_buffer(allocator, BUFFER_SIZE);
         STAGING_BUFFER.copyDataToBuffer(indices.data(), BUFFER_SIZE);
 
-        mcs::vulkan::simple_copy_buffer(*commandpool, *queue, STAGING_BUFFER.buffer(),
-                                        destBuffer.buffer(),
-                                        {VkBufferCopy{.size = BUFFER_SIZE}});
+        simple_copy_buffer(*commandpool, *queue, STAGING_BUFFER.buffer(),
+                           destBuffer.buffer(), {VkBufferCopy{.size = BUFFER_SIZE}});
     }
 
-    void getBufferDeviceAddresses(FrameBuffers &fb)
+    void getBufferDeviceAddresses(FrameBuffers &fb) const
     {
         const auto *device = commandpool->device();
         if (fb.vertexBuffer.buffer() != VK_NULL_HANDLE)
@@ -886,11 +738,11 @@ try
         // diff:     // 检查是否需要更新形状
         auto now = std::chrono::steady_clock::now();
         static auto lastUpdate = std::chrono::steady_clock::now();
-        if (now - lastUpdate > std::chrono::seconds(2))
+        if (now - lastUpdate > std::chrono::microseconds(200)) // NOLINT
         {
             lastUpdate = now;
 
-            static bool isTriangle = false;
+            static bool isTriangle = true;
             if (isTriangle)
             {
                 // 只记录要更新的数据，不立即执行
@@ -904,8 +756,7 @@ try
             }
             else
             {
-                // 只记录要更新的数据，不立即执行
-                input_mesh.queueUpdate(vertices, indices);
+                break;
             }
             isTriangle = !isTriangle;
         }

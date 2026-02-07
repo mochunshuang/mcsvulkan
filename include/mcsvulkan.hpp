@@ -4,7 +4,7 @@
 #include "detail/__tool.hpp"
 #include "detail/__utils.hpp"
 #include "detail/__wsi.hpp"
-
+#include "detail/__vma.hpp"
 #include "detail/raii_vulkan.hpp"
 #include "detail/Instance.hpp"
 #include "detail/surface_impl.hpp"
