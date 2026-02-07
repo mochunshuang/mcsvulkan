@@ -12,3 +12,5 @@
 #include "tool/create_command_pool.hpp"
 #include "tool/frame_context.hpp"
 #include "tool/simple_copy_buffer.hpp"
+#include "tool/create_descriptor_set_layout.hpp"
+#include "tool/create_descriptor_pool.hpp"
