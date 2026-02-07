@@ -591,7 +591,7 @@ try
             {.extendedDynamicState = VK_TRUE}};
 
     // NOTE: 配置 vma 的 flags
-    VmaAllocatorCreateFlags vma_flags = initVmaFlag(requiredDeviceExtension);
+    // VmaAllocatorCreateFlags vma_flags = initVmaFlag(requiredDeviceExtension);
 
     auto [id [[maybe_unused]], physical_device [[maybe_unused]]] =
         physical_device_selector{instance}
@@ -636,7 +636,7 @@ try
             .select()[0];
 
     // NOTE: 根据GPU 配置 vma
-    updateVmaFlag(vma_flags, physical_device, requiredDeviceExtension);
+    // updateVmaFlag(vma_flags, physical_device, requiredDeviceExtension);
 
     mcs::vulkan::surface auto surface = surface_impl(physical_device, window);
 
@@ -666,12 +666,12 @@ try
     requiredDeviceExtension.clear();
 
     // NOTE: 逻辑设备确定后，就能初始化 vma了
-    raii_vma vma{{.flags = vma_flags,
-                  .physicalDevice = *physical_device,
-                  .device = *device,
-                  .instance = *instance,
-                  .vulkanApiVersion = APIVERSION}};
-    [[maybe_unused]] VmaAllocator allocator = vma.allocator();
+    // raii_vma vma{{.flags = vma_flags,
+    //               .physicalDevice = *physical_device,
+    //               .device = *device,
+    //               .instance = *instance,
+    //               .vulkanApiVersion = APIVERSION}};
+    // [[maybe_unused]] VmaAllocator allocator = vma.allocator();
 
     const auto GRAPHICS_AND_PRESENT = Queue(
         device, {.queue_family_index = GRAPHICS_QUEUE_FAMILY_IDX, .queue_index = 0});
@@ -940,9 +940,11 @@ try
         semaphoreIndex = (semaphoreIndex + 1) % presentCompleteSemaphore.size();
         currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     };
+    size_t while_count = 0;
     while (window.shouldClose() == 0)
     {
         surface::pollEvents();
+        while_count++;
 
         // diff:     // 检查是否需要更新形状
         auto now = std::chrono::steady_clock::now();
@@ -954,6 +956,8 @@ try
             static bool isTriangle = false;
             if (isTriangle)
             {
+                std::cout << "2s: while_count: " << while_count << '\n';
+                while_count = 0;
                 // 只记录要更新的数据，不立即执行
                 // 切换到三角形 // NOLINTBEGIN
                 static const std::vector<Vertex> VERTICES = {
