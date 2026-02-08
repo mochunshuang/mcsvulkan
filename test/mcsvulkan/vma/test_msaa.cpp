@@ -612,7 +612,8 @@ try
                             .depth = 1},
                  .mipLevels = 1,
                  .arrayLayers = 1,
-                 .samples = VK_SAMPLE_COUNT_1_BIT,
+                 .samples =
+                     physical_device.getMaxUsableSampleCount(), // diff: update by [depth]
                  .tiling = VK_IMAGE_TILING_OPTIMAL,
                  .usage =
                      VkImageUsageFlagBits::VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
@@ -634,6 +635,38 @@ try
     std::cout << "depthResource hasStencilComponent: "
               << depthResourcesBuild.hasStencilComponent() << '\n';
     // diff: [depth] end
+
+    // diff: [msaa] start
+    auto msaaResourcesBuild =
+        create_resources{device, allocator}
+            .setCreateInfo(
+                {.imageType = VK_IMAGE_TYPE_2D,
+                 .format = swapchainBuild.refImageFormat(),
+                 .extent = {.width = swapchain.refImageExtent().width,
+                            .height = swapchain.refImageExtent().height,
+                            .depth = 1},
+                 .mipLevels = 1,
+                 .arrayLayers = 1,
+                 .samples = physical_device.getMaxUsableSampleCount(),
+                 .tiling = VK_IMAGE_TILING_OPTIMAL,
+                 .usage = VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
+                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                 .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                 // VMA 配置
+                 .allocationCreateInfo = {.flags =
+                                              VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+                                          .usage = VMA_MEMORY_USAGE_AUTO}})
+            .setViewCreateInfo(
+                {.viewType = VK_IMAGE_VIEW_TYPE_2D,
+                 .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                      .baseMipLevel = 0,
+                                      .levelCount = 1,
+                                      .baseArrayLayer = 0,
+                                      .layerCount = 1}});
+    auto msaaResource = msaaResourcesBuild.build();
+
+    // diff: [msaa] end
 
     auto pipelineLayout =
         create_pipeline_layout{}
@@ -675,13 +708,16 @@ try
                                         // .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
                                         .depthBiasEnable = VK_FALSE,
                                         .lineWidth = 1.0F},
-                 .multisampleState =
-                     {
-                         // 没有硬件采样配置
-                         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
-                         // NOTE: 9. 这里可以改进内部颜色质量
-                         .sampleShadingEnable = VK_FALSE,
-                     }, // diff: [depth] start 添加深度测试和模板测试状态
+                 .multisampleState = // diff: [msaa] start 多重采样状态使用MSAA采样计数
+                 {
+                     .rasterizationSamples = physical_device.getMaxUsableSampleCount(),
+                     .sampleShadingEnable = VK_FALSE,
+                     .minSampleShading = 1.0F,
+                     .sampleMask = {},
+                     .alphaToCoverageEnable = VK_FALSE,
+                     .alphaToOneEnable = VK_FALSE,
+                 }, // diff: [msaa] end
+                    // diff: [depth] start 添加深度测试和模板测试状态
                  .depthStencilState = {.depthTestEnable = VK_TRUE,
                                        .depthWriteEnable = VK_TRUE,
                                        .depthCompareOp = VK_COMPARE_OP_LESS,
@@ -761,6 +797,9 @@ try
         VkImage depthImage = depthResource.image();
         VkImageView depthImageView = depthResource.imageView();
 
+        VkImage msaaImage = msaaResource.image();
+        VkImageView msaaImageView = msaaResource.imageView();
+
         commandBuffer.begin({.sType = sType<VkCommandBufferBeginInfo>()});
 
         // Before starting rendering,
@@ -769,8 +808,20 @@ try
             commandBuffer, image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             {}, // srcAccessMask (no need to wait for previous operations)
-            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, // diff: update by  [msaa]
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+        // Transition the multisampled color image to COLOR_ATTACHMENT_OPTIMAL
+        // diff: [msaa] start
+        my_render::transition_image_layout(
+            commandBuffer, msaaImage, VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
+        // diff: [msaa] end
 
         // Transition depth image to depth attachment optimal layout
         // diff: [depth] start
@@ -785,13 +836,20 @@ try
                 VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT);
         // diff: [depth] end
 
+        // diff: update by [mass] start 修改颜色附件为MSAA颜色图像，添加解析附件
         VkRenderingAttachmentInfo colorAttachment = {
             .sType = sType<VkRenderingAttachmentInfo>(),
-            .imageView = imageView,
+            .imageView = msaaImageView,
             .imageLayout = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT, // diff: 添加解析模式
+            .resolveImageView = imageView,              // diff: 解析到交换链图像
+            .resolveImageLayout =
+                VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, // diff:
+                                                                         // 解析图像布局
             .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
             .clearValue = {.color = {.float32 = {0.0F, 0.0F, 0.0F, 1.0F}}}};
+        // diff: update by [mass] end
 
         // diff: [depth] start: 添加深度附件
         VkRenderingAttachmentInfo depthAttachment = {
@@ -890,6 +948,13 @@ try
 
         swapchain.destroy();
         swapchain = swapchainBuild.rebuild();
+
+        // diff: [msaa] end
+        msaaResourcesBuild.updateImageExtent({.width = swapchain.refImageExtent().width,
+                                              .height = swapchain.refImageExtent().height,
+                                              .depth = 1});
+        msaaResource = msaaResourcesBuild.rebuild();
+        // diff: [msaa] start
 
         // diff: [depth] start
         depthResourcesBuild.updateImageExtent(

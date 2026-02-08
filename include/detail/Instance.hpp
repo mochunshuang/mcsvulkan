@@ -226,5 +226,30 @@ namespace mcs::vulkan
             vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &props);
             return props;
         }
+
+        static VkSampleCountFlagBits getMaxUsableSampleCount(
+            VkPhysicalDevice physicalDevice)
+        {
+            VkPhysicalDeviceProperties physicalDeviceProperties =
+                getPhysicalDeviceProperties(physicalDevice);
+
+            VkSampleCountFlags counts =
+                physicalDeviceProperties.limits.framebufferColorSampleCounts &
+                physicalDeviceProperties.limits.framebufferDepthSampleCounts;
+
+            if ((counts & VK_SAMPLE_COUNT_64_BIT) != 0)
+                return VK_SAMPLE_COUNT_64_BIT;
+            if ((counts & VK_SAMPLE_COUNT_32_BIT) != 0)
+                return VK_SAMPLE_COUNT_32_BIT;
+            if ((counts & VK_SAMPLE_COUNT_16_BIT) != 0)
+                return VK_SAMPLE_COUNT_16_BIT;
+            if ((counts & VK_SAMPLE_COUNT_8_BIT) != 0)
+                return VK_SAMPLE_COUNT_8_BIT;
+            if ((counts & VK_SAMPLE_COUNT_4_BIT) != 0)
+                return VK_SAMPLE_COUNT_4_BIT;
+            if ((counts & VK_SAMPLE_COUNT_2_BIT) != 0)
+                return VK_SAMPLE_COUNT_2_BIT;
+            return VK_SAMPLE_COUNT_1_BIT;
+        }
     };
 }; // namespace mcs::vulkan

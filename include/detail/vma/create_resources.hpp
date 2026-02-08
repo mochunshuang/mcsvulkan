@@ -12,7 +12,7 @@
 
 namespace mcs::vulkan::vma
 {
-    struct create_depth_resources
+    struct create_resources
     {
         /*
         typedef struct VkImageCreateInfo {
@@ -149,8 +149,8 @@ namespace mcs::vulkan::vma
             imageViewCreateInfo_.format = imageCreateInfo_.format;
             return rebuild();
         }
-        constexpr create_depth_resources(const LogicalDevice &device,
-                                         VmaAllocator allocator) noexcept
+        constexpr create_resources(const LogicalDevice &device,
+                                   VmaAllocator allocator) noexcept
             : device_{&device}, allocator_{allocator}
         {
         }

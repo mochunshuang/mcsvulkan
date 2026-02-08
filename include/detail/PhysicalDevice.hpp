@@ -95,5 +95,9 @@ namespace mcs::vulkan
         {
             return Instance::getPhysicalDeviceFormatProperties(value_, format);
         }
+        [[nodiscard]] auto getMaxUsableSampleCount() const noexcept
+        {
+            return Instance::getMaxUsableSampleCount(value_);
+        }
     };
 }; // namespace mcs::vulkan
