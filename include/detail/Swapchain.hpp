@@ -38,6 +38,10 @@ namespace mcs::vulkan
         {
             return swapChainImageViews_;
         }
+        [[nodiscard]] constexpr const VkExtent2D &refImageExtent() const noexcept
+        {
+            return imageExtent_;
+        }
         [[nodiscard]] constexpr VkExtent2D imageExtent() const noexcept
         {
             return imageExtent_;

@@ -91,5 +91,9 @@ namespace mcs::vulkan
         {
             return Instance::getPhysicalDeviceSurfacePresentModesKHR(value_, surface);
         }
+        [[nodiscard]] auto getFormatProperties(const VkFormat &format) const noexcept
+        {
+            return Instance::getPhysicalDeviceFormatProperties(value_, format);
+        }
     };
 }; // namespace mcs::vulkan

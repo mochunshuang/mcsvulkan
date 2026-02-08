@@ -218,5 +218,13 @@ namespace mcs::vulkan
                 physicalDevice, surface, &presentModeCount, presentModes.data()));
             return presentModes;
         }
+
+        static constexpr auto getPhysicalDeviceFormatProperties(
+            VkPhysicalDevice physicalDevice, const VkFormat &format) noexcept
+        {
+            VkFormatProperties props;
+            vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &props);
+            return props;
+        }
     };
 }; // namespace mcs::vulkan
