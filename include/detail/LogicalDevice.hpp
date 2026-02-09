@@ -458,6 +458,22 @@ namespace mcs::vulkan
             table_.vkUnmapMemory(value_, memory);
         }
 
+        constexpr void cmdPipelineBarrier(
+            VkCommandBuffer commandBuffer, VkPipelineStageFlags srcStageMask,
+            VkPipelineStageFlags dstStageMask, VkDependencyFlags dependencyFlags,
+            uint32_t memoryBarrierCount, const VkMemoryBarrier *pMemoryBarriers,
+            uint32_t bufferMemoryBarrierCount,
+            const VkBufferMemoryBarrier *pBufferMemoryBarriers,
+            uint32_t imageMemoryBarrierCount,
+            const VkImageMemoryBarrier *pImageMemoryBarriers) const noexcept
+        {
+            MCS_ASSERT(table_.vkCmdPipelineBarrier != nullptr);
+            table_.vkCmdPipelineBarrier(
+                commandBuffer, srcStageMask, dstStageMask, dependencyFlags,
+                memoryBarrierCount, pMemoryBarriers, bufferMemoryBarrierCount,
+                pBufferMemoryBarriers, imageMemoryBarrierCount, pImageMemoryBarriers);
+        }
+
         constexpr void cmdPipelineBarrier2(
             VkCommandBuffer commandBuffer,
             const VkDependencyInfo &dependencyInfo) const noexcept

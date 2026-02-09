@@ -4,7 +4,7 @@
 #include "../tool/pNext.hpp"
 #include "../tool/Flags.hpp"
 #include "../utils/check_vkresult.hpp"
-#include "image_base.hpp"
+#include "resource.hpp"
 #include "../LogicalDevice.hpp"
 #include <span>
 #include <utility>
@@ -118,7 +118,7 @@ namespace mcs::vulkan::vma
             viewCreateInfo_ = std::move(viewCreateInfo);
             return std::move(*this);
         }
-        [[nodiscard]] image_base rebuild() &
+        [[nodiscard]] resource rebuild() &
         {
             VkImage image;            // NOLINT
             VmaAllocation allocation; // NOLINT
@@ -131,7 +131,7 @@ namespace mcs::vulkan::vma
                 imageViewCreateInfo_.image = image;
                 VkImageView imageView =
                     device_->createImageView(imageViewCreateInfo_, device_->allocator());
-                return image_base{device_, image, allocator_, allocation, imageView};
+                return resource{device_, image, allocator_, allocation, imageView};
             }
             catch (...)
             {
@@ -142,7 +142,7 @@ namespace mcs::vulkan::vma
                 throw;
             }
         }
-        [[nodiscard]] image_base build() &
+        [[nodiscard]] resource build() &
         {
             imageCreateInfo_ = createInfo_();
             imageViewCreateInfo_ = viewCreateInfo_();

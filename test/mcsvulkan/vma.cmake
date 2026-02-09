@@ -22,11 +22,15 @@ unset(DIR_NAME)
 
 std_glsl_env_init("mcsvulkan/vma")
 auto_compile_glsl_shaders(${GLSL_SHADERS_NAME} ${SHADER_DIR} ${SHADER_OUTPUT_DIR})
+copy_dir_to_bindir("textures")
 
 add_std_glsl_target(test_buffer_base test_bindless_vertext.vert test_triangle.frag)
 add_std_glsl_target(test_uniform test_uniform.vert test_triangle.frag)
 add_std_glsl_target(test_depth test_depth.vert test_triangle.frag)
 add_std_glsl_target(test_msaa test_depth.vert test_triangle.frag)
+
+set(BASE_LIBS volk vma glfw glm stb)
+add_std_glsl_target(test_texture test_texture.vert test_texture.frag)
 
 # end
 std_glsl_env_destroy()

@@ -263,6 +263,20 @@ namespace mcs::vulkan
         {
             pool_->device()->resetCommandBuffer(value_, flags);
         }
+        constexpr void pipelineBarrier(
+            VkPipelineStageFlags srcStageMask, VkPipelineStageFlags dstStageMask,
+            VkDependencyFlags dependencyFlags,
+            const std::span<const VkMemoryBarrier> &memoryBarriers,
+            const std::span<const VkBufferMemoryBarrier> &bufferMemoryBarriers,
+            const std::span<const VkImageMemoryBarrier> &imageMemoryBarriers)
+            const noexcept
+        {
+            pool_->device()->cmdPipelineBarrier(
+                value_, srcStageMask, dstStageMask, dependencyFlags,
+                memoryBarriers.size(), memoryBarriers.data(), bufferMemoryBarriers.size(),
+                bufferMemoryBarriers.data(), imageMemoryBarriers.size(),
+                imageMemoryBarriers.data());
+        }
         constexpr void pipelineBarrier2(
             const VkDependencyInfo &dependencyInfo) const noexcept
         {
@@ -306,13 +320,13 @@ namespace mcs::vulkan
                 value_, pipelineBindPoint, layout, firstSet, descriptorSetCount,
                 pDescriptorSets, dynamicOffsetCount, pDynamicOffsets);
         }
-        constexpr void copyBufferToImage(VkBuffer srcBuffer, VkImage dstImage,
-                                         VkImageLayout dstImageLayout,
-                                         uint32_t regionCount,
-                                         const VkBufferImageCopy *pRegions) const noexcept
+        constexpr void copyBufferToImage(
+            VkBuffer srcBuffer, VkImage dstImage, VkImageLayout dstImageLayout,
+            const std::span<const VkBufferImageCopy> &regions) const noexcept
         {
             pool_->device()->cmdCopyBufferToImage(value_, srcBuffer, dstImage,
-                                                  dstImageLayout, regionCount, pRegions);
+                                                  dstImageLayout, regions.size(),
+                                                  regions.data());
         }
     };
 

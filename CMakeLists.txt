@@ -22,6 +22,7 @@ include(third_party/volk.cmake)
 include(third_party/vma.cmake)
 include(third_party/glfw.cmake)
 include(third_party/glm.cmake)
+include(third_party/stb.cmake)
 
 # test add
 include(test/all_test.cmake)

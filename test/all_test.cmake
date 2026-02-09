@@ -7,6 +7,7 @@ include(test/script/add_compile_glslc_shader.cmake)
 include(test/script/auto_compile_glsl_shaders.cmake)
 include(test/script/add_glsl_shader_dependencies.cmake)
 include(test/script/std_glsl_env.cmake)
+include(test/script/copy_dir_to_bindir.cmake)
 
 include(test/env.cmake)
 include(test/base.cmake)

@@ -949,12 +949,12 @@ try
         swapchain.destroy();
         swapchain = swapchainBuild.rebuild();
 
-        // diff: [msaa] end
+        // diff: [msaa] start
         msaaResourcesBuild.updateImageExtent({.width = swapchain.refImageExtent().width,
                                               .height = swapchain.refImageExtent().height,
                                               .depth = 1});
         msaaResource = msaaResourcesBuild.rebuild();
-        // diff: [msaa] start
+        // diff: [msaa] end
 
         // diff: [depth] start
         depthResourcesBuild.updateImageExtent(
