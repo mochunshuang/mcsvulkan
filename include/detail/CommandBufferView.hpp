@@ -328,6 +328,15 @@ namespace mcs::vulkan
                                                   dstImageLayout, regions.size(),
                                                   regions.data());
         }
+        constexpr void blitImage(VkImage srcImage, VkImageLayout srcImageLayout,
+                                 VkImage dstImage, VkImageLayout dstImageLayout,
+                                 const std::span<const VkImageBlit> &regions,
+                                 VkFilter filter) const noexcept
+        {
+            pool_->device()->cmdBlitImage(value_, srcImage, srcImageLayout, dstImage,
+                                          dstImageLayout, regions.size(), regions.data(),
+                                          filter);
+        }
     };
 
 }; // namespace mcs::vulkan

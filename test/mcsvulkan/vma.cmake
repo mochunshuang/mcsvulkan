@@ -31,6 +31,7 @@ add_std_glsl_target(test_msaa test_depth.vert test_triangle.frag)
 
 set(BASE_LIBS volk vma glfw glm stb)
 add_std_glsl_target(test_texture test_texture.vert test_texture.frag)
+add_std_glsl_target(test_mipmapping test_texture.vert test_texture.frag)
 
 # end
 std_glsl_env_destroy()

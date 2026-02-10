@@ -670,5 +670,15 @@ namespace mcs::vulkan
             MCS_ASSERT(table_.vkBindImageMemory != nullptr);
             table_.vkBindImageMemory(value_, image, memory, memoryOffset);
         }
+        constexpr void cmdBlitImage(VkCommandBuffer commandBuffer, VkImage srcImage,
+                                    VkImageLayout srcImageLayout, VkImage dstImage,
+                                    VkImageLayout dstImageLayout, uint32_t regionCount,
+                                    const VkImageBlit *pRegions,
+                                    VkFilter filter) const noexcept
+        {
+            MCS_ASSERT(table_.vkCmdBlitImage != nullptr);
+            table_.vkCmdBlitImage(commandBuffer, srcImage, srcImageLayout, dstImage,
+                                  dstImageLayout, regionCount, pRegions, filter);
+        }
     };
 }; // namespace mcs::vulkan
