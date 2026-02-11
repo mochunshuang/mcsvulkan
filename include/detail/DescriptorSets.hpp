@@ -26,6 +26,10 @@ namespace mcs::vulkan
         {
             return pool_;
         }
+        [[nodiscard]] auto size() const noexcept
+        {
+            return value_.size();
+        }
 
         DescriptorSets() = default;
         constexpr DescriptorSets(const DescriptorPool &pool,
