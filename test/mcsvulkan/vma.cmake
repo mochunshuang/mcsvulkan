@@ -38,6 +38,8 @@ add_std_glsl_target(test_model_matrix test_model_matrix.vert test_texture.frag)
 add_std_glsl_target(test_model_matrix2 test_model_matrix2.vert test_texture.frag)
 add_std_glsl_target(test_model_matrix3 test_model_matrix2.vert test_texture.frag)
 add_std_glsl_target(test_views_matrix test_model_matrix2.vert test_texture.frag)
+add_std_glsl_target(test_projection_matrix test_model_matrix2.vert test_texture.frag)
+add_std_glsl_target(test_ortho_matrix test_model_matrix2.vert test_texture.frag)
 
 # end
 std_glsl_env_destroy()
