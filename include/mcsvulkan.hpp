@@ -6,6 +6,7 @@
 #include "detail/__wsi.hpp"
 #include "detail/__vma.hpp"
 #include "detail/__input.hpp"
+#include "detail/__camera.hpp"
 #include "detail/raii_vulkan.hpp"
 #include "detail/Instance.hpp"
 #include "detail/surface_impl.hpp"

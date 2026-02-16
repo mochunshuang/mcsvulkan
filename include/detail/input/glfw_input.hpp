@@ -123,6 +123,21 @@ namespace mcs::vulkan::input
         }
         // NOLINTEND
 
+        // API::
+        auto isKeyPressedOrRepeat(event::Key key) noexcept
+        {
+            const auto &event = get_keyboard_event(key);
+            return event.press() || event.repeat();
+        };
+        auto isKeyPressed(event::Key key) noexcept
+        {
+            return get_keyboard_event(key).press();
+        };
+        auto isKeyRepeat(event::Key key) noexcept
+        {
+            return get_keyboard_event(key).repeat();
+        };
+
       private:
         std::array<keyboard_event, static_cast<uint8_t>(event::Key::eSIZE)> keyboards_;
         std::array<mousebutton_event, static_cast<uint8_t>(event::MouseButtons::eSIZE)>

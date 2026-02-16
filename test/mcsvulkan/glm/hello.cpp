@@ -1,4 +1,5 @@
 
+#include <assert.h>
 #include <cassert>
 #include <glm/trigonometric.hpp>
 #include <iostream>
@@ -434,6 +435,34 @@ glm::mat4 MVPmatrix = projection * view * model; // Remember: inverted!
 transformed_vertex = MVP * in_vertex;
 
 */
+    // translate
+    {
+        std::cout << "translate:\n";
+        constexpr glm::mat4 ret =
+            glm::translate(glm::mat4(1.0f), glm::vec3(1.0f, 2.0f, 3.0f));
+        for (int row = 0; row < 4; row++)
+        {
+            for (int col = 0; col < 4; col++)
+            {
+                std::print("{:f} ", ret[row][col]); // 注意是[row][col]
+            }
+            std::print("\n");
+        }
+        static_assert(ret == glm::mat4{//
+                                       {1, 0, 0, 0},
+                                       {0, 1, 0, 0},
+                                       {0, 0, 1, 0},
+                                       {1, 2, 3, 1}});
+
+        constexpr glm::mat4 RET2 = glm::translate(ret, glm::vec3(1.0f, 0.0f, 0.0f));
+        static_assert(RET2 == glm::mat4{//
+                                        {1, 0, 0, 0},
+                                        {0, 1, 0, 0},
+                                        {0, 0, 1, 0},
+                                        {2, 2, 3, 1}});
+        constexpr glm::vec4 MY_VECTOR{10, 10, 10, 1};
+        static_assert(RET2 * MY_VECTOR == glm::vec4{12, 12, 13, 1});
+    }
 
     std::cout << "main done\n";
     return 0;
