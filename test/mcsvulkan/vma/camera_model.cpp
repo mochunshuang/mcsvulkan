@@ -1796,6 +1796,8 @@ but can only be on the last binding element (binding 2).
             update_perspective<perspective_member::eZ_FAR>(camera, step);
         }
     };
+    // diff: [camera_view] end
+    // diff: [camera_model] start
     mcs::vulkan::event::position2d_event lastPos{};
     bool isMiddleButtonPressed = false;
     bool isLeftButtonPressed = false;
@@ -1996,7 +1998,7 @@ but can only be on the last binding element (binding 2).
             isMiddleButtonPressed = false;
         }
     };
-    // diff: [camera_view] end
+    // diff: [camera_model] end
     // NOLINTNEXTLINE
     const auto recordCommandBuffer = [&](const CommandBufferView &commandBuffer,
                                          record_info info) {
