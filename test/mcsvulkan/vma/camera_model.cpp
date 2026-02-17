@@ -3,6 +3,8 @@
 #include <cassert>
 #include <cstdint>
 #include <exception>
+#include <glm/ext/matrix_transform.hpp>
+#include <glm/fwd.hpp>
 #include <iostream>
 #include <print>
 #include <chrono>
@@ -152,6 +154,11 @@ struct mesh_base
         VkDeviceAddress objectDataAddress = 0;
         VmaAllocationInfo allocInfo;
         // diff: [test_model_matrix2] end
+
+        // diff: [camera_model] start
+        //  新增：物体左上角在局部坐标系中的坐标（相对于物体中心）
+        glm::vec3 topLeftLocal = glm::vec3(0.0f);
+        // diff: [camera_model] end
     };
 
     static consteval auto indexType()
@@ -186,6 +193,7 @@ struct mesh_base
             createIndexBufferForFrame(allocator, fb);
             createObjectBuffer(allocator, fb);
             getBufferDeviceAddresses(fb);
+            bounding_box(fb);
         }
     }
 
@@ -293,6 +301,28 @@ struct mesh_base
         }
     }
 
+    // diff: [camera_model] start
+    void bounding_box(FrameBuffers &fb)
+    { // 计算包围盒和左上角坐标
+        if (!queue_data.vertices.empty())
+        {
+            glm::vec3 minPos = queue_data.vertices[0].pos;
+            glm::vec3 maxPos = queue_data.vertices[0].pos;
+            for (const auto &v : queue_data.vertices)
+            {
+                minPos = glm::min(minPos, v.pos);
+                maxPos = glm::max(maxPos, v.pos);
+            }
+            // 左上角 = (minX, maxY, maxZ)
+            fb.topLeftLocal = glm::vec3(minPos.x, maxPos.y, maxPos.z);
+        }
+    }
+    auto topLeftLocal(uint32_t currentFrame)
+    {
+        return frameBuffers[currentFrame].topLeftLocal;
+    }
+    // diff: [camera_model] end
+
     [[nodiscard]] VkDeviceAddress getVertexBufferAddress(
         uint32_t currentFrame) const noexcept
     {
@@ -327,6 +357,7 @@ struct mesh_base
         createVertexBufferForFrame(allocator, fb);
         createIndexBufferForFrame(allocator, fb);
         getBufferDeviceAddresses(fb);
+        bounding_box(fb);
     }
 
     constexpr void clear() noexcept
@@ -345,7 +376,7 @@ static auto initVmaFlag(std::vector<const char *> &requiredDeviceExtension)
     // NOTE: 配置 vma 的 flags
     VmaAllocatorCreateFlags vma_flags = 0;
     // @see
-    // https://gpuopen-librariesandsdks.github.io/VulkanMemoryAllocator/html/quick_start.html#:~:text=of%20this%20function.-,Enabling%20extensions,-VMA%20can%20automatically
+    // https://gpuopen-librariesandsdks.github.io/VulkanMemoryAllocator/html/quick_start.html#:~:text=of%20this%20Function.-,Enabling%20extensions,-VMA%20can%20automatically
 #if VK_USE_PLATFORM_WIN32_KHR
     std::cout << "vma_flags config with WIN32 \n";
     requiredDeviceExtension.emplace_back("VK_KHR_external_memory_win32");
@@ -973,40 +1004,59 @@ auto update_eye(camera_interface &camera, float step) noexcept
 };
 // diff: [camera_view] end
 
-// diff: [camera_ortho] start
-enum class ortho_member : std::uint8_t
+// diff: [camera_perspective] start
+enum class perspective_member : std::uint8_t
 {
-    eLEFT,
-    eRIGHT,
-    eBOTTOM,
-    eTOP,
+    eFOVY,
+    eASPECT,
     eZ_NEAR,
     eZ_FAR
 };
-// NOTE: WS 依旧有效，超过+-10就完蛋. 区别是 Z的修改 没有近大远小，畸变严重
-template <ortho_member member>
-auto update_ortho(camera_interface &camera, float step) noexcept
+// NOTE: WS 依旧有效，超过+-10就完蛋
+template <perspective_member member>
+auto update_perspective(camera_interface &camera, float step) noexcept
 {
-    using enum ortho_member;
-    if (member == eLEFT)
-        camera.refOrthoMatrix().left += step;
-    else if (member == eRIGHT)
-        camera.refOrthoMatrix().right += step;
-    else if (member == eBOTTOM)
-        camera.refOrthoMatrix().bottom += step;
-    else if (member == eTOP)
-        camera.refOrthoMatrix().top += step;
+    using enum perspective_member;
+    if (member == eFOVY)
+        camera.refPerspectiveMatrix().fovy += step;
+    else if (member == eASPECT)
+        camera.refPerspectiveMatrix().aspect += step;
     else if (member == eZ_NEAR)
-        camera.refOrthoMatrix().zNear += step;
+        camera.refPerspectiveMatrix().zNear += step;
     else
-        camera.refOrthoMatrix().zFar += step;
+        camera.refPerspectiveMatrix().zFar += step;
 
-    auto [left, right, bottom, top, zNear, zFar] = camera.refOrthoMatrix();
-    std::print("Key::eW: [left: {:f},right: {:f},bottom: {:f},top: "
-               "{:f},zNear: {:f},zFar: {:f}]\n",
-               left, right, bottom, top, zNear, zFar);
+    auto [fovy, aspect, zNear, zFar] = camera.refPerspectiveMatrix();
+    std::print("Key::eW: [fovy: {:f},aspect: {:f},zNear: {:f},zFar: {:f}]\n", fovy,
+               aspect, zNear, zFar);
 }
-// diff: [camera_ortho] end
+// diff: [camera_perspective] end
+
+// diff: [camera_model] start
+struct model_matrix
+{
+    // NOLINTBEGIN
+    glm::vec3 translation = glm::vec3(0.0F, 0.0F, 0.0F);    // 平移（默认无偏移）
+    glm::quat rotation = glm::quat(1.0F, 0.0F, 0.0F, 0.0F); // 旋转（默认无旋转）
+    glm::vec3 scale = glm::vec3(1.0F, 1.0F, 1.0F);          // 缩放（默认无缩放）
+    // NOLINTEND
+
+    // ========== 核心：计算最终的model矩阵（固定顺序：缩放→旋转→平移） ==========
+    constexpr auto operator()() const noexcept
+    {
+        // 1. 缩放 → 2. 旋转 → 3. 平移（3D变换的标准顺序）
+        auto model = glm::mat4(1.0F);
+        // 平移
+        model = glm::translate(model, translation);
+        // 旋转（四元数转矩阵）
+        model = model * glm::toMat4(rotation);
+        // 缩放
+        model = glm::scale(model, scale);
+        return model;
+    }
+};
+
+// diff: [camera_model] end
 
 int main()
 try
@@ -1655,13 +1705,13 @@ but can only be on the last binding element (binding 2).
                 .eye = glm::vec3(0.0F, 0.0F, 2.0F),
                 .center = glm::vec3(0.0F, 0.0F, 0.0F),
                 .up = glm::vec3(0.0F, 1.0F, 0.0F) // 修正：Y轴为上方向（符合常规3D场景）
-            })                                    // diff: [camera_ortho] start
-            .setOrthoMatrix({.left = -1.0F,
-                             .right = 1.0F,
-                             .bottom = -1.0F,
-                             .top = 1.0F,
-                             .zNear = 0.1F,
-                             .zFar = 10.0F}); // diff: [camera_ortho] end
+            })                                    // diff: [camera_perspective] start
+            .setPerspectiveMatrix(
+                {.fovy = glm::radians(45.0F),
+                 .aspect = swapchain.refImageExtent().width /
+                           static_cast<float>(swapchain.refImageExtent().height),
+                 .zNear = 0.1f,
+                 .zFar = 10.0F}); // diff: [camera_perspective] end
 
     glfw_input input{};
     auto views_matrix_update = [&](glfw_input &input) {
@@ -1700,73 +1750,250 @@ but can only be on the last binding element (binding 2).
             update_eye<eye_member::eZ>(camera, step);
         }
     };
-    auto views_ortho_update = [&](glfw_input &input) {
+    auto views_perspective_update = [&](glfw_input &input) {
         using mcs::vulkan::event::Key;
 
         if (input.isKeyPressedOrRepeat(Key::eR))
         {
             constexpr auto step = 00.1;
-            update_ortho<ortho_member::eLEFT>(camera, step);
+            update_perspective<perspective_member::eFOVY>(camera, step);
         }
         if (input.isKeyPressedOrRepeat(Key::eF))
         {
             constexpr auto step = -00.1;
-            update_ortho<ortho_member::eLEFT>(camera, step);
+            update_perspective<perspective_member::eFOVY>(camera, step);
         }
-
         if (input.isKeyPressedOrRepeat(Key::eT))
         {
             constexpr auto step = 00.1;
-            update_ortho<ortho_member::eRIGHT>(camera, step);
+            update_perspective<perspective_member::eASPECT>(camera, step);
         }
         if (input.isKeyPressedOrRepeat(Key::eG))
         {
             constexpr auto step = -00.1;
-            update_ortho<ortho_member::eRIGHT>(camera, step);
+            update_perspective<perspective_member::eASPECT>(camera, step);
         }
 
         if (input.isKeyPressedOrRepeat(Key::eY))
         {
             constexpr auto step = 00.1;
-            update_ortho<ortho_member::eBOTTOM>(camera, step);
+            update_perspective<perspective_member::eZ_NEAR>(camera, step);
         }
         if (input.isKeyPressedOrRepeat(Key::eH))
         {
             constexpr auto step = -00.1;
-            update_ortho<ortho_member::eBOTTOM>(camera, step);
+            update_perspective<perspective_member::eZ_NEAR>(camera, step);
         }
 
         if (input.isKeyPressedOrRepeat(Key::eU))
         {
             constexpr auto step = 00.1;
-            update_ortho<ortho_member::eTOP>(camera, step);
+            update_perspective<perspective_member::eZ_FAR>(camera, step);
         }
         if (input.isKeyPressedOrRepeat(Key::eJ))
         {
             constexpr auto step = -00.1;
-            update_ortho<ortho_member::eTOP>(camera, step);
+            update_perspective<perspective_member::eZ_FAR>(camera, step);
+        }
+    };
+    mcs::vulkan::event::position2d_event lastPos{};
+    bool isMiddleButtonPressed = false;
+    bool isLeftButtonPressed = false;
+    bool rightButtonPressedLast = false; // 新增：记录上一帧右键状态
+    mcs::vulkan::event::position2d_event lastLeftPos{};
+    model_matrix modelMatrix_{};
+    auto model_update = [&](glfw_input &input) {
+        using mcs::vulkan::event::MouseButtons;
+        using mcs::vulkan::event::Key;
+        using mcs::vulkan::event::scroll_event;
+        const auto cur = input.cursorPos();
+        const auto windowSize = swapchain.refImageExtent();
+
+        const bool curMiddlePressed =
+            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_MIDDLE);
+        const bool curLeftPressed =
+            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_LEFT);
+        const bool curRightPressed =
+            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_RIGHT);
+
+        if (scroll_event{} != input.scroll())
+        {
+            std::println("input.scroll(): {}", input.scroll());
+            // 获取修饰键状态
+            bool ctrlPressed = input.isKeyPressedOrRepeat(Key::eLEFT_CONTROL) ||
+                               input.isKeyPressedOrRepeat(Key::eRIGHT_CONTROL);
+            bool altPressed = input.isKeyPressedOrRepeat(Key::eLEFT_ALT) ||
+                              input.isKeyPressedOrRepeat(Key::eRIGHT_ALT);
+            bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
+                                input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
+            auto scroll = input.scroll();
+            float delta = scroll.yoffset; // +1 向上滚（放大），-1 向下滚（缩小）
+
+            if (delta != 0.0f)
+            {
+                // 缩放因子：每格 ±10%
+                const float factor = (delta > 0) ? 1.1f : (1.0f / 1.1f);
+
+                // 统计按下修饰键的数量
+                int modCount =
+                    (ctrlPressed ? 1 : 0) + (altPressed ? 1 : 0) + (shiftPressed ? 1 : 0);
+
+                if (modCount == 1)
+                {
+                    // 仅一个修饰键按下：缩放对应的轴
+                    if (ctrlPressed)
+                        modelMatrix_.scale.x *= factor;
+                    else if (altPressed)
+                        modelMatrix_.scale.y *= factor;
+                    else if (shiftPressed)
+                        modelMatrix_.scale.z *= factor;
+                }
+                else
+                {
+                    // 无修饰键或多个修饰键：均匀缩放所有轴
+                    modelMatrix_.scale *= factor;
+                }
+
+                // 可选：限制缩放范围，避免过小或过大
+                // modelMatrix_.scale = glm::clamp(modelMatrix_.scale, 0.01f, 100.0f);
+            }
         }
 
-        if (input.isKeyPressedOrRepeat(Key::eI))
+        // ========== 右键单击复位物体 ==========
+        if (curRightPressed && !rightButtonPressedLast)
         {
-            constexpr auto step = 00.1;
-            update_ortho<ortho_member::eZ_NEAR>(camera, step);
+            // 按下瞬间：平移归零，旋转归单位四元数
+            modelMatrix_.translation = glm::vec3(0.0f);
+            modelMatrix_.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+            // scale 保持 (1,1,1) 不变
         }
-        if (input.isKeyPressedOrRepeat(Key::eK))
+        rightButtonPressedLast = curRightPressed; // 更新状态供下一帧使用
+
+        // ========== 左键旋转处理（支持修饰键分离轴） ==========
+        if (curLeftPressed)
         {
-            constexpr auto step = -00.1;
-            update_ortho<ortho_member::eZ_NEAR>(camera, step);
+            if (!isLeftButtonPressed)
+            {
+                // 首次按下，记录初始位置
+                lastLeftPos = cur;
+                isLeftButtonPressed = true;
+            }
+            else
+            {
+                // 计算鼠标移动增量（像素）
+                float dx = static_cast<float>(cur.xpos - lastLeftPos.xpos);
+                float dy = static_cast<float>(cur.ypos - lastLeftPos.ypos);
+
+                if (dx != 0.0f || dy != 0.0f)
+                {
+                    // 获取相机视图矩阵的逆，用于默认模式下的世界轴方向
+                    glm::mat4 view = camera.viewsMatrix();
+                    glm::mat4 viewInv = glm::inverse(view);
+                    glm::vec3 worldRight = viewInv[0]; // 相机右方向在世界空间中的方向
+                    glm::vec3 worldUp = viewInv[1];    // 相机上方向在世界空间中的方向
+
+                    // 旋转灵敏度（弧度/像素）
+                    const float rotSensitivity = 0.01f;
+
+                    // 检测修饰键状态
+                    bool ctrlPressed = input.isKeyPressedOrRepeat(Key::eLEFT_CONTROL) ||
+                                       input.isKeyPressedOrRepeat(Key::eRIGHT_CONTROL);
+                    bool altPressed = input.isKeyPressedOrRepeat(Key::eLEFT_ALT) ||
+                                      input.isKeyPressedOrRepeat(Key::eRIGHT_ALT);
+                    bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
+                                        input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
+
+                    glm::quat deltaRot(1.0f, 0.0f, 0.0f, 0.0f); // 单位四元数
+
+                    if (ctrlPressed)
+                    {
+                        // Ctrl + 左键：水平移动绕世界 Y 轴旋转，垂直移动无效
+                        deltaRot = glm::angleAxis(dx * rotSensitivity,
+                                                  glm::vec3(0.0f, 1.0f, 0.0f));
+                    }
+                    else if (altPressed)
+                    {
+                        // Alt + 左键：垂直移动绕世界 X 轴旋转，水平移动无效
+                        deltaRot = glm::angleAxis(dy * rotSensitivity,
+                                                  glm::vec3(1.0f, 0.0f, 0.0f));
+                    }
+                    else if (shiftPressed)
+                    {
+                        // Shift + 左键：水平移动绕世界 Z 轴旋转（即滚动），垂直移动无效
+                        deltaRot = glm::angleAxis(-1 * dx * rotSensitivity,
+                                                  glm::vec3(0.0f, 0.0f, 1.0f));
+                    }
+                    else
+                    {
+                        // 无修饰键：默认行为，水平绕 worldUp 旋转，垂直绕 worldRight 旋转
+                        glm::quat rotY = glm::angleAxis(dx * rotSensitivity, worldUp);
+                        glm::quat rotX = glm::angleAxis(dy * rotSensitivity, worldRight);
+                        deltaRot = rotY * rotX; // 顺序影响不大，也可用 rotX * rotY
+                    }
+
+                    // 应用旋转（左乘表示在世界空间中旋转）
+                    if (deltaRot != glm::quat(1.0f, 0.0f, 0.0f, 0.0f))
+                    {
+                        modelMatrix_.rotation = deltaRot * modelMatrix_.rotation;
+                    }
+                }
+                lastLeftPos = cur;
+            }
+        }
+        else
+        {
+            isLeftButtonPressed = false;
         }
 
-        if (input.isKeyPressedOrRepeat(Key::eO))
+        if (curMiddlePressed)
         {
-            constexpr auto step = 00.1;
-            update_ortho<ortho_member::eZ_FAR>(camera, step);
+            glm::mat4 view = camera.viewsMatrix();
+            glm::mat4 proj = camera.perspectiveMatrix();
+            glm::vec4 viewport(0.0f, 0.0f, static_cast<float>(windowSize.width),
+                               static_cast<float>(windowSize.height));
+
+            // 获取当前缩放、旋转和局部左上角坐标
+            glm::vec3 currentScale = modelMatrix_.scale;
+            glm::quat currentRot = modelMatrix_.rotation;
+            glm::vec3 localTopLeft =
+                input_mesh2.topLeftLocal(frameContext.currentFrame); // 物体局部左上角
+
+            // 计算旋转后的偏移量（相对于平移）
+            glm::vec3 scaledTopLeft = currentScale * localTopLeft;
+            glm::vec3 rotatedOffset = currentRot * scaledTopLeft;
+
+            // 目标平面 Z = 当前平移 Z + 旋转后的偏移量 Z
+            float targetZ = modelMatrix_.translation.z + rotatedOffset.z;
+
+            glm::vec3 winNear(static_cast<float>(cur.xpos),
+                              static_cast<float>(windowSize.height - cur.ypos), 0.0f);
+            glm::vec3 winFar(static_cast<float>(cur.xpos),
+                             static_cast<float>(windowSize.height - cur.ypos), 1.0f);
+
+            glm::vec3 nearPoint = glm::unProject(winNear, view, proj, viewport);
+            glm::vec3 farPoint = glm::unProject(winFar, view, proj, viewport);
+            glm::vec3 dir = glm::normalize(farPoint - nearPoint);
+
+            const float eps = 1e-6f;
+            if (std::fabs(dir.z) > eps)
+            {
+                float t = (targetZ - nearPoint.z) / dir.z;
+                if (t >= 0.0f)
+                {
+                    glm::vec3 worldPoint = nearPoint + t * dir;
+
+                    // 新平移 = 世界点 - 旋转后的偏移量
+                    modelMatrix_.translation = worldPoint - rotatedOffset;
+                }
+            }
+
+            if (!isMiddleButtonPressed)
+                isMiddleButtonPressed = true;
+            lastPos = cur;
         }
-        if (input.isKeyPressedOrRepeat(Key::eL))
+        else
         {
-            constexpr auto step = -00.1;
-            update_ortho<ortho_member::eZ_FAR>(camera, step);
+            isMiddleButtonPressed = false;
         }
     };
     // diff: [camera_view] end
@@ -1882,9 +2109,9 @@ but can only be on the last binding element (binding 2).
             // diff: [camera_view] end
             // diff: [test_views_matrix] end
 
-            // diff: [camera_ortho] start
-            ubo.proj = camera.orthoMatrix();
-            // diff: [camera_ortho] end
+            // diff: [camera_perspective] start
+            ubo.proj = camera.perspectiveMatrix();
+            // diff: [camera_perspective] end
 
             // Vulkan的Y轴是向下的，需要翻转Y轴
             ubo.proj[1][1] *= -1;
@@ -1950,10 +2177,8 @@ but can only be on the last binding element (binding 2).
             // diff: [test_model_matrix2] start
             uint64_t objectDataAddress = input_mesh2.getObjectDataAddress(currentFrame);
             // diff: [test_model_matrix3] start
-            mesh_base::updateObjectData(input_mesh2.frameBuffers[currentFrame], [&] {
-                return glm::rotate(glm::mat4(1.0F), time * glm::radians(45.0F),
-                                   glm::vec3(0.0F, 0.0F, 1.0F));
-            });
+            mesh_base::updateObjectData(input_mesh2.frameBuffers[currentFrame],
+                                        [&] { return modelMatrix_(); });
             // diff: [test_model_matrix3] end
             // diff: [test_model_matrix2] end
 
@@ -2010,6 +2235,12 @@ but can only be on the last binding element (binding 2).
              .depth = 1});
         depthResource = depthResourcesBuild.rebuild();
         // diff: [depth] end
+
+        // diff: [camera_perspective] start
+        camera.refPerspectiveMatrix().aspect =
+            swapchain.refImageExtent().width /
+            static_cast<float>(swapchain.refImageExtent().height);
+        // diff: [camera_perspective] end
     };
     // NOLINTNEXTLINE
     const auto drawFrame = [&]() constexpr {
@@ -2109,14 +2340,23 @@ but can only be on the last binding element (binding 2).
         deltaTime = glm::clamp(deltaTime, 0.001f, 0.1f); // 限制最大时间差
         lastFrameTime = currentFrameTime;
 
+        // diff: [camera_model] start
+        // NOTE: 重置输入
+        input.scroll() = {};
+        // diff: [camera_model] start
+
         surface::pollEvents();
         // diff: [camera_view] start
         views_matrix_update(input);
         // diff: [camera_view] end
 
-        // diff: [camera_ortho] start
-        views_ortho_update(input);
-        // diff: [camera_ortho] end
+        // diff: [camera_perspective] start
+        views_perspective_update(input);
+        // diff: [camera_perspective] end
+
+        // diff: [camera_model] start
+        model_update(input);
+        // diff: [camera_model] end
 
         // diff:     // 检查是否需要更新形状
         auto now = std::chrono::steady_clock::now();
@@ -2177,9 +2417,11 @@ but can only be on the last binding element (binding 2).
                                           "textures/viking_room.png", false, 0);
                     add = true;
                     // NOTE: 看起来用户必须维护一个有效的范围。
-                    //  diff: [test_update_texture2]  ← 必须加！当前纹理数量变成4。 没用到
+                    //  diff: [test_update_texture2]  ← 必须加！当前纹理数量变成4。
+                    //  没用到
                     CURRENT_TEXTURE_COUNT++;
-                    // NOTE: 必须一开始创建描述符布局 就分配好全部最大范围，再也不能扩容了
+                    // NOTE: 必须一开始创建描述符布局
+                    // 就分配好全部最大范围，再也不能扩容了
 
                     // 2. 选择要更新的纹理数组索引（确保 < TEXTURE_COUNT）
                     const uint32_t textureIndexToUpdate = textures.size() - 1;

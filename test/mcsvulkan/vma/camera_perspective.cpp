@@ -1846,9 +1846,6 @@ but can only be on the last binding element (binding 2).
 
         auto mvp = [&]() {
             UniformBufferObject ubo{};
-
-            auto swapChainExtent = swapchain.imageExtent();
-
             // diff: [test_views_matrix] start
             // diff: [camera_view] start
             ubo.view = camera.viewsMatrix();

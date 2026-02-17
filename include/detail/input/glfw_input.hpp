@@ -137,6 +137,14 @@ namespace mcs::vulkan::input
         {
             return get_keyboard_event(key).repeat();
         };
+        auto isMouseButtonPressed(event::MouseButtons key) noexcept
+        {
+            return get_mousebutton_event(key).press();
+        };
+        auto isMouseButtonRelease(event::MouseButtons key) noexcept
+        {
+            return get_mousebutton_event(key).release();
+        };
 
       private:
         std::array<keyboard_event, static_cast<uint8_t>(event::Key::eSIZE)> keyboards_;
