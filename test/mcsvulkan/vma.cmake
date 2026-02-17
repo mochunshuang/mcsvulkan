@@ -46,6 +46,7 @@ add_std_glsl_target(camera_perspective test_model_matrix2.vert test_texture.frag
 add_std_glsl_target(camera_model test_model_matrix2.vert test_texture.frag)
 add_std_glsl_target(camera_model2 test_model_matrix2.vert test_texture.frag)
 add_std_glsl_target(camera_model3 test_model_matrix2.vert test_texture.frag)
+add_std_glsl_target(test_ray test_model_matrix2.vert test_texture.frag)
 
 # end
 std_glsl_env_destroy()
