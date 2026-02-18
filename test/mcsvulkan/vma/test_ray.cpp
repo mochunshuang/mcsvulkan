@@ -1973,106 +1973,6 @@ but can only be on the last binding element (binding 2).
         }
         rightButtonPressedLast = curRightPressed; // 更新状态供下一帧使用
 
-        // diff: [test_ray] start
-        // // 获取当前帧时间（已在外部定义 time）
-        static bool prevLeftPressed = false;
-        bool ctrlPressed =
-            input.isKeyPressedOrRepeat(mcs::vulkan::event::Key::eLEFT_CONTROL) ||
-            input.isKeyPressedOrRepeat(mcs::vulkan::event::Key::eRIGHT_CONTROL);
-        bool altPressed =
-            input.isKeyPressedOrRepeat(mcs::vulkan::event::Key::eLEFT_ALT) ||
-            input.isKeyPressedOrRepeat(mcs::vulkan::event::Key::eRIGHT_ALT);
-        bool shiftPressed =
-            input.isKeyPressedOrRepeat(mcs::vulkan::event::Key::eLEFT_SHIFT) ||
-            input.isKeyPressedOrRepeat(mcs::vulkan::event::Key::eRIGHT_SHIFT);
-        // 左键刚按下且无修饰键 -> 执行射线拾取
-        if (curLeftPressed && !prevLeftPressed && !ctrlPressed && !altPressed &&
-            !shiftPressed)
-        {
-            auto extent = swapchain.refImageExtent();
-            glm::vec2 mousePos = {input.cursorPos().xpos, input.cursorPos().ypos};
-            glm::vec4 viewport(0, 0, extent.width, extent.height);
-            glm::mat4 view = camera.viewsMatrix();
-            glm::mat4 proj = camera.perspectiveMatrix(); // 未翻转Y，用于unProject
-            glm::vec3 nearPos(mousePos.x, extent.height - mousePos.y, 0.0f);
-            glm::vec3 farPos(mousePos.x, extent.height - mousePos.y, 1.0f);
-            glm::vec3 nearWorld = glm::unProject(nearPos, view, proj, viewport);
-            glm::vec3 farWorld = glm::unProject(farPos, view, proj, viewport);
-            glm::vec3 rayDir = glm::normalize(farWorld - nearWorld);
-            glm::vec3 rayOrigin = camera.refViewsMatrix().eye;
-
-            float closestT = std::numeric_limits<float>::max();
-            int hitMeshId = -1;
-            glm::vec3 hitPoint;
-
-            // 测试 input_mesh (ID=0)
-            {
-                static auto startTime = std::chrono::high_resolution_clock::now();
-                auto currentTime = std::chrono::high_resolution_clock::now();
-                float time = std::chrono::duration<float, std::chrono::seconds::period>(
-                                 currentTime - startTime)
-                                 .count();
-                const auto &vertices = input_mesh.queue_data.vertices;
-                const auto &indices = input_mesh.queue_data.indices;
-                // 计算模型矩阵：与 recordCommandBuffer 中一致（绕Z轴旋转）
-                glm::mat4 model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f),
-                                              glm::vec3(0.0f, 0.0f, 1.0f));
-                for (size_t i = 0; i + 2 < indices.size(); i += 3)
-                {
-                    uint32_t i0 = indices[i];
-                    uint32_t i1 = indices[i + 1];
-                    uint32_t i2 = indices[i + 2];
-                    glm::vec3 v0 = glm::vec3(model * glm::vec4(vertices[i0].pos, 1.0f));
-                    glm::vec3 v1 = glm::vec3(model * glm::vec4(vertices[i1].pos, 1.0f));
-                    glm::vec3 v2 = glm::vec3(model * glm::vec4(vertices[i2].pos, 1.0f));
-                    float t, u, v;
-                    if (rayTriangleIntersect(rayOrigin, rayDir, v0, v1, v2, t, u, v) &&
-                        t > 0 && t < closestT)
-                    {
-                        closestT = t;
-                        hitMeshId = 0;
-                        hitPoint = rayOrigin + rayDir * t;
-                    }
-                }
-            }
-
-            // 测试 input_mesh2 (ID=1)
-            {
-                const auto &vertices = input_mesh2.queue_data.vertices;
-                const auto &indices = input_mesh2.queue_data.indices;
-                glm::mat4 model = modelMatrix_(); // 使用当前模型矩阵
-                for (size_t i = 0; i + 2 < indices.size(); i += 3)
-                {
-                    uint32_t i0 = indices[i];
-                    uint32_t i1 = indices[i + 1];
-                    uint32_t i2 = indices[i + 2];
-                    glm::vec3 v0 = glm::vec3(model * glm::vec4(vertices[i0].pos, 1.0f));
-                    glm::vec3 v1 = glm::vec3(model * glm::vec4(vertices[i1].pos, 1.0f));
-                    glm::vec3 v2 = glm::vec3(model * glm::vec4(vertices[i2].pos, 1.0f));
-                    float t, u, v;
-                    if (rayTriangleIntersect(rayOrigin, rayDir, v0, v1, v2, t, u, v) &&
-                        t > 0 && t < closestT)
-                    {
-                        closestT = t;
-                        hitMeshId = 1;
-                        hitPoint = rayOrigin + rayDir * t;
-                    }
-                }
-            }
-
-            if (hitMeshId != -1)
-            {
-                std::println("Left click hit mesh {} at ({:.3f}, {:.3f}, {:.3f})",
-                             hitMeshId, hitPoint.x, hitPoint.y, hitPoint.z);
-            }
-            else
-            {
-                std::println("Left click did not hit any mesh");
-            }
-        }
-        prevLeftPressed = curLeftPressed;
-        // diff: [test_ray] end
-
         // ========== 左键旋转处理（支持修饰键分离轴） ==========
         if (curLeftPressed)
         {
@@ -2357,6 +2257,104 @@ but can only be on the last binding element (binding 2).
 
         mvp();
         // diff: [test_model_matrix] end
+
+        // diff: [test_ray] start
+        // // 获取当前帧时间（已在外部定义 time）
+        using mcs::vulkan::event::MouseButtons;
+        static bool prevLeftPressed = false;
+        bool ctrlPressed =
+            input.isKeyPressedOrRepeat(mcs::vulkan::event::Key::eLEFT_CONTROL) ||
+            input.isKeyPressedOrRepeat(mcs::vulkan::event::Key::eRIGHT_CONTROL);
+        bool curLeftPressed =
+            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_LEFT);
+        bool altPressed =
+            input.isKeyPressedOrRepeat(mcs::vulkan::event::Key::eLEFT_ALT) ||
+            input.isKeyPressedOrRepeat(mcs::vulkan::event::Key::eRIGHT_ALT);
+        bool shiftPressed =
+            input.isKeyPressedOrRepeat(mcs::vulkan::event::Key::eLEFT_SHIFT) ||
+            input.isKeyPressedOrRepeat(mcs::vulkan::event::Key::eRIGHT_SHIFT);
+        // 左键刚按下且无修饰键 -> 执行射线拾取
+        if (curLeftPressed && !prevLeftPressed && !ctrlPressed && !altPressed &&
+            !shiftPressed)
+        {
+            auto extent = swapchain.refImageExtent();
+            glm::vec2 mousePos = {input.cursorPos().xpos, input.cursorPos().ypos};
+            glm::vec4 viewport(0, 0, extent.width, extent.height);
+            glm::mat4 view = camera.viewsMatrix();
+            glm::mat4 proj = camera.perspectiveMatrix(); // 未翻转Y，用于unProject
+            glm::vec3 nearPos(mousePos.x, extent.height - mousePos.y, 0.0f);
+            glm::vec3 farPos(mousePos.x, extent.height - mousePos.y, 1.0f);
+            glm::vec3 nearWorld = glm::unProject(nearPos, view, proj, viewport);
+            glm::vec3 farWorld = glm::unProject(farPos, view, proj, viewport);
+            glm::vec3 rayDir = glm::normalize(farWorld - nearWorld);
+            glm::vec3 rayOrigin = camera.refViewsMatrix().eye;
+
+            float closestT = std::numeric_limits<float>::max();
+            int hitMeshId = -1;
+            glm::vec3 hitPoint;
+
+            // 测试 input_mesh (ID=0)
+            {
+                const auto &vertices = input_mesh.queue_data.vertices;
+                const auto &indices = input_mesh.queue_data.indices;
+                // 计算模型矩阵：与 recordCommandBuffer 中一致（绕Z轴旋转）
+                glm::mat4 model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f),
+                                              glm::vec3(0.0f, 0.0f, 1.0f));
+                for (size_t i = 0; i + 2 < indices.size(); i += 3)
+                {
+                    uint32_t i0 = indices[i];
+                    uint32_t i1 = indices[i + 1];
+                    uint32_t i2 = indices[i + 2];
+                    glm::vec3 v0 = glm::vec3(model * glm::vec4(vertices[i0].pos, 1.0f));
+                    glm::vec3 v1 = glm::vec3(model * glm::vec4(vertices[i1].pos, 1.0f));
+                    glm::vec3 v2 = glm::vec3(model * glm::vec4(vertices[i2].pos, 1.0f));
+                    float t, u, v;
+                    if (rayTriangleIntersect(rayOrigin, rayDir, v0, v1, v2, t, u, v) &&
+                        t > 0 && t < closestT)
+                    {
+                        closestT = t;
+                        hitMeshId = 0;
+                        hitPoint = rayOrigin + rayDir * t;
+                    }
+                }
+            }
+
+            // 测试 input_mesh2 (ID=1)
+            {
+                const auto &vertices = input_mesh2.queue_data.vertices;
+                const auto &indices = input_mesh2.queue_data.indices;
+                glm::mat4 model = modelMatrix_(); // 使用当前模型矩阵
+                for (size_t i = 0; i + 2 < indices.size(); i += 3)
+                {
+                    uint32_t i0 = indices[i];
+                    uint32_t i1 = indices[i + 1];
+                    uint32_t i2 = indices[i + 2];
+                    glm::vec3 v0 = glm::vec3(model * glm::vec4(vertices[i0].pos, 1.0f));
+                    glm::vec3 v1 = glm::vec3(model * glm::vec4(vertices[i1].pos, 1.0f));
+                    glm::vec3 v2 = glm::vec3(model * glm::vec4(vertices[i2].pos, 1.0f));
+                    float t, u, v;
+                    if (rayTriangleIntersect(rayOrigin, rayDir, v0, v1, v2, t, u, v) &&
+                        t > 0 && t < closestT)
+                    {
+                        closestT = t;
+                        hitMeshId = 1;
+                        hitPoint = rayOrigin + rayDir * t;
+                    }
+                }
+            }
+
+            if (hitMeshId != -1)
+            {
+                std::println("Left click hit mesh {} at ({:.3f}, {:.3f}, {:.3f})",
+                             hitMeshId, hitPoint.x, hitPoint.y, hitPoint.z);
+            }
+            else
+            {
+                std::println("Left click did not hit any mesh");
+            }
+        }
+        prevLeftPressed = curLeftPressed;
+        // diff: [test_ray] end
 
         {
             // diff: [Uniform] start
