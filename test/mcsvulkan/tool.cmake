@@ -27,6 +27,7 @@ add_vulkan_tool_test(test_create_logical_device)
 add_vulkan_tool_test(test_create_swap_chain)
 add_vulkan_tool_test(test_create_command_pool)
 add_vulkan_tool_test(test_frame_context)
+add_vulkan_tool_test(test_format)
 
 add_std_glsl_target(test_create_pipeline_layout test_triangle.vert test_triangle.frag)
 add_std_glsl_target(test_create_graphics_pipeline test_triangle.vert test_triangle.frag)

@@ -3,7 +3,7 @@
 macro(add_compile_glslc_shader TARGET_NAME input_file out_file)
     add_custom_target(${TARGET_NAME}
         COMMAND ${Vulkan_glslc_EXECUTABLE}
-        ${input_file}
+        ${input_file} --target-env=vulkan1.4
         -o ${out_file}
         DEPENDS ${SHADER_OUTPUT_DIR}
         COMMENT "Compiling glslc shader: ${TARGET_NAME}"

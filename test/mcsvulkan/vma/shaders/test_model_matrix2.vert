@@ -15,10 +15,6 @@ layout(buffer_reference,scalar)readonly buffer VertexBuffer{
     VertexData vertices[];
 };
 
-struct RenderObjectData{
-    mat4 model;//diff: 模型矩阵私有
-};
-
 layout(buffer_reference,scalar)readonly buffer MatrixReference{
     mat4 matrix;
 };

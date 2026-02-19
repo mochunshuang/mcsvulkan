@@ -14,11 +14,11 @@ namespace mcs::vulkan
         std::vector<value_type> value_;
 
       public:
-        [[nodiscard]] auto operator[](size_t i) noexcept
+        [[nodiscard]] auto &operator[](size_t i) noexcept
         {
             return value_[i];
         };
-        [[nodiscard]] auto operator[](size_t i) const noexcept
+        [[nodiscard]] auto &operator[](size_t i) const noexcept
         {
             return value_[i];
         };

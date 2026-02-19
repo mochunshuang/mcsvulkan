@@ -302,7 +302,7 @@ namespace mcs::vulkan
                                             vertexOffset, firstInstance);
         }
         constexpr void pushConstants(VkPipelineLayout layout,
-                                     VkShaderStageFlagBits stageFlags, uint32_t offset,
+                                     VkShaderStageFlags stageFlags, uint32_t offset,
                                      uint32_t size, const void *pValues) const noexcept
         {
             pool_->device()->cmdPushConstants(value_, layout, stageFlags, offset, size,
@@ -336,6 +336,21 @@ namespace mcs::vulkan
             pool_->device()->cmdBlitImage(value_, srcImage, srcImageLayout, dstImage,
                                           dstImageLayout, regions.size(), regions.data(),
                                           filter);
+        }
+        constexpr void bindVertexBuffers(uint32_t firstBinding, uint32_t bindingCount,
+                                         const VkBuffer &buffers,
+                                         const VkDeviceSize &offsets) const noexcept
+        {
+            pool_->device()->cmdBindVertexBuffers(value_, firstBinding, bindingCount,
+                                                  &buffers, &offsets);
+        }
+        constexpr void copyImageToBuffer(
+            VkImage srcImage, VkImageLayout srcImageLayout, VkBuffer dstBuffer,
+            const std::span<const VkBufferImageCopy> &regions) const noexcept
+        {
+            pool_->device()->cmdCopyImageToBuffer(value_, srcImage, srcImageLayout,
+                                                  dstBuffer, regions.size(),
+                                                  regions.data());
         }
     };
 
