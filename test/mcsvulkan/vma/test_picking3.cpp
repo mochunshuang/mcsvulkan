@@ -1536,6 +1536,33 @@ but can only be on the last binding element (binding 2).
               << depthResourcesBuild.hasStencilComponent() << '\n';
     // diff: [depth] end
 
+    // diff: [test_picking3] start
+    // 在 depthResource = depthResourcesBuild.build(); 之后添加
+    {
+        CommandBuffer initCmd = commandPool.allocateOneCommandBuffer(
+            {.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY});
+        initCmd.begin({.sType = sType<VkCommandBufferBeginInfo>(),
+                       .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT});
+
+        my_render::transition_image_layout(
+            initCmd, depthResource.image(), VK_IMAGE_ASPECT_DEPTH_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, 0,
+            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT);
+        initCmd.end();
+
+        Fence initFence{device, {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}};
+        GRAPHICS_AND_PRESENT.submit(1,
+                                    {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                                     .commandBufferCount = 1,
+                                     .pCommandBuffers = &*initCmd},
+                                    *initFence);
+        device.waitForFences(1, *initFence, VK_TRUE, UINT64_MAX);
+    }
+    // diff: [test_picking3] end
+
     // diff: [msaa] start
     auto msaaResourcesBuild =
         create_resources{device, allocator}
@@ -2115,7 +2142,8 @@ but can only be on the last binding element (binding 2).
     pickImageInfo.extent = {WIDTH, HEIGHT, 1};
     pickImageInfo.mipLevels = 1;
     pickImageInfo.arrayLayers = 1;
-    pickImageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    pickImageInfo.samples =
+        physical_device.getMaxUsableSampleCount(); // diff: [test_picking3]
     pickImageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
     pickImageInfo.usage =
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
@@ -2129,6 +2157,18 @@ but can only be on the last binding element (binding 2).
     VmaAllocation pickingAllocation;
     vmaCreateImage(allocator, &pickImageInfo, &pickAllocInfo, &pickingImage,
                    &pickingAllocation, nullptr);
+
+    // diff: [test_picking3] start
+    //  创建解析图像（单样本）
+    VkImageCreateInfo resolveImageInfo = pickImageInfo; // 复用 pickImageInfo 的设置
+    resolveImageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    resolveImageInfo.usage =
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    VkImage resolveImage;
+    VmaAllocation resolveAllocation;
+    vmaCreateImage(allocator, &resolveImageInfo, &pickAllocInfo, &resolveImage,
+                   &resolveAllocation, nullptr);
+    // diff: [test_picking3] end
 
     // 创建图像视图
     VkImageViewCreateInfo pickViewInfo = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -2256,13 +2296,14 @@ but can only be on the last binding element (binding 2).
         .lineWidth = 1.0f};
     VkPipelineMultisampleStateCreateInfo multisample = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT // 拾取不需要 MSAA
-    };
+        .rasterizationSamples =
+            physical_device
+                .getMaxUsableSampleCount()}; // diff: [test_picking3]  与颜色图像一致
     VkPipelineDepthStencilStateCreateInfo depthStencil = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
         .depthTestEnable = VK_TRUE,
         .depthWriteEnable = VK_TRUE,
-        .depthCompareOp = VK_COMPARE_OP_LESS};
+        .depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL};
     VkPipelineColorBlendAttachmentState blendAttach = {
         .blendEnable = VK_FALSE,
         .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -2293,41 +2334,13 @@ but can only be on the last binding element (binding 2).
 
     bool enable_picking = false;
 
-    // ========== 拾取深度图像 ==========
-    VkImageCreateInfo pickDepthImageInfo = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    pickDepthImageInfo.imageType = VK_IMAGE_TYPE_2D;
-    pickDepthImageInfo.format = depthFormat_ref; // 与主深度相同格式
-    pickDepthImageInfo.extent = {WIDTH, HEIGHT, 1};
-    pickDepthImageInfo.mipLevels = 1;
-    pickDepthImageInfo.arrayLayers = 1;
-    pickDepthImageInfo.samples = VK_SAMPLE_COUNT_1_BIT; // 样本数为1
-    pickDepthImageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    pickDepthImageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    pickDepthImageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-    VmaAllocationCreateInfo pickDepthAllocInfo = {};
-    pickDepthAllocInfo.usage = VMA_MEMORY_USAGE_AUTO;
-    pickDepthAllocInfo.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
-
-    VkImage pickingDepthImage;
-    VmaAllocation pickingDepthAllocation;
-    vmaCreateImage(allocator, &pickDepthImageInfo, &pickDepthAllocInfo,
-                   &pickingDepthImage, &pickingDepthAllocation, nullptr);
-
-    // 创建深度图像视图
-    VkImageViewCreateInfo pickDepthViewInfo = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    pickDepthViewInfo.image = pickingDepthImage;
-    pickDepthViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    pickDepthViewInfo.format = depthFormat_ref;
-    pickDepthViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    pickDepthViewInfo.subresourceRange.levelCount = 1;
-    pickDepthViewInfo.subresourceRange.layerCount = 1;
-    VkImageView pickingDepthImageView =
-        device.createImageView(pickDepthViewInfo, nullptr);
-
     VkImageLayout pickingImageCurrentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     VkImageLayout pickingDepthImageCurrentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     // diff: [test_picking] end
+
+    // diff: [test_picking3] start
+    // 删除自有深度图像
+    // diff: [test_picking3] end
 
     // NOLINTNEXTLINE
     const auto recordCommandBuffer = [&](const CommandBufferView &commandBuffer,
@@ -2393,15 +2406,17 @@ but can only be on the last binding element (binding 2).
                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
             pickingImageCurrentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
-            // 转换拾取深度图像到 DEPTH_ATTACHMENT_OPTIMAL
+            // diff: [test_picking3] start
+            //  将主深度图像从 DEPTH_ATTACHMENT_OPTIMAL 转换为只读
             my_render::transition_image_layout(
-                commandBuffer, pickingDepthImage, VK_IMAGE_ASPECT_DEPTH_BIT,
-                pickingDepthImageCurrentLayout, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                0, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
-                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT);
-            pickingDepthImageCurrentLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+                commandBuffer, depthImage, VK_IMAGE_ASPECT_DEPTH_BIT,
+                VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT);
+            // diff: [test_picking3] end
 
             // 开始动态渲染
             VkRenderingAttachmentInfo pickColorAttachment = {
@@ -2411,13 +2426,15 @@ but can only be on the last binding element (binding 2).
                 .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
                 .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
                 .clearValue = {.color = {.uint32 = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0}}}};
+            // diff: [test_picking3] start
             VkRenderingAttachmentInfo pickDepthAttachment = {
                 .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                .imageView = pickingDepthImageView, // 使用独立的深度图像
-                .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .imageView = depthImageView, // 使用主深度图像视图
+                .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,        // 加载主渲染写入的深度值
+                .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE, // 无需存储
                 .clearValue = {.depthStencil = {1.0f, 0}}};
+            // diff: [test_picking3] end
             VkRenderingInfo pickRenderingInfo = {
                 .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
                 .renderArea = {.offset = {0, 0}, .extent = {WIDTH, HEIGHT}},
@@ -2463,7 +2480,7 @@ but can only be on the last binding element (binding 2).
                     0);
             }
             // NOTE: 不再支持hover
-#if 0
+#if 1
             // 绘制第二个 mesh (ID=1)
             {
                 struct PickPush
@@ -2487,6 +2504,54 @@ but can only be on the last binding element (binding 2).
             }
 #endif
             commandBuffer.endRendering();
+
+            // 将 pickingImage 转换为 TRANSFER_SRC_OPTIMAL
+            my_render::transition_image_layout(
+                commandBuffer, pickingImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+
+            // 将 resolveImage 转换为 TRANSFER_DST_OPTIMAL（从 UNDEFINED
+            // 转换，因为我们不关心之前的内容）
+            my_render::transition_image_layout(
+                commandBuffer, resolveImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+
+            // 执行解析
+            VkImageResolve resolveRegion = {
+                .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                .srcOffset = {0, 0, 0},
+                .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                .dstOffset = {0, 0, 0},
+                .extent = {WIDTH, HEIGHT, 1}};
+            commandBuffer.resolveImage(pickingImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       resolveImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                       std::span{&resolveRegion, 1});
+
+            // 将 resolveImage 转换为 TRANSFER_SRC_OPTIMAL，供后续复制到 buffer
+            my_render::transition_image_layout(
+                commandBuffer, resolveImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                VK_ACCESS_2_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+
+            // diff: [test_picking3] start
+            //  将主深度图像从只读转回 DEPTH_ATTACHMENT_OPTIMAL
+            my_render::transition_image_layout(
+                commandBuffer, depthImage, VK_IMAGE_ASPECT_DEPTH_BIT,
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
+                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT);
+            // diff: [test_picking3] end
 
             // 转换拾取图像到 TRANSFER_SRC_OPTIMAL 供后续读取
             my_render::transition_image_layout(
@@ -2702,7 +2767,6 @@ but can only be on the last binding element (binding 2).
             static_cast<float>(swapchain.refImageExtent().height);
         // diff: [camera_perspective] end
 
-        // diff: [test_picking] start
         // 重建拾取图像（假设 pickingImage, pickingImageView, pickingAllocation
         // 是全局或捕获的变量）
         device.destroyImageView(pickingImageView, nullptr);
@@ -2720,7 +2784,6 @@ but can only be on the last binding element (binding 2).
         pickingImageView = device.createImageView(newViewInfo, nullptr);
 
         // 同样，如果存在解析图像（方案B），也要重建
-        // diff: [test_picking] end
     };
     // NOLINTNEXTLINE
     const auto drawFrame = [&]() constexpr {
@@ -3021,8 +3084,10 @@ but can only be on the last binding element (binding 2).
                 .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                 .imageOffset = {int32_t(curPos.xpos), int32_t(curPos.ypos), 0},
                 .imageExtent = {1, 1, 1}};
-            copyCmd.copyImageToBuffer(pickingImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            // diff: [test_picking3] start
+            copyCmd.copyImageToBuffer(resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                       stagingBuffer, std::span{&region, 1});
+            // diff: [test_picking3] end
             copyCmd.end();
 
             // 提交并等待
@@ -3067,8 +3132,8 @@ but can only be on the last binding element (binding 2).
     device.destroyShaderModule(VertshaderModule, nullptr);
     device.destroyShaderModule(FragshaderModule, nullptr);
 
-    device.destroyImageView(pickingDepthImageView, nullptr);
-    vmaDestroyImage(allocator, pickingDepthImage, pickingDepthAllocation);
+    vmaDestroyImage(allocator, resolveImage, resolveAllocation);
+
     // diff: [test_picking] end
 
     std::cout << "main done\n";

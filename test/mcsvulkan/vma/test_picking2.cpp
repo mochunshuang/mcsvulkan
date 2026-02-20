@@ -2258,11 +2258,19 @@ but can only be on the last binding element (binding 2).
         .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
         .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT // 拾取不需要 MSAA
     };
+    // diff: [test_picking2] start
     VkPipelineDepthStencilStateCreateInfo depthStencil = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
         .depthTestEnable = VK_TRUE,
-        .depthWriteEnable = VK_TRUE,
-        .depthCompareOp = VK_COMPARE_OP_LESS};
+        .depthWriteEnable = VK_FALSE,                  // 禁止写入深度
+        .depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL, // diff:[test_picking2] 相等也通过
+        .depthBoundsTestEnable = VK_FALSE,
+        .stencilTestEnable = VK_FALSE,
+        .front = {},
+        .back = {},
+        .minDepthBounds = 0.0F,
+        .maxDepthBounds = 1.0F};
+    // diff: [test_picking2] end
     VkPipelineColorBlendAttachmentState blendAttach = {
         .blendEnable = VK_FALSE,
         .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -2292,41 +2300,41 @@ but can only be on the last binding element (binding 2).
         device.createGraphicsPipelines(VK_NULL_HANDLE, 1, pickPipeInfo, nullptr);
 
     bool enable_picking = false;
+    // diff: [test_picking] start
+    // ========== 深度解析图像（1x）==========
+    VkImageCreateInfo depthResolveInfo = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    depthResolveInfo.imageType = VK_IMAGE_TYPE_2D;
+    depthResolveInfo.format = depthFormat_ref; // 与主深度相同格式
+    depthResolveInfo.extent = {WIDTH, HEIGHT, 1};
+    depthResolveInfo.mipLevels = 1;
+    depthResolveInfo.arrayLayers = 1;
+    depthResolveInfo.samples = VK_SAMPLE_COUNT_1_BIT; // 样本数为1
+    depthResolveInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    depthResolveInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    depthResolveInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    // ========== 拾取深度图像 ==========
-    VkImageCreateInfo pickDepthImageInfo = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    pickDepthImageInfo.imageType = VK_IMAGE_TYPE_2D;
-    pickDepthImageInfo.format = depthFormat_ref; // 与主深度相同格式
-    pickDepthImageInfo.extent = {WIDTH, HEIGHT, 1};
-    pickDepthImageInfo.mipLevels = 1;
-    pickDepthImageInfo.arrayLayers = 1;
-    pickDepthImageInfo.samples = VK_SAMPLE_COUNT_1_BIT; // 样本数为1
-    pickDepthImageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    pickDepthImageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    pickDepthImageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VmaAllocationCreateInfo depthResolveAllocInfo = {};
+    depthResolveAllocInfo.usage = VMA_MEMORY_USAGE_AUTO;
+    depthResolveAllocInfo.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
 
-    VmaAllocationCreateInfo pickDepthAllocInfo = {};
-    pickDepthAllocInfo.usage = VMA_MEMORY_USAGE_AUTO;
-    pickDepthAllocInfo.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+    VkImage depthResolveImage;
+    VmaAllocation depthResolveAllocation;
+    vmaCreateImage(allocator, &depthResolveInfo, &depthResolveAllocInfo,
+                   &depthResolveImage, &depthResolveAllocation, nullptr);
 
-    VkImage pickingDepthImage;
-    VmaAllocation pickingDepthAllocation;
-    vmaCreateImage(allocator, &pickDepthImageInfo, &pickDepthAllocInfo,
-                   &pickingDepthImage, &pickingDepthAllocation, nullptr);
-
-    // 创建深度图像视图
-    VkImageViewCreateInfo pickDepthViewInfo = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-    pickDepthViewInfo.image = pickingDepthImage;
-    pickDepthViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    pickDepthViewInfo.format = depthFormat_ref;
-    pickDepthViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    pickDepthViewInfo.subresourceRange.levelCount = 1;
-    pickDepthViewInfo.subresourceRange.layerCount = 1;
-    VkImageView pickingDepthImageView =
-        device.createImageView(pickDepthViewInfo, nullptr);
-
+    VkImageViewCreateInfo depthResolveViewInfo = {
+        VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    depthResolveViewInfo.image = depthResolveImage;
+    depthResolveViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    depthResolveViewInfo.format = depthFormat_ref;
+    depthResolveViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    depthResolveViewInfo.subresourceRange.levelCount = 1;
+    depthResolveViewInfo.subresourceRange.layerCount = 1;
+    VkImageView depthResolveImageView =
+        device.createImageView(depthResolveViewInfo, nullptr);
+    // diff: [test_picking] end
     VkImageLayout pickingImageCurrentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VkImageLayout pickingDepthImageCurrentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout depthResolveImageCurrentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     // diff: [test_picking] end
 
     // NOLINTNEXTLINE
@@ -2383,6 +2391,19 @@ but can only be on the last binding element (binding 2).
         if (enable_picking)
         {
 
+            // diff: [test_picking2] start
+            //  将深度解析图像转换为只读，供拾取Pass使用
+            my_render::transition_image_layout(
+                commandBuffer, depthResolveImage, VK_IMAGE_ASPECT_DEPTH_BIT,
+                depthResolveImageCurrentLayout,
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT);
+            depthResolveImageCurrentLayout =
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+            // diff: [test_picking2] end
             std::cout << "拾取中....\n";
             // 转换拾取图像到 COLOR_ATTACHMENT_OPTIMAL
             my_render::transition_image_layout(
@@ -2393,15 +2414,7 @@ but can only be on the last binding element (binding 2).
                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
             pickingImageCurrentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
-            // 转换拾取深度图像到 DEPTH_ATTACHMENT_OPTIMAL
-            my_render::transition_image_layout(
-                commandBuffer, pickingDepthImage, VK_IMAGE_ASPECT_DEPTH_BIT,
-                pickingDepthImageCurrentLayout, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                0, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
-                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT);
-            pickingDepthImageCurrentLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+            // diff: [test_picking2] 删除 pickingDepthImage 转换，只保留深度
 
             // 开始动态渲染
             VkRenderingAttachmentInfo pickColorAttachment = {
@@ -2413,11 +2426,12 @@ but can only be on the last binding element (binding 2).
                 .clearValue = {.color = {.uint32 = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0}}}};
             VkRenderingAttachmentInfo pickDepthAttachment = {
                 .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                .imageView = pickingDepthImageView, // 使用独立的深度图像
-                .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-                .clearValue = {.depthStencil = {1.0f, 0}}};
+                .imageView = depthResolveImageView, // 使用解析后的深度图像
+                .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,        // 加载已有的深度值
+                .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE, // 无需存储
+                .clearValue = {.depthStencil = {1.0f, 0}}    // 实际不会使用
+            };
             VkRenderingInfo pickRenderingInfo = {
                 .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
                 .renderArea = {.offset = {0, 0}, .extent = {WIDTH, HEIGHT}},
@@ -2430,15 +2444,16 @@ but can only be on the last binding element (binding 2).
             commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pickingPipeline);
 
             // 设置视口和裁剪
-            VkViewport viewport = {0, 0, WIDTH, HEIGHT, 0, 1};
-            VkRect2D scissor = {{0, 0}, {WIDTH, HEIGHT}};
+            VkViewport viewport = {
+                0, 0, (float)imageExtent.width, (float)imageExtent.height, 0, 1};
+            VkRect2D scissor = {{0, 0}, imageExtent};
             commandBuffer.setViewport(0, std::span{&viewport, 1});
             commandBuffer.setScissor(0, std::span{&scissor, 1});
 
             // 绑定描述符集（主渲染的当前帧描述符集，包含 view/proj）
             commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                              pickingPipelineLayout, 0, 1,
-                                             &(descriptorSet), 0, nullptr);
+                                             &descriptorSets[currentFrame], 0, nullptr);
 
             // 绘制第一个 mesh (ID=0)
             {
@@ -2551,15 +2566,18 @@ but can only be on the last binding element (binding 2).
             .clearValue = {.color = {.float32 = {0.0F, 0.0F, 0.0F, 1.0F}}}};
         // diff: update by [mass] end
 
-        // diff: [depth] start: 添加深度附件
+        // diff: [depth] start: 添加深度附件 //diff: [test_picking2] start
         VkRenderingAttachmentInfo depthAttachment = {
             .sType = sType<VkRenderingAttachmentInfo>(),
             .imageView = depthImageView,
             .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            .resolveMode = VK_RESOLVE_MODE_MIN_BIT, // 使用 MIN 模式，取最近距离
+            .resolveImageView = depthResolveImageView,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
             .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
             .clearValue = {.depthStencil = {.depth = 1.0F}}};
-        // diff: [depth] end
+        // diff: [depth] end //diff: [test_picking2] end
 
         commandBuffer.beginRendering({
             .sType = sType<VkRenderingInfo>(),
@@ -2638,7 +2656,7 @@ but can only be on the last binding element (binding 2).
             uint64_t objectDataAddress = input_mesh2.getObjectDataAddress(currentFrame);
             // diff: [test_model_matrix3] start
             mesh_base::updateObjectData(input_mesh2.frameBuffers[currentFrame],
-                                        [&] { return mesh2_model; });
+                                        [&] { return modelMatrix_(); });
             // diff: [test_model_matrix3] end
             // diff: [test_model_matrix2] end
 
@@ -2702,7 +2720,7 @@ but can only be on the last binding element (binding 2).
             static_cast<float>(swapchain.refImageExtent().height);
         // diff: [camera_perspective] end
 
-        // diff: [test_picking] start
+        // diff: [test_picking2] start
         // 重建拾取图像（假设 pickingImage, pickingImageView, pickingAllocation
         // 是全局或捕获的变量）
         device.destroyImageView(pickingImageView, nullptr);
@@ -2719,8 +2737,23 @@ but can only be on the last binding element (binding 2).
         newViewInfo.image = pickingImage;
         pickingImageView = device.createImageView(newViewInfo, nullptr);
 
-        // 同样，如果存在解析图像（方案B），也要重建
-        // diff: [test_picking] end
+        // ----- 新增：重建深度解析图像 -----
+        device.destroyImageView(depthResolveImageView, nullptr);
+        vmaDestroyImage(allocator, depthResolveImage, depthResolveAllocation);
+
+        VkImageCreateInfo newDepthResolveInfo = depthResolveInfo; // 之前保存的创建信息
+        newDepthResolveInfo.extent = {swapchain.refImageExtent().width,
+                                      swapchain.refImageExtent().height, 1};
+        vmaCreateImage(allocator, &newDepthResolveInfo, &depthResolveAllocInfo,
+                       &depthResolveImage, &depthResolveAllocation, nullptr);
+
+        VkImageViewCreateInfo newDepthResolveViewInfo = depthResolveViewInfo;
+        newDepthResolveViewInfo.image = depthResolveImage;
+        depthResolveImageView = device.createImageView(newDepthResolveViewInfo, nullptr);
+
+        pickingImageCurrentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        depthResolveImageCurrentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        // diff: [test_picking2] end
     };
     // NOLINTNEXTLINE
     const auto drawFrame = [&]() constexpr {
@@ -3067,8 +3100,9 @@ but can only be on the last binding element (binding 2).
     device.destroyShaderModule(VertshaderModule, nullptr);
     device.destroyShaderModule(FragshaderModule, nullptr);
 
-    device.destroyImageView(pickingDepthImageView, nullptr);
-    vmaDestroyImage(allocator, pickingDepthImage, pickingDepthAllocation);
+    // 销毁深度解析图像
+    device.destroyImageView(depthResolveImageView, nullptr);
+    vmaDestroyImage(allocator, depthResolveImage, depthResolveAllocation);
     // diff: [test_picking] end
 
     std::cout << "main done\n";

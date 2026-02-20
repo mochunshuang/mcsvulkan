@@ -352,6 +352,15 @@ namespace mcs::vulkan
                                                   dstBuffer, regions.size(),
                                                   regions.data());
         }
+        constexpr void resolveImage(
+            VkImage srcImage, VkImageLayout srcImageLayout, VkImage dstImage,
+            VkImageLayout dstImageLayout,
+            const std::span<const VkImageResolve> &regions) const noexcept
+        {
+            pool_->device()->cmdResolveImage(value_, srcImage, srcImageLayout, dstImage,
+                                             dstImageLayout, regions.size(),
+                                             regions.data());
+        }
     };
 
 }; // namespace mcs::vulkan

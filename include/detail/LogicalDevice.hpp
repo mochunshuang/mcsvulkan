@@ -699,5 +699,14 @@ namespace mcs::vulkan
             table_.vkCmdCopyImageToBuffer(commandBuffer, srcImage, srcImageLayout,
                                           dstBuffer, regionCount, pRegions);
         }
+        constexpr void cmdResolveImage(VkCommandBuffer commandBuffer, VkImage srcImage,
+                                       VkImageLayout srcImageLayout, VkImage dstImage,
+                                       VkImageLayout dstImageLayout, uint32_t regionCount,
+                                       const VkImageResolve *pRegions) const noexcept
+        {
+            MCS_ASSERT(table_.vkCmdResolveImage != nullptr);
+            table_.vkCmdResolveImage(commandBuffer, srcImage, srcImageLayout, dstImage,
+                                     dstImageLayout, regionCount, pRegions);
+        }
     };
 }; // namespace mcs::vulkan
