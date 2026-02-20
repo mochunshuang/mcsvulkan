@@ -2428,7 +2428,8 @@ but can only be on the last binding element (binding 2).
                     static_cast<uint32_t>(input_mesh.queue_data.indices.size()), 1, 0, 0,
                     0);
             }
-
+            // NOTE: 不再支持hover
+#if 0
             // 绘制第二个 mesh (ID=1)
             {
                 struct PickPush
@@ -2450,7 +2451,7 @@ but can only be on the last binding element (binding 2).
                     static_cast<uint32_t>(input_mesh2.queue_data.indices.size()), 1, 0, 0,
                     0);
             }
-
+#endif
             commandBuffer.endRendering();
 
             // 转换拾取图像到 TRANSFER_SRC_OPTIMAL 供后续读取
