@@ -23,6 +23,10 @@ include(third_party/vma.cmake)
 include(third_party/glfw.cmake)
 include(third_party/glm.cmake)
 include(third_party/stb.cmake)
+include(third_party/nlohmann_json.cmake)
+include(third_party/ktx.cmake)
+
+set(ASSETS_DIR ${CMAKE_SOURCE_DIR}/assets)
 
 # test add
 include(test/all_test.cmake)

@@ -56,6 +56,11 @@ add_executable(${TAGET_NAME} ${EXE_DIR}/test_vulkan_hpp.cpp)
 target_link_libraries(${TAGET_NAME} PRIVATE vulkan)
 target_include_directories(${TAGET_NAME} PRIVATE ${Vulkan_Include_DIR})
 
+set(TAGET_NAME "${DIR_NAME}-test_nlohmann_json")
+add_executable(${TAGET_NAME} ${EXE_DIR}/test_nlohmann_json.cpp)
+target_link_libraries(${TAGET_NAME} PRIVATE nlohmann_json)
+target_include_directories(${TAGET_NAME} PRIVATE ${Vulkan_Include_DIR})
+
 # end
 unset(EXE_DIR)
 unset(DIR_NAME)
