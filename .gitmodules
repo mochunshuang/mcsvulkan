@@ -23,3 +23,6 @@
 [submodule "third_party/vma"]
 	path = third_party/vma
 	url = https://gh-proxy.org/https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
+[submodule "third_party/nlohmann_json"]
+	path = third_party/nlohmann_json
+	url = https://gh-proxy.org/https://github.com/nlohmann/json.git
