@@ -32,3 +32,6 @@
 [submodule "third_party/harfbuzz"]
 	path = third_party/harfbuzz
 	url = https://gh-proxy.org/https://github.com/harfbuzz/harfbuzz.git
+[submodule "third_party/msdfgen"]
+	path = third_party/msdfgen
+	url = https://gh-proxy.org/https://github.com/Chlumsky/msdfgen.git
