@@ -52,5 +52,8 @@ add_std_glsl_target(test_picking test_model_matrix2.vert test_texture.frag)
 add_std_glsl_target(test_picking2 test_model_matrix2.vert test_texture.frag)
 add_std_glsl_target(test_picking3 test_model_matrix2.vert test_texture.frag)
 
+set(BASE_LIBS volk vma glfw glm stb ktx nlohmann_json)
+add_std_glsl_target(test_front test_triangle.vert test_triangle.frag)
+
 # end
 std_glsl_env_destroy()

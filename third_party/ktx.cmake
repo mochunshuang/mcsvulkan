@@ -26,7 +26,7 @@
 # git remote set-url origin https://gh-proxy.org/https://github.com/KhronosGroup/KTX-Software.git
 
 # libktx
-set(KTX_DIR ${CMAKE_SOURCE_DIR}/third_party//ktx)
+set(KTX_DIR ${CMAKE_SOURCE_DIR}/third_party/ktx)
 
 set(KTX_SOURCES
     ${KTX_DIR}/lib/checkheader.c
@@ -111,11 +111,8 @@ target_compile_definitions(ktx PUBLIC KTX_FEATURE_WRITE=0)
 target_compile_definitions(ktx PUBLIC BASISD_SUPPORT_KTX2_ZSTD=0)
 target_compile_definitions(ktx PUBLIC BASISU_NO_ITERATOR_DEBUG_LEVEL)
 
-target_include_directories(ktx SYSTEM PUBLIC ${KTX_INCLUDE_DIRS})
-
-# 添加 Vulkan 头文件目录
-target_include_directories(ktx SYSTEM PUBLIC
-    ${VULKAN_SDK_DIR}/Include # 这里包含 vulkan/vk_platform.h
-)
-target_link_directories(ktx PUBLIC ${VULKAN_SDK_DIR}/Lib)
-target_link_libraries(ktx PUBLIC vulkan-1)
+target_include_directories(ktx SYSTEM PUBLIC ${Vulkan_Include_DIR}
+    "${KTX_DIR}/include"
+    "${KTX_DIR}/external" "${KTX_DIR}/external/basisu/zstd"
+    "${KTX_DIR}/utils" "${KTX_DIR}/other_include")
+target_link_libraries(ktx PUBLIC vulkan)

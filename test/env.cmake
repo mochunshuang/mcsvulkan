@@ -61,6 +61,30 @@ add_executable(${TAGET_NAME} ${EXE_DIR}/test_nlohmann_json.cpp)
 target_link_libraries(${TAGET_NAME} PRIVATE nlohmann_json)
 target_include_directories(${TAGET_NAME} PRIVATE ${Vulkan_Include_DIR})
 
+set(TAGET_NAME "${DIR_NAME}-test_freetype_harfbuzz")
+add_executable(${TAGET_NAME} ${EXE_DIR}/test_freetype_harfbuzz.cpp)
+target_link_libraries(${TAGET_NAME} PRIVATE freetype harfbuzz)
+
+set(TAGET_NAME "${DIR_NAME}-test_msdfgen")
+add_executable(${TAGET_NAME} ${EXE_DIR}/test_msdfgen.cpp)
+target_link_libraries(${TAGET_NAME} PRIVATE freetype harfbuzz msdfgen::msdfgen)
+
+set(TAGET_NAME "${DIR_NAME}-test_msdfgen2")
+add_executable(${TAGET_NAME} ${EXE_DIR}/test_msdfgen2.cpp)
+target_link_libraries(${TAGET_NAME} PRIVATE freetype harfbuzz msdfgen::msdfgen)
+
+set(TAGET_NAME "${DIR_NAME}-test_msdfgen3")
+add_executable(${TAGET_NAME} ${EXE_DIR}/test_msdfgen3.cpp)
+target_link_libraries(${TAGET_NAME} PRIVATE freetype harfbuzz msdfgen::msdfgen)
+
+set(TAGET_NAME "${DIR_NAME}-test_msdfgen4")
+add_executable(${TAGET_NAME} ${EXE_DIR}/test_msdfgen4.cpp)
+target_link_libraries(${TAGET_NAME} PRIVATE freetype harfbuzz msdfgen::msdfgen)
+
+set(TAGET_NAME "${DIR_NAME}-test_msdfgen5")
+add_executable(${TAGET_NAME} ${EXE_DIR}/test_msdfgen5.cpp)
+target_link_libraries(${TAGET_NAME} PRIVATE freetype harfbuzz msdfgen::msdfgen)
+
 # end
 unset(EXE_DIR)
 unset(DIR_NAME)

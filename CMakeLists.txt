@@ -26,6 +26,12 @@ include(third_party/stb.cmake)
 include(third_party/nlohmann_json.cmake)
 include(third_party/ktx.cmake)
 
+include(third_party/freetype.cmake)
+include(third_party/harfbuzz.cmake)
+include(third_party/msdfgen.cmake)
+
+include(third_party/agg.cmake)
+
 set(ASSETS_DIR ${CMAKE_SOURCE_DIR}/assets)
 
 # test add
