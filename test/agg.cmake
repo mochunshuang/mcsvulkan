@@ -7,9 +7,21 @@ file(COPY "${EXE_DIR}/assets/" DESTINATION "${OUTPUT_DIRECTORY}")
 
 set(agg_freetype_dir ${EXE_DIR}/font_freetype)
 add_library(agg_freetype STATIC ${agg_freetype_dir}/agg_font_freetype.cpp)
-target_include_directories(agg_freetype PUBLIC ${agg_freetype_dir} ${antigrain_SOURCE_DIR}/include)
+target_include_directories(agg_freetype PUBLIC ${agg_freetype_dir} ${antigrain_SOURCE_DIR}/include ${antigrain_SOURCE_DIR}/font_win32_tt)
 target_link_libraries(agg_freetype PUBLIC freetype)
 target_compile_definitions(agg_freetype PUBLIC NOMINMAX)
+
+macro(add_target NAME)
+    set(TARGET_NAME "${DIR_NAME}-${NAME}")
+    add_executable(${TARGET_NAME} "${EXE_DIR}/${NAME}.cpp")
+    target_link_libraries(${TARGET_NAME} PRIVATE antigrain controls platform agg_freetype harfbuzz)
+    set_target_properties(${TARGET_NAME} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY ${OUTPUT_DIRECTORY}
+        OUTPUT_NAME ${NAME}
+    )
+    target_include_directories(${TARGET_NAME} PRIVATE ${antigrain_examples_dir})
+    target_compile_definitions(${TARGET_NAME} PUBLIC AGG_USE_FREETYPE)
+endmacro()
 
 macro(add_agg_target NAME)
     set(TARGET_NAME "${DIR_NAME}-${NAME}")
@@ -45,9 +57,23 @@ endmacro()
 add_agg_target(t01_rendering_buffer)
 add_agg_target(t02_pixel_formats)
 add_agg_target(test_clip)
+add_agg_target(t03visualize)
+
+add_target(arrow_demo)
+add_target(arrow_demo1)
+add_target(arrow_demo2)
+add_target(arrow_demo3)
+add_target(arrow_demo4)
+add_target(arrow_demo5)
+add_target(arrow_demo6)
+add_target(freeType)
+add_target(harfbuzz)
+add_target(harfbuzz2)
+add_target(harfbuzz3)
 
 # --------------------- examples  ---------------------
 add_agg_target(lion parse_lion.cpp)
 add_agg_target(freetype_test
     make_arrows.cpp
     make_gb_poly.cpp)
+add_agg_target(truetype_test)

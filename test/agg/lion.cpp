@@ -65,8 +65,8 @@ class the_application : public agg::platform_support
     agg::slider_ctrl<color_type> m_alpha_slider;
 
   public:
-    typedef agg::renderer_base<pixfmt> renderer_base;
-    typedef agg::renderer_scanline_aa_solid<renderer_base> renderer_solid;
+    using renderer_base = agg::renderer_base<pixfmt>;
+    using renderer_solid = agg::renderer_scanline_aa_solid<renderer_base>;
 
     the_application(agg::pix_format_e format, bool flip_y)
         : agg::platform_support(format, flip_y),
@@ -150,6 +150,7 @@ class the_application : public agg::platform_support
 };
 
 // NOTE: 狮子的矢量数据在 parse_lion.cpp 中定义
+// 没有main函数，是因为集成平台的一种实现方法 [comments/lion_0.png]
 int agg_main(int argc, char *argv[])
 {
     the_application app(pix_format, flip_y);
