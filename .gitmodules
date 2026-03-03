@@ -41,3 +41,6 @@
 [submodule "third_party/libraqm"]
 	path = third_party/libraqm
 	url = https://gh-proxy.org/https://github.com/HOST-Oman/libraqm.git
+[submodule "third_party/SheenBidi"]
+	path = third_party/SheenBidi
+	url = https://gh-proxy.org/https://github.com/Tehreer/SheenBidi.git
