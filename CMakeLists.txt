@@ -32,6 +32,11 @@ include(third_party/msdfgen.cmake)
 
 include(third_party/agg.cmake)
 
+# text layout
+include(third_party/SheenBidi.cmake)
+include(third_party/libraqm.cmake)
+include(third_party/libunibreak.cmake)
+
 set(ASSETS_DIR ${CMAKE_SOURCE_DIR}/assets)
 
 # test add

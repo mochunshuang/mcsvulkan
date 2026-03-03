@@ -14,7 +14,7 @@ target_compile_definitions(agg_freetype PUBLIC NOMINMAX)
 macro(add_target NAME)
     set(TARGET_NAME "${DIR_NAME}-${NAME}")
     add_executable(${TARGET_NAME} "${EXE_DIR}/${NAME}.cpp")
-    target_link_libraries(${TARGET_NAME} PRIVATE antigrain controls platform agg_freetype harfbuzz)
+    target_link_libraries(${TARGET_NAME} PRIVATE antigrain controls platform agg_freetype harfbuzz libraqm libunibreak)
     set_target_properties(${TARGET_NAME} PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${OUTPUT_DIRECTORY}
         OUTPUT_NAME ${NAME}
@@ -70,6 +70,9 @@ add_target(freeType)
 add_target(harfbuzz)
 add_target(harfbuzz2)
 add_target(harfbuzz3)
+
+add_target(raqm)
+add_target(unibreak)
 
 # --------------------- examples  ---------------------
 add_agg_target(lion parse_lion.cpp)
