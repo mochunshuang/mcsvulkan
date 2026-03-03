@@ -73,6 +73,10 @@ add_target(harfbuzz3)
 
 add_target(raqm)
 add_target(unibreak)
+add_target(unibreak2)
+add_target(unibreak3)
+add_target(color)
+add_target(unibreak4)
 
 # --------------------- examples  ---------------------
 add_agg_target(lion parse_lion.cpp)

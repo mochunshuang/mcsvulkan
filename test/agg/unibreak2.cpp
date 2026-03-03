@@ -33,9 +33,7 @@ const int HEIGHT = 800;
 const int BYTES_PER_PIXEL = 3;
 const double LINE_HEIGHT_FACTOR = 1.2;
 
-// ---------- AGG 辅助函数（与之前相同，此处保留占位）----------
-// ... (请保留您原有的 draw_line_with_stroke, draw_arrow, OutlineToAgg 等函数)
-
+// ---------- AGG 辅助函数（保持不变）----------
 struct OutlineToAgg
 {
     agg::path_storage &path;
@@ -88,17 +86,153 @@ struct OutlineToAgg
     }
 };
 
-// ---------- 测量宽度 ----------
-double measure_text_width(FT_Face face, raqm_t *rq, const char *utf8_text,
-                          size_t byte_len)
+// ---------- 获取 UTF-8 字符串中下一个字符的字节偏移 ----------
+size_t next_utf8_char_offset(const char *text, size_t current_offset, size_t text_len)
 {
-    raqm_clear_contents(rq);
-    raqm_set_text_utf8(rq, utf8_text, byte_len);
-    raqm_set_freetype_face(rq, face);
-    raqm_set_par_direction(rq, RAQM_DIRECTION_LTR);
-    raqm_set_language(rq, "en", 0, byte_len);
-    if (!raqm_layout(rq))
+    if (current_offset >= text_len)
+        return text_len;
+    unsigned char c = static_cast<unsigned char>(text[current_offset]);
+    size_t char_len = 1;
+    if (c >= 0xF0)
+        char_len = 4;
+    else if (c >= 0xE0)
+        char_len = 3;
+    else if (c >= 0xC0)
+        char_len = 2;
+    size_t next = current_offset + char_len;
+    return (next > text_len) ? text_len : next;
+}
+
+// ---------- 从 UTF-8 字符串的指定位置解码一个 Unicode 码点 ----------
+uint32_t decode_utf8_char(const char *text, size_t offset, size_t *char_len = nullptr)
+{
+    uint32_t ch = 0;
+    unsigned char c = static_cast<unsigned char>(text[offset]);
+    if (c < 0x80)
+    {
+        ch = c;
+        if (char_len)
+            *char_len = 1;
+    }
+    else if (c < 0xE0)
+    {
+        ch = (c & 0x1F) << 6;
+        ch |= (text[offset + 1] & 0x3F);
+        if (char_len)
+            *char_len = 2;
+    }
+    else if (c < 0xF0)
+    {
+        ch = (c & 0x0F) << 12;
+        ch |= (text[offset + 1] & 0x3F) << 6;
+        ch |= (text[offset + 2] & 0x3F);
+        if (char_len)
+            *char_len = 3;
+    }
+    else
+    {
+        ch = (c & 0x07) << 18;
+        ch |= (text[offset + 1] & 0x3F) << 12;
+        ch |= (text[offset + 2] & 0x3F) << 6;
+        ch |= (text[offset + 3] & 0x3F);
+        if (char_len)
+            *char_len = 4;
+    }
+    return ch;
+}
+
+// ---------- 检查字体是否有某个 Unicode 字符 ----------
+bool has_glyph(FT_Face face, uint32_t codepoint)
+{
+    return FT_Get_Char_Index(face, codepoint) != 0;
+}
+
+// ---------- 字体段结构 ----------
+struct FontRun
+{
+    size_t byte_start; // 相对于当前子串的起始字节偏移
+    size_t byte_len;
+    FT_Face face;
+};
+
+// ---------- 收集指定子串内的字体段 ----------
+std::vector<FontRun> collect_font_runs_for_range(
+    const char *text, size_t byte_len, FT_Face primary_face,
+    const std::vector<FT_Face> &fallback_faces)
+{
+    std::vector<FontRun> runs;
+    size_t pos = 0;
+    while (pos < byte_len)
+    {
+        size_t char_len;
+        uint32_t ch = decode_utf8_char(text, pos, &char_len);
+        // 选择字体
+        FT_Face current_face = primary_face;
+        if (!has_glyph(primary_face, ch))
+        {
+            for (FT_Face face : fallback_faces)
+            {
+                if (has_glyph(face, ch))
+                {
+                    current_face = face;
+                    break;
+                }
+            }
+        }
+        // 如果 runs 为空或上一个 face 不同，则开始新段
+        if (runs.empty() || runs.back().face != current_face)
+        {
+            runs.push_back({pos, char_len, current_face});
+        }
+        else
+        {
+            runs.back().byte_len += char_len;
+        }
+        pos += char_len;
+    }
+    return runs;
+}
+
+// ---------- 带字体回退的宽度测量 ----------
+double measure_text_width_with_fallback(FT_Library ft_library, const char *text,
+                                        size_t byte_start, size_t byte_end,
+                                        FT_Face primary_face,
+                                        const std::vector<FT_Face> &fallback_faces)
+{
+    // 创建临时 raqm 对象
+    raqm_t *rq = raqm_create();
+    if (!rq)
         return 0.0;
+
+    size_t seg_len = byte_end - byte_start;
+    const char *seg_text = text + byte_start;
+
+    // 设置文本
+    if (!raqm_set_text_utf8(rq, seg_text, seg_len))
+    {
+        raqm_destroy(rq);
+        return 0.0;
+    }
+
+    // 收集字体段
+    auto runs =
+        collect_font_runs_for_range(seg_text, seg_len, primary_face, fallback_faces);
+    for (const auto &run : runs)
+    {
+        if (!raqm_set_freetype_face_range(rq, run.face, run.byte_start, run.byte_len))
+        {
+            std::println(stderr, "raqm_set_freetype_face_range failed");
+        }
+    }
+
+    raqm_set_par_direction(rq, RAQM_DIRECTION_LTR);
+    raqm_set_language(rq, "en", 0, seg_len);
+
+    if (!raqm_layout(rq))
+    {
+        raqm_destroy(rq);
+        return 0.0;
+    }
 
     size_t glyph_cnt;
     raqm_glyph_t *glyphs = raqm_get_glyphs(rq, &glyph_cnt);
@@ -107,23 +241,18 @@ double measure_text_width(FT_Face face, raqm_t *rq, const char *utf8_text,
     {
         width += glyphs[i].x_advance / 64.0;
     }
+
+    raqm_destroy(rq);
     return width;
 }
 
-// ---------- 渲染一行 ----------
+// ---------- 渲染一行（已设置好 raqm 对象）----------
 void render_line(
-    FT_Face face, raqm_t *rq, const char *utf8_text, size_t byte_len, double pen_x,
-    double pen_y, agg::rasterizer_scanline_aa<> &ras, agg::scanline_u8 &sl,
-    agg::renderer_scanline_aa_solid<agg::renderer_base<agg::pixfmt_rgb24>> &ren_solid)
+    raqm_t *rq, double pen_x, double pen_y, agg::rasterizer_scanline_aa<> &ras,
+    agg::scanline_u8 &sl,
+    agg::renderer_scanline_aa_solid<agg::renderer_base<agg::pixfmt_rgb24>> &ren_solid,
+    FT_Face primary_face)
 {
-    raqm_clear_contents(rq);
-    raqm_set_text_utf8(rq, utf8_text, byte_len);
-    raqm_set_freetype_face(rq, face);
-    raqm_set_par_direction(rq, RAQM_DIRECTION_LTR);
-    raqm_set_language(rq, "en", 0, byte_len);
-    if (!raqm_layout(rq))
-        return;
-
     size_t glyph_cnt;
     raqm_glyph_t *glyphs = raqm_get_glyphs(rq, &glyph_cnt);
 
@@ -134,7 +263,7 @@ void render_line(
         raqm_glyph_t &g = glyphs[i];
         FT_Face current_face = (FT_Face)g.ftface;
         if (!current_face)
-            current_face = face;
+            current_face = primary_face;
 
         if (FT_Load_Glyph(current_face, g.index, FT_LOAD_NO_BITMAP))
         {
@@ -171,24 +300,6 @@ void render_line(
     }
 }
 
-// ---------- 获取 UTF-8 字符串中下一个字符的字节偏移 ----------
-size_t next_utf8_char_offset(const char *text, size_t current_offset, size_t text_len)
-{
-    if (current_offset >= text_len)
-        return text_len;
-    unsigned char c = static_cast<unsigned char>(text[current_offset]);
-    size_t char_len = 1;
-    if (c >= 0xF0)
-        char_len = 4; // 11110xxx
-    else if (c >= 0xE0)
-        char_len = 3; // 1110xxxx
-    else if (c >= 0xC0)
-        char_len = 2; // 110xxxxx
-    // ASCII (0xxxxxxx) 长度为 1
-    size_t next = current_offset + char_len;
-    return (next > text_len) ? text_len : next;
-}
-
 int main()
 {
     // ---------- 测试文本 ----------
@@ -220,18 +331,52 @@ int main()
 
     // ---------- 初始化 FreeType ----------
     FT_Library ft_library;
-    FT_Init_FreeType(&ft_library);
-    const char *font_path = "C:/Windows/Fonts/msyh.ttc";
-    FT_Face ft_face;
-    FT_New_Face(ft_library, font_path, 0, &ft_face);
-    double font_size = 20.0;
-    FT_Set_Pixel_Sizes(ft_face, 0, font_size);
+    if (FT_Init_FreeType(&ft_library))
+    {
+        std::println(stderr, "FT_Init_FreeType failed");
+        return 1;
+    }
 
-    // ---------- 【正确用法】直接对 UTF-8 字符串调用 libunibreak ----------
+    // 主字体（微软雅黑）
+    const char *font_path = "C:/Windows/Fonts/msyh.ttc";
+    FT_Face primary_face;
+    if (FT_New_Face(ft_library, font_path, 0, &primary_face))
+    {
+        std::println(stderr, "FT_New_Face failed: {}", font_path);
+        FT_Done_FreeType(ft_library);
+        return 1;
+    }
+    double font_size = 20.0;
+    FT_Set_Pixel_Sizes(primary_face, 0, font_size);
+
+    // ---------- 加载备选字体（Windows 常用）----------
+    std::vector<FT_Face> fallback_faces;
+    const char *fallback_paths[] = {
+        "C:/Windows/Fonts/seguiemj.ttf",  // Segoe UI Emoji
+        "C:/Windows/Fonts/seguiisym.ttf", // Segoe UI Symbol
+        "C:/Windows/Fonts/arial.ttf",     // Arial (包含希伯来语等)
+        "C:/Windows/Fonts/times.ttf",     // Times New Roman
+        "C:/Windows/Fonts/cour.ttf",      // Courier New
+    };
+    for (const char *path : fallback_paths)
+    {
+        FT_Face face;
+        if (FT_New_Face(ft_library, path, 0, &face) == 0)
+        {
+            FT_Set_Pixel_Sizes(face, 0, font_size);
+            fallback_faces.push_back(face);
+        }
+        else
+        {
+            std::println(stderr, "Failed to load fallback font: {}", path);
+        }
+    }
+
+    // ---------- 使用 libunibreak 获取换行属性 ----------
     char *brks = new char[text_len]; // breaks 数组长度 = 字节数
     set_linebreaks_utf8(reinterpret_cast<const utf8_t *>(text), text_len, nullptr, brks);
 
-    // ---------- 创建 raqm 对象 ----------
+    // ---------- 主 raqm 对象（用于渲染）---------
     raqm_t *rq = raqm_create();
 
     // ---------- 对不同宽度生成图片 ----------
@@ -255,70 +400,96 @@ int main()
         double pen_y = line_height;
         size_t total_lines = 0;
         size_t byte_start = 0; // 当前行的起始字节偏移
+
         while (byte_start < text_len)
         {
-            total_lines++; // 统计行数
+            total_lines++;
 
             size_t byte_end = byte_start;
-            size_t last_break_byte = byte_start; // 上一个可换行点（字节偏移，不包含）
-            size_t forced_next_start = text_len; // 遇到强制换行时记录的下一行起始
+            size_t last_break_byte = byte_start;
+            size_t forced_next_start = text_len;
 
-            // 贪心扩展行
+            // 贪心扩展行，使用带回退的宽度测量
             while (byte_end < text_len)
             {
                 size_t next_char_end = next_utf8_char_offset(text, byte_end, text_len);
-                double line_width = measure_text_width(ft_face, rq, text + byte_start,
-                                                       next_char_end - byte_start);
+                double line_width = measure_text_width_with_fallback(
+                    ft_library, text, byte_start, next_char_end, primary_face,
+                    fallback_faces);
 
                 if (line_width > max_width - 20)
-                { // 超宽
+                {
                     if (last_break_byte > byte_start)
                     {
-                        // 存在上一个可换行点，回退到那里
                         byte_end = last_break_byte;
                         forced_next_start = byte_end;
                     }
                     else
                     {
-                        // 无可换行点，强制在此字符处断行（包含该字符）
                         byte_end = next_char_end;
                         forced_next_start = byte_end;
                     }
-                    break; // 行结束
+                    break;
                 }
                 else
                 {
-                    // 未超宽，检查当前字符的换行属性
                     char break_type = brks[next_char_end - 1];
                     if (break_type == LINEBREAK_ALLOWBREAK)
                     {
-                        last_break_byte = next_char_end; // 记录可换行点
+                        last_break_byte = next_char_end;
                     }
                     if (break_type == LINEBREAK_MUSTBREAK)
                     {
-                        // 强制换行：当前行到此字符之前结束，下一行从此字符之后开始
-                        forced_next_start = next_char_end; // 记录下一行起始
-                        // byte_end 保持当前值（即该字符之前的位置），不包含此字符
-                        break; // 行结束
+                        forced_next_start = next_char_end;
+                        // 当前行结束于此字符之前，所以 byte_end 保持当前值
+                        break;
                     }
-                    // 继续扩展
                     byte_end = next_char_end;
                 }
             }
 
-            // 如果循环自然结束（到达文本末尾）且未设置
-            // forced_next_start，则剩余部分作为一行
             if (byte_end >= text_len && forced_next_start == text_len)
             {
                 forced_next_start = text_len;
-                // byte_end 已经是 text_len
             }
 
-            // 渲染当前行 [byte_start, byte_end)
+            // ---------- 渲染当前行 ----------
             if (byte_end > byte_start)
             {
-                render_line(ft_face, rq, text + byte_start, byte_end - byte_start, 10.0,
-                            pen_y, ras, sl, ren_solid);
+                size_t seg_len = byte_end - byte_start;
+                const char *seg_text = text + byte_start;
+
+                // 清空 raqm 对象并设置当前行的文本
+                raqm_clear_contents(rq);
+                if (!raqm_set_text_utf8(rq, seg_text, seg_len))
+                {
+                    std::println(stderr, "raqm_set_text_utf8 failed");
+                    break;
+                }
+
+                // 收集当前行的字体段
+                auto runs = collect_font_runs_for_range(seg_text, seg_len, primary_face,
+                                                        fallback_faces);
+                for (const auto &run : runs)
+                {
+                    if (!raqm_set_freetype_face_range(rq, run.face, run.byte_start,
+                                                      run.byte_len))
+                    {
+                        std::println(stderr, "raqm_set_freetype_face_range failed");
+                    }
+                }
+
+                raqm_set_par_direction(rq, RAQM_DIRECTION_LTR);
+                raqm_set_language(rq, "en", 0, seg_len);
+
+                if (!raqm_layout(rq))
+                {
+                    std::println(stderr, "raqm_layout failed");
+                }
+                else
+                {
+                    render_line(rq, 10.0, pen_y, ras, sl, ren_solid, primary_face);
+                }
             }
 
             // 移动到下一行
@@ -331,7 +502,7 @@ int main()
                 break;
             }
         }
-        // 循环结束后
+
         if (byte_start < text_len)
         {
             std::println(stderr, "警告：文本未完全渲染，剩余 {} 字节",
@@ -357,7 +528,9 @@ int main()
     // 清理
     raqm_destroy(rq);
     delete[] brks;
-    FT_Done_Face(ft_face);
+    FT_Done_Face(primary_face);
+    for (FT_Face f : fallback_faces)
+        FT_Done_Face(f);
     FT_Done_FreeType(ft_library);
     return 0;
 }
