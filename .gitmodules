@@ -44,3 +44,6 @@
 [submodule "third_party/SheenBidi"]
 	path = third_party/SheenBidi
 	url = https://gh-proxy.org/https://github.com/Tehreer/SheenBidi.git
+[submodule "third_party/libunibreak"]
+	path = third_party/libunibreak
+	url = https://gh-proxy.org/https://github.com/adah1972/libunibreak.git
