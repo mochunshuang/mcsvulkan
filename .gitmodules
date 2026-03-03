@@ -38,6 +38,3 @@
 [submodule "third_party/agg"]
 	path = third_party/agg
 	url = https://gh-proxy.org/https://github.com/ghaerr/agg-2.6.git
-[submodule "third_party/pango"]
-	path = third_party/pango
-	url = https://gh-proxy.org/https://github.com/GNOME/pango.git
