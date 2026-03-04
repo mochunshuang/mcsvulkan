@@ -28,6 +28,9 @@ include(third_party/ktx.cmake)
 
 include(third_party/freetype.cmake)
 include(third_party/harfbuzz.cmake)
+
+include(third_party/zlib.cmake)
+include(third_party/libpng.cmake)
 include(third_party/msdfgen.cmake)
 
 include(third_party/agg.cmake)
