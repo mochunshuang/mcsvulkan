@@ -47,3 +47,6 @@
 [submodule "third_party/libunibreak"]
 	path = third_party/libunibreak
 	url = https://gh-proxy.org/https://github.com/adah1972/libunibreak.git
+[submodule "third_party/libpng"]
+	path = third_party/libpng
+	url = https://gh-proxy.org/https://github.com/pnggroup/libpng.git
