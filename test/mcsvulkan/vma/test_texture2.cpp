@@ -1013,10 +1013,14 @@ try
     // 第一个纹理：从文件加载
     // diff: [test_texture2.cpp] start
     const std::string TEXTURE_PATH = "textures/msdfgen.png";
-    constexpr auto CHAR_A = U'M'; // NOTE: 妈的有参数耦合着色器
+    constexpr auto CHAR_A = U'B'; // NOTE: 注意有参数耦合着色器，‘g’渲染不全
+    constexpr auto PATH = R"(C:\Windows\Fonts\arialbd.ttf)";
+    // NOTE: 有些字渲染不全，中英文都有问题
+    // constexpr auto CHAR_A = U'你';
+    // constexpr auto PATH = R"(C:\Windows\Fonts\msyh.ttc)";
     if (msdfgen::FreetypeHandle *ft = msdfgen::initializeFreetype())
     {
-        if (msdfgen::FontHandle *font = loadFont(ft, R"(C:\Windows\Fonts\arialbd.ttf)"))
+        if (msdfgen::FontHandle *font = loadFont(ft, PATH))
         {
             msdfgen::Shape shape;
             if (loadGlyph(shape, font, CHAR_A, msdfgen::FONT_SCALING_EM_NORMALIZED))
