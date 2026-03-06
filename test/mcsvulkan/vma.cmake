@@ -57,5 +57,7 @@ add_std_glsl_target(test_texture2 test_texture.vert test_texture2.frag)
 add_std_glsl_target(test_texture3 test_texture.vert test_texture2.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
+add_std_glsl_target(create_texture_image test_texture.vert test_texture.frag)
+
 # end
 std_glsl_env_destroy()

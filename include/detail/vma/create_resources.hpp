@@ -113,7 +113,7 @@ namespace mcs::vulkan::vma
             return std::move(*this);
         }
 
-        auto &&setViewCreateInfo(view_create_info &&viewCreateInfo)
+        auto &&setViewCreateInfo(view_create_info &&viewCreateInfo) noexcept
         {
             viewCreateInfo_ = std::move(viewCreateInfo);
             return std::move(*this);

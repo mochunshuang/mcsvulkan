@@ -5,3 +5,4 @@
 #include "./vma/staging_buffer.hpp"
 #include "./vma/create_resources.hpp"
 #include "./vma/create_image.hpp"
+#include "./vma/create_texture_image.hpp"

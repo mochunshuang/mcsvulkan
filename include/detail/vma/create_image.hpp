@@ -11,12 +11,28 @@ namespace mcs::vulkan::vma
         using create_info = create_resources::create_info;
         using view_create_info = create_resources::view_create_info;
 
+        [[nodiscard]] auto &createInfo() const noexcept
+        {
+            return createInfo_;
+        }
+        [[nodiscard]] auto &createInfo() noexcept
+        {
+            return createInfo_;
+        }
         auto &&setCreateInfo(create_info &&createInfo) noexcept
         {
             createInfo_ = std::move(createInfo);
             return std::move(*this);
         }
 
+        [[nodiscard]] auto &viewCreateInfo() const noexcept
+        {
+            return viewCreateInfo_;
+        }
+        [[nodiscard]] auto &viewCreateInfo() noexcept
+        {
+            return viewCreateInfo_;
+        }
         auto &&setViewCreateInfo(view_create_info &&viewCreateInfo)
         {
             viewCreateInfo_ = std::move(viewCreateInfo);
@@ -36,6 +52,15 @@ namespace mcs::vulkan::vma
         constexpr void updateImageExtent(const VkExtent3D &extent) noexcept
         {
             imageCreateInfo_.extent = extent;
+        }
+        [[nodiscard]] VkExtent2D extent2D() const noexcept
+        {
+            return VkExtent2D{.width = imageCreateInfo_.extent.width,
+                              .height = imageCreateInfo_.extent.height};
+        }
+        [[nodiscard]] VkExtent3D extent() const noexcept
+        {
+            return imageCreateInfo_.extent;
         }
 
         vma_image makeImage()

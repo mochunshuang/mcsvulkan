@@ -1,23 +1,15 @@
-#include <algorithm>
+
 #include <array>
 #include <cassert>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <print>
 #include <chrono>
 #include <random>
 #include <utility>
-
-// diff: [test_texture2.cpp] start
-#include <msdfgen.h>
-#include <msdfgen-ext.h>
-// diff: [test_texture2.cpp] end
-
-// diff: [test_texture3.cpp] start
-#include <nlohmann/json.hpp>
-using json = nlohmann::json;
-// diff: [test_texture3.cpp] end
 
 #include "../head.hpp"
 
@@ -62,6 +54,11 @@ using raii_vma = mcs::vulkan::raii_vma;
 using buffer_base = mcs::vulkan::vma::buffer_base;
 using mcs::vulkan::vma::create_buffer;
 using mcs::vulkan::vma::staging_buffer;
+using mcs::vulkan::vma::create_texture_image;
+using mcs::vulkan::tool::create_sampler;
+using texture_image_base = mcs::vulkan::vma::texture_image_base;
+using raw_stbi_image = mcs::vulkan::load::raw_stbi_image;
+using Sampler = mcs::vulkan::Sampler;
 
 using mcs::vulkan::vma::create_resources;
 using mcs::vulkan::vma::create_image;
@@ -413,6 +410,10 @@ class TextureImage
     // VkSampler textureSampler_ = VK_NULL_HANDLE;
     // diff: [移除] VkSampler textureSampler_ = VK_NULL_HANDLE;
 
+    int texWidth_ = 0;
+    int texHeight_ = 0;
+    int texChannels_ = 0;
+
   public:
     TextureImage() = default;
 
@@ -453,7 +454,7 @@ class TextureImage
 
     static void transitionImageLayout(const CommandPool &pool, const Queue &queue,
                                       const VkImage &image, VkImageLayout oldLayout,
-                                      VkImageLayout newLayout)
+                                      VkImageLayout newLayout, uint32_t mipLevels)
     {
         // 我们需要执行几个转换：
         // 1.从初始未定义的布局到针对接收数据优化的布局（传输目的地）
@@ -465,8 +466,12 @@ class TextureImage
             .oldLayout = oldLayout,
             .newLayout = newLayout,
             .image = image,
-            .subresourceRange = {VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
-                                 0, 1}};
+            .subresourceRange = VkImageSubresourceRange{
+                .aspectMask = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = mipLevels, // diff: [test_mipmapping]
+                .baseArrayLayer = 0,
+                .layerCount = 1}};
 
         // NOTE: 7. 过度屏障掩码？
         VkPipelineStageFlags sourceStage;      // NOLINT
@@ -522,6 +527,18 @@ class TextureImage
         endSingleTimeCommand(commandpool, queue, commandBuffer);
     }
 
+    template <typename T>
+    constexpr static auto getMipLevels(T w, T h) noexcept
+    {
+        return static_cast<uint32_t>(std::floor(std::log2(std::max(w, h)))) + 1;
+    }
+
+    struct mipmap_param
+    {
+        int32_t tex_width, tex_height;
+        uint32_t mip_levels;
+    };
+
     // diff: [修改] 移除samplerType参数，不创建采样器
     TextureImage(VmaAllocator allocator, const LogicalDevice &device,
                  const CommandPool &pool, const Queue &queue, const std::string &path,
@@ -529,9 +546,7 @@ class TextureImage
     {
         VkDeviceSize imageSize; // NOLINT
         uint8_t *pixels = nullptr;
-        int texWidth_ = 0;
-        int texHeight_ = 0;
-        int texChannels_ = 0;
+
         if (!generateTexture)
         {
             // 从文件加载纹理
@@ -578,46 +593,182 @@ class TextureImage
         else
             ::stbi_image_free(pixels);
 
+        // diff: [test_mipmapping] start
+        auto mipLevels = getMipLevels(texWidth_, texHeight_);
+        // diff: [test_mipmapping] end
+
         auto build =
             create_image{device, allocator}
-                .setCreateInfo({.imageType = VK_IMAGE_TYPE_2D,
-                                // diff: [test_texture2] 从 SRGB 改为 UNORM（线性空间）
-                                .format = VK_FORMAT_R8G8B8A8_UNORM,
-                                .extent = {.width = static_cast<uint32_t>(texWidth_),
-                                           .height = static_cast<uint32_t>(texHeight_),
-                                           .depth = 1},
-                                .mipLevels = 1,
-                                .arrayLayers = 1,
-                                .samples = VK_SAMPLE_COUNT_1_BIT,
-                                .tiling = VK_IMAGE_TILING_OPTIMAL,
-                                .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                         VK_IMAGE_USAGE_SAMPLED_BIT,
-                                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                                // VMA 配置
-                                .allocationCreateInfo =
-                                    {.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
-                                     .usage = VMA_MEMORY_USAGE_AUTO}})
+                .setCreateInfo(
+                    {.imageType = VK_IMAGE_TYPE_2D,
+                     .format = VK_FORMAT_R8G8B8A8_SRGB,
+                     .extent = {.width = static_cast<uint32_t>(texWidth_),
+                                .height = static_cast<uint32_t>(texHeight_),
+                                .depth = 1},
+                     .mipLevels = mipLevels, // diff: [test_mipmapping]
+                     .arrayLayers = 1,
+                     .samples = VK_SAMPLE_COUNT_1_BIT,
+                     .tiling = VK_IMAGE_TILING_OPTIMAL,
+                     .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | // diff: [test_mipmapping]
+                              VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                              VK_IMAGE_USAGE_SAMPLED_BIT,
+                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                     .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                     // VMA 配置
+                     .allocationCreateInfo =
+                         {.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+                          .usage = VMA_MEMORY_USAGE_AUTO}})
                 .setViewCreateInfo(
                     {.viewType = VK_IMAGE_VIEW_TYPE_2D,
                      .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
                                           .baseMipLevel = 0,
-                                          .levelCount = 1,
+                                          .levelCount =
+                                              mipLevels, // diff: [test_mipmapping]
                                           .baseArrayLayer = 0,
                                           .layerCount = 1}});
 
         textureImage_ = build.makeImage();
         transitionImageLayout(pool, queue, *textureImage_,
                               VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED,
-                              VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                              VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                              mipLevels); // diff: [test_mipmapping]
         copyBufferToImage(pool, queue, *stagingBuffer, *textureImage_,
                           VkExtent2D{.width = static_cast<uint32_t>(texWidth_),
                                      .height = static_cast<uint32_t>(texHeight_)});
-        transitionImageLayout(pool, queue, *textureImage_,
-                              VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                              VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+        // diff: [test_mipmapping] start
+        // transitionImageLayout(pool, queue, *textureImage_,
+        //                       VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        //                       VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        generateMipmaps(pool, queue, *textureImage_, build.refImageFormat(),
+                        mipmap_param{.tex_width = texWidth_,
+                                     .tex_height = texHeight_,
+                                     .mip_levels = mipLevels});
+        // diff: [test_mipmapping] end
 
         imageView_ = build.makeImageView(*textureImage_);
+    }
+
+    // 告诉采样器如何采样：通过绑定或提交命令
+    static void generateMipmaps(const CommandPool &commandpool, const Queue &queue,
+                                VkImage &image, VkFormat imageFormat, mipmap_param param)
+    {
+        auto [texWidth, texHeight, mipLevels] = param;
+
+        const auto *logicalDevice = commandpool.device();
+
+        /*
+        这样的内置函数生成所有mip级别非常方便，
+        但遗憾的是不能保证所有平台都支持，它需要我们使用的纹理图像格式来支持线性过滤
+        */
+        // NOTE: 4. 要求线性滤波
+        //  Check if image format supports linear blit-ing
+        VkFormatProperties formatProperties =
+            logicalDevice->physicalDevice()->getFormatProperties(imageFormat);
+
+        if ((formatProperties.optimalTilingFeatures &
+             VkFormatFeatureFlagBits::
+                 VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) == 0)
+        {
+            throw std::runtime_error(
+                "texture image format does not support linear blitting!");
+        }
+
+        auto commandBuffer = beginSingleTimeCommand(commandpool);
+
+        VkImageMemoryBarrier barrier = {
+            .sType = sType<VkImageMemoryBarrier>(),
+            .srcAccessMask = VkAccessFlagBits::VK_ACCESS_TRANSFER_WRITE_BIT,
+            .dstAccessMask = VkAccessFlagBits::VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .newLayout = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image,
+            .subresourceRange = {.aspectMask =
+                                     VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT,
+                                 .baseMipLevel = 0,
+                                 .levelCount = 1,
+                                 .baseArrayLayer = 0,
+                                 .layerCount = 1}};
+
+        int32_t mipWidth = texWidth;
+        int32_t mipHeight = texHeight;
+
+        // 我们将进行几个转换，所以我们将重用这个VkImageMemoryBarrier。上面设置的字段对于所有屏障将保持不变
+        for (uint32_t i = 1; i < mipLevels; i++)
+        {
+            // 将第i-1级从TRANSFER_DST_OPTIMAL转换为TRANSFER_SRC_OPTIMAL
+            barrier.subresourceRange.baseMipLevel = i - 1;
+            barrier.oldLayout = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.newLayout = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier.srcAccessMask = VkAccessFlagBits::VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = VkAccessFlagBits::VK_ACCESS_TRANSFER_READ_BIT;
+
+            commandBuffer.pipelineBarrier(
+                VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TRANSFER_BIT, {}, {}, {},
+                std::span{&barrier, 1});
+
+            // 设置blit操作的参数
+            VkImageBlit blit = {
+                .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                   .mipLevel = i - 1,
+                                   .baseArrayLayer = 0,
+                                   .layerCount = 1},
+                .srcOffsets = {{.x = 0, .y = 0, .z = 0},
+                               {.x = mipWidth, .y = mipHeight, .z = 1}},
+                .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                   .mipLevel = i,
+                                   .baseArrayLayer = 0,
+                                   .layerCount = 1},
+                .dstOffsets = {{.x = 0, .y = 0, .z = 0},
+                               {.x = mipWidth > 1 ? mipWidth / 2 : 1,
+                                .y = mipHeight > 1 ? mipHeight / 2 : 1,
+                                .z = 1}}};
+
+            // NOTE: 该命令执行复制、缩放和过滤操作。
+            // 我们的纹理图像现在有多个mip级别，但是暂存缓冲区只能用于填充mip级别0
+            // 如果您使用专用传输队列（如顶点缓冲区中建议的），请注意：vkCmdBlitImage必须提交到具有图形功能的队列
+            commandBuffer.blitImage(
+                image, VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
+                VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, std::span{&blit, 1},
+                VK_FILTER_LINEAR);
+
+            // 将第i-1级从TRANSFER_SRC_OPTIMAL转换为SHADER_READ_ONLY_OPTIMAL
+            barrier.oldLayout = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier.newLayout = VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            barrier.srcAccessMask = VkAccessFlagBits::VK_ACCESS_TRANSFER_READ_BIT;
+            barrier.dstAccessMask = VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT;
+
+            commandBuffer.pipelineBarrier(
+                VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VkPipelineStageFlagBits::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, {}, {},
+                std::span{&barrier, 1});
+
+            // 我们将当前mip维度除以2。我们在除法之前检查每个维度，以确保维度永远不会变成0
+            if (mipWidth > 1)
+                mipWidth /= 2;
+            if (mipHeight > 1)
+                mipHeight /= 2;
+        }
+
+        barrier.subresourceRange.baseMipLevel = mipLevels - 1;
+        barrier.oldLayout = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barrier.newLayout = VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VkAccessFlagBits::VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VkAccessFlagBits::VK_ACCESS_SHADER_READ_BIT;
+
+        commandBuffer.pipelineBarrier(
+            VkPipelineStageFlagBits::VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VkPipelineStageFlagBits::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, {}, {},
+            std::span{&barrier, 1});
+
+        endSingleTimeCommand(commandpool, queue, commandBuffer);
+        // NOTE: 应该注意的是，在运行时生成mipmap级别在实践中并不常见。
+        //  通常它们是预先生成的，并与基本级别一起存储在纹理文件中，以提高加载速度
+
+        // NOTE:总之，每个mip级别都要像加载原始图像一样加载到图像中。
     }
 };
 
@@ -648,6 +799,18 @@ class TextureSampler
     ~TextureSampler()
     {
         destroy();
+    }
+    constexpr operator bool() const noexcept // NOLINT
+    {
+        return sampler_ != nullptr;
+    }
+    constexpr auto &operator*() noexcept
+    {
+        return sampler_;
+    }
+    constexpr const auto &operator*() const noexcept
+    {
+        return sampler_;
     }
 
     explicit TextureSampler(const LogicalDevice &device, int samplerType = 0)
@@ -691,13 +854,38 @@ class TextureSampler
         samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
         samplerInfo.mipLodBias = 0.0F;
         samplerInfo.minLod = 0.0F;
-        samplerInfo.maxLod = 0.0F;
+        samplerInfo.maxLod =
+            VK_LOD_CLAMP_NONE; // diff:[create_texture_image] 这个配置兼容一切,看下面原理
 
         sampler_ = device_->createSampler(samplerInfo, device_->allocator());
 
+        // diff: [test_mipmapping] start
         // NOTE:
         //  请注意，采样器不会在任何地方引用VkImage。采样器是一个独特的对象，它提供了一个从纹理中提取颜色的接口。
         //  它可以应用于您想要的任何图像，无论是1D、2D还是3D。
+
+        // 当对纹理进行采样时，采样器根据以下伪代码选择mip级别：
+        /*
+lod = getLodLevelFromScreenSize(); //smaller when the object is close, may be negative
+lod = clamp(lod + mipLodBias, minLod, maxLod);
+
+level = clamp(floor(lod), 0, texture.mipLevels - 1);  //clamped to the number of mip
+levels in the texture
+
+if (mipmapMode == vk::SamplerMipmapMode::eNearest) {
+    color = sample(level);
+} else {
+    color = blend(sample(level), sample(level + 1));
+}
+//lod用于选择要采样的两个mip级别。这些级别被采样，结果被线性混合
+
+if (lod <= 0) {
+    color = readTexture(uv, magFilter);
+} else {
+    color = readTexture(uv, minFilter);
+}
+*/
+        // diff: [test_mipmapping] end
     }
 
     void destroy() noexcept
@@ -708,23 +896,10 @@ class TextureSampler
             sampler_ = VK_NULL_HANDLE;
         }
     }
-
-    [[nodiscard]] VkSampler sampler() const noexcept
-    {
-        return sampler_;
-    }
 };
 
 // diff: [texture] end
-/*
-MSDF
-利用纹理中的多通道距离数据，经采样器线性插值后计算透明度，再通过混合与背景合成，实现抗锯齿效果。这种技术尤其适合字体渲染，能在放大时保持字形锐利，特别是拐角处无模糊。
-NOTE: MSDF原理， 混合是透明度渲染的基础
-MSDF 的抗锯齿效果需要三个条件同时满足：
-纹理图像：格式为线性（如 UNORM），存储的距离值准确。
-采样器：线性过滤，确保距离值插值正确。
-混合：启用透明度混合，将着色器计算出的透明度与背景合成，形成平滑边缘。
-*/
+
 int main()
 try
 {
@@ -903,10 +1078,9 @@ try
             .setCreateInfo(
                 {.changeMinImageCount =
                      [](uint32_t minImageCount) noexcept { return minImageCount + 1; },
-                 .candidateSurfaceFormats =
-                     {{// diff: [test_texture2] 不需从 SRGB 改为 UNORM
-                       .format = VK_FORMAT_R8G8B8A8_SRGB,
-                       .colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR}},
+                 .candidateSurfaceFormats = {{.format = VK_FORMAT_B8G8R8A8_SRGB,
+                                              .colorSpace =
+                                                  VK_COLOR_SPACE_SRGB_NONLINEAR_KHR}},
                  .imageArrayLayers = 1,
                  .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
                  .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -937,7 +1111,7 @@ try
 
     // diff: [Uniform] start
     // diff: [texture] start
-    constexpr int TEXTURE_COUNT = 1; // diff: [test_texture2] msdf：测试纹理+着色器
+    constexpr int TEXTURE_COUNT = 3;
     constexpr int SAMPLER_COUNT = 2; // 创建2个不同的采样器
     // diff: [texture] end
     auto descriptorSetLayout =
@@ -1010,76 +1184,158 @@ try
         uniformBuffersMapped[i] = uniformBuffers[i].map();
     }
 
-    // diff: [texture] start
+    // diff: [create_texture_image] start
+    //  diff: [texture] start
+
+#define TEST_TEXTURE_IMAGE
+
+#ifndef TEST_TEXTURE_IMAGE
     std::vector<TextureImage> textures;
     textures.reserve(TEXTURE_COUNT);
     // 第一个纹理：从文件加载
-    // diff: [test_texture3.cpp] start
-    // diff: [test_texture2.cpp] start
-    auto pre = std::string{MSDF_OUTPUT_DIR};
-    // const std::string TEXTURE_PATH = pre + "/tirobangla_ascii.png";
-    // const std::string JSON_PATH = pre + "/tirobangla_ascii.json";
-    // constexpr auto CHAR = U'g'; // NOTE: 注意有参数耦合着色器
-
-    const std::string TEXTURE_PATH = pre + "/msyh_chinese.png";
-    const std::string JSON_PATH = pre + "/msyh_chinese.json";
-    constexpr auto CHAR = U'是'; // NOTE: 注意有参数耦合着色器
-
-    // 加载 JSON 元数据
-    std::ifstream jsonFile(JSON_PATH);
-    json msdfData = json::parse(jsonFile);
-    // "atlas":{"type":"msdf","distanceRange":8,"distanceRangeMiddle":0,"size":32,"width":288,"height":288,"yOrigin":"bottom"}
-    int atlasWidth = msdfData["atlas"]["width"];
-    int atlasHeight = msdfData["atlas"]["height"];
-    auto &atlas = msdfData["atlas"];
-    std::println("distanceRangeMiddle: {},size: {},yOrigin: {}",
-                 atlas["distanceRange"].get<int>(), atlas["size"].get<int>(),
-                 atlas["yOrigin"].get<std::string>());
-    //"metrics":{"emSize":1,"lineHeight":1.3300000000000001,"ascender":0.755,"descender":-0.245,"underlineY":-0.11,"underlineThickness":0.044999999999999998}
-
-    // 查找字符 'A' 的 UV
-    float u0, v0, u1, v1;
-    for (const auto &glyph : msdfData["glyphs"])
-    {
-        if (glyph["unicode"] == CHAR)
-        {
-            float left = glyph["atlasBounds"]["left"];
-            float bottom = glyph["atlasBounds"]["bottom"];
-            float right = glyph["atlasBounds"]["right"];
-            float top = glyph["atlasBounds"]["top"];
-
-            u0 = left / atlasWidth;
-            u1 = right / atlasWidth;
-            // 翻转 v 坐标：bottom 对应纹理底部（v=1），top 对应纹理顶部（v=0）
-            float v_bottom =
-                (atlasHeight - bottom) / atlasHeight;        // 字符底部（左下/右下顶点）
-            float v_top = (atlasHeight - top) / atlasHeight; // 字符顶部（左上/右上顶点）
-
-            v0 = v_bottom;
-            v1 = v_top;
-            break;
-        }
-    }
-
-    // diff: [test_texture2.cpp] end
-    // diff: [test_texture3.cpp] end
-
+    const std::string TEXTURE_PATH = "textures/texture.jpg";
     textures.emplace_back(allocator, device, commandPool, GRAPHICS_AND_PRESENT,
                           TEXTURE_PATH, false, 0);
-    // // 第二个纹理：程序生成的红蓝棋盘
-    // textures.emplace_back(allocator, device, commandPool, GRAPHICS_AND_PRESENT, "",
-    // true,
-    //                       1);
-    // // 第三个纹理：程序生成的绿黄渐变
-    // textures.emplace_back(allocator, device, commandPool, GRAPHICS_AND_PRESENT, "",
-    // true,
-    //                       2);
+    // 第二个纹理：程序生成的红蓝棋盘
+    textures.emplace_back(allocator, device, commandPool, GRAPHICS_AND_PRESENT, "", true,
+                          1);
+    // 第三个纹理：程序生成的绿黄渐变
+    textures.emplace_back(allocator, device, commandPool, GRAPHICS_AND_PRESENT, "", true,
+                          2);
+#else
+    std::vector<texture_image_base> textures;
+    textures.reserve(TEXTURE_COUNT);
+    const std::string TEXTURE_PATH = "textures/texture.jpg";
+    auto raw_data = raw_stbi_image{TEXTURE_PATH.data(), STBI_rgb_alpha};
+    auto width = raw_data.width();
+    auto height = raw_data.height();
+    auto mipLevels = create_texture_image::mipLevels(width, height);
 
+    create_image build =
+        create_image{device, allocator}
+            .setCreateInfo(
+                {.imageType = VK_IMAGE_TYPE_2D,
+                 .format = VK_FORMAT_R8G8B8A8_SRGB,
+                 .extent = {.width = static_cast<uint32_t>(width),
+                            .height = static_cast<uint32_t>(height),
+                            .depth = 1},
+                 .mipLevels = mipLevels, // diff: [test_mipmapping]
+                 .arrayLayers = 1,
+                 .samples = VK_SAMPLE_COUNT_1_BIT,
+                 .tiling = VK_IMAGE_TILING_OPTIMAL,
+                 .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | // diff: [test_mipmapping]
+                          VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                          VK_IMAGE_USAGE_SAMPLED_BIT, // NOTE: 采样
+                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                 .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                 // VMA 配置
+                 .allocationCreateInfo = {.flags =
+                                              VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+                                          .usage = VMA_MEMORY_USAGE_AUTO}})
+            .setViewCreateInfo(
+                {.viewType = VK_IMAGE_VIEW_TYPE_2D,
+                 .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                      .baseMipLevel = 0,
+                                      .levelCount = mipLevels, // diff: [test_mipmapping]
+                                      .baseArrayLayer = 0,
+                                      .layerCount = 1}});
+    auto create_texture =
+        create_texture_image{allocator, commandPool, GRAPHICS_AND_PRESENT}
+            .setEnableMipmapping(true);
+    textures.emplace_back(create_texture.build(
+        build, std::span<const unsigned char>{raw_data.data(), raw_data.size()}));
+
+    // 生成程序纹理
+    width = 256;
+    height = 256;
+    const auto IMAGE_SIZE = static_cast<const size_t>(width * height * STBI_rgb_alpha);
+    auto pixels = std::make_unique_for_overwrite<uint8_t[]>(IMAGE_SIZE);
+
+    // 生成红蓝棋盘纹理
+    uint8_t color1[4] = {255, 0, 0, 255}; // 红色
+    uint8_t color2[4] = {0, 0, 255, 255}; // 蓝色
+    generateCheckerboardTexture(pixels.get(), width, height, color1, color2);
+
+    create_texture.setEnableMipmapping(true);
+    mipLevels = create_texture_image::mipLevels(width, height);
+    build.createInfo().mipLevels = mipLevels;
+    build.viewCreateInfo().subresourceRange.levelCount = mipLevels;
+    build.createInfo().extent = {.width = static_cast<uint32_t>(width),
+                                 .height = static_cast<uint32_t>(height),
+                                 .depth = 1};
+    textures.emplace_back(create_texture.build(
+        build, std::span<const unsigned char>{pixels.get(), IMAGE_SIZE}));
+
+    // 生成绿色到黄色渐变纹理
+    uint8_t topColor[4] = {0, 255, 0, 255};      // 绿色
+    uint8_t bottomColor[4] = {255, 255, 0, 255}; // 黄色
+    generateGradientTexture(pixels.get(), width, height, topColor, bottomColor);
+
+#define DISABLE_MAPPING
+
+#ifndef DISABLE_MAPPING
+    create_texture.setEnableMipmapping(false);
+    build.createInfo().mipLevels = 1;
+    build.viewCreateInfo().subresourceRange.levelCount = 1;
+#else
+    build.createInfo().mipLevels = mipLevels;
+    build.viewCreateInfo().subresourceRange.levelCount = mipLevels;
+#endif //! DISABLE_MAPPING
+    build.createInfo().extent = {.width = static_cast<uint32_t>(width),
+                                 .height = static_cast<uint32_t>(height),
+                                 .depth = 1};
+    textures.emplace_back(create_texture.build(
+        build, std::span<const unsigned char>{pixels.get(), IMAGE_SIZE}));
+
+#endif //! TEST_TEXTURE_IMAGE
+
+#define TEST_SAMPLER
+
+#ifndef TEST_SAMPLER
     std::vector<TextureSampler> samplers;
     samplers.reserve(SAMPLER_COUNT);
     samplers.emplace_back(device, 0); // 线性采样器
     samplers.emplace_back(device, 1); // 最近邻采样器
+#else
+    // Sampler
+    std::vector<Sampler> samplers;
+    samplers.reserve(SAMPLER_COUNT);
+    // 采样器类型0：线性过滤，重复寻址，各向异性
+    auto build_sampler = create_sampler{}.setCreateInfo(
+        {.flags = {},
+         .magFilter = VK_FILTER_LINEAR,
+         .minFilter = VK_FILTER_LINEAR,
+         .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+         .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+         .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+         .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+         .mipLodBias = 0,
+         .anisotropyEnable = VK_TRUE, // NOTE: 各向异性器件特性启用
+         .maxAnisotropy = physical_device.getProperties().limits.maxSamplerAnisotropy,
+         .compareEnable = VK_FALSE,
+         .compareOp = VK_COMPARE_OP_ALWAYS,
+         .minLod = 0,
+         .maxLod = VK_LOD_CLAMP_NONE, // NOTE: vulkan 内置最大值，就能适配一切mip
+         .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+         .unnormalizedCoordinates = VK_FALSE});
+
+    samplers.emplace_back(build_sampler.build(device));
+
+    auto &samplerInfo = build_sampler.createInfo();
+    // 采样器类型1：最近邻过滤，钳位到边缘
+    samplerInfo.magFilter = VK_FILTER_NEAREST;
+    samplerInfo.minFilter = VK_FILTER_NEAREST;
+    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    samplerInfo.anisotropyEnable = VK_FALSE;
+    samplerInfo.maxAnisotropy = 1.0F;
+
+    samplers.emplace_back(build_sampler.build(device));
+#endif //! TEST_SAMPLER
+
     // diff: [texture] end
+    // diff: [create_texture_image] end
 
     // createDescriptorSets
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
@@ -1100,7 +1356,7 @@ try
         std::vector<VkDescriptorImageInfo> samplerInfos =
             samplers | std::views::transform([](const auto &s) constexpr noexcept {
                 return VkDescriptorImageInfo{
-                    .sampler = s.sampler(),
+                    .sampler = *s,
                     .imageView = nullptr,
                     .imageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
                 };
@@ -1300,32 +1556,14 @@ try
                                        .back = {},
                                        .minDepthBounds = 0.0F,
                                        .maxDepthBounds = 1.0F}, // diff: [depth] end
-                 .colorBlendState =
-                     {.logicOpEnable = VK_FALSE,
-                      .logicOp = VkLogicOp::VK_LOGIC_OP_COPY,
-                      .attachments =
-                          /*
-                           //NOTE: [comments/test_texture2_0.png]
-                           MSDF 的抗锯齿依赖于透明度混合，原因如下：
-                           MSDF 的工作原理：
-                           距离场纹理存储的是有符号距离值，在着色器中转换为透明度opacity(取值范围
-                           0~1) 最终颜色是前景色和背景色的混合：color =
-                           mix(bgColor,fgColor, opacity)。
-
-
-                           透明度混合的作用：混合阶段将着色器输出的颜色与帧缓冲区中已有的背景颜色进行合成，形成平滑的边缘。如果不启用混合，着色器输出的颜色会直接覆盖背景，透明度信息被丢弃，边缘就会呈现锯齿（要么完全不透明，要么完全透明）。
-
-                           文档示例的隐含条件：示例着色器中的 mix
-                           函数只是计算了混合后的颜色，但实际写入帧缓冲区时，仍需依赖图形管线的混合功能来与背景合成。文档省略了管线设置，是因为它假定开发者已具备基础渲染知识。
-                           */
-                      {{                        // diff: [test_texture2.cpp] start
-                        .blendEnable = VK_TRUE, // 启用混合
-                        .srcColorBlendFactor =
-                            VK_BLEND_FACTOR_ONE, // 预乘 Alpha
-                                                 // diff: [test_texture2.cpp] end
-                        .colorWriteMask =
-                            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT}}},
+                 .colorBlendState = {.logicOpEnable = VK_FALSE,
+                                     .logicOp = VkLogicOp::VK_LOGIC_OP_COPY,
+                                     .attachments = {{.blendEnable = VK_FALSE, // 关闭混合
+                                                      .colorWriteMask =
+                                                          VK_COLOR_COMPONENT_R_BIT |
+                                                          VK_COLOR_COMPONENT_G_BIT |
+                                                          VK_COLOR_COMPONENT_B_BIT |
+                                                          VK_COLOR_COMPONENT_A_BIT}}},
                  .dynamicState = {.dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT,
                                                     VK_DYNAMIC_STATE_SCISSOR}},
                  .layout = *pipelineLayout})
@@ -1337,25 +1575,33 @@ try
                                             .commandBufferCount = MAX_FRAMES_IN_FLIGHT});
     frame_context<MAX_FRAMES_IN_FLIGHT> frameContext{device, swapchain.imagesSize()};
 
-    // diff: [test_texture3.cpp] start
     // diff: 准备好顶点和顶点索引--------------- // NOLINTBEGIN
     // 顶点数据（四边形由两个三角形组成）//diff: [texture] start. 设置UV坐标
-    std::vector<Vertex> vertices = {
-        {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {u0, v0}}, // 左下
-        {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {u1, v0}},  // 右下
-        {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {u1, v1}},   // 右上
-        {{-0.5f, 0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {u0, v1}}}; // 左上
-    // diff: [texture] end
-    // diff: [test_texture3.cpp] end
+    const std::vector<Vertex> vertices = {
+        {{-0.5f, -0.5f, 0}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}}, // 左下
+        {{0.5, -0.5, 0}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},    // 右下
+        {{0.5, 0.5, 0}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},     // 右上
+        {{-0.5, 0.5, 0}, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f}}     // 左上
+    }; // diff: [texture] end
 
     // 索引数据
     const std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
 
     mesh_base input_mesh{
         allocator, commandPool, GRAPHICS_AND_PRESENT, {vertices, indices}};
+    mesh_base input_mesh2{allocator,
+                          commandPool,
+                          GRAPHICS_AND_PRESENT,
+                          {vertices | std::views::transform([](const Vertex &vertex) {
+                               auto newvertex = vertex;
+                               newvertex.pos[2] = 0.5;
+                               return newvertex;
+                           }) | std::ranges::to<std::vector<Vertex>>(),
+                           indices}};
 
     // NOTE: 这才是数据来源。这是引用语义
     auto &indexs = input_mesh.queue_data.indices;
+    auto &indexs2 = input_mesh2.queue_data.indices;
 
     // diff: end // NOLINTEND
 
@@ -1368,7 +1614,9 @@ try
 
     // 随机生成两个纹理索引和采样器索引
     uint32_t textureIndex1 = textureDis(gen);
-    uint32_t samplerIndex1 = 0; // diff: [test_texture2.cpp]必须固定使用线性采样器
+    uint32_t textureIndex2 = textureDis(gen);
+    uint32_t samplerIndex1 = samplerDis(gen);
+    uint32_t samplerIndex2 = samplerDis(gen);
     //  diff: [texture] end
 
     struct record_info
@@ -1501,6 +1749,35 @@ try
             commandBuffer.drawIndexed(static_cast<uint32_t>(indexs.size()), 1, 0, 0, 0);
             // diff: end
         }
+        {
+            // diff: [Uniform] start
+            commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                             *pipelineLayout, 0, 1, &(descriptorSet), 0,
+                                             nullptr);
+            // diff: [Uniform] end
+
+            // diff: [new] 即使使用设备地址，Vulkan仍需要绑定索引缓冲区.来变量顶点数组
+            uint64_t vertexBufferDeviceAddress =
+                input_mesh2.getVertexBufferAddress(currentFrame);
+            PushConstants pushConstants = {
+                .vertexBufferAddress = vertexBufferDeviceAddress,
+                // diff: [Uniform] start
+                .textureIndex = textureIndex2,
+                .samplerIndex = samplerIndex2,
+                // diff: [Uniform] end
+            };
+
+            // NOTE: 当前仅仅推送顶点数据
+            commandBuffer.pushConstants(*pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                                        sizeof(PushConstants), &pushConstants);
+
+            commandBuffer.bindIndexBuffer(
+                input_mesh2.frameBuffers[currentFrame].indexBuffer.buffer(), 0,
+                mesh_base::indexType());
+
+            commandBuffer.drawIndexed(static_cast<uint32_t>(indexs2.size()), 1, 0, 0, 0);
+            // diff: end
+        }
         commandBuffer.endRendering();
 
         // After rendering, transition the swapchain image to PRESENT_SRC
@@ -1612,6 +1889,50 @@ try
     {
         surface::pollEvents();
 
+        // diff:     // 检查是否需要更新形状
+        auto now = std::chrono::steady_clock::now();
+        static auto lastUpdate = std::chrono::steady_clock::now();
+        if (now - lastUpdate > std::chrono::seconds(1)) // NOLINT
+        {
+            lastUpdate = now;
+
+            // diff: [texture] start
+            textureIndex1 = textureDis(gen);
+            textureIndex2 = textureDis(gen);
+            samplerIndex1 = samplerDis(gen);
+            samplerIndex2 = samplerDis(gen);
+            // diff: [texture] end
+
+            static bool isTriangle = true;
+            if (isTriangle)
+            {
+                // 只记录要更新的数据，不立即执行
+                // 切换到三角形 // NOLINTBEGIN //diff: [texture] start. 设置UV坐标
+                static const std::vector<Vertex> VERTICES = {
+                    // 左下角 - 红色
+                    {.pos = {-0.5f, -0.5f, 0.7f},
+                     .color = {1.0f, 0.0f, 0.0f},
+                     .texCoord = {0.0f, 0.0f}}, // UV: (0,0)
+
+                    // 右下角 - 绿色
+                    {.pos = {0.5f, -0.5f, 0.7f},
+                     .color = {0.0f, 1.0f, 0.0f},
+                     .texCoord = {1.0f, 0.0f}}, // UV: (1,0)
+
+                    // 顶部中间 - 蓝色
+                    {.pos = {0.0f, 0.5f, 0.7f},
+                     .color = {0.0f, 0.0f, 1.0f},
+                     .texCoord = {0.5f, 1.0f}} // UV: (0.5,1)
+                }; // diff: [texture] end
+                static const std::vector<uint32_t> INDICES = {0, 1, 2}; // NOLINTEND
+                input_mesh.queueUpdate(VERTICES, INDICES);
+            }
+            else
+            {
+                input_mesh.queueUpdate(vertices, indices);
+            }
+            isTriangle = !isTriangle;
+        }
         drawFrame();
     }
     device.waitIdle();
