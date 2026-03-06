@@ -58,6 +58,15 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "Generate dynamic library files instead of 
 # 2. add_subdirectory
 add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/msdf-atlas-gen)
 
+# gen msdf config
+set(MSDF_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/msdf" CACHE STRING "MSDF_ATLAS_GEN_EXE NAME" FORCE)
+set(FONT_INPUT_DIR "${CMAKE_SOURCE_DIR}/assets/font" CACHE STRING "MSDF_ATLAS_GEN_EXE NAME" FORCE)
+set(CHASET_INPUT_DIR "${CMAKE_SOURCE_DIR}/assets/charset" CACHE STRING "MSDF_ATLAS_GEN_EXE NAME" FORCE)
+
+function(ADD_MSDF_DEF TARGET_NAME)
+    target_compile_definitions(${TARGET_NAME} PRIVATE MSDF_OUTPUT_DIR="${MSDF_OUTPUT_DIR}" FONT_INPUT_DIR="${FONT_INPUT_DIR}" CHASET_INPUT_DIR="${CHASET_INPUT_DIR}")
+endfunction()
+
 if(TARGET msdf-atlas-gen-standalone)
     message(STATUS "gen target: msdf-atlas-gen-standalone")
     set(EXE_NAME "msdf-atlas-gen")
@@ -72,11 +81,6 @@ if(TARGET msdf-atlas-gen-standalone)
         RUNTIME_OUTPUT_DIRECTORY ${MSDF_ATLAS_GEN_OUTPUT_DIR}
         OUTPUT_NAME ${EXE_NAME}
     )
-
-    # gen msdf config
-    set(MSDF_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/msdf")
-    set(FONT_INPUT_DIR "${CMAKE_SOURCE_DIR}/assets/font")
-    set(CHASET_INPUT_DIR "${CMAKE_SOURCE_DIR}/assets/charset")
 
     add_custom_command(
         OUTPUT ${MSDF_OUTPUT_DIR}
@@ -103,7 +107,7 @@ if(TARGET msdf-atlas-gen-standalone)
         endif()
 
         if(NOT GEN_OUTPUT_DIR)
-            set(GEN_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/msdf")
+            set(GEN_OUTPUT_DIR "${MSDF_OUTPUT_DIR}")
         endif()
 
         if(NOT GEN_TYPE)

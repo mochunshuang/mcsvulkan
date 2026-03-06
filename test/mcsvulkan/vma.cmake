@@ -54,6 +54,8 @@ add_std_glsl_target(test_picking3 test_model_matrix2.vert test_texture.frag)
 
 set(BASE_LIBS volk vma glfw glm stb ktx nlohmann_json msdfgen::msdfgen)
 add_std_glsl_target(test_texture2 test_texture.vert test_texture2.frag)
+add_std_glsl_target(test_texture3 test_texture.vert test_texture2.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
 
 # end
 std_glsl_env_destroy()
