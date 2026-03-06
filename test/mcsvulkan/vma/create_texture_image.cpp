@@ -1302,7 +1302,8 @@ try
     samplers.reserve(SAMPLER_COUNT);
     // 采样器类型0：线性过滤，重复寻址，各向异性
     auto build_sampler = create_sampler{}.setCreateInfo(
-        {.flags = {},
+        {.pNext = {},
+         .flags = {},
          .magFilter = VK_FILTER_LINEAR,
          .minFilter = VK_FILTER_LINEAR,
          .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
