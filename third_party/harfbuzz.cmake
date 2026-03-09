@@ -25,3 +25,4 @@
 # git submodule status
 
 add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/harfbuzz)
+set(HARFBUZZ_SOURCE_DIR ${CMAKE_SOURCE_DIR}/third_party/harfbuzz CACHE STRING "HARFBUZZ SOURCE DIR" FORCE)

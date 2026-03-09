@@ -5,8 +5,6 @@ set(TOOL_EXE_DIR ${CMAKE_SOURCE_DIR}/tool CACHE STRING "TOOL EXE DIR" FORCE)
 
 set(OUTPUT_DIRECTORY ${TOOL_EXE_DIR})
 
-set(LIBS "")
-
 macro(add_tool_target NAME)
     set(TARGET_NAME "${DIR_NAME}-${NAME}")
     add_executable(${TARGET_NAME} "${EXE_DIR}/${NAME}.cpp")
@@ -16,6 +14,12 @@ macro(add_tool_target NAME)
         OUTPUT_NAME ${NAME}
     )
 endmacro()
+
+set(LIBS freetype harfbuzz harfbuzz-subset)
+add_tool_target(hb_subset_tool)
+set(EXE_NAME "hb_subset_tool")
+set(HB_SUBSET_TOOL_EXE "${TOOL_EXE_DIR}/${EXE_NAME}${CMAKE_EXECUTABLE_SUFFIX}" CACHE STRING "HB_SUBSET_TOOL_EXE NAME" FORCE)
+message(STATUS "HB_SUBSET_TOOL_EXE: ${HB_SUBSET_TOOL_EXE}")
 
 # gen msdf config
 set(MSDF_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/msdf" CACHE STRING "MSDF_ATLAS_GEN_EXE NAME" FORCE)
@@ -84,15 +88,40 @@ if(TARGET msdf-atlas-gen-standalone)
         # 定义输出文件
         set(ATLAS_PNG "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}.png")
         set(ATLAS_JSON "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}.json")
-
-        # 获取字体扩展名，构造复制后的文件名
         get_filename_component(FONT_EXT "${GEN_FONT_PATH}" LAST_EXT)
-        set(FONT_COPY "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}${FONT_EXT}")
+        set(FONT_FILE "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}${FONT_EXT}")
 
-        # 构建命令参数列表
+        # 判断是否需要裁剪：仅当 CHARSET 是存在的文件时
+        set(SHOULD_SUBSET FALSE)
+
+        if(GEN_CHARSET AND EXISTS "${GEN_CHARSET}")
+            set(SHOULD_SUBSET TRUE)
+        endif()
+
+        if(SHOULD_SUBSET)
+            # 第一步：裁剪字体
+            add_custom_command(
+                OUTPUT ${FONT_FILE}
+                COMMAND ${HB_SUBSET_TOOL_EXE} "${GEN_FONT_PATH}" "${FONT_FILE}" "${GEN_CHARSET}"
+                DEPENDS ${HB_SUBSET_TOOL_EXE} "${GEN_FONT_PATH}" "${GEN_CHARSET}"
+                COMMENT "Subsetting font to ${FONT_FILE}"
+            )
+            set(FONT_DEP ${FONT_FILE})
+        else()
+            # 不裁剪，直接复制原字体
+            add_custom_command(
+                OUTPUT ${FONT_FILE}
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${GEN_FONT_PATH}" "${FONT_FILE}"
+                DEPENDS "${GEN_FONT_PATH}"
+                COMMENT "Copying font to ${FONT_FILE}"
+            )
+            set(FONT_DEP ${FONT_FILE})
+        endif()
+
+        # 构建 msdf-atlas-gen 命令参数
         set(CMD_ARGS
             ${MSDF_ATLAS_GEN_EXE}
-            -font "${GEN_FONT_PATH}"
+            -font "${FONT_FILE}" # 使用最终的字体文件
             -type ${GEN_TYPE}
             -size ${GEN_SIZE}
             -pxrange ${GEN_PX_RANGE}
@@ -100,31 +129,25 @@ if(TARGET msdf-atlas-gen-standalone)
             -json ${ATLAS_JSON}
         )
 
-        # 处理字符集参数
+        # 处理字符集参数（原样传递给 msdf-atlas-gen）
         if(GEN_CHARSET)
             if(EXISTS "${GEN_CHARSET}")
                 list(APPEND CMD_ARGS -charset "${GEN_CHARSET}")
             elseif(NOT GEN_CHARSET STREQUAL "ascii")
-                # 非 ascii 且不是文件，则作为内联字符串传递
                 list(APPEND CMD_ARGS -chars "\"${GEN_CHARSET}\"")
             endif()
-
-            # 如果 GEN_CHARSET 是 "ascii"，不添加任何参数（默认）
         endif()
 
         add_custom_command(
             OUTPUT ${ATLAS_PNG} ${ATLAS_JSON}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${GEN_OUTPUT_DIR}
             COMMAND ${CMD_ARGS}
-
-            # 继续添加一个命令
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${GEN_FONT_PATH}" "${FONT_COPY}"
-            DEPENDS msdf-atlas-gen-standalone "${GEN_FONT_PATH}"
-            COMMENT "Generating MSDF atlas for ${GEN_OUTPUT_NAME} and copying font as ${GEN_OUTPUT_NAME}${FONT_EXT}"
+            DEPENDS ${MSDF_ATLAS_GEN_EXE} ${FONT_DEP} ${GEN_CHARSET}
+            COMMENT "Generating MSDF atlas for ${GEN_OUTPUT_NAME}"
         )
 
         if(GEN_TARGET_NAME)
-            add_custom_target(${GEN_TARGET_NAME} DEPENDS ${ATLAS_PNG} ${ATLAS_JSON})
+            add_custom_target(${GEN_TARGET_NAME} DEPENDS ${ATLAS_PNG} ${ATLAS_JSON} ${FONT_FILE})
         endif()
     endfunction()
 
@@ -186,14 +209,6 @@ function(generate_emoji_atlas)
         message(FATAL_ERROR "generate_emoji_atlas: OUTPUT_NAME is required")
     endif()
 
-    if(NOT GEN_CHARSET)
-        message(FATAL_ERROR "generate_emoji_atlas: CHARSET is required")
-    endif()
-
-    if(NOT EXISTS "${GEN_CHARSET}")
-        message(FATAL_ERROR "generate_emoji_atlas: CHARSET file '${GEN_CHARSET}' does not exist")
-    endif()
-
     # 设置默认值
     if(NOT GEN_OUTPUT_DIR)
         set(GEN_OUTPUT_DIR "${EMOJI_OUTPUT_DIR}")
@@ -214,33 +229,71 @@ function(generate_emoji_atlas)
     # 定义输出文件
     set(ATLAS_PNG "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}.png")
     set(ATLAS_JSON "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}.json")
-
-    # 获取字体扩展名，构造复制后的文件名（可选）
     get_filename_component(FONT_EXT "${GEN_FONT_PATH}" LAST_EXT)
-    set(FONT_COPY "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}${FONT_EXT}")
+    set(FONT_FILE "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}${FONT_EXT}")
 
-    # 构建命令行参数
+    # 判断是否需要裁剪：仅当提供了有效的字符集文件时
+    set(SHOULD_SUBSET FALSE)
+
+    if(GEN_CHARSET AND EXISTS "${GEN_CHARSET}")
+        set(SHOULD_SUBSET TRUE)
+    endif()
+
+    if(SHOULD_SUBSET)
+        # 第一步：裁剪字体
+        add_custom_command(
+            OUTPUT ${FONT_FILE}
+            COMMAND ${HB_SUBSET_TOOL_EXE} "${GEN_FONT_PATH}" "${FONT_FILE}" "${GEN_CHARSET}"
+            DEPENDS ${HB_SUBSET_TOOL_EXE} "${GEN_FONT_PATH}" "${GEN_CHARSET}"
+            COMMENT "Subsetting font to ${FONT_FILE}"
+        )
+        set(FONT_DEP ${FONT_FILE})
+        set(CHARSET_ARG "-charset" "${GEN_CHARSET}")
+    else()
+        # 不裁剪，直接复制原字体
+        add_custom_command(
+            OUTPUT ${FONT_FILE}
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${GEN_FONT_PATH}" "${FONT_FILE}"
+            DEPENDS "${GEN_FONT_PATH}"
+            COMMENT "Copying font to ${FONT_FILE}"
+        )
+        set(FONT_DEP ${FONT_FILE})
+
+        # 如果没有提供字符集文件，不传递 -charset 参数（gen_emoji_atlas 可能会默认处理所有字符？）
+        # 注意：gen_emoji_atlas 可能需要字符集，若未提供可能出错，这里根据实际情况处理
+        if(GEN_CHARSET)
+            # 如果 GEN_CHARSET 是内联字符串，可能需要特殊处理，但这里简化处理
+            message(WARNING "No valid charset file provided for ${GEN_OUTPUT_NAME}, skipping subset but passing -charset argument as is.")
+            set(CHARSET_ARG "-charset" "${GEN_CHARSET}")
+        else()
+            set(CHARSET_ARG "")
+        endif()
+    endif()
+
+    # 构建 gen_emoji_atlas 命令参数
     set(CMD_ARGS
         ${EMOJI_ATLAS_GEN_EXE}
-        -font "${GEN_FONT_PATH}"
-        -charset "${GEN_CHARSET}"
+        -font "${FONT_FILE}"
         -size ${GEN_SIZE}
         -padding ${GEN_PADDING}
         -max-size ${GEN_MAX_SIZE}
         -file_name "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}"
     )
 
+    if(CHARSET_ARG)
+        list(APPEND CMD_ARGS ${CHARSET_ARG})
+    endif()
+
     add_custom_command(
         OUTPUT ${ATLAS_PNG} ${ATLAS_JSON}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${GEN_OUTPUT_DIR}
         COMMAND ${CMD_ARGS}
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${GEN_FONT_PATH}" "${FONT_COPY}"
-        DEPENDS ${EMOJI_ATLAS_GEN_EXE} "${GEN_FONT_PATH}"
-        COMMENT "Generating emoji atlas for ${GEN_OUTPUT_NAME} and copying font"
+        DEPENDS ${EMOJI_ATLAS_GEN_EXE} ${FONT_DEP} ${GEN_CHARSET}
+        COMMENT "Generating emoji atlas for ${GEN_OUTPUT_NAME}"
     )
 
     if(GEN_TARGET_NAME)
-        add_custom_target(${GEN_TARGET_NAME} DEPENDS ${ATLAS_PNG} ${ATLAS_JSON})
+        add_custom_target(${GEN_TARGET_NAME} DEPENDS ${ATLAS_PNG} ${ATLAS_JSON} ${FONT_FILE})
     endif()
 endfunction()
 
