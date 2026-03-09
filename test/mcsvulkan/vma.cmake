@@ -72,5 +72,8 @@ set(BASE_LIBS volk vma glfw glm stb ktx nlohmann_json msdfgen::msdfgen
 add_std_glsl_target(test_msdf_atlas_gen3 test_msdf_atlas_gen.vert test_msdf_atlas_gen.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
+add_std_glsl_target(test_emoji test_emoji.vert test_emoji.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
 # end
 std_glsl_env_destroy()

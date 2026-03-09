@@ -34,6 +34,8 @@ include(third_party/libpng.cmake)
 include(third_party/msdfgen.cmake)
 include(third_party/msdf-atlas-gen.cmake)
 
+include(third_party/rectpack2D.cmake)
+
 include(third_party/agg.cmake)
 
 # text layout

@@ -11,6 +11,8 @@ include(test/script/copy_dir_to_bindir.cmake)
 
 include(test/env.cmake)
 include(test/base.cmake)
+include(test/tool.cmake)
+
 include(test/mcsvulkan.cmake)
 include(test/font.cmake)
 include(test/agg.cmake)
