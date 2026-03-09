@@ -126,6 +126,10 @@ if(TARGET msdf-atlas-gen-standalone)
         set(ATLAS_PNG "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}.png")
         set(ATLAS_JSON "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}.json")
 
+        # 获取字体扩展名，构造复制后的文件名
+        get_filename_component(FONT_EXT "${GEN_FONT_PATH}" LAST_EXT)
+        set(FONT_COPY "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}${FONT_EXT}")
+
         # 构建命令参数列表
         set(CMD_ARGS
             ${MSDF_ATLAS_GEN_EXE}
@@ -153,8 +157,11 @@ if(TARGET msdf-atlas-gen-standalone)
             OUTPUT ${ATLAS_PNG} ${ATLAS_JSON}
             COMMAND ${CMAKE_COMMAND} -E make_directory ${GEN_OUTPUT_DIR}
             COMMAND ${CMD_ARGS}
+
+            # 继续添加一个命令
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${GEN_FONT_PATH}" "${FONT_COPY}"
             DEPENDS msdf-atlas-gen-standalone "${GEN_FONT_PATH}"
-            COMMENT "Generating MSDF atlas for ${GEN_OUTPUT_NAME}"
+            COMMENT "Generating MSDF atlas for ${GEN_OUTPUT_NAME} and copying font as ${GEN_OUTPUT_NAME}${FONT_EXT}"
         )
 
         if(GEN_TARGET_NAME)
@@ -167,6 +174,7 @@ if(TARGET msdf-atlas-gen-standalone)
         TARGET_NAME generate_english_atlas
         FONT_PATH "${FONT_INPUT_DIR}/TiroBangla-Regular.ttf"
         OUTPUT_NAME "tirobangla_ascii"
+        PX_RANGE 2 # 用官方默认值
 
         # CHARSET 不传或传 "ascii" 都不添加参数，使用默认 ASCII
     )
@@ -177,7 +185,8 @@ if(TARGET msdf-atlas-gen-standalone)
             TARGET_NAME generate_chinese_atlas
             FONT_PATH "C:/Windows/Fonts/msyh.ttc" # 中文字体
             OUTPUT_NAME "msyh_chinese"
-            SIZE 48 # 建议提高精度
+            PX_RANGE 2 # 必须用官方默认值，不要乱改
+            SIZE 96 # 建议提高精度
             CHARSET "${CHASET_INPUT_DIR}/small_chinese_common.txt"
         )
 
@@ -186,6 +195,8 @@ if(TARGET msdf-atlas-gen-standalone)
             TARGET_NAME generate_emoji_atlas
             FONT_PATH "C:/Windows/Fonts/seguiemj.ttf"
             OUTPUT_NAME "emoji"
+            PX_RANGE 2 # 必须用官方默认值，不要乱改
+            SIZE 96 # 建议提高精度
             CHARSET "${CHASET_INPUT_DIR}/small_emoji.txt"
         )
     endif(WIN32)

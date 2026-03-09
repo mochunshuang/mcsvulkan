@@ -617,7 +617,7 @@ int main()
         }
 
         char filename[64];
-        std::snprintf(filename, sizeof(filename), "linebreak_%d.ppm", max_width);
+        std::snprintf(filename, sizeof(filename), "unibreak4_%d.ppm", max_width);
         FILE *fd = std::fopen(filename, "wb");
         if (fd)
         {

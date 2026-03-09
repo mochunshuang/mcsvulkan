@@ -8,6 +8,7 @@ namespace mcs::vulkan::vma
 {
     struct texture_image_base
     {
+        texture_image_base() = default;
         constexpr texture_image_base(vma_image textureImage, ImageView imageView) noexcept
             : textureImage_{std::move(textureImage)}, imageView_{std::move(imageView)}
         {

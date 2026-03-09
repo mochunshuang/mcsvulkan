@@ -406,7 +406,7 @@ int main()
         return 1;
     }
 
-    double desired_height = HEIGHT * 0.7;
+    constexpr double desired_height = HEIGHT * 0.7;
     feng.height(desired_height);
     feng.width(desired_height);
     feng.flip_y(true); // 渲染时 Y 轴向下

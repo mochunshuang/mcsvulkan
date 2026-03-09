@@ -58,6 +58,19 @@ add_std_glsl_target(test_texture3 test_texture.vert test_texture2.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
 add_std_glsl_target(create_texture_image test_texture.vert test_texture.frag)
+add_std_glsl_target(test_msdf_atlas_gen test_texture.vert test_texture2.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
+add_std_glsl_target(test_msdf_atlas_gen1 test_msdf_atlas_gen.vert test_msdf_atlas_gen.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+add_std_glsl_target(test_msdf_atlas_gen2 test_msdf_atlas_gen.vert test_msdf_atlas_gen.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
+set(BASE_LIBS volk vma glfw glm stb ktx nlohmann_json msdfgen::msdfgen
+    freetype harfbuzz libraqm libunibreak
+)
+add_std_glsl_target(test_msdf_atlas_gen3 test_msdf_atlas_gen.vert test_msdf_atlas_gen.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
 
 # end
 std_glsl_env_destroy()
