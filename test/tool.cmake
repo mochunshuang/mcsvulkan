@@ -181,6 +181,16 @@ if(TARGET msdf-atlas-gen-standalone)
         # SIZE 96 # 建议提高精度
         # CHARSET "${CHASET_INPUT_DIR}/small_emoji.txt"
         # )
+
+        # 使用示例 4：阿拉伯测试BIDI
+        generate_msdf_atlas(
+            TARGET_NAME generate_segoeui_atlas
+            FONT_PATH "C:/Windows/Fonts/segoeui.ttf" # 中文字体
+            OUTPUT_NAME "segoe_arabic"
+            PX_RANGE 2 # 默认值
+            SIZE 96 # 建议提高精度
+            CHARSET "${CHASET_INPUT_DIR}/arabic_charset.txt"
+        )
     endif(WIN32)
 endif(TARGET msdf-atlas-gen-standalone)
 

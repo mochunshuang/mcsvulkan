@@ -8,7 +8,7 @@ layout(location=1)in vec2 fragTexCoord;// diff: 添加纹理坐标输入
 layout(location=2)in flat uint fragTextureIndex;// diff: 添加纹理输入
 layout(location=3)in flat uint fragSamplerIndex;// diff: 添加采样器输入
 layout(location=4)in flat uint fragFontType;// 备用，目前未用
-layout(location=5)in float pxRange;//diff: msdf算法需要
+layout(location=5)in flat float pxRange;//diff: msdf算法需要
 
 layout(location=6)in flat uint modulateFlag;//diff: [test_emoji]
 

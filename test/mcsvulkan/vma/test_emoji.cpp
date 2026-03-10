@@ -918,7 +918,7 @@ namespace font
                               .face = std::move(face),
                               .type = type,
                               .texture_index = bind.texture_index,
-                              .sampler_index = bind.texture_index});
+                              .sampler_index = bind.sampler_index});
         }
 
         [[nodiscard]] glyph_info getGlyph(char32_t unicode) const

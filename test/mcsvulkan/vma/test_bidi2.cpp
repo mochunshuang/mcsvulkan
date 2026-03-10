@@ -1,12 +1,11 @@
-#include <algorithm>
 #include <array>
 #include <cassert>
+#include <codecvt>
 #include <cstdint>
 #include <exception>
 #include <iostream>
 #include <print>
 #include <chrono>
-#include <random>
 #include <stdexcept>
 #include <utility>
 
@@ -27,9 +26,10 @@ using json = nlohmann::json;
 
 #include <hb.h>
 #include <hb-ft.h>
-#include <raqm.h>
-#include <linebreak.h>   // libunibreak 核心头文件
-#include <unibreakdef.h> // 基础定义
+#include <raqm.h>                //NOTE: 不需要,因为和换行不搭
+#include <SheenBidi/SheenBidi.h> //diff: [test_bidi] bidi
+#include <linebreak.h>           // libunibreak 核心头文件
+#include <unibreakdef.h>         // 基础定义
 // diff: [test_msdf_atlas_gen3] end
 
 #include "../head.hpp"
@@ -167,9 +167,11 @@ struct Vertex // NOLINT
     uint32_t fontType;     // 4 (枚举对齐到 uint32_t)
     float pxRange{8};      // 4 float
     // diff: [test_msdf_atlas_gen1] end
+
+    uint32_t modulateFlag; // diff: [test_emoji]
 };
 static_assert(alignof(Vertex) == 4, "check alignof error");
-static_assert(sizeof(Vertex) == 32 + 12 + 4, "check sizeof error");
+static_assert(sizeof(Vertex) == 32 + 12 + 4 + 4, "check sizeof error");
 
 struct mesh_base
 {
@@ -739,7 +741,10 @@ namespace font
             static std::vector<Kerning> make(const json &obj)
             {
                 std::vector<Kerning> ret{};
-                const auto &kernings = obj["kerning"];
+                const auto it = obj.find("kerning");
+                if (it == obj.end() || it->is_null())
+                    return ret;
+                const auto &kernings = *it;
                 for (const auto &kerning : kernings)
                 {
                     if (kerning.contains("index1"))
@@ -750,7 +755,6 @@ namespace font
                                              .advance = kerning["advance"]});
                 }
                 ret.shrink_to_fit();
-                return ret;
                 return ret;
             }
         };
@@ -840,7 +844,8 @@ namespace font
         eSDF,
         ePSDF,
         eMSDF,
-        eMTSDF
+        eMTSDF,
+        eBITMAP,
     };
 
     class FontAtlas
@@ -854,6 +859,10 @@ namespace font
         FontType type;
         uint32_t texture_index;
         uint32_t sampler_index;
+
+        // diff: [test_bidi] start
+        std::unordered_map<uint32_t, const Font::glyphs_type *> glyph_index_to_info;
+        // diff: [test_bidi] end
     };
     struct glyph_info // NOLINTBEGIN
     {
@@ -867,7 +876,7 @@ namespace font
 
         auto &type() const noexcept
         {
-            return font_ctx->texture_index;
+            return font_ctx->type;
         }
         auto &texture_index() const noexcept
         {
@@ -897,6 +906,14 @@ namespace font
         std::vector<FontAtlas> fonts_;
 
       public:
+        auto &operator[](size_t i) noexcept
+        {
+            return fonts_[i];
+        }
+        auto &operator[](size_t i) const noexcept
+        {
+            return fonts_[i];
+        }
         struct texture_bind_sampler
         {
             uint32_t texture_index;
@@ -907,13 +924,24 @@ namespace font
                   const FontTexture::msdf_info &info, const std::string &jsonPath,
                   freetype_face face)
         {
-            fonts_.push_back({.name = jsonPath,
-                              .font = Font::make(jsonPath),
-                              .texture = FontTexture{info},
-                              .face = std::move(face),
-                              .type = type,
-                              .texture_index = bind.texture_index,
-                              .sampler_index = bind.sampler_index});
+            fonts_.push_back(
+                {.name = jsonPath,
+                 .font = Font::make(jsonPath),
+                 .texture = FontTexture{info},
+                 .face = std::move(face),
+                 .type = type,
+                 .texture_index = bind.texture_index,
+                 .sampler_index = bind.sampler_index}); // diff: [test_bidi] 大bug
+            // diff: [test_bidi] start
+            // 这样，通过 shaping 返回的 glyph index 就能找到对应的图集信息
+            auto &atlas = fonts_[fonts_.size() - 1];
+            for (const auto &glyph : atlas.font.glyphs)
+            {
+                FT_UInt glyph_index = ::FT_Get_Char_Index(*atlas.face, glyph.unicode);
+                if (glyph_index != 0)
+                    atlas.glyph_index_to_info[glyph_index] = &glyph;
+            }
+            // diff: [test_bidi] end
         }
 
         [[nodiscard]] glyph_info getGlyph(char32_t unicode) const
@@ -1203,8 +1231,8 @@ try
 
     // diff: [Uniform] start
     // diff: [texture] start
-    // diff: [test_msdf_atlas_gen1] 改成3.
-    constexpr int TEXTURE_COUNT = 3; // diff: [test_texture2] msdf：测试纹理+着色器
+    // diff: [test_bidi] 改成4.
+    constexpr int TEXTURE_COUNT = 4; // diff: [test_texture2] msdf：测试纹理+着色器
     constexpr int SAMPLER_COUNT = 2; // 创建2个不同的采样器
     // diff: [texture] end
     auto descriptorSetLayout =
@@ -1284,7 +1312,7 @@ try
     const std::string TEXTURE_PATH_0 = pre + "/tirobangla_ascii.png";
     const std::string JSON_PATH_0 = pre + "/tirobangla_ascii.json";
     const std::string FONT_PATH_0 = pre + "/tirobangla_ascii.ttf";
-    constexpr auto CHAR = U'g'; // NOTE: 注意有参数耦合着色器
+    // constexpr auto CHAR = U'g'; // NOTE: 注意有参数耦合着色器
     // constexpr auto CHAR = U' '; //NOTE: 空格就是什么都看不到
 
     const std::string TEXTURE_PATH_1 = pre + "/msyh_chinese.png";
@@ -1292,35 +1320,59 @@ try
     const std::string FONT_PATH_1 = pre + "/msyh_chinese.ttc";
     // constexpr auto CHAR = U'是'; // NOTE: 注意有参数耦合着色器
 
+    // diff: [test_emoji] start
     const std::string TEXTURE_PATH_2 = pre + "/emoji.png";
     const std::string JSON_PATH_2 = pre + "/emoji.json";
     const std::string FONT_PATH_2 = pre + "/emoji.ttf";
+    // diff: [test_emoji] end
+
+    // diff: [test_bidi] start
+    const std::string TEXTURE_PATH_3 = pre + "/segoe_arabic.png";
+    const std::string JSON_PATH_3 = pre + "/segoe_arabic.json";
+    const std::string FONT_PATH_3 = pre + "/segoe_arabic.ttf";
+    // diff: [test_bidi] end
 
     // 添加字体
     font::freetype_loader loader{};
     font::FontLibrary font_lib{};
-    font_lib.load(font::FontType::eMSDF, {0, 0}, // textureIndex=0, samplerIndex=0
-                  {.png = raw_stbi_image{TEXTURE_PATH_0.data(), STBI_rgb_alpha},
-                   .allocator = allocator,
-                   .device = device,
-                   .pool = commandPool,
-                   .queue = GRAPHICS_AND_PRESENT},
-                  JSON_PATH_0, font::freetype_face{*loader, FONT_PATH_0});
+    font_lib.load(
+        font::FontType::eMSDF,
+        {.texture_index = 0, .sampler_index = 0}, // textureIndex=0, samplerIndex=0
+        {.png = raw_stbi_image{TEXTURE_PATH_0.data(), STBI_rgb_alpha},
+         .allocator = allocator,
+         .device = device,
+         .pool = commandPool,
+         .queue = GRAPHICS_AND_PRESENT},
+        JSON_PATH_0, font::freetype_face{*loader, FONT_PATH_0});
     font_lib.load(font::FontType::eMSDF,
-                  {1, 0}, // 第二个字体用 textureIndex=1, samplerIndex=0
+                  {.texture_index = 1,
+                   .sampler_index = 0}, // 第二个字体用 textureIndex=1, samplerIndex=0
                   {.png = raw_stbi_image{TEXTURE_PATH_1.data(), STBI_rgb_alpha},
                    .allocator = allocator,
                    .device = device,
                    .pool = commandPool,
                    .queue = GRAPHICS_AND_PRESENT},
                   JSON_PATH_1, font::freetype_face{*loader, FONT_PATH_1});
-    font_lib.load(font::FontType::eMSDF, {2, 0}, // textureIndex=2, samplerIndex=0
-                  {.png = raw_stbi_image{TEXTURE_PATH_2.data(), STBI_rgb_alpha},
+
+    // diff: [test_emoji] 使用 eBITMAP
+    font_lib.load(
+        font::FontType::eBITMAP,
+        {.texture_index = 2, .sampler_index = 0}, // textureIndex=2, samplerIndex=0
+        {.png = raw_stbi_image{TEXTURE_PATH_2.data(), STBI_rgb_alpha},
+         .allocator = allocator,
+         .device = device,
+         .pool = commandPool,
+         .queue = GRAPHICS_AND_PRESENT},
+        JSON_PATH_2, font::freetype_face{*loader, FONT_PATH_2});
+
+    // diff: [test_bidi] 添加阿拉伯字体
+    font_lib.load(font::FontType::eMSDF, {.texture_index = 3, .sampler_index = 0},
+                  {.png = raw_stbi_image{TEXTURE_PATH_3.data(), STBI_rgb_alpha},
                    .allocator = allocator,
                    .device = device,
                    .pool = commandPool,
                    .queue = GRAPHICS_AND_PRESENT},
-                  JSON_PATH_2, font::freetype_face{*loader, FONT_PATH_2});
+                  JSON_PATH_3, font::freetype_face{*loader, FONT_PATH_3});
 
     auto textures = font_lib.getTextureImageBases();
     // Sampler
@@ -1362,40 +1414,163 @@ try
         samplers.emplace_back(build_sampler.build(device));
     }
 
+    /*
+    NOTE: 简单说：双向处理和整形要在换行之前，但最后一步的视觉重排要在换行之后
+    数据流大致如下：理论正确流程：双向分析 → 整形（逻辑顺序）→ 换行 → 重排 → 渲染。
+    [Unicode 文本段落]
+        ↓
+    1️⃣ 双向分析 (BiDi Analysis) ← SheenBidi/FriBiDi
+    • 分析整段文本的书写方向
+    • 为每个字符计算嵌入层级 (embedding levels)
+    • 输出：带层级信息的逻辑文本
+        ↓
+    2️⃣ 整形 (Shaping) ← HarfBuzz
+    • 将字符转换为字形 (glyphs)
+    • 应用连字、位置调整等规则
+    • 输出：字形序列（仍按逻辑顺序）
+        ↓
+    3️⃣ 测量与换行 (Line Breaking) ← libunibreak
+    • 按逻辑顺序累加每个字形的宽度
+    • 根据宽度限制确定断点位置
+    • 输出：分行后的字形序列（逻辑顺序）
+        ↓
+    4️⃣ 行内重排 (Line Reordering) ← SheenBidi
+    • 对每一行应用规则 L1-L4
+    • 将逻辑顺序转换为视觉顺序
+    • 输出：每行已重排的字形（准备渲染）
+        ↓
+    5️⃣ 渲染 (Rendering) ← Vulkan + 你的代码
+
+    关键点：
+        换行是在 逻辑顺序 下用 塑形后 的字形宽度来决定的
+        如果先换行再做双向处理，混合方向文本的宽度计算会完全错误
+        最后的重排（视觉顺序）必须在换行之后，因为重排是逐行进行的
+
+    所以你在代码里的正确做法是：
+        用 SheenBidi 分析整段文本 → 得到每个字符的嵌入层级
+        用 HarfBuzz 对整段整形 → 得到字形和宽度
+        用 libunibreak 确定断点 → 分行（用逻辑顺序的宽度）
+        对每一行调用 SheenBidi 的 reorder_line 进行视觉重排
+        逐行生成顶点数据 → Vulkan 渲染
+
+    */
+    /*
+    SheenBidi
+    并不直接修改你的顶点数据，而是通过输出一个关键的中间产物——嵌入层级（embedding level）
+    来影响整个后续流程 。
+        偶数值层级：表示该字符是从左到右（LTR）的，例如英文和数字。
+        奇数值层级：表示该字符是从右到左（RTL）的，例如阿拉伯语和希伯来语字母
+    NOTE: BIDI: BIDI（双向算法）的任务是：决定一段混合了 LTR 和 RTL
+    文字的文本，每个字符在屏幕上应该从左到右还是从右到左显示。
+    它输出的是视觉顺序，即字符渲染时的前后次序。
+    */
     // Vectex
+    auto printu32string = [](const std::u32string &text) {
+        for (char32_t ch : text)
+        {
+            std::cout << "U+" << std::hex << std::uppercase << std::setw(4)
+                      << std::setfill('0') << static_cast<uint32_t>(ch) << " ";
+            // optionally print the character itself if convertible
+        }
+        std::cout << '\n';
+    };
+    {
+        // NOTE: 从表情向左删除。第一个删除的是"م"。说明"م"就是在数组的尾部
+        //  std::u32string text = U"Hello سلام的😅";
+        // U+0048 U+0065 U+006C U+006C U+006F U+0020 U+0633 U+0644 U+0627 U+0645 U+7684
+        // U+1F605
+        // NOTE: 下面能证明 逻辑输入顺序。 阿拉伯字符确实视觉和输入相反的
+        static_assert(U'😅' == 0x1F605, "U+1F605 expected for '😅'");
+        static_assert(U'的' == 0x7684, "U+7684 expected for '的'");
+        static_assert(U'م' == 0x0645, "U+0645 expected for 'م'");
+        static_assert(U'م' == 0x0645U, "U+0645 expected for 'م'"); // 或加上 U 后缀
 
-    std::u32string text = U"Hello 是的😀"; // 示例文本
-    // std::u32string text = U"Hello world";  // 示例文本
-    // std::u32string text = U"e"; // 示例文本
+        static_assert(U'س' == 0x0633, "U+0645 expected for 'س'");
 
-    float cursorX = 0.0F, cursorY = 0.0F;
-    constexpr float fontSize = 0.2F; // 每个字符缩放
-    std::vector<Vertex> tmp_vertices;
-    std::vector<uint32_t> tmp_idxs;
-    tmp_vertices.reserve(4);
-    tmp_idxs.reserve(6);
+        static_assert(U' ' == 0x0020, "U+0020 expected for ' '");
+    }
+    std::u32string text = U"Hello سلام的😅"; // diff: [test_bidi]
+    printu32string(text);
 
-    std::vector<mesh_base> objects;
+    // diff: test_bidi2 start
+    // NOTE: 应该和控制台渲染一样才算OK
+    std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> conv;
+    std::string utf8_text = conv.to_bytes(text);
+    std::cout << "UTF-8 text: " << utf8_text << " (bytes: " << utf8_text.size() << ")\n";
+
+    // ----- 步骤1：UTF-32 双向分析（SheenBidi）-----
+    // 使用 UTF-32 编码，长度传递代码单元个数（即 text.size()）
+    SBCodepointSequence codepointSequence = {
+        SBStringEncodingUTF32, (void *)text.data(),
+        static_cast<SBUInteger>(text.size()) // 注意：这里是 text.size()，不是乘以 sizeof
+    };
+
+    SBAlgorithmRef bidiAlgorithm = SBAlgorithmCreate(&codepointSequence);
+    SBParagraphRef firstParagraph =
+        SBAlgorithmCreateParagraph(bidiAlgorithm, 0, INT32_MAX, SBLevelDefaultLTR);
+    SBUInteger paragraphLength = SBParagraphGetLength(firstParagraph);
+
+    SBLineRef paragraphLine = SBParagraphCreateLine(firstParagraph, 0, paragraphLength);
+    SBUInteger runCount = SBLineGetRunCount(paragraphLine);
+    const SBRun *runArray = SBLineGetRunsPtr(paragraphLine);
+
+    // 保存 runs 信息（视觉顺序），offset/length 已是码点索引/个数
+    std::vector<SBRun> runs(runArray, runArray + runCount);
+
+    // 打印 runs 验证（应该与 UTF-8 分析结果一致）
+    for (const auto &run : runs)
+    {
+        std::println("Run Offset: {}", (long)run.offset);
+        std::println("Run Length: {}", (long)run.length);
+        std::println("Run Level: {}\n", (long)run.level);
+    }
+
+    // 释放 SheenBidi 对象
+    SBLineRelease(paragraphLine);
+    SBParagraphRelease(firstParagraph);
+    SBAlgorithmRelease(bidiAlgorithm);
+    // ----- 步骤2：预计算每个逻辑字符的图形信息 -----
+    struct CharInfo
+    {
+        font::glyph_info glyph;
+        double distanceRange;
+        uint32_t modulateFlag;
+    };
+    std::vector<CharInfo> charInfos;
+    charInfos.reserve(text.size());
+
+    bool modulateFlag = false;
     for (char32_t ch : text)
     {
-        tmp_vertices.clear();
-        tmp_idxs.clear();
-
+        modulateFlag = !modulateFlag;
         auto info = font_lib.getGlyph(ch);
         double distanceRange = info.font().atlas.distanceRange.value_or(0);
+        charInfos.push_back({info, distanceRange, static_cast<uint32_t>(modulateFlag)});
+    }
 
-        auto pos = info.plane_bounds();
-        glm::vec3 pos_left_bottom(
-            glm::vec2{pos.left + cursorX, pos.bottom + cursorY} * fontSize, 0);
-        glm::vec3 pos_right_bottom(
-            glm::vec2{pos.right + cursorX, pos.bottom + cursorY} * fontSize, 0);
-        glm::vec3 pos_right_top(
-            glm::vec2{pos.right + cursorX, pos.top + cursorY} * fontSize, 0);
-        glm::vec3 pos_left_top(
-            glm::vec2{pos.left + cursorX, pos.top + cursorY} * fontSize, 0);
+    // ----- 步骤3：按视觉顺序生成顶点数据 -----
+    const float fontSize = 0.2f;
+    float cursorX = 0.0f, cursorY = 0.0f; // 当前绘制位置（原点）
+    std::vector<mesh_base> objects;       // 新的对象容器
 
-        cursorX += info.advance();
-        cursorX += 0.1;
+    auto createMeshForChar = [&](const CharInfo &ci, float originX, float originY) {
+        std::vector<Vertex> tmp_vertices;
+        std::vector<uint32_t> tmp_idxs;
+        tmp_vertices.reserve(4);
+        tmp_idxs.reserve(6);
+
+        const auto &info = ci.glyph;
+        const auto pos = info.plane_bounds();
+
+        float left = originX + static_cast<float>(pos.left) * fontSize;
+        float bottom = originY + static_cast<float>(pos.bottom) * fontSize;
+        float right = originX + static_cast<float>(pos.right) * fontSize;
+        float top = originY + static_cast<float>(pos.top) * fontSize;
+
+        glm::vec3 pos_left_bottom(left, bottom, 0.0f);
+        glm::vec3 pos_right_bottom(right, bottom, 0.0f);
+        glm::vec3 pos_right_top(right, top, 0.0f);
+        glm::vec3 pos_left_top(left, top, 0.0f);
 
         glm::vec2 uv_left_bottom(info.uv_bounds.left, info.uv_bounds.bottom);
         glm::vec2 uv_right_bottom(info.uv_bounds.right, info.uv_bounds.bottom);
@@ -1403,44 +1578,109 @@ try
         glm::vec2 uv_left_top(info.uv_bounds.left, info.uv_bounds.top);
 
         tmp_vertices.push_back(Vertex{.pos = pos_left_bottom,
-                                      .color = {1.0F, 0.0F, 0.0F},
+                                      .color = {1.0f, 0.0f, 0.0f},
                                       .texCoord = uv_left_bottom,
                                       .textureIndex = info.texture_index(),
                                       .samplerIndex = info.sampler_index(),
                                       .fontType = static_cast<uint32_t>(info.type()),
-                                      .pxRange = static_cast<float>(distanceRange)});
+                                      .pxRange = static_cast<float>(ci.distanceRange),
+                                      .modulateFlag = ci.modulateFlag});
         tmp_vertices.push_back(Vertex{.pos = pos_right_bottom,
-                                      .color = {0.0F, 1.0F, 0.0F},
+                                      .color = {0.0f, 1.0f, 0.0f},
                                       .texCoord = uv_right_bottom,
                                       .textureIndex = info.texture_index(),
                                       .samplerIndex = info.sampler_index(),
                                       .fontType = static_cast<uint32_t>(info.type()),
-                                      .pxRange = static_cast<float>(distanceRange)});
+                                      .pxRange = static_cast<float>(ci.distanceRange),
+                                      .modulateFlag = ci.modulateFlag});
         tmp_vertices.push_back(Vertex{.pos = pos_right_top,
-                                      .color = {0.0F, 0.0F, 1.0F},
+                                      .color = {0.0f, 0.0f, 1.0f},
                                       .texCoord = uv_right_top,
                                       .textureIndex = info.texture_index(),
                                       .samplerIndex = info.sampler_index(),
                                       .fontType = static_cast<uint32_t>(info.type()),
-                                      .pxRange = static_cast<float>(distanceRange)});
+                                      .pxRange = static_cast<float>(ci.distanceRange),
+                                      .modulateFlag = ci.modulateFlag});
         tmp_vertices.push_back(Vertex{.pos = pos_left_top,
-                                      .color = {1.0F, 0.0F, 0.0F},
+                                      .color = {1.0f, 0.0f, 0.0f},
                                       .texCoord = uv_left_top,
                                       .textureIndex = info.texture_index(),
                                       .samplerIndex = info.sampler_index(),
                                       .fontType = static_cast<uint32_t>(info.type()),
-                                      .pxRange = static_cast<float>(distanceRange)});
+                                      .pxRange = static_cast<float>(ci.distanceRange),
+                                      .modulateFlag = ci.modulateFlag});
 
-        uint32_t base = 0; // NOTE: 每次都重新开始
+        uint32_t base = 0;
         tmp_idxs.insert(tmp_idxs.end(),
                         {base, base + 1, base + 2, base, base + 2, base + 3});
 
-        objects.emplace_back(mesh_base{
-            allocator, commandPool, GRAPHICS_AND_PRESENT, {tmp_vertices, tmp_idxs}});
-    }
+        objects.emplace_back(mesh_base{allocator,
+                                       commandPool,
+                                       GRAPHICS_AND_PRESENT,
+                                       {std::move(tmp_vertices), std::move(tmp_idxs)}});
+    };
 
-    // diff: [texture] end
-    // diff: [test_msdf_atlas_gen] start
+    // 遍历视觉顺序的 runs
+    for (const auto &run : runs)
+    {
+        uint32_t start = static_cast<uint32_t>(run.offset);
+        uint32_t length = static_cast<uint32_t>(run.length);
+        bool isRTL = (run.level % 2) == 1;
+
+        if (isRTL)
+        {
+            // 预先计算每个字符的缩放后宽度，避免重复乘法
+            std::vector<float> scaledAdvances(length);
+            float runWidth = 0.0f;
+            for (uint32_t i = 0; i < length; ++i)
+            {
+                float adv =
+                    static_cast<float>(charInfos[start + i].glyph.advance()) * fontSize;
+                scaledAdvances[i] = adv;
+                runWidth += adv;
+            }
+
+            // run 的右边界 = 当前光标位置 + 总宽度
+            float runRight = cursorX + runWidth;
+            float runCursor = runRight; // 从右边界开始放置
+
+            // 按逻辑顺序放置字符，原点依次向左移动
+            for (uint32_t i = 0; i < length; ++i)
+            {
+                const auto &ci = charInfos[start + i];
+                float originX = runCursor - scaledAdvances[i];
+                createMeshForChar(ci, originX, cursorY);
+                runCursor = originX; // 光标左移
+            }
+
+            // 更新全局光标到 run 的右边界，供后续 run 使用
+            cursorX = runRight;
+        }
+        else // LTR run
+        {
+            // 从左向右放置字符
+            for (uint32_t i = start; i < start + length; ++i)
+            {
+                const auto &ci = charInfos[i];
+                createMeshForChar(ci, cursorX, cursorY);
+                cursorX += static_cast<float>(ci.glyph.advance()) * fontSize;
+            }
+        }
+    }
+    // objects 已填充完毕，后续代码保持不变
+
+    /*
+    NOTE: 渲染和控制台打印的顺序一致，说明BIDI已经完毕。否则失败
+    NOTE: 控制台的可能是错误的。控制台的就是错误的输出。当前和控制台相反
+    NOTE: 和原生 test_bidi 的阿拉伯渲染视觉相反，说明是集成OK了
+    NOTE: vscode是视觉字符串 和 vulkan的渲染字符串 视觉一致的，
+    第一步（双向分析）已成功完成！SheenBidi 输出的 runs 信息完全正确：
+    第一个 run：offset 0，length 6，level 0（LTR，对应 "Hello "）
+    第二个 run：offset 6，length 4，level 1（RTL，对应 "سلام"）
+    第三个 run：offset 10，length 2，level 0（LTR，对应 "的😅"）
+    */
+
+    // diff: [test_bidi2] end
 
     // createDescriptorSets
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
