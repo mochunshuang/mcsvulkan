@@ -684,7 +684,7 @@ namespace font
             using PlaneBounds = Bounds;
             using AtlasBounds = Bounds;
             // "\"unicode\":%u,"
-            char32_t unicode;
+            char32_t index_or_unicode;
             static_assert(!std::is_same_v<char32_t, uint32_t>);
             static_assert(sizeof(char32_t) == sizeof(uint32_t));
 
@@ -719,7 +719,7 @@ namespace font
                                       .right = b["right"],
                                       .top = b["top"]};
                     };
-                    ret.emplace_back(Glyphs{.unicode = glyph["unicode"],
+                    ret.emplace_back(Glyphs{.index_or_unicode = glyph["unicode"],
                                             .advance = glyph["advance"],
                                             .planeBounds = parseBounds("planeBounds"),
                                             .atlasBounds = parseBounds("atlasBounds")});
@@ -937,7 +937,8 @@ namespace font
             auto &atlas = fonts_[fonts_.size() - 1];
             for (const auto &glyph : atlas.font.glyphs)
             {
-                FT_UInt glyph_index = ::FT_Get_Char_Index(*atlas.face, glyph.unicode);
+                FT_UInt glyph_index =
+                    ::FT_Get_Char_Index(*atlas.face, glyph.index_or_unicode);
                 if (glyph_index != 0)
                     atlas.glyph_index_to_info[glyph_index] = &glyph;
             }
@@ -951,7 +952,7 @@ namespace font
                 const auto &font = atlas.font;
                 for (const auto &glyph : font.glyphs)
                 {
-                    if (unicode == glyph.unicode)
+                    if (unicode == glyph.index_or_unicode)
                     {
                         auto atlasBounds = glyph.atlasBounds;
                         if (!atlasBounds)

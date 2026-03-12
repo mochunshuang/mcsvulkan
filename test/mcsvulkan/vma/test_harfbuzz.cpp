@@ -1,12 +1,12 @@
-#include <algorithm>
 #include <array>
 #include <cassert>
+#include <codecvt>
+#include <variant>
 #include <cstdint>
 #include <exception>
 #include <iostream>
 #include <print>
 #include <chrono>
-#include <random>
 #include <stdexcept>
 #include <utility>
 
@@ -27,9 +27,10 @@ using json = nlohmann::json;
 
 #include <hb.h>
 #include <hb-ft.h>
-#include <raqm.h>
-#include <linebreak.h>   // libunibreak 核心头文件
-#include <unibreakdef.h> // 基础定义
+#include <raqm.h>                //NOTE: 不需要,因为和换行不搭
+#include <SheenBidi/SheenBidi.h> //diff: [test_bidi] bidi
+#include <linebreak.h>           // libunibreak 核心头文件
+#include <unibreakdef.h>         // 基础定义
 // diff: [test_msdf_atlas_gen3] end
 
 #include "../head.hpp"
@@ -167,9 +168,11 @@ struct Vertex // NOLINT
     uint32_t fontType;     // 4 (枚举对齐到 uint32_t)
     float pxRange{8};      // 4 float
     // diff: [test_msdf_atlas_gen1] end
+
+    uint32_t modulateFlag; // diff: [test_emoji]
 };
 static_assert(alignof(Vertex) == 4, "check alignof error");
-static_assert(sizeof(Vertex) == 32 + 12 + 4, "check sizeof error");
+static_assert(sizeof(Vertex) == 32 + 12 + 4 + 4, "check sizeof error");
 
 struct mesh_base
 {
@@ -681,8 +684,21 @@ namespace font
             };
             using PlaneBounds = Bounds;
             using AtlasBounds = Bounds;
+            /*
+             switch (font.getPreferredIdentifierType()) {
+                            case GlyphIdentifierType::GLYPH_INDEX:
+                                fprintf(f, "\"index\":%d,", glyph.getIndex());
+                                break;
+                            case GlyphIdentifierType::UNICODE_CODEPOINT:
+                                fprintf(f, "\"unicode\":%u,", glyph.getCodepoint());
+                                break;
+                        }
+            */
+            using GLYPH_INDEX = signed int;
+            using UNICODE_CODEPOINT = unsigned int;
+            using IdentifierType = std::variant<GLYPH_INDEX, UNICODE_CODEPOINT>;
             // "\"unicode\":%u,"
-            char32_t index_or_unicode;
+            IdentifierType index_or_unicode;
             static_assert(!std::is_same_v<char32_t, uint32_t>);
             static_assert(sizeof(char32_t) == sizeof(uint32_t));
 
@@ -696,8 +712,16 @@ namespace font
                 const auto &glyphs = obj["glyphs"];
                 for (const auto &glyph : glyphs)
                 {
+                    // NOTE: BUG BUG
+                    //  NOTE: 拆分就没事太离谱l
+                    //   IdentifierType id = glyph.contains("index")
+                    //                           ? GLYPH_INDEX{glyph["index"]}
+                    //                           : UNICODE_CODEPOINT{glyph["unicode"]};
+                    IdentifierType id;
                     if (glyph.contains("index"))
-                        throw std::runtime_error{"unsuported index now."};
+                        id = GLYPH_INDEX{glyph["index"]};
+                    else
+                        id = UNICODE_CODEPOINT{glyph["unicode"]};
 
                     constexpr auto makebounds = [](const auto &bound) -> Bounds {
                         return {.left = bound["left"],
@@ -717,7 +741,7 @@ namespace font
                                       .right = b["right"],
                                       .top = b["top"]};
                     };
-                    ret.emplace_back(Glyphs{.index_or_unicode = glyph["unicode"],
+                    ret.emplace_back(Glyphs{.index_or_unicode = std::move(id),
                                             .advance = glyph["advance"],
                                             .planeBounds = parseBounds("planeBounds"),
                                             .atlasBounds = parseBounds("atlasBounds")});
@@ -731,26 +755,52 @@ namespace font
         class Kerning
         {
           public:
+            /*
+            fprintf(f, "\"index1\":%d,", kernPair.first.first);
+                                    fprintf(f, "\"index2\":%d,", kernPair.first.second);
+                                    fprintf(f, "\"advance\":%.17g", kernPair.second);
+            */
+            struct GLYPH_INDEX
+            {
+                signed int index1;
+                signed int index2;
+                double advance;
+            };
             //"\"unicode2\":%u,"
-            char32_t unicode1;
-            char32_t unicode2;
-            double advance;
+            struct UNICODE_CODEPOINT
+            {
+                char32_t unicode1;
+                char32_t unicode2;
+                double advance;
+            };
+
+            // using GLYPH_INDEX = signed int;
+            // using UNICODE_CODEPOINT = unsigned int;
+
+            using kerning_data = std::variant<GLYPH_INDEX, UNICODE_CODEPOINT>;
+            kerning_data value;
 
             static std::vector<Kerning> make(const json &obj)
             {
                 std::vector<Kerning> ret{};
-                const auto &kernings = obj["kerning"];
+                const auto it = obj.find("kerning");
+                if (it == obj.end() || it->is_null())
+                    return ret;
+                const auto &kernings = *it;
                 for (const auto &kerning : kernings)
                 {
                     if (kerning.contains("index1"))
-                        throw std::runtime_error{"unsuported index type now."};
-
-                    ret.emplace_back(Kerning{.unicode1 = kerning["unicode1"],
-                                             .unicode2 = kerning["unicode2"],
-                                             .advance = kerning["advance"]});
+                        ret.emplace_back(
+                            Kerning{.value = GLYPH_INDEX{.index1 = kerning["index1"],
+                                                         .index2 = kerning["index2"],
+                                                         .advance = kerning["advance"]}});
+                    else
+                        ret.emplace_back(Kerning{
+                            .value = UNICODE_CODEPOINT{.unicode1 = kerning["unicode1"],
+                                                       .unicode2 = kerning["unicode2"],
+                                                       .advance = kerning["advance"]}});
                 }
                 ret.shrink_to_fit();
-                return ret;
                 return ret;
             }
         };
@@ -770,7 +820,7 @@ namespace font
         {
             json data = json::parse(std::ifstream(jsonPath));
             if (data.contains("variants"))
-                throw std::runtime_error{"unsuported now."};
+                throw std::runtime_error{".......[TODO] unsuported now."};
             return {.atlas = Atlas::make(data),
                     .metrics = Metrics::make(data),
                     .glyphs = Glyphs::make(data),
@@ -840,8 +890,72 @@ namespace font
         eSDF,
         ePSDF,
         eMSDF,
-        eMTSDF
+        eMTSDF,
+        eBITMAP,
     };
+
+    // diff: [test_harfbuzz] start
+    struct harfbuzz_font
+    {
+        constexpr operator bool() const noexcept // NOLINT
+        {
+            return value_ != nullptr;
+        }
+        constexpr auto &operator*() noexcept
+        {
+            return value_;
+        }
+        constexpr const auto &operator*() const noexcept
+        {
+            return value_;
+        }
+
+        constexpr harfbuzz_font(const harfbuzz_font &) = delete;
+        constexpr harfbuzz_font &operator=(const harfbuzz_font &) = delete;
+
+        harfbuzz_font() = default;
+        // 从 FT_Face 创建 hb_font_t
+        constexpr explicit harfbuzz_font(FT_Face ft_face)
+            : value_(hb_ft_font_create(ft_face, nullptr))
+        {
+            if (value_ == nullptr)
+                throw std::runtime_error("hb_ft_font_create failed");
+        }
+
+        // 移动构造函数
+        constexpr harfbuzz_font(harfbuzz_font &&o) noexcept
+            : value_{std::exchange(o.value_, {})}
+        {
+        }
+
+        // 移动赋值
+        constexpr harfbuzz_font &operator=(harfbuzz_font &&o) noexcept
+        {
+            if (this != &o)
+            {
+                destroy();
+                value_ = std::exchange(o.value_, {});
+            }
+            return *this;
+        }
+
+        constexpr void destroy() noexcept
+        {
+            if (value_ != nullptr)
+            {
+                hb_font_destroy(value_);
+                value_ = nullptr;
+            }
+        }
+        constexpr ~harfbuzz_font() noexcept
+        {
+            destroy();
+        }
+
+      private:
+        hb_font_t *value_{};
+    };
+    // diff: [test_harfbuzz] end
 
     class FontAtlas
     {
@@ -854,6 +968,12 @@ namespace font
         FontType type;
         uint32_t texture_index;
         uint32_t sampler_index;
+
+        // diff: [test_bidi] start
+        std::unordered_map<uint32_t, const Font::glyphs_type *> glyph_index_to_info;
+        // diff: [test_bidi] end
+
+        harfbuzz_font hb_font; // diff: [test_harfbuzz]
     };
     struct glyph_info // NOLINTBEGIN
     {
@@ -867,7 +987,7 @@ namespace font
 
         auto &type() const noexcept
         {
-            return font_ctx->texture_index;
+            return font_ctx->type;
         }
         auto &texture_index() const noexcept
         {
@@ -897,6 +1017,14 @@ namespace font
         std::vector<FontAtlas> fonts_;
 
       public:
+        auto &operator[](size_t i) noexcept
+        {
+            return fonts_[i];
+        }
+        auto &operator[](size_t i) const noexcept
+        {
+            return fonts_[i];
+        }
         struct texture_bind_sampler
         {
             uint32_t texture_index;
@@ -907,13 +1035,44 @@ namespace font
                   const FontTexture::msdf_info &info, const std::string &jsonPath,
                   freetype_face face)
         {
-            fonts_.push_back({.name = jsonPath,
-                              .font = Font::make(jsonPath),
-                              .texture = FontTexture{info},
-                              .face = std::move(face),
-                              .type = type,
-                              .texture_index = bind.texture_index,
-                              .sampler_index = bind.sampler_index});
+            // 先构造一个完整的 FontAtlas 对象（但此时 hb_font 还未初始化）
+            fonts_.push_back({
+                .name = jsonPath,
+                .font = Font::make(jsonPath),
+                .texture = FontTexture{info},
+                .face = std::move(face), // face 被移动进 atlas
+                .type = type,
+                .texture_index = bind.texture_index,
+                .sampler_index = bind.sampler_index,
+                // hb_font 稍后设置
+            });
+
+            auto &atlas = fonts_.back();
+            FT_Face raw_face = *atlas.face; // 获取 FT_Face
+
+            // 先设置像素大小（与图集尺寸匹配，例如 96）
+            FT_Set_Pixel_Sizes(raw_face, 0, atlas.font.atlas.size);
+
+            // 再创建 hb_font（此时 FT_Face 已有正确的缩放）
+            atlas.hb_font = harfbuzz_font{raw_face};
+
+            // 填充 glyph_index_to_info 映射（保持不变）
+            for (const auto &glyph : atlas.font.glyphs)
+            {
+                if (glyph.index_or_unicode.index() == 0)
+                { // GLYPH_INDEX
+                    auto glyph_index =
+                        static_cast<FT_UInt>(std::get<0>(glyph.index_or_unicode));
+                    atlas.glyph_index_to_info[glyph_index] = &glyph;
+                }
+                else
+                { // UNICODE_CODEPOINT
+                    char32_t codepoint = std::get<1>(glyph.index_or_unicode);
+                    FT_UInt glyph_index = FT_Get_Char_Index(raw_face, codepoint);
+                    if (glyph_index != 0)
+                        atlas.glyph_index_to_info[glyph_index] = &glyph;
+                }
+            }
         }
 
         [[nodiscard]] glyph_info getGlyph(char32_t unicode) const
@@ -923,7 +1082,10 @@ namespace font
                 const auto &font = atlas.font;
                 for (const auto &glyph : font.glyphs)
                 {
-                    if (unicode == glyph.index_or_unicode)
+                    long long id = glyph.index_or_unicode.index() == 0
+                                       ? std::get<0>(glyph.index_or_unicode)
+                                       : std::get<1>(glyph.index_or_unicode);
+                    if (unicode == id)
                     {
                         auto atlasBounds = glyph.atlasBounds;
                         if (!atlasBounds)
@@ -1203,8 +1365,8 @@ try
 
     // diff: [Uniform] start
     // diff: [texture] start
-    // diff: [test_msdf_atlas_gen1] 改成3.
-    constexpr int TEXTURE_COUNT = 3; // diff: [test_texture2] msdf：测试纹理+着色器
+    // diff: [test_bidi] 改成4.
+    constexpr int TEXTURE_COUNT = 4; // diff: [test_texture2] msdf：测试纹理+着色器
     constexpr int SAMPLER_COUNT = 2; // 创建2个不同的采样器
     // diff: [texture] end
     auto descriptorSetLayout =
@@ -1284,7 +1446,7 @@ try
     const std::string TEXTURE_PATH_0 = pre + "/tirobangla_ascii.png";
     const std::string JSON_PATH_0 = pre + "/tirobangla_ascii.json";
     const std::string FONT_PATH_0 = pre + "/tirobangla_ascii.ttf";
-    constexpr auto CHAR = U'g'; // NOTE: 注意有参数耦合着色器
+    // constexpr auto CHAR = U'g'; // NOTE: 注意有参数耦合着色器
     // constexpr auto CHAR = U' '; //NOTE: 空格就是什么都看不到
 
     const std::string TEXTURE_PATH_1 = pre + "/msyh_chinese.png";
@@ -1292,35 +1454,109 @@ try
     const std::string FONT_PATH_1 = pre + "/msyh_chinese.ttc";
     // constexpr auto CHAR = U'是'; // NOTE: 注意有参数耦合着色器
 
+    // diff: [test_emoji] start
     const std::string TEXTURE_PATH_2 = pre + "/emoji.png";
     const std::string JSON_PATH_2 = pre + "/emoji.json";
     const std::string FONT_PATH_2 = pre + "/emoji.ttf";
+    // diff: [test_emoji] end
+
+    // diff: [test_bidi] start
+    // const std::string TEXTURE_PATH_3 = pre + "/segoe_arabic.png";
+    // const std::string JSON_PATH_3 = pre + "/segoe_arabic.json";
+    // const std::string FONT_PATH_3 = pre + "/segoe_arabic.ttf";
+    // const std::string FONT_PATH_3 = "C:/Windows/Fonts/segoeui.ttf";
+
+    // diff: [test_harfbuzz] BUG BUG. 会导致无法加载font
+    // NOTE: 要想解决
+    // const std::string TEXTURE_PATH_3 = pre + "/segoe_arabic_new.png";
+    // const std::string JSON_PATH_3 = pre + "/segoe_arabic_new.json";
+    const std::string TEXTURE_PATH_3 = pre + "/segoe_arabic_all.png";
+    const std::string JSON_PATH_3 = pre + "/segoe_arabic_all.json";
+    const std::string FONT_PATH_3 = "C:/Windows/Fonts/segoeui.ttf";
+    /*
+NOTE: segoe_arabic_new 并没有解决问题。
+PS E:\mysoftware\msdf-atlas-gen> .\msdf-atlas-gen.exe -font "C:\Windows\Fonts\segoeui.ttf"
+-chars "[0x0000,0x9FFF]" -type msdf -format png -imageout segoe_arabic_new.png -json
+segoe_arabic_new.json -size 64 -pxrange 2
+
+U+0048 U+0065 U+006C U+006C U+006F U+0020 U+0633
+U+0644 U+0627 U+0645 U+7684 U+1F605 Warning: glyph index 159 not found in font atlas,
+using default glyph for character U+627 Warning: glyph index 169 not found in font atlas,
+using default glyph for character U+644 Warning: glyph index 15 not found in font atlas,
+using default glyph for character U+633
+
+NOTE: 引入新警告。。。
+Warning: glyph index 3941 not found in font atlas, using default glyph for character U+627
+Warning: glyph index 3981 not found in font atlas, using default glyph for character U+644
+Warning: glyph index 2260 not found in font atlas, using default glyph for character U+633
+
+NOTE: 新的API。 也无济于事。纹理还变化了. 结果 ？： 变成 if-else 就没问题。离谱
+./msdf-atlas-gen.exe -font "C:\Windows\Fonts\segoeui.ttf" -allglyphs -type msdf -format
+png -imageout segoe_arabic_all.png -json segoe_arabic_all.json -size 64 -pxrange 2
+
+U+0048 U+0065 U+006C U+006C U+006F U+0020 U+0633 U+0644 U+0627 U+0645 U+7684 U+1F605
+Warning: glyph index 3941 not found in font atlas, using default glyph for character U+627
+Warning: glyph index 3981 not found in font atlas, using default glyph for character U+644
+Warning: glyph index 2260 not found in font atlas, using default glyph for character U+633
+*/
+
+    // diff: [test_bidi] end
 
     // 添加字体
     font::freetype_loader loader{};
+    {
+        FT_Face test_face;
+        FT_New_Face(*loader, "C:/Windows/Fonts/segoeui.ttf", 0, &test_face);
+        // 查三个字符：U+0627 (ا), U+0644 (ل), U+0633 (س)
+        FT_UInt idx1 = FT_Get_Char_Index(test_face, 0x0627);
+        FT_UInt idx2 = FT_Get_Char_Index(test_face, 0x0644);
+        FT_UInt idx3 = FT_Get_Char_Index(test_face, 0x0633);
+        std::cout << "glyph index for U+0627: " << idx1 << std::endl;
+        std::cout << "glyph index for U+0644: " << idx2 << std::endl;
+        std::cout << "glyph index for U+0633: " << idx3 << std::endl;
+        FT_Done_Face(test_face);
+    }
     font::FontLibrary font_lib{};
-    font_lib.load(font::FontType::eMSDF, {0, 0}, // textureIndex=0, samplerIndex=0
-                  {.png = raw_stbi_image{TEXTURE_PATH_0.data(), STBI_rgb_alpha},
+    font_lib.load(
+        font::FontType::eMSDF,
+        {.texture_index = 0, .sampler_index = 0}, // textureIndex=0, samplerIndex=0
+        {.png = raw_stbi_image{TEXTURE_PATH_0.data(), STBI_rgb_alpha},
+         .allocator = allocator,
+         .device = device,
+         .pool = commandPool,
+         .queue = GRAPHICS_AND_PRESENT},
+        JSON_PATH_0, font::freetype_face{*loader, FONT_PATH_0});
+
+    font_lib.load(
+        font::FontType::eMSDF,
+        {.texture_index = 1, .sampler_index = 0}, // textureIndex=2, samplerIndex=0
+        {.png = raw_stbi_image{TEXTURE_PATH_1.data(), STBI_rgb_alpha},
+         .allocator = allocator,
+         .device = device,
+         .pool = commandPool,
+         .queue = GRAPHICS_AND_PRESENT},
+        JSON_PATH_1, font::freetype_face{*loader, FONT_PATH_1});
+
+    // diff: [test_emoji] 使用 eBITMAP
+    font_lib.load(
+        font::FontType::eBITMAP,
+        {.texture_index = 2, .sampler_index = 0}, // textureIndex=2, samplerIndex=0
+        {.png = raw_stbi_image{TEXTURE_PATH_2.data(), STBI_rgb_alpha},
+         .allocator = allocator,
+         .device = device,
+         .pool = commandPool,
+         .queue = GRAPHICS_AND_PRESENT},
+        JSON_PATH_2, font::freetype_face{*loader, FONT_PATH_2});
+
+    // diff: [test_bidi] 添加阿拉伯字体
+    auto image = raw_stbi_image{TEXTURE_PATH_3.data(), STBI_rgb_alpha};
+    font_lib.load(font::FontType::eMSDF, {.texture_index = 3, .sampler_index = 0},
+                  {.png = std::move(image),
                    .allocator = allocator,
                    .device = device,
                    .pool = commandPool,
                    .queue = GRAPHICS_AND_PRESENT},
-                  JSON_PATH_0, font::freetype_face{*loader, FONT_PATH_0});
-    font_lib.load(font::FontType::eMSDF,
-                  {1, 0}, // 第二个字体用 textureIndex=1, samplerIndex=0
-                  {.png = raw_stbi_image{TEXTURE_PATH_1.data(), STBI_rgb_alpha},
-                   .allocator = allocator,
-                   .device = device,
-                   .pool = commandPool,
-                   .queue = GRAPHICS_AND_PRESENT},
-                  JSON_PATH_1, font::freetype_face{*loader, FONT_PATH_1});
-    font_lib.load(font::FontType::eMSDF, {2, 0}, // textureIndex=2, samplerIndex=0
-                  {.png = raw_stbi_image{TEXTURE_PATH_2.data(), STBI_rgb_alpha},
-                   .allocator = allocator,
-                   .device = device,
-                   .pool = commandPool,
-                   .queue = GRAPHICS_AND_PRESENT},
-                  JSON_PATH_2, font::freetype_face{*loader, FONT_PATH_2});
+                  JSON_PATH_3, font::freetype_face{*loader, FONT_PATH_3});
 
     auto textures = font_lib.getTextureImageBases();
     // Sampler
@@ -1362,40 +1598,172 @@ try
         samplers.emplace_back(build_sampler.build(device));
     }
 
+    /*
+    NOTE: 简单说：双向处理和整形要在换行之前，但最后一步的视觉重排要在换行之后
+    数据流大致如下：理论正确流程：双向分析 → 整形（逻辑顺序）→ 换行 → 重排 → 渲染。
+    [Unicode 文本段落]
+        ↓
+    1️⃣ 双向分析 (BiDi Analysis) ← SheenBidi/FriBiDi
+    • 分析整段文本的书写方向
+    • 为每个字符计算嵌入层级 (embedding levels)
+    • 输出：带层级信息的逻辑文本
+        ↓
+    2️⃣ 整形 (Shaping) ← HarfBuzz
+    • 将字符转换为字形 (glyphs)
+    • 应用连字、位置调整等规则
+    • 输出：字形序列（仍按逻辑顺序）
+        ↓
+    3️⃣ 测量与换行 (Line Breaking) ← libunibreak
+    • 按逻辑顺序累加每个字形的宽度
+    • 根据宽度限制确定断点位置
+    • 输出：分行后的字形序列（逻辑顺序）
+        ↓
+    4️⃣ 行内重排 (Line Reordering) ← SheenBidi
+    • 对每一行应用规则 L1-L4
+    • 将逻辑顺序转换为视觉顺序
+    • 输出：每行已重排的字形（准备渲染）
+        ↓
+    5️⃣ 渲染 (Rendering) ← Vulkan + 你的代码
+
+    关键点：
+        换行是在 逻辑顺序 下用 塑形后 的字形宽度来决定的
+        如果先换行再做双向处理，混合方向文本的宽度计算会完全错误
+        最后的重排（视觉顺序）必须在换行之后，因为重排是逐行进行的
+
+    所以你在代码里的正确做法是：
+        用 SheenBidi 分析整段文本 → 得到每个字符的嵌入层级
+        用 HarfBuzz 对整段整形 → 得到字形和宽度
+        用 libunibreak 确定断点 → 分行（用逻辑顺序的宽度）
+        对每一行调用 SheenBidi 的 reorder_line 进行视觉重排
+        逐行生成顶点数据 → Vulkan 渲染
+
+    */
+    /*
+    SheenBidi
+    并不直接修改你的顶点数据，而是通过输出一个关键的中间产物——嵌入层级（embedding level）
+    来影响整个后续流程 。
+        偶数值层级：表示该字符是从左到右（LTR）的，例如英文和数字。
+        奇数值层级：表示该字符是从右到左（RTL）的，例如阿拉伯语和希伯来语字母
+    NOTE: BIDI: BIDI（双向算法）的任务是：决定一段混合了 LTR 和 RTL
+    文字的文本，每个字符在屏幕上应该从左到右还是从右到左显示。
+    它输出的是视觉顺序，即字符渲染时的前后次序。
+    */
     // Vectex
+    auto printu32string = [](const std::u32string &text) {
+        for (char32_t ch : text)
+        {
+            std::cout << "U+" << std::hex << std::uppercase << std::setw(4)
+                      << std::setfill('0') << static_cast<uint32_t>(ch) << " ";
+            // optionally print the character itself if convertible
+        }
+        std::cout << '\n';
+    };
+    {
+        // NOTE: 从表情向左删除。第一个删除的是"م"。说明"م"就是在数组的尾部
+        //  std::u32string text = U"Hello سلام的😅";
+        // U+0048 U+0065 U+006C U+006C U+006F U+0020 U+0633 U+0644 U+0627 U+0645 U+7684
+        // U+1F605
+        // NOTE: 下面能证明 逻辑输入顺序。 阿拉伯字符确实视觉和输入相反的
+        static_assert(U'😅' == 0x1F605, "U+1F605 expected for '😅'");
+        static_assert(U'的' == 0x7684, "U+7684 expected for '的'");
+        static_assert(U'م' == 0x0645, "U+0645 expected for 'م'");
+        static_assert(U'م' == 0x0645U, "U+0645 expected for 'م'"); // 或加上 U 后缀
 
-    std::u32string text = U"Hello 是的😀"; // 示例文本
-    // std::u32string text = U"Hello world";  // 示例文本
-    // std::u32string text = U"e"; // 示例文本
+        static_assert(U'س' == 0x0633, "U+0645 expected for 'س'");
 
-    float cursorX = 0.0F, cursorY = 0.0F;
-    constexpr float fontSize = 0.2F; // 每个字符缩放
-    std::vector<Vertex> tmp_vertices;
-    std::vector<uint32_t> tmp_idxs;
-    tmp_vertices.reserve(4);
-    tmp_idxs.reserve(6);
+        static_assert(U' ' == 0x0020, "U+0020 expected for ' '");
+    }
+    std::u32string text = U"Hello سلام的😅"; // diff: [test_bidi]
+    printu32string(text);
 
-    std::vector<mesh_base> objects;
+    /*
+    整形（Shaping） 是文本渲染中的一个关键步骤，它的核心任务是：将一串
+    Unicode字符（逻辑顺序）转换为字体中对应的具体字形，
+    并计算出每个字形应该如何摆放，以便最终正确呈现文字的视觉形态。
+    HarfBuzz 本身只负责文本整形——将 Unicode
+    字符序列转换为字体字形（glyph）序列，并计算出每个字形的位置偏移（offset）和前进量（advance）。它输出的结果是一系列逻辑顺序的字形
+    ID 和位置信息，完全不涉及图形 API 的顶点缓冲区或渲染命令。
+    */
+#if 0
+    // diff: test_bidi2 start
+    // NOTE: 应该和控制台渲染一样才算OK
+    std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> conv;
+    std::string utf8_text = conv.to_bytes(text);
+    std::cout << "UTF-8 text: " << utf8_text << " (bytes: " << utf8_text.size() << ")\n";
+
+    // ----- 步骤1：UTF-32 双向分析（SheenBidi）-----
+    // 使用 UTF-32 编码，长度传递代码单元个数（即 text.size()）
+    SBCodepointSequence codepointSequence = {
+        SBStringEncodingUTF32, (void *)text.data(),
+        static_cast<SBUInteger>(text.size()) // 注意：这里是 text.size()，不是乘以 sizeof
+    };
+
+    SBAlgorithmRef bidiAlgorithm = SBAlgorithmCreate(&codepointSequence);
+    SBParagraphRef firstParagraph =
+        SBAlgorithmCreateParagraph(bidiAlgorithm, 0, INT32_MAX, SBLevelDefaultLTR);
+    SBUInteger paragraphLength = SBParagraphGetLength(firstParagraph);
+
+    SBLineRef paragraphLine = SBParagraphCreateLine(firstParagraph, 0, paragraphLength);
+    SBUInteger runCount = SBLineGetRunCount(paragraphLine);
+    const SBRun *runArray = SBLineGetRunsPtr(paragraphLine);
+
+    // 保存 runs 信息（视觉顺序），offset/length 已是码点索引/个数
+    std::vector<SBRun> runs(runArray, runArray + runCount);
+
+    // 打印 runs 验证（应该与 UTF-8 分析结果一致）
+    for (const auto &run : runs)
+    {
+        std::println("Run Offset: {}", (long)run.offset);
+        std::println("Run Length: {}", (long)run.length);
+        std::println("Run Level: {}\n", (long)run.level);
+    }
+
+    // 释放 SheenBidi 对象
+    SBLineRelease(paragraphLine);
+    SBParagraphRelease(firstParagraph);
+    SBAlgorithmRelease(bidiAlgorithm);
+    // ----- 步骤2：预计算每个逻辑字符的图形信息 -----
+    struct CharInfo
+    {
+        font::glyph_info glyph;
+        double distanceRange;
+        uint32_t modulateFlag;
+    };
+    std::vector<CharInfo> charInfos;
+    charInfos.reserve(text.size());
+
+    bool modulateFlag = false;
     for (char32_t ch : text)
     {
-        tmp_vertices.clear();
-        tmp_idxs.clear();
-
+        modulateFlag = !modulateFlag;
         auto info = font_lib.getGlyph(ch);
         double distanceRange = info.font().atlas.distanceRange.value_or(0);
+        charInfos.push_back({info, distanceRange, static_cast<uint32_t>(modulateFlag)});
+    }
 
-        auto pos = info.plane_bounds();
-        glm::vec3 pos_left_bottom(
-            glm::vec2{pos.left + cursorX, pos.bottom + cursorY} * fontSize, 0);
-        glm::vec3 pos_right_bottom(
-            glm::vec2{pos.right + cursorX, pos.bottom + cursorY} * fontSize, 0);
-        glm::vec3 pos_right_top(
-            glm::vec2{pos.right + cursorX, pos.top + cursorY} * fontSize, 0);
-        glm::vec3 pos_left_top(
-            glm::vec2{pos.left + cursorX, pos.top + cursorY} * fontSize, 0);
+    // ----- 步骤3：按视觉顺序生成顶点数据 -----
+    const float fontSize = 0.2f;
+    float cursorX = 0.0f, cursorY = 0.0f; // 当前绘制位置（原点）
+    std::vector<mesh_base> objects;       // 新的对象容器
 
-        cursorX += info.advance();
-        cursorX += 0.1;
+    auto createMeshForChar = [&](const CharInfo &ci, float originX, float originY) {
+        std::vector<Vertex> tmp_vertices;
+        std::vector<uint32_t> tmp_idxs;
+        tmp_vertices.reserve(4);
+        tmp_idxs.reserve(6);
+
+        const auto &info = ci.glyph;
+        const auto pos = info.plane_bounds();
+
+        float left = originX + static_cast<float>(pos.left) * fontSize;
+        float bottom = originY + static_cast<float>(pos.bottom) * fontSize;
+        float right = originX + static_cast<float>(pos.right) * fontSize;
+        float top = originY + static_cast<float>(pos.top) * fontSize;
+
+        glm::vec3 pos_left_bottom(left, bottom, 0.0f);
+        glm::vec3 pos_right_bottom(right, bottom, 0.0f);
+        glm::vec3 pos_right_top(right, top, 0.0f);
+        glm::vec3 pos_left_top(left, top, 0.0f);
 
         glm::vec2 uv_left_bottom(info.uv_bounds.left, info.uv_bounds.bottom);
         glm::vec2 uv_right_bottom(info.uv_bounds.right, info.uv_bounds.bottom);
@@ -1403,45 +1771,427 @@ try
         glm::vec2 uv_left_top(info.uv_bounds.left, info.uv_bounds.top);
 
         tmp_vertices.push_back(Vertex{.pos = pos_left_bottom,
-                                      .color = {1.0F, 0.0F, 0.0F},
+                                      .color = {1.0f, 0.0f, 0.0f},
                                       .texCoord = uv_left_bottom,
                                       .textureIndex = info.texture_index(),
                                       .samplerIndex = info.sampler_index(),
                                       .fontType = static_cast<uint32_t>(info.type()),
-                                      .pxRange = static_cast<float>(distanceRange)});
+                                      .pxRange = static_cast<float>(ci.distanceRange),
+                                      .modulateFlag = ci.modulateFlag});
         tmp_vertices.push_back(Vertex{.pos = pos_right_bottom,
-                                      .color = {0.0F, 1.0F, 0.0F},
+                                      .color = {0.0f, 1.0f, 0.0f},
                                       .texCoord = uv_right_bottom,
                                       .textureIndex = info.texture_index(),
                                       .samplerIndex = info.sampler_index(),
                                       .fontType = static_cast<uint32_t>(info.type()),
-                                      .pxRange = static_cast<float>(distanceRange)});
+                                      .pxRange = static_cast<float>(ci.distanceRange),
+                                      .modulateFlag = ci.modulateFlag});
         tmp_vertices.push_back(Vertex{.pos = pos_right_top,
-                                      .color = {0.0F, 0.0F, 1.0F},
+                                      .color = {0.0f, 0.0f, 1.0f},
                                       .texCoord = uv_right_top,
                                       .textureIndex = info.texture_index(),
                                       .samplerIndex = info.sampler_index(),
                                       .fontType = static_cast<uint32_t>(info.type()),
-                                      .pxRange = static_cast<float>(distanceRange)});
+                                      .pxRange = static_cast<float>(ci.distanceRange),
+                                      .modulateFlag = ci.modulateFlag});
         tmp_vertices.push_back(Vertex{.pos = pos_left_top,
-                                      .color = {1.0F, 0.0F, 0.0F},
+                                      .color = {1.0f, 0.0f, 0.0f},
                                       .texCoord = uv_left_top,
                                       .textureIndex = info.texture_index(),
                                       .samplerIndex = info.sampler_index(),
                                       .fontType = static_cast<uint32_t>(info.type()),
-                                      .pxRange = static_cast<float>(distanceRange)});
+                                      .pxRange = static_cast<float>(ci.distanceRange),
+                                      .modulateFlag = ci.modulateFlag});
 
-        uint32_t base = 0; // NOTE: 每次都重新开始
+        uint32_t base = 0;
         tmp_idxs.insert(tmp_idxs.end(),
                         {base, base + 1, base + 2, base, base + 2, base + 3});
 
-        objects.emplace_back(mesh_base{
-            allocator, commandPool, GRAPHICS_AND_PRESENT, {tmp_vertices, tmp_idxs}});
+        objects.emplace_back(mesh_base{allocator,
+                                       commandPool,
+                                       GRAPHICS_AND_PRESENT,
+                                       {std::move(tmp_vertices), std::move(tmp_idxs)}});
+    };
+
+    // 遍历视觉顺序的 runs
+    for (const auto &run : runs)
+    {
+        uint32_t start = static_cast<uint32_t>(run.offset);
+        uint32_t length = static_cast<uint32_t>(run.length);
+        bool isRTL = (run.level % 2) == 1;
+
+        if (isRTL)
+        {
+            // 预先计算每个字符的缩放后宽度，避免重复乘法
+            std::vector<float> scaledAdvances(length);
+            float runWidth = 0.0f;
+            for (uint32_t i = 0; i < length; ++i)
+            {
+                float adv =
+                    static_cast<float>(charInfos[start + i].glyph.advance()) * fontSize;
+                scaledAdvances[i] = adv;
+                runWidth += adv;
+            }
+
+            // run 的右边界 = 当前光标位置 + 总宽度
+            float runRight = cursorX + runWidth;
+            float runCursor = runRight; // 从右边界开始放置
+
+            // 按逻辑顺序放置字符，原点依次向左移动
+            for (uint32_t i = 0; i < length; ++i)
+            {
+                const auto &ci = charInfos[start + i];
+                float originX = runCursor - scaledAdvances[i];
+                createMeshForChar(ci, originX, cursorY);
+                runCursor = originX; // 光标左移
+            }
+
+            // 更新全局光标到 run 的右边界，供后续 run 使用
+            cursorX = runRight;
+        }
+        else // LTR run
+        {
+            // 从左向右放置字符
+            for (uint32_t i = start; i < start + length; ++i)
+            {
+                const auto &ci = charInfos[i];
+                createMeshForChar(ci, cursorX, cursorY);
+                cursorX += static_cast<float>(ci.glyph.advance()) * fontSize;
+            }
+        }
     }
+    // objects 已填充完毕，后续代码保持不变
 
-    // diff: [texture] end
-    // diff: [test_msdf_atlas_gen] start
+    // diff: [test_bidi2] end
+#else
+    // diff: [test_harfbuzz] start
+    // 步骤1 的输出：双向分析结果
+    struct BidiResult
+    {
+        std::u32string text;           // 原始文本
+        std::vector<SBLevel> levels;   // 每个字符的嵌入层级
+        std::vector<SBRun> visualRuns; // 视觉顺序的 run（用于重排）
+        // 可选：保存 SBLineRef 等，但为简化，这里只保存 runs
+    };
 
+    // 步骤2 的输出：逻辑顺序的字形
+    struct ShapedGlyph
+    {
+        uint32_t glyphIndex;
+        const font::FontAtlas *fontAtlas;
+        double advance; // 像素单位（已除以64）
+        double offsetX;
+        double offsetY;
+        size_t charIndex;                      // 对应字符在 text 中的索引
+        font::glyph_info::Bounds uv_bounds;    // 归一化 UV
+        font::glyph_info::Bounds plane_bounds; // 平面坐标边界
+    };
+    using LogicalGlyphs = std::vector<ShapedGlyph>;
+
+    // 步骤3 的输出：视觉顺序的字形（只需指针，避免拷贝）
+    using VisualGlyphs = std::vector<const ShapedGlyph *>;
+
+    // 步骤4 的输出：最终生成的网格对象
+    using RenderMeshes = std::vector<mesh_base>;
+
+    // 步骤1：双向分析
+    auto bidi_analyze = [](const std::u32string &text) -> BidiResult {
+        SBCodepointSequence seq{SBStringEncodingUTF32, (void *)text.data(), text.size()};
+        SBAlgorithmRef algo = SBAlgorithmCreate(&seq);
+        SBParagraphRef para =
+            SBAlgorithmCreateParagraph(algo, 0, INT32_MAX, SBLevelDefaultLTR);
+        SBUInteger len = SBParagraphGetLength(para);
+
+        // 保存每个字符的嵌入层级
+        const SBLevel *levelsPtr = SBParagraphGetLevelsPtr(para);
+        std::vector<SBLevel> levels(levelsPtr, levelsPtr + len);
+
+        // 创建一行（整段作为一行）
+        SBLineRef line = SBParagraphCreateLine(para, 0, len);
+        SBUInteger runCount = SBLineGetRunCount(line);
+        const SBRun *runsPtr = SBLineGetRunsPtr(line);
+        std::vector<SBRun> visualRuns(runsPtr, runsPtr + runCount);
+
+        // 释放 SheenBidi 对象（注意：line 需要稍后释放，但 runs 数据已经拷贝）
+        SBLineRelease(line);
+        SBParagraphRelease(para);
+        SBAlgorithmRelease(algo);
+
+        return {std::move(text), std::move(levels), std::move(visualRuns)};
+    };
+    // 步骤2：HarfBuzz 整形（逻辑顺序）
+    auto shape_with_harfbuzz = [](const BidiResult &bidi,
+                                  const font::FontLibrary &fontLib) -> LogicalGlyphs {
+        LogicalGlyphs glyphs;
+        const auto &text = bidi.text;
+        const auto &levels = bidi.levels;
+        const size_t n = text.size();
+
+        // ----- 1. 预计算每个字符的默认字形信息（用于分组和回退）-----
+        std::vector<font::glyph_info> charDefaultInfo;
+        charDefaultInfo.reserve(n);
+        for (size_t i = 0; i < n; ++i)
+        {
+            try
+            {
+                charDefaultInfo.push_back(fontLib.getGlyph(text[i]));
+            }
+            catch (std::exception &e)
+            {
+                std::println(">>> Failed for U+{:X}", static_cast<uint32_t>(text[i]));
+            }
+        }
+
+        // ----- 2. 分组：生成逻辑运行（run）区间 -----
+        struct Run
+        {
+            size_t start;
+            size_t end;
+            const font::FontAtlas *font;
+            bool isRTL;
+        };
+        std::vector<Run> runs;
+
+        size_t i = 0;
+        while (i < n)
+        {
+            const auto *currentFont = charDefaultInfo[i].font_ctx;
+            if (!currentFont)
+            {
+                ++i;
+                continue;
+            }
+            bool isRTL = (levels[i] % 2) == 1;
+            size_t j = i + 1;
+            while (j < n && charDefaultInfo[j].font_ctx == currentFont &&
+                   (levels[j] % 2) == isRTL)
+            {
+                ++j;
+            }
+            runs.push_back({i, j, currentFont, isRTL});
+            i = j;
+        }
+
+        // ----- 3. 对每个 run 进行 HarfBuzz 整形 -----
+        for (const auto &run : runs)
+        {
+            hb_buffer_t *buf = hb_buffer_create();
+            hb_buffer_add_utf32(
+                buf, reinterpret_cast<const uint32_t *>(text.data()) + run.start,
+                static_cast<int>(run.end - run.start), 0,
+                static_cast<int>(run.end - run.start));
+            hb_buffer_guess_segment_properties(buf);
+            hb_buffer_set_direction(buf, run.isRTL ? HB_DIRECTION_RTL : HB_DIRECTION_LTR);
+
+            hb_shape(*run.font->hb_font, buf, nullptr, 0);
+
+            unsigned count;
+            hb_glyph_info_t *info = hb_buffer_get_glyph_infos(buf, &count);
+            hb_glyph_position_t *pos = hb_buffer_get_glyph_positions(buf, &count);
+
+            double emSize = run.font->font.atlas.size; // 单位转换因子
+
+            for (unsigned k = 0; k < count; ++k)
+            {
+                size_t charIdx = run.start + info[k].cluster; // 原始字符索引
+
+                // 尝试通过字形索引查找对应的元数据（来自图集）
+                auto it = run.font->glyph_index_to_info.find(info[k].codepoint);
+                if (it == run.font->glyph_index_to_info.end())
+                {
+                    // 找不到该字形，回退到字符的默认字形，并使用默认字形的 advance
+                    std::cerr << "Warning: glyph index " << info[k].codepoint
+                              << " not found in font atlas, using default glyph for "
+                                 "character U+"
+                              << std::hex << (uint32_t)text[charIdx] << std::dec
+                              << std::endl;
+                    const auto &fallback = charDefaultInfo[charIdx];
+                    glyphs.push_back(
+                        {.glyphIndex = info[k].codepoint,
+                         .fontAtlas = run.font,
+                         .advance = fallback.advance(), // 直接使用 JSON 中的
+                                                        // advance（已经是 em 单位）
+                         .offsetX = static_cast<double>(pos[k].x_offset) / 64.0 / emSize,
+                         .offsetY = static_cast<double>(pos[k].y_offset) / 64.0 / emSize,
+                         .charIndex = charIdx,
+                         .uv_bounds = fallback.uv_bounds,
+                         .plane_bounds = fallback.plane_bounds()});
+                }
+                else
+                {
+                    const auto *raw_glyph = it->second;
+                    // 计算归一化 UV（复用 getGlyph 逻辑）
+                    font::glyph_info::Bounds uv_bounds;
+                    if (raw_glyph->atlasBounds.has_value())
+                    {
+                        const auto &ab = raw_glyph->atlasBounds.value();
+                        double atlas_w = run.font->font.atlas.width;
+                        double atlas_h = run.font->font.atlas.height;
+                        if (run.font->font.atlas.yOrigin == "bottom")
+                        {
+                            uv_bounds.left = ab.left / atlas_w;
+                            uv_bounds.bottom = (atlas_h - ab.bottom) / atlas_h;
+                            uv_bounds.right = ab.right / atlas_w;
+                            uv_bounds.top = (atlas_h - ab.top) / atlas_h;
+                        }
+                        else
+                        {
+                            uv_bounds.left = ab.left / atlas_w;
+                            uv_bounds.bottom = ab.bottom / atlas_h;
+                            uv_bounds.right = ab.right / atlas_w;
+                            uv_bounds.top = ab.top / atlas_h;
+                        }
+                    }
+                    else
+                    {
+                        uv_bounds = {0, 0, 0, 0};
+                    }
+                    auto plane_bounds =
+                        raw_glyph->planeBounds.value_or(font::Font::Bounds{0, 0, 0, 0});
+
+                    glyphs.push_back(
+                        {.glyphIndex = info[k].codepoint,
+                         .fontAtlas = run.font,
+                         .advance = static_cast<double>(pos[k].x_advance) / 64.0 / emSize,
+                         .offsetX = static_cast<double>(pos[k].x_offset) / 64.0 / emSize,
+                         .offsetY = static_cast<double>(pos[k].y_offset) / 64.0 / emSize,
+                         .charIndex = charIdx,
+                         .uv_bounds = uv_bounds,
+                         .plane_bounds = plane_bounds});
+                }
+            }
+
+            hb_buffer_destroy(buf);
+        }
+
+        return glyphs;
+    };
+    // 步骤3：视觉重排
+    auto reorder_visually = [](const BidiResult &bidi,
+                               const LogicalGlyphs &logicalGlyphs) -> VisualGlyphs {
+        // 构建字符到字形列表的映射
+        std::unordered_map<size_t, std::vector<const ShapedGlyph *>> charToGlyphs;
+        for (const auto &g : logicalGlyphs)
+        {
+            charToGlyphs[g.charIndex].push_back(&g);
+        }
+
+        VisualGlyphs visual;
+        for (const auto &run : bidi.visualRuns)
+        {
+            bool isRTL = (run.level % 2) == 1;
+            std::vector<const ShapedGlyph *> runGlyphs;
+            for (size_t ch = run.offset; ch < run.offset + run.length; ++ch)
+            {
+                auto it = charToGlyphs.find(ch);
+                if (it != charToGlyphs.end())
+                {
+                    for (const auto *g : it->second)
+                    {
+                        runGlyphs.push_back(g);
+                    }
+                }
+            }
+            if (isRTL)
+            {
+                std::reverse(runGlyphs.begin(), runGlyphs.end());
+            }
+            visual.insert(visual.end(), runGlyphs.begin(), runGlyphs.end());
+        }
+        return visual;
+    };
+
+    // 步骤4：生成网格
+    auto generate_meshes = [&](const VisualGlyphs &visual, VmaAllocator allocator,
+                               const CommandPool &pool, const Queue &queue,
+                               float fontSize) -> RenderMeshes {
+        RenderMeshes objects;
+        float cursorX = 0.0f, cursorY = 0.0f;
+
+        for (const auto *g : visual)
+        {
+            // 直接从 g 获取 plane 和 UV 边界
+            const auto &plane = g->plane_bounds;
+            const auto &uv = g->uv_bounds;
+
+            // 计算四边形顶点
+            std::vector<Vertex> vertices(4);
+            std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+
+            float left = cursorX + static_cast<float>(g->offsetX * fontSize) +
+                         static_cast<float>(plane.left) * fontSize;
+            float bottom = cursorY + static_cast<float>(g->offsetY * fontSize) +
+                           static_cast<float>(plane.bottom) * fontSize;
+            float right = cursorX + static_cast<float>(g->offsetX * fontSize) +
+                          static_cast<float>(plane.right) * fontSize;
+            float top = cursorY + static_cast<float>(g->offsetY * fontSize) +
+                        static_cast<float>(plane.top) * fontSize;
+
+            glm::vec2 uv_lb(static_cast<float>(uv.left), static_cast<float>(uv.bottom));
+            glm::vec2 uv_rb(static_cast<float>(uv.right), static_cast<float>(uv.bottom));
+            glm::vec2 uv_rt(static_cast<float>(uv.right), static_cast<float>(uv.top));
+            glm::vec2 uv_lt(static_cast<float>(uv.left), static_cast<float>(uv.top));
+
+            // 填充顶点数据（保持与原有 Vertex 结构一致）
+            vertices[0] = {
+                {left, bottom, 0},
+                {1, 0, 0},
+                uv_lb,
+                g->fontAtlas->texture_index,
+                g->fontAtlas->sampler_index,
+                static_cast<uint32_t>(g->fontAtlas->type),
+                static_cast<float>(g->fontAtlas->font.atlas.distanceRange.value_or(0)),
+                0};
+            vertices[1] = {
+                {right, bottom, 0},
+                {0, 1, 0},
+                uv_rb,
+                g->fontAtlas->texture_index,
+                g->fontAtlas->sampler_index,
+                static_cast<uint32_t>(g->fontAtlas->type),
+                static_cast<float>(g->fontAtlas->font.atlas.distanceRange.value_or(0)),
+                0};
+            vertices[2] = {
+                {right, top, 0},
+                {0, 0, 1},
+                uv_rt,
+                g->fontAtlas->texture_index,
+                g->fontAtlas->sampler_index,
+                static_cast<uint32_t>(g->fontAtlas->type),
+                static_cast<float>(g->fontAtlas->font.atlas.distanceRange.value_or(0)),
+                0};
+            vertices[3] = {
+                {left, top, 0},
+                {1, 0, 0},
+                uv_lt,
+                g->fontAtlas->texture_index,
+                g->fontAtlas->sampler_index,
+                static_cast<uint32_t>(g->fontAtlas->type),
+                static_cast<float>(g->fontAtlas->font.atlas.distanceRange.value_or(0)),
+                0};
+
+            objects.emplace_back(
+                allocator, pool, queue,
+                mesh_base::mesh_data{std::move(vertices), std::move(indices)});
+
+            cursorX += static_cast<float>(g->advance * fontSize);
+            cursorX += 0.06; // diff: [test_harfbuzz] 能解决闪烁
+        }
+        return objects;
+    };
+
+    // NOTE: 生成结果
+    // RenderMeshes objects;
+    BidiResult bidi = bidi_analyze(text);
+    LogicalGlyphs logical = shape_with_harfbuzz(bidi, font_lib);
+    VisualGlyphs visual = reorder_visually(bidi, logical);
+    RenderMeshes objects =
+        generate_meshes(visual, allocator, commandPool, GRAPHICS_AND_PRESENT, 0.2f);
+
+    // diff: [test_harfbuzz] end
+#endif
+
+    std::println("objects.size()==text.size(): {}", objects.size() == text.size());
     // createDescriptorSets
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
     {
@@ -1502,27 +2252,29 @@ try
                          currentTime - startTime)
                          .count();
 
-        UniformBufferObject ubo{};
+        // 旋转持续时间（秒），可改为任意需要的值
+        const float rotationDuration = 10000.0F;
 
+        // 计算受限后的旋转角度：在 duration 秒内线性增加到最大值，之后保持不变
+        float angle = std::min(time, rotationDuration) * glm::radians(90.0f);
+
+        UniformBufferObject ubo{};
         auto swapChainExtent = swapchain.imageExtent();
 
-        // 模型矩阵：随时间旋转
-        ubo.model = glm::rotate(glm::mat4(1.0F), time * glm::radians(90.0F),
-                                glm::vec3(0.0F, 0.0F, 1.0F));
+        // 模型矩阵：角度随时间增加，到达 rotationDuration 后固定
+        ubo.model = glm::rotate(glm::mat4(1.0F), angle, glm::vec3(0.0F, 0.0F, 1.0F));
 
-        // 视图矩阵：从上方看
+        // 视图矩阵：固定视角
         ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0F, 0.0F, 0.0F),
                                glm::vec3(0.0F, 0.0F, 1.0F));
 
-        // 投影矩阵：透视投影
+        // 投影矩阵
         ubo.proj = glm::perspective(glm::radians(45.0f),
                                     swapChainExtent.width / (float)swapChainExtent.height,
                                     0.1f, 10.0F);
+        ubo.proj[1][1] *= -1; // 翻转Y轴（Vulkan坐标系）
 
-        // Vulkan的Y轴是向下的，需要翻转Y轴
-        ubo.proj[1][1] *= -1;
-
-        // 复制数据到Uniform Buffer
+        // 复制到uniform buffer
         memcpy(uniformBuffersMapped[currentFrame], &ubo, sizeof(ubo));
     };
 
@@ -1652,15 +2404,20 @@ try
                      .alphaToOneEnable = VK_FALSE,
                  }, // diff: [msaa] end
                     // diff: [depth] start 添加深度测试和模板测试状态
-                 .depthStencilState = {.depthTestEnable = VK_TRUE,
-                                       .depthWriteEnable = VK_TRUE,
-                                       .depthCompareOp = VK_COMPARE_OP_LESS,
-                                       .depthBoundsTestEnable = VK_FALSE,
-                                       .stencilTestEnable = VK_FALSE,
-                                       .front = {},
-                                       .back = {},
-                                       .minDepthBounds = 0.0F,
-                                       .maxDepthBounds = 1.0F}, // diff: [depth] end
+                 .depthStencilState =
+                     {// diff: [test_harfbuzz] start 连字引入了 BUG. 连字有闪烁
+                      .depthTestEnable = VK_TRUE,
+                      .depthWriteEnable = VK_TRUE,
+                      //   .depthTestEnable = VK_FALSE, // NOTE: 临时关闭 解决
+                      //   .depthWriteEnable = VK_FALSE,
+                      // diff: [test_harfbuzz] end 连字引入了 BUG. 连字有闪烁
+                      .depthCompareOp = VK_COMPARE_OP_LESS,
+                      .depthBoundsTestEnable = VK_FALSE,
+                      .stencilTestEnable = VK_FALSE,
+                      .front = {},
+                      .back = {},
+                      .minDepthBounds = 0.0F,
+                      .maxDepthBounds = 1.0F}, // diff: [depth] end
                  .colorBlendState =
                      {.logicOpEnable = VK_FALSE,
                       .logicOp = VkLogicOp::VK_LOGIC_OP_COPY,
