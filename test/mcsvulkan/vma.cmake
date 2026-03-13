@@ -82,5 +82,10 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_harfbuzz test_emoji.vert test_emoji.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
+add_std_glsl_target(test_harfbuzz2 test_emoji.vert test_emoji.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+add_std_glsl_target(test_harfbuzz3 test_emoji.vert test_emoji.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
 # end
 std_glsl_env_destroy()
