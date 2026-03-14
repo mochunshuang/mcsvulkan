@@ -56,4 +56,8 @@ set(MSDF_ATLAS_DYNAMIC_RUNTIME ON CACHE BOOL "Link dynamic runtime library inste
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Generate dynamic library files instead of static" FORCE)
 
 # 2. add_subdirectory
-add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/msdf-atlas-gen)
+# add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/msdf-atlas-gen)
+add_subdirectory(
+    ${CMAKE_CURRENT_LIST_DIR}/msdf-atlas-gen
+    ${CMAKE_CURRENT_BINARY_DIR}/msdf-atlas-gen
+)

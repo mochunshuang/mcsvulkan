@@ -24,5 +24,9 @@
 # NOTE: 查看项目的所有子模块
 # git submodule status
 
-add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/harfbuzz)
+# add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/harfbuzz)
+add_subdirectory(
+    ${CMAKE_CURRENT_LIST_DIR}/harfbuzz
+    ${CMAKE_CURRENT_BINARY_DIR}/harfbuzz
+)
 set(HARFBUZZ_SOURCE_DIR ${CMAKE_SOURCE_DIR}/third_party/harfbuzz CACHE STRING "HARFBUZZ SOURCE DIR" FORCE)

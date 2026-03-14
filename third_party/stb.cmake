@@ -10,7 +10,7 @@
 
 # define STB_IMAGE_IMPLEMENTATION
 # include "stb_image.h"
-set(STB_DIR "${CMAKE_SOURCE_DIR}/third_party/stb")
+set(STB_DIR "${CMAKE_CURRENT_LIST_DIR}/stb")
 
 add_library(stb STATIC "${STB_DIR}/stb_image.h")
 target_include_directories(stb SYSTEM PUBLIC "${STB_DIR}")

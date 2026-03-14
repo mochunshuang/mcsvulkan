@@ -20,4 +20,8 @@
 # git add third_party/rectpack2D
 
 # git commit -m "Pin rectpack2D"
-add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/rectpack2D)
+# add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/rectpack2D)
+add_subdirectory(
+    ${CMAKE_CURRENT_LIST_DIR}/rectpack2D
+    ${CMAKE_CURRENT_BINARY_DIR}/rectpack2D
+)

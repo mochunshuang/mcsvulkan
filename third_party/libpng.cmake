@@ -31,5 +31,9 @@ set(PSKIP_INSTALL_ALLS ON CACHE BOOL "" FORCE)
 set(SKIP_INSTALL_EXPORT ON CACHE BOOL "" FORCE)
 set(SKIP_INSTALL_CONFIG_FILE ON CACHE BOOL "" FORCE)
 
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/third_party/libpng)
+# add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/third_party/libpng)
+add_subdirectory(
+    ${CMAKE_CURRENT_LIST_DIR}/libpng
+    ${CMAKE_CURRENT_BINARY_DIR}/libpng
+)
 add_library(PNG::PNG ALIAS png_static)

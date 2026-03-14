@@ -38,4 +38,9 @@ set(CMAKE_DISABLE_FIND_PACKAGE_ZLIB ON)
 set(CMAKE_DISABLE_FIND_PACKAGE_PNG ON)
 set(CMAKE_DISABLE_FIND_PACKAGE_BZip2 ON)
 set(CMAKE_DISABLE_FIND_PACKAGE_HarfBuzz ON) # 不让 FreeType 在构建时链接 HarfBuzz
-add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/freetype)
+
+# add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/freetype)
+add_subdirectory(
+    ${CMAKE_CURRENT_LIST_DIR}/freetype
+    ${CMAKE_CURRENT_BINARY_DIR}/freetype
+)

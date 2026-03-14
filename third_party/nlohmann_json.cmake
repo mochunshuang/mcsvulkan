@@ -22,7 +22,7 @@
 # PS E:\0_github_project\mcsvulkan> git submodule status
 # +55f93686c01528224f448c19128836e7df245f72 third_party/nlohmann_json (v3.12.0)
 
-set(NLOHMANN_JSON_DIR "${CMAKE_SOURCE_DIR}/third_party/nlohmann_json/include")
+set(NLOHMANN_JSON_DIR "${CMAKE_CURRENT_LIST_DIR}/nlohmann_json/include")
 add_library(nlohmann_json INTERFACE)
 target_compile_features(nlohmann_json INTERFACE cxx_std_23)
 target_include_directories(nlohmann_json SYSTEM INTERFACE "${NLOHMANN_JSON_DIR}")

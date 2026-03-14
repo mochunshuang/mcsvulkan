@@ -35,4 +35,9 @@ set(MSDFGEN_DYNAMIC_RUNTIME ON CACHE BOOL "" FORCE) # 关闭静态运行时
 
 # Freetype::Freetype. msdfgen只认识这个
 add_library(Freetype::Freetype ALIAS freetype)
-add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/msdfgen)
+
+# add_subdirectory(${CMAKE_SOURCE_DIR}/third_party/msdfgen)
+add_subdirectory(
+    ${CMAKE_CURRENT_LIST_DIR}/msdfgen
+    ${CMAKE_CURRENT_BINARY_DIR}/msdfgen
+)

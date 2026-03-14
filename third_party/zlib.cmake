@@ -28,8 +28,15 @@ set(ZLIB_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(ZLIB_BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(ZLIB_INSTALL OFF CACHE BOOL "" FORCE) # 不安装
 
+# NOTE: 跨项目。错误发生在 ExternalProject_Add
+set(ZLIB_BUILD_TESTING OFF CACHE BOOL "" FORCE) # 新增：禁用测试
+
 # 2. 添加 zlib 子目录
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/third_party/zlib)
+# add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/third_party/zlib)
+add_subdirectory(
+    ${CMAKE_CURRENT_LIST_DIR}/zlib
+    ${CMAKE_CURRENT_BINARY_DIR}/zlib
+)
 
 add_library(ZLIB::ZLIB ALIAS zlibstatic)
 
@@ -37,7 +44,7 @@ add_library(ZLIB::ZLIB ALIAS zlibstatic)
 # 手动设置 find_package(ZLIB) 所需的所有变量，模拟查找成功
 # 这些变量是 CMake 内置的 ZLIB 查找模块会检查的核心变量
 set(ZLIB_FOUND TRUE) # 标记找到 ZLIB
-set(ZLIB_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/zlib) # zlib 头文件目录
+set(ZLIB_INCLUDE_DIRS ${CMAKE_CURRENT_LIST_DIR}/zlib) # zlib 头文件目录
 set(ZLIB_LIBRARIES ZLIB::ZLIB) # zlib 库目标
 
 set(ZLIB_VERSION_MAJOR 1)
