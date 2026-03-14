@@ -1,323 +1,441 @@
-set(DIR_NAME tool)
-set(EXE_DIR ${CMAKE_SOURCE_DIR}/test/tool)
+# 收集要传递的工具链变量（使用 CMake 当前缓存的值）
+set(TOOLCHAIN_VARS
+    CMAKE_C_COMPILER
+    CMAKE_CXX_COMPILER
+    CMAKE_TOOLCHAIN_FILE
+    CMAKE_MAKE_PROGRAM
+    CMAKE_PREFIX_PATH
+)
 
-set(TOOL_EXE_DIR ${CMAKE_SOURCE_DIR}/tool CACHE STRING "TOOL EXE DIR" FORCE)
+# 构建参数字符串
+set(EXTERNAL_CMAKE_ARGS "")
 
-set(OUTPUT_DIRECTORY ${TOOL_EXE_DIR})
+foreach(VAR ${TOOLCHAIN_VARS})
+    if(DEFINED ${VAR})
+        # 将变量值加入参数，处理路径中的空格
+        list(APPEND EXTERNAL_CMAKE_ARGS "-D${VAR}:STRING=${${VAR}}")
+    endif()
+endforeach()
 
-macro(add_tool_target NAME)
-    set(TARGET_NAME "${DIR_NAME}-${NAME}")
-    add_executable(${TARGET_NAME} "${EXE_DIR}/${NAME}.cpp")
-    target_link_libraries(${TARGET_NAME} PRIVATE ${LIBS})
-    set_target_properties(${TARGET_NAME} PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY ${OUTPUT_DIRECTORY}
-        OUTPUT_NAME ${NAME}
-    )
-endmacro()
+# 工具输出路径（与工具项目中的 OUTPUT_DIRECTORY 保持一致）
+set(TOOL_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/tool")
+set(HB_SUBSET_TOOL_NAME hb_subset_tool)
+set(HB_SUBSET_TOOL_EXE "${TOOL_OUTPUT_DIR}/${HB_SUBSET_TOOL_NAME}${CMAKE_EXECUTABLE_SUFFIX}")
 
-set(LIBS freetype harfbuzz harfbuzz-subset)
-add_tool_target(hb_subset_tool)
-set(EXE_NAME "hb_subset_tool")
-set(HB_SUBSET_TOOL_EXE "${TOOL_EXE_DIR}/${EXE_NAME}${CMAKE_EXECUTABLE_SUFFIX}" CACHE STRING "HB_SUBSET_TOOL_EXE NAME" FORCE)
-message(STATUS "HB_SUBSET_TOOL_EXE: ${HB_SUBSET_TOOL_EXE}")
+set(EMOJI_ATLAS_NAME gen_emoji_atlas)
+set(EMOJI_ATLAS_EXE "${TOOL_OUTPUT_DIR}/${EMOJI_ATLAS_NAME}${CMAKE_EXECUTABLE_SUFFIX}")
+
+set(MSDF_ATLAS_NAME msdf-atlas-gen)
+set(MSDF_ATLAS_EXE "${TOOL_OUTPUT_DIR}/${MSDF_ATLAS_NAME}${CMAKE_EXECUTABLE_SUFFIX}")
+
+list(APPEND EXTERNAL_CMAKE_ARGS "-DHB_SUBSET_TOOL_NAME=${HB_SUBSET_TOOL_NAME}")
+list(APPEND EXTERNAL_CMAKE_ARGS "-DEMOJI_ATLAS_NAME=${EMOJI_ATLAS_NAME}")
+list(APPEND EXTERNAL_CMAKE_ARGS "-DMSDF_ATLAS_NAME=${MSDF_ATLAS_NAME}")
+
+include(ExternalProject)
+ExternalProject_Add(my_tool_external
+    SOURCE_DIR ${CMAKE_SOURCE_DIR}/test/tool
+    BINARY_DIR ${CMAKE_SOURCE_DIR}/test/tool/build
+    CMAKE_ARGS
+    ${EXTERNAL_CMAKE_ARGS}
+    INSTALL_COMMAND ""
+    BUILD_ALWAYS YES
+    BUILD_BYPRODUCTS # 声明构建产物
+    ${HB_SUBSET_TOOL_EXE}
+    ${EMOJI_ATLAS_EXE}
+    ${MSDF_ATLAS_EXE}
+)
+
+# # 现在可以在自定义命令或自定义目标中依赖这些文件
+# add_custom_command(
+# OUTPUT some_output
+# COMMAND ${HB_SUBSET_TOOL_EXE} ... # 使用工具
+# DEPENDS ${HB_SUBSET_TOOL_EXE} # 依赖该文件，CMake 会自动触发 my_tool_external 的构建
+# # ... 其他参数
+# )
+# # 或创建一个聚合目标
+# add_custom_target(use_tools ALL
+# DEPENDS ${HB_SUBSET_TOOL_EXE} ${EMOJI_ATLAS_EXE} ${MSDF_ATLAS_EXE}
+# )
+# # 无需显式 add_dependencies，因为 DEPENDS 已包含文件，CMake 会自动处理
 
 # gen msdf config
-set(MSDF_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/msdf" CACHE STRING "MSDF_ATLAS_GEN_EXE NAME" FORCE)
-set(FONT_INPUT_DIR "${CMAKE_SOURCE_DIR}/assets/font" CACHE STRING "MSDF_ATLAS_GEN_EXE NAME" FORCE)
-set(CHASET_INPUT_DIR "${CMAKE_SOURCE_DIR}/assets/charset" CACHE STRING "MSDF_ATLAS_GEN_EXE NAME" FORCE)
+set(MSDF_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/msdf" CACHE STRING "MSDF_OUTPUT_DIR NAME" FORCE)
+set(FONT_INPUT_DIR "${CMAKE_SOURCE_DIR}/assets/font" CACHE STRING "FONT_INPUT_DIR NAME" FORCE)
+set(CHASET_INPUT_DIR "${CMAKE_SOURCE_DIR}/assets/charset" CACHE STRING "CHASET_INPUT_DIR NAME" FORCE)
+add_custom_command(
+    OUTPUT ${MSDF_OUTPUT_DIR}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${MSDF_OUTPUT_DIR}
+)
 
 function(ADD_MSDF_DEF TARGET_NAME)
     target_compile_definitions(${TARGET_NAME} PRIVATE MSDF_OUTPUT_DIR="${MSDF_OUTPUT_DIR}" FONT_INPUT_DIR="${FONT_INPUT_DIR}" CHASET_INPUT_DIR="${CHASET_INPUT_DIR}")
 endfunction()
 
-if(TARGET msdf-atlas-gen-standalone)
-    message(STATUS "gen target: msdf-atlas-gen-standalone")
-    set(EXE_NAME "msdf-atlas-gen")
-    set(MSDF_ATLAS_GEN_OUTPUT_DIR "${TOOL_EXE_DIR}")
+function(add_msdf_atlas_target TARGET_NAME)
+    # 解析命名参数
+    set(prefix ARG)
+    set(noValues "")
+    set(singleValues FONT_PATH OUTPUT_NAME TYPE SIZE PX_RANGE CHARSET CHARS FORMAT OUTPUT_DIR)
+    set(multiValues EXTRA_ARGS)
+    cmake_parse_arguments(${prefix} "${noValues}" "${singleValues}" "${multiValues}" ${ARGN})
 
-    message(STATUS "${EXE_NAME} out dir: ${MSDF_ATLAS_GEN_OUTPUT_DIR}")
-    add_custom_command(
-        OUTPUT ${MSDF_ATLAS_GEN_OUTPUT_DIR}
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${MSDF_ATLAS_GEN_OUTPUT_DIR}
-    )
-    set_target_properties(msdf-atlas-gen-standalone PROPERTIES
-        RUNTIME_OUTPUT_DIRECTORY ${MSDF_ATLAS_GEN_OUTPUT_DIR}
-        OUTPUT_NAME ${EXE_NAME}
-    )
-
-    add_custom_command(
-        OUTPUT ${MSDF_OUTPUT_DIR}
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${MSDF_OUTPUT_DIR}
-    )
-
-    # 获取可执行文件的完整路径（生成器表达式）
-    # set(MSDF_ATLAS_GEN_EXE $<TARGET_FILE:msdf-atlas-gen-standalone>) # 得不到的
-    set(MSDF_ATLAS_GEN_EXE "${MSDF_ATLAS_GEN_OUTPUT_DIR}/${EXE_NAME}${CMAKE_EXECUTABLE_SUFFIX}" CACHE STRING "MSDF_ATLAS_GEN_EXE NAME" FORCE)
-    message(STATUS "MSDF_ATLAS_GEN_EXE: ${MSDF_ATLAS_GEN_EXE}")
-
-    # 定义模板函数，用于生成不同字体的图集
-    function(generate_msdf_atlas)
-        set(oneValueArgs TARGET_NAME FONT_PATH OUTPUT_NAME TYPE SIZE PX_RANGE CHARSET OUTPUT_DIR)
-        cmake_parse_arguments(GEN "" "${oneValueArgs}" "" ${ARGN})
-
-        # 设置默认值
-        if(NOT GEN_FONT_PATH)
-            message(FATAL_ERROR "generate_msdf_atlas: FONT_PATH is required")
-        endif()
-
-        if(NOT GEN_OUTPUT_NAME)
-            message(FATAL_ERROR "generate_msdf_atlas: OUTPUT_NAME is required")
-        endif()
-
-        if(NOT GEN_OUTPUT_DIR)
-            set(GEN_OUTPUT_DIR "${MSDF_OUTPUT_DIR}")
-        endif()
-
-        if(NOT GEN_TYPE)
-            set(GEN_TYPE "msdf")
-        endif()
-
-        if(NOT GEN_SIZE)
-            set(GEN_SIZE "32")
-        endif()
-
-        if(NOT GEN_PX_RANGE)
-            set(GEN_PX_RANGE "8")
-        endif()
-
-        # 定义输出文件
-        set(ATLAS_PNG "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}.png")
-        set(ATLAS_JSON "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}.json")
-        get_filename_component(FONT_EXT "${GEN_FONT_PATH}" LAST_EXT)
-        set(FONT_FILE "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}${FONT_EXT}")
-
-        # 判断是否需要裁剪：仅当 CHARSET 是存在的文件时
-        set(SHOULD_SUBSET FALSE)
-
-        if(GEN_CHARSET AND EXISTS "${GEN_CHARSET}")
-            set(SHOULD_SUBSET TRUE)
-        endif()
-
-        if(SHOULD_SUBSET)
-            # 第一步：裁剪字体
-            add_custom_command(
-                OUTPUT ${FONT_FILE}
-                COMMAND ${HB_SUBSET_TOOL_EXE} "${GEN_FONT_PATH}" "${FONT_FILE}" "${GEN_CHARSET}"
-                DEPENDS ${HB_SUBSET_TOOL_EXE} "${GEN_FONT_PATH}" "${GEN_CHARSET}"
-                COMMENT "Subsetting font to ${FONT_FILE}"
-            )
-            set(FONT_DEP ${FONT_FILE})
-        else()
-            # 不裁剪，直接复制原字体
-            add_custom_command(
-                OUTPUT ${FONT_FILE}
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${GEN_FONT_PATH}" "${FONT_FILE}"
-                DEPENDS "${GEN_FONT_PATH}"
-                COMMENT "Copying font to ${FONT_FILE}"
-            )
-            set(FONT_DEP ${FONT_FILE})
-        endif()
-
-        # 构建 msdf-atlas-gen 命令参数
-        set(CMD_ARGS
-            ${MSDF_ATLAS_GEN_EXE}
-            -font "${FONT_FILE}" # 使用最终的字体文件
-            -type ${GEN_TYPE}
-            -size ${GEN_SIZE}
-            -pxrange ${GEN_PX_RANGE}
-            -imageout ${ATLAS_PNG}
-            -json ${ATLAS_JSON}
-        )
-
-        # 处理字符集参数（原样传递给 msdf-atlas-gen）
-        if(GEN_CHARSET)
-            if(EXISTS "${GEN_CHARSET}")
-                list(APPEND CMD_ARGS -charset "${GEN_CHARSET}")
-            elseif(NOT GEN_CHARSET STREQUAL "ascii")
-                list(APPEND CMD_ARGS -chars "\"${GEN_CHARSET}\"")
-            endif()
-        endif()
-
-        add_custom_command(
-            OUTPUT ${ATLAS_PNG} ${ATLAS_JSON}
-            COMMAND ${CMAKE_COMMAND} -E make_directory ${GEN_OUTPUT_DIR}
-            COMMAND ${CMD_ARGS}
-            DEPENDS ${MSDF_ATLAS_GEN_EXE} ${FONT_DEP} ${GEN_CHARSET}
-            COMMENT "Generating MSDF atlas for ${GEN_OUTPUT_NAME}"
-        )
-
-        if(GEN_TARGET_NAME)
-            add_custom_target(${GEN_TARGET_NAME} DEPENDS ${ATLAS_PNG} ${ATLAS_JSON} ${FONT_FILE})
-        endif()
-    endfunction()
-
-    # 使用示例 1：英文（默认 ASCII）
-    generate_msdf_atlas(
-        TARGET_NAME generate_english_atlas
-        FONT_PATH "${FONT_INPUT_DIR}/TiroBangla-Regular.ttf"
-        OUTPUT_NAME "tirobangla_ascii"
-        PX_RANGE 2 # 用官方默认值
-
-        # CHARSET 不传或传 "ascii" 都不添加参数，使用默认 ASCII
-    )
-
-    if(WIN32)
-        # # 使用示例 2：中文（假设有中文字体 simhei.ttf 和常用汉字列表 chinese_common.txt）
-        generate_msdf_atlas(
-            TARGET_NAME generate_chinese_atlas
-            FONT_PATH "C:/Windows/Fonts/msyh.ttc" # 中文字体
-            OUTPUT_NAME "msyh_chinese"
-            PX_RANGE 2 # 必须用官方默认值，不要乱改
-            SIZE 96 # 建议提高精度
-            CHARSET "${CHASET_INPUT_DIR}/small_chinese_common.txt"
-        )
-
-        # # # 使用示例 3：表情符号（假设有表情字体 seguiemj.ttf 和表情列表 emoji.txt）
-        # generate_msdf_atlas(
-        # TARGET_NAME generate_emoji_atlas
-        # FONT_PATH "C:/Windows/Fonts/seguiemj.ttf"
-        # OUTPUT_NAME "emoji"
-        # PX_RANGE 2 # 必须用官方默认值，不要乱改
-        # SIZE 96 # 建议提高精度
-        # CHARSET "${CHASET_INPUT_DIR}/small_emoji.txt"
-        # )
-
-        # 使用示例 4：阿拉伯测试BIDI
-        generate_msdf_atlas(
-            TARGET_NAME generate_segoeui_atlas
-            FONT_PATH "C:/Windows/Fonts/segoeui.ttf" # 中文字体
-            OUTPUT_NAME "segoe_arabic"
-            PX_RANGE 2 # 默认值
-            SIZE 96 # 建议提高精度
-            CHARSET "${CHASET_INPUT_DIR}/arabic_charset.txt"
-        )
-    endif(WIN32)
-endif(TARGET msdf-atlas-gen-standalone)
-
-set(LIBS freetype nlohmann_json stb rectpack2D)
-add_tool_target(gen_emoji_atlas)
-
-set(EXE_NAME "gen_emoji_atlas")
-set(EMOJI_ATLAS_GEN_EXE "${TOOL_EXE_DIR}/${EXE_NAME}${CMAKE_EXECUTABLE_SUFFIX}" CACHE STRING "EMOJI_ATLAS_GEN_EXE NAME" FORCE)
-message(STATUS "EMOJI_ATLAS_GEN_EXE: ${EMOJI_ATLAS_GEN_EXE}")
-
-# 使用示例 3：表情符号 使用自定义生成
-# 设置 emoji 图集输出目录
-set(EMOJI_OUTPUT_DIR "${MSDF_OUTPUT_DIR}" CACHE STRING "Directory for emoji atlases")
-
-# 定义生成 emoji 图集的函数
-function(generate_emoji_atlas)
-    set(oneValueArgs TARGET_NAME FONT_PATH OUTPUT_NAME CHARSET SIZE PADDING MAX_SIZE OUTPUT_DIR)
-    cmake_parse_arguments(GEN "" "${oneValueArgs}" "" ${ARGN})
-
-    # 必需参数检查
-    if(NOT GEN_FONT_PATH)
-        message(FATAL_ERROR "generate_emoji_atlas: FONT_PATH is required")
+    # 检查必需参数
+    if(NOT ARG_FONT_PATH OR NOT ARG_OUTPUT_NAME)
+        message(FATAL_ERROR "add_msdf_atlas_target: FONT_PATH and OUTPUT_NAME are required")
     endif()
 
-    if(NOT GEN_OUTPUT_NAME)
-        message(FATAL_ERROR "generate_emoji_atlas: OUTPUT_NAME is required")
+    # 不能同时指定 CHARSET 和 CHARS
+    if(ARG_CHARSET AND ARG_CHARS)
+        message(FATAL_ERROR "add_msdf_atlas_target: Cannot specify both CHARSET and CHARS")
     endif()
 
     # 设置默认值
-    if(NOT GEN_OUTPUT_DIR)
-        set(GEN_OUTPUT_DIR "${EMOJI_OUTPUT_DIR}")
+    if(NOT ARG_OUTPUT_DIR)
+        set(ARG_OUTPUT_DIR "${MSDF_OUTPUT_DIR}")
     endif()
 
-    if(NOT GEN_SIZE)
-        set(GEN_SIZE "64")
+    if(NOT ARG_TYPE)
+        set(ARG_TYPE "msdf")
     endif()
 
-    if(NOT GEN_PADDING)
-        set(GEN_PADDING "1")
+    if(NOT ARG_SIZE)
+        set(ARG_SIZE "32")
     endif()
 
-    if(NOT GEN_MAX_SIZE)
-        set(GEN_MAX_SIZE "4096")
+    if(NOT ARG_PX_RANGE)
+        set(ARG_PX_RANGE "2")
     endif()
 
-    # 定义输出文件
-    set(ATLAS_PNG "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}.png")
-    set(ATLAS_JSON "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}.json")
-    get_filename_component(FONT_EXT "${GEN_FONT_PATH}" LAST_EXT)
-    set(FONT_FILE "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}${FONT_EXT}")
+    if(NOT ARG_FORMAT)
+        set(ARG_FORMAT "png")
+    endif()
 
-    # 判断是否需要裁剪：仅当提供了有效的字符集文件时
+    # 确保输出目录存在
+    add_custom_command(
+        OUTPUT ${ARG_OUTPUT_DIR}
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${ARG_OUTPUT_DIR}
+        COMMENT "Creating output directory ${ARG_OUTPUT_DIR}"
+    )
+
+    # ----- 图集生成命令 -----
+    set(PNG_FILE "${ARG_OUTPUT_DIR}/${ARG_OUTPUT_NAME}.${ARG_FORMAT}")
+    set(JSON_FILE "${ARG_OUTPUT_DIR}/${ARG_OUTPUT_NAME}.json")
+
+    set(ATLAS_CMD_ARGS
+        ${MSDF_ATLAS_EXE}
+        -font "${ARG_FONT_PATH}"
+        -type "${ARG_TYPE}"
+        -size "${ARG_SIZE}"
+        -pxrange "${ARG_PX_RANGE}"
+        -imageout "${PNG_FILE}"
+        -format "${ARG_FORMAT}"
+        -json "${JSON_FILE}"
+    )
+
+    # 添加字符集参数（优先使用 CHARS 内联）
+    if(ARG_CHARS)
+        list(APPEND ATLAS_CMD_ARGS -chars "${ARG_CHARS}")
+    elseif(ARG_CHARSET)
+        list(APPEND ATLAS_CMD_ARGS -charset "${ARG_CHARSET}")
+    endif()
+
+    # 附加其他额外参数
+    if(ARG_EXTRA_ARGS)
+        list(APPEND ATLAS_CMD_ARGS ${ARG_EXTRA_ARGS})
+    endif()
+
+    string(JOIN " " ATLAS_CMD_DISPLAY ${ATLAS_CMD_ARGS})
+
+    add_custom_command(
+        OUTPUT ${PNG_FILE} ${JSON_FILE}
+        COMMAND ${CMAKE_COMMAND} -E echo "====== Starting MSDF atlas generation for ${ARG_OUTPUT_NAME} ======"
+        COMMAND ${CMAKE_COMMAND} -E echo "cmd: ${ATLAS_CMD_DISPLAY}"
+        COMMAND ${ATLAS_CMD_ARGS}
+        COMMAND ${CMAKE_COMMAND} -E echo "====== Finished MSDF atlas generation ======"
+        DEPENDS
+        ${MSDF_ATLAS_EXE}
+        "${ARG_FONT_PATH}"
+        ${ARG_CHARSET}
+        COMMENT "Generating MSDF atlas: ${ARG_OUTPUT_NAME}"
+        VERBATIM # ← 添加这一行
+        COMMAND_EXPAND_LISTS # ← 添加这一行
+    )
+
+    set(ALL_OUTPUTS ${PNG_FILE} ${JSON_FILE})
+
+    # ----- 字体子集化（仅当提供了字符集（内联或文件）且没有 -allglyphs 时）-----
+    set(SUBSET_FONT_PATH "")
+
+    # 判断是否应该执行子集化
     set(SHOULD_SUBSET FALSE)
 
-    if(GEN_CHARSET AND EXISTS "${GEN_CHARSET}")
+    if(ARG_CHARS OR ARG_CHARSET)
         set(SHOULD_SUBSET TRUE)
     endif()
 
+    # # 检查是否有 -allglyphs
+    list(FIND ARG_EXTRA_ARGS "-allglyphs" allglyphs_idx)
+
+    if(allglyphs_idx GREATER -1)
+        set(SHOULD_SUBSET FALSE)
+    endif()
+
     if(SHOULD_SUBSET)
-        # 第一步：裁剪字体
-        add_custom_command(
-            OUTPUT ${FONT_FILE}
-            COMMAND ${HB_SUBSET_TOOL_EXE} "${GEN_FONT_PATH}" "${FONT_FILE}" "${GEN_CHARSET}"
-            DEPENDS ${HB_SUBSET_TOOL_EXE} "${GEN_FONT_PATH}" "${GEN_CHARSET}"
-            COMMENT "Subsetting font to ${FONT_FILE}"
-        )
-        set(FONT_DEP ${FONT_FILE})
-        set(CHARSET_ARG "-charset" "${GEN_CHARSET}")
-    else()
-        # 不裁剪，直接复制原字体
-        add_custom_command(
-            OUTPUT ${FONT_FILE}
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${GEN_FONT_PATH}" "${FONT_FILE}"
-            DEPENDS "${GEN_FONT_PATH}"
-            COMMENT "Copying font to ${FONT_FILE}"
-        )
-        set(FONT_DEP ${FONT_FILE})
-
-        # 如果没有提供字符集文件，不传递 -charset 参数（gen_emoji_atlas 可能会默认处理所有字符？）
-        # 注意：gen_emoji_atlas 可能需要字符集，若未提供可能出错，这里根据实际情况处理
-        if(GEN_CHARSET)
-            # 如果 GEN_CHARSET 是内联字符串，可能需要特殊处理，但这里简化处理
-            message(WARNING "No valid charset file provided for ${GEN_OUTPUT_NAME}, skipping subset but passing -charset argument as is.")
-            set(CHARSET_ARG "-charset" "${GEN_CHARSET}")
-        else()
-            set(CHARSET_ARG "")
+        if(NOT HB_SUBSET_TOOL_EXE)
+            message(FATAL_ERROR "add_msdf_atlas_target: HB_SUBSET_TOOL_EXE is not defined")
         endif()
+
+        # 获取原始字体扩展名
+        get_filename_component(FONT_EXT "${ARG_FONT_PATH}" LAST_EXT)
+        set(SUBSET_FONT_PATH "${ARG_OUTPUT_DIR}/${ARG_OUTPUT_NAME}${FONT_EXT}")
+
+        # 构建子集化命令
+        set(SUBSET_CMD_ARGS ${HB_SUBSET_TOOL_EXE} -font "${ARG_FONT_PATH}" -out "${SUBSET_FONT_PATH}")
+
+        if(ARG_CHARS)
+            list(APPEND SUBSET_CMD_ARGS -chars "${ARG_CHARS}")
+        elseif(ARG_CHARSET)
+            list(APPEND SUBSET_CMD_ARGS -charset "${ARG_CHARSET}")
+        endif()
+
+        string(JOIN " " SUBSET_CMD_DISPLAY ${SUBSET_CMD_ARGS})
+
+        add_custom_command(
+            OUTPUT ${SUBSET_FONT_PATH}
+            COMMAND ${CMAKE_COMMAND} -E echo "====== Subsetting font for ${ARG_OUTPUT_NAME} ======"
+            COMMAND ${CMAKE_COMMAND} -E echo "cmd: ${SUBSET_CMD_DISPLAY}"
+            COMMAND ${SUBSET_CMD_ARGS}
+            COMMAND ${CMAKE_COMMAND} -E echo "====== Subsetting done ======"
+            DEPENDS
+            ${PNG_FILE} # 确保图集先生成
+            ${HB_SUBSET_TOOL_EXE}
+            "${ARG_FONT_PATH}"
+            ${ARG_CHARSET} # 文件依赖（如果有）
+            COMMENT "Subsetting font for ${ARG_OUTPUT_NAME}"
+
+            # NOTE: 这样才保留双引号，避免双引号被删除
+            VERBATIM # ← 添加这一行
+            COMMAND_EXPAND_LISTS # ← 添加这一行
+        )
+
+        list(APPEND ALL_OUTPUTS ${SUBSET_FONT_PATH})
     endif()
 
-    # 构建 gen_emoji_atlas 命令参数
-    set(CMD_ARGS
-        ${EMOJI_ATLAS_GEN_EXE}
-        -font "${FONT_FILE}"
-        -size ${GEN_SIZE}
-        -padding ${GEN_PADDING}
-        -max-size ${GEN_MAX_SIZE}
-        -file_name "${GEN_OUTPUT_DIR}/${GEN_OUTPUT_NAME}"
-    )
+    # ----- 最终目标 -----
+    add_custom_target(${TARGET_NAME} ALL DEPENDS ${ALL_OUTPUTS})
 
-    if(CHARSET_ARG)
-        list(APPEND CMD_ARGS ${CHARSET_ARG})
+    if(TARGET msdf-atlas-gen-standalone)
+        add_dependencies(${TARGET_NAME} msdf-atlas-gen-standalone)
     endif()
 
-    add_custom_command(
-        OUTPUT ${ATLAS_PNG} ${ATLAS_JSON}
-        COMMAND ${CMAKE_COMMAND} -E make_directory ${GEN_OUTPUT_DIR}
-        COMMAND ${CMD_ARGS}
-        DEPENDS ${EMOJI_ATLAS_GEN_EXE} ${FONT_DEP} ${GEN_CHARSET}
-        COMMENT "Generating emoji atlas for ${GEN_OUTPUT_NAME}"
-    )
-
-    if(GEN_TARGET_NAME)
-        add_custom_target(${GEN_TARGET_NAME} DEPENDS ${ATLAS_PNG} ${ATLAS_JSON} ${FONT_FILE})
+    if(SUBSET_FONT_PATH AND TARGET ${HB_SUBSET_TOOL_NAME})
+        add_dependencies(${TARGET_NAME} ${HB_SUBSET_TOOL_NAME})
     endif()
 endfunction()
 
-# 使用示例：生成 emoji 图集
-if(WIN32)
-    generate_emoji_atlas(
-        TARGET_NAME generate_emoji_atlas_custom
-        FONT_PATH "C:/Windows/Fonts/seguiemj.ttf"
-        OUTPUT_NAME "emoji"
-        CHARSET "${CHASET_INPUT_DIR}/small_emoji.txt"
-        SIZE 96
-        PADDING 2
-        MAX_SIZE 4096
+# E:/0_github_project/mcsvulkan/tool/msdf-atlas-gen.exe -font "E:/0_github_project/mcsvulkan/msdf/tirobangla_ascii.ttf" -type msdf -size 32 -pxrange 2 -imageout "E:/0_github_project/mcsvulkan/msdf/tirobangla_ascii.png" -json "E:/0_github_project/mcsvulkan/msdf/tirobangla_ascii.json"
 
-        # OUTPUT_DIR 可选，默认使用 ${EMOJI_OUTPUT_DIR}
+# 生成英文图集（使用默认参数）
+add_msdf_atlas_target(
+    generate_english_atlas
+    FONT_PATH "${FONT_INPUT_DIR}/TiroBangla-Regular.ttf"
+    OUTPUT_NAME "tirobangla_ascii"
+    EXTRA_ARGS -allglyphs # 传递额外参数
+)
+
+# 生成中文图集，指定尺寸和字符集
+add_msdf_atlas_target(
+    generate_chinese_atlas
+    FONT_PATH "C:/Windows/Fonts/msyh.ttc"
+    OUTPUT_NAME "msyh_chinese"
+    SIZE 64
+    PX_RANGE 2
+    CHARSET "${CHASET_INPUT_DIR}/small_chinese_common.txt"
+)
+
+# 阿拉伯字
+# E:/0_github_project/mcsvulkan/tool/msdf-atlas-gen.exe -font "C:\Windows\Fonts\arial.ttf" -allglyphs -type msdf -format png -imageout arial.png -json arial.json -size 64 -pxrange 2
+add_msdf_atlas_target(
+    generate_arial_atlas
+    FONT_PATH "C:/Windows/Fonts/arial.ttf"
+    OUTPUT_NAME "arial_all"
+    SIZE 64
+    PX_RANGE 2
+    EXTRA_ARGS -allglyphs # 传递额外参数
+)
+add_msdf_atlas_target(
+    generate_segoeui_atlas
+    FONT_PATH "C:/Windows/Fonts/segoeui.ttf" # 中文字体
+    OUTPUT_NAME "segoe_arabic"
+    PX_RANGE 2 # 默认值
+    SIZE 64 # 建议提高精度
+    CHARSET "${CHASET_INPUT_DIR}/arabic_charset.txt"
+)
+
+# ------------------------------------------ bitmap ----------------------------------------------------------
+function(add_emoji_atlas_target TARGET_NAME)
+    # 解析命名参数
+    set(options "")
+    set(oneValueArgs EXECUTABLE FONT_PATH CHARSET OUTPUT_NAME SIZE PADDING MAX_SIZE OUTPUT_DIR)
+    set(multiValueArgs DIMENSIONS) # 固定尺寸需要两个值
+    cmake_parse_arguments(ARG "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+
+    # 检查必需参数
+    if(NOT ARG_FONT_PATH)
+        message(FATAL_ERROR "add_emoji_atlas_target: FONT_PATH is required")
+    endif()
+
+    if(NOT ARG_CHARSET)
+        message(FATAL_ERROR "add_emoji_atlas_target: CHARSET is required")
+    endif()
+
+    if(NOT ARG_OUTPUT_NAME)
+        message(FATAL_ERROR "add_emoji_atlas_target: OUTPUT_NAME is required")
+    endif()
+
+    # 可执行文件：优先使用传入的 EXECUTABLE，否则从父作用域获取
+    if(NOT ARG_EXECUTABLE)
+        if(NOT EMOJI_ATLAS_EXE)
+            message(FATAL_ERROR "add_emoji_atlas_target: No executable provided and EMOJI_ATLAS_GEN_EXE is not defined")
+        endif()
+
+        set(ARG_EXECUTABLE "${EMOJI_ATLAS_EXE}")
+    endif()
+
+    # 输出目录：优先使用传入的 OUTPUT_DIR，否则使用 EMOJI_OUTPUT_DIR 或默认
+    if(NOT ARG_OUTPUT_DIR)
+        set(ARG_OUTPUT_DIR "${MSDF_OUTPUT_DIR}") # 使用你已有的变量
+    endif()
+
+    # 设置默认参数
+    if(NOT ARG_SIZE)
+        set(ARG_SIZE "64")
+    endif()
+
+    if(NOT ARG_PADDING)
+        set(ARG_PADDING "1")
+    endif()
+
+    if(NOT ARG_MAX_SIZE)
+        set(ARG_MAX_SIZE "4096")
+    endif()
+
+    # 输出文件路径
+    set(PNG_FILE "${ARG_OUTPUT_DIR}/${ARG_OUTPUT_NAME}.png")
+    set(JSON_FILE "${ARG_OUTPUT_DIR}/${ARG_OUTPUT_NAME}.json")
+
+    # 构造命令列表
+    set(CMD_ARGS
+        "${ARG_EXECUTABLE}"
+        -font "${ARG_FONT_PATH}"
+        -charset "${ARG_CHARSET}"
+        -size "${ARG_SIZE}"
+        -padding "${ARG_PADDING}"
+        -file_name "${ARG_OUTPUT_DIR}/${ARG_OUTPUT_NAME}"
     )
-endif()
+
+    # 如果指定了固定尺寸，添加 -dimensions 参数
+    if(ARG_DIMENSIONS)
+        list(LENGTH ARG_DIMENSIONS DIM_LEN)
+
+        if(NOT DIM_LEN EQUAL 2)
+            message(FATAL_ERROR "add_emoji_atlas_target: DIMENSIONS requires exactly two values (width height)")
+        endif()
+
+        list(APPEND CMD_ARGS -dimensions ${ARG_DIMENSIONS})
+    endif()
+
+    # 添加 -max-size 参数（除非用户明确不想用，但这里我们总是指定）
+    list(APPEND CMD_ARGS -max-size "${ARG_MAX_SIZE}")
+
+    # 将命令列表转换为空格分隔的字符串（仅用于显示）
+    string(JOIN " " CMD_DISPLAY ${CMD_ARGS})
+
+    # 添加自定义命令
+    add_custom_command(
+        OUTPUT ${PNG_FILE} ${JSON_FILE}
+        COMMAND ${CMAKE_COMMAND} -E echo "====== Starting emoji atlas generation for ${ARG_OUTPUT_NAME} ======"
+        COMMAND ${CMAKE_COMMAND} -E echo "cmd: ${CMD_DISPLAY}"
+        COMMAND ${CMD_ARGS}
+        COMMAND ${CMAKE_COMMAND} -E echo "====== Finished emoji atlas generation for ${ARG_OUTPUT_NAME} ======"
+        DEPENDS "${ARG_EXECUTABLE}" # 依赖可执行文件
+        "${ARG_FONT_PATH}" # 依赖字体文件
+        "${ARG_CHARSET}" # 依赖字符集文件
+        COMMENT "Generating emoji atlas: ${ARG_OUTPUT_NAME}"
+
+        # NOTE: 这样才保留双引号，避免双引号被删除
+        VERBATIM # ← 添加这一行
+        COMMAND_EXPAND_LISTS # ← 添加这一行
+    )
+
+    # 创建自定义目标，并标记为 ALL 以便默认构建
+    add_custom_target(${TARGET_NAME} ALL DEPENDS ${PNG_FILE} ${JSON_FILE})
+
+    # 如果可执行文件是由 CMake 目标生成的，添加目标依赖以确保构建顺序
+    if(TARGET ${EMOJI_ATLAS_NAME}) # 假设你的工具目标名为 gen_emoji_atlas（根据你的 add_tool_target 宏）
+        add_dependencies(${TARGET_NAME} ${EMOJI_ATLAS_NAME})
+    endif()
+endfunction()
+
+add_emoji_atlas_target(
+    generate_emoji_atlas_custom
+    FONT_PATH "C:/Windows/Fonts/seguiemj.ttf"
+    CHARSET "${CHASET_INPUT_DIR}/small_emoji.txt"
+    OUTPUT_NAME "emoji"
+    SIZE 96
+    PADDING 2
+
+    # DIMENSIONS 4096 4096 # 可选，固定尺寸
+
+    # MAX_SIZE 4096        # 可选，默认已设
+)
+
+# -----------------------------------测试-----------------------------------
+# 测试单个字符格式（三种表示法）
+add_msdf_atlas_target(
+    generate_test_single_char
+    FONT_PATH "${FONT_INPUT_DIR}/TiroBangla-Regular.ttf"
+    OUTPUT_NAME "test_single_char"
+    CHARS "'A',65,0x41"
+)
+
+# 测试字符范围格式（三种表示法）
+add_msdf_atlas_target(
+    generate_test_range
+    FONT_PATH "${FONT_INPUT_DIR}/TiroBangla-Regular.ttf"
+    OUTPUT_NAME "test_range"
+    CHARS "['A','Z'],[65,90],[0x41,0x5a]"
+)
+
+# 测试字符串格式
+add_msdf_atlas_target(
+    generate_test_string
+    FONT_PATH "${FONT_INPUT_DIR}/TiroBangla-Regular.ttf"
+    OUTPUT_NAME "test_string"
+    CHARS "\"ABCDEFGHIJKLMNOPQRSTUVWXYZ\"" # 注意转义的双引号
+)
+
+# 测试混合格式（同时包含单字符、范围、字符串）
+add_msdf_atlas_target(
+    generate_test_mixed
+    FONT_PATH "${FONT_INPUT_DIR}/TiroBangla-Regular.ttf"
+    OUTPUT_NAME "test_mixed"
+    CHARS "'A',65,0x41,['B','D'],\"EFG\",[0x48,0x4a]"
+)
+
+# 测试带转义字符的字符串（包含引号和反斜杠）
+add_msdf_atlas_target(
+    generate_test_escape
+    FONT_PATH "${FONT_INPUT_DIR}/TiroBangla-Regular.ttf"
+    OUTPUT_NAME "test_escape"
+    CHARS "\"'A' \\\"B\\\" C\\\\\""
+)
+
+# 测试空白和逗号分隔
+add_msdf_atlas_target(
+    generate_test_whitespace
+    FONT_PATH "${FONT_INPUT_DIR}/TiroBangla-Regular.ttf"
+    OUTPUT_NAME "test_whitespace"
+    CHARS " 'A'  65  0x42 , ['C','E']  \"FG\" "
+)
