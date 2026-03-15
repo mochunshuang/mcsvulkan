@@ -338,6 +338,62 @@ std::vector<uint32_t> readCharsetFromString(const std::string &str)
     return result;
 }
 
+// 新增：从字符串解析字形索引集（仅支持数字和范围，不支持引号）
+std::vector<uint32_t> readGlyphsFromString(const std::string &str)
+{
+    std::vector<uint32_t> result;
+    const char *p = str.c_str();
+    while (*p)
+    {
+        // 跳过空白和逗号
+        while (*p && (std::isspace(*p) || *p == ','))
+            ++p;
+        if (!*p)
+            break;
+
+        if (*p == '[')
+        {
+            auto range = parseRange(p);
+            if (range)
+            {
+                uint32_t start = range->first, end = range->second;
+                if (start <= end)
+                {
+                    for (uint32_t idx = start; idx <= end; ++idx)
+                        result.push_back(idx);
+                }
+                else
+                {
+                    std::cerr << "Warning: invalid range start > end\n";
+                }
+            }
+            else
+            {
+                std::cerr << "Warning: invalid range\n";
+            }
+        }
+        else if (*p == '\'' || *p == '"')
+        {
+            std::cerr << "Error: character literals or strings not allowed for -glyphs\n";
+            return {};
+        }
+        else
+        {
+            if (auto num = parseNumber(p))
+            {
+                result.push_back(*num);
+            }
+            else
+            {
+                std::cerr << "Warning: unrecognized token\n";
+                while (*p && !std::isspace(*p) && *p != ',')
+                    ++p;
+            }
+        }
+    }
+    return result;
+}
+
 int main(int argc, char *argv[])
 {
     std::ignore = std::setlocale(LC_ALL, "en_US.utf8");
@@ -346,6 +402,7 @@ int main(int argc, char *argv[])
     std::string output_path;
     std::string charset_file;
     std::string charset_string;
+    std::string glyphs_string; // 新增
 
     // 解析命令行
     if (argc == 4 && argv[1][0] != '-')
@@ -377,6 +434,10 @@ int main(int argc, char *argv[])
             {
                 charset_string = argv[++i];
             }
+            else if (arg == "-glyphs" && i + 1 < argc) // 新增
+            {
+                glyphs_string = argv[++i];
+            }
             else if (arg == "-help" || arg == "--help")
             {
                 std::println(
@@ -386,6 +447,8 @@ int main(int argc, char *argv[])
                     "  -out <output_font>       Output subset font\n"
                     "  -charset <charset.txt>   Character set file\n"
                     "  -chars <string>          Character set specification in-line\n"
+                    "  -glyphs <string>         Glyph index set in-line (numbers and "
+                    "ranges only)\n"
                     "  Legacy: <input_font> <output_font> <charset.txt>\n",
                     argv[0]);
                 return 0;
@@ -404,16 +467,46 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    std::vector<uint32_t> unicodes;
+    // 检查输入模式互斥
+    int modeCount = 0;
+    if (!charset_file.empty())
+        ++modeCount;
     if (!charset_string.empty())
+        ++modeCount;
+    if (!glyphs_string.empty())
+        ++modeCount;
+    if (modeCount == 0)
     {
-        unicodes = readCharsetFromString(charset_string);
+        std::cerr << "No character set specified. Use -charset, -chars, or -glyphs.\n";
+        return 1;
+    }
+    if (modeCount > 1)
+    {
+        std::cerr << "Error: Cannot specify multiple of -charset, -chars, -glyphs.\n";
+        return 1;
+    }
+
+    std::vector<uint32_t> indices; // 存储 Unicode 码点或字形索引
+    bool isGlyphMode = !glyphs_string.empty();
+
+    if (isGlyphMode)
+    {
+        indices = readGlyphsFromString(glyphs_string);
+        if (indices.empty())
+        {
+            std::cerr << "No valid glyph indices found.\n";
+            return 1;
+        }
+    }
+    else if (!charset_string.empty())
+    {
+        indices = readCharsetFromString(charset_string);
     }
     else if (!charset_file.empty())
     {
         try
         {
-            unicodes = readCharsetFromFile(charset_file);
+            indices = readCharsetFromFile(charset_file);
         }
         catch (const std::exception &e)
         {
@@ -421,38 +514,48 @@ int main(int argc, char *argv[])
             return 1;
         }
     }
-    else
-    {
-        std::cerr << "No character set specified. Use -charset or -chars.\n";
-        return 1;
-    }
 
-    if (unicodes.empty())
+    if (indices.empty())
     {
-        std::cerr << "No valid Unicode characters found in charset.\n";
+        std::cerr << "No valid " << (isGlyphMode ? "glyph indices" : "Unicode characters")
+                  << " found.\n";
         return 1;
     }
 
     // 去重
-    std::set<uint32_t> unique_set(unicodes.begin(), unicodes.end());
-    unicodes.assign(unique_set.begin(), unique_set.end());
+    std::set<uint32_t> unique_set(indices.begin(), indices.end());
+    indices.assign(unique_set.begin(), unique_set.end());
 
-    std::println("Loaded {} unique Unicode characters ({} total entries)",
-                 unique_set.size(), unicodes.size());
+    std::println("Loaded {} unique {} ({} total entries)", unique_set.size(),
+                 isGlyphMode ? "glyph indices" : "Unicode characters", indices.size());
 
     // 打印示例
-    if (unicodes.size() <= 10)
+    if (indices.size() <= 10)
     {
-        std::print("Characters: ");
-        for (auto cp : unicodes)
-            std::print("U+{:04X} ", cp);
+        if (isGlyphMode)
+            std::print("Glyphs: ");
+        else
+            std::print("Characters: ");
+
+        for (auto cp : indices)
+        {
+            if (isGlyphMode)
+                std::print("{} ", cp);
+            else
+                std::print("U+{:04X} ", cp);
+        }
         std::println("");
     }
     else
     {
-        std::print("First 5 characters: ");
+        std::print("First 5 {}: ", isGlyphMode ? "glyph indices" : "characters");
         for (int i = 0; i < 5; ++i)
-            std::print("U+{:04X} ", unicodes[i]);
+        {
+            if (isGlyphMode)
+                std::print("{} ", indices[i]);
+            else
+                std::print("U+{:04X} ", indices[i]);
+        }
         std::println("");
     }
 
@@ -474,9 +577,20 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    hb_set_t *unicode_set = hb_subset_input_unicode_set(input);
-    for (uint32_t cp : unicodes)
-        hb_set_add(unicode_set, cp);
+    if (isGlyphMode)
+    {
+        // 使用字形索引模式
+        hb_set_t *glyph_set = hb_subset_input_glyph_set(input);
+        for (uint32_t idx : indices)
+            hb_set_add(glyph_set, idx);
+    }
+    else
+    {
+        // 使用 Unicode 码点模式
+        hb_set_t *unicode_set = hb_subset_input_unicode_set(input);
+        for (uint32_t cp : indices)
+            hb_set_add(unicode_set, cp);
+    }
 
     hb_face_t *subset_face = hb_subset_or_fail(face, input);
     hb_subset_input_destroy(input);
@@ -484,7 +598,8 @@ int main(int argc, char *argv[])
 
     if (!subset_face)
     {
-        std::cerr << "Subset failed! Possibly font does not contain some characters.\n";
+        std::cerr << "Subset failed! Possibly font does not contain some "
+                  << (isGlyphMode ? "glyph indices" : "characters") << ".\n";
         return 1;
     }
 
@@ -505,7 +620,7 @@ int main(int argc, char *argv[])
     hb_blob_destroy(subset_blob);
     hb_face_destroy(subset_face);
 
-    std::println("Subset font saved to {} ({} bytes, {} characters)", output_path, length,
-                 unicodes.size());
+    std::println("Subset font saved to {} ({} bytes, {} {})", output_path, length,
+                 indices.size(), isGlyphMode ? "glyph indices" : "characters");
     return 0;
 }

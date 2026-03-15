@@ -76,18 +76,34 @@ function(add_msdf_atlas_target TARGET_NAME)
     # 解析命名参数
     set(prefix ARG)
     set(noValues "")
-    set(singleValues FONT_PATH OUTPUT_NAME TYPE SIZE PX_RANGE CHARSET CHARS FORMAT OUTPUT_DIR)
+    set(singleValues FONT_PATH OUTPUT_NAME TYPE SIZE PX_RANGE CHARSET CHARS GLYPHS FORMAT OUTPUT_DIR)
     set(multiValues EXTRA_ARGS)
     cmake_parse_arguments(${prefix} "${noValues}" "${singleValues}" "${multiValues}" ${ARGN})
+
+    message(STATUS "DEBUG: GLYPHS = '${ARG_GLYPHS}'") # 添加调试输出
 
     # 检查必需参数
     if(NOT ARG_FONT_PATH OR NOT ARG_OUTPUT_NAME)
         message(FATAL_ERROR "add_msdf_atlas_target: FONT_PATH and OUTPUT_NAME are required")
     endif()
 
-    # 不能同时指定 CHARSET 和 CHARS
-    if(ARG_CHARSET AND ARG_CHARS)
-        message(FATAL_ERROR "add_msdf_atlas_target: Cannot specify both CHARSET and CHARS")
+    # 不能同时指定多个标识符类型
+    set(id_count 0)
+
+    if(ARG_CHARSET)
+        math(EXPR id_count "${id_count}+1")
+    endif()
+
+    if(ARG_CHARS)
+        math(EXPR id_count "${id_count}+1")
+    endif()
+
+    if(NOT "${ARG_GLYPHS}" STREQUAL "")
+        math(EXPR id_count "${id_count}+1")
+    endif()
+
+    if(id_count GREATER 1)
+        message(FATAL_ERROR "add_msdf_atlas_target: Cannot specify multiple of CHARSET, CHARS, or GLYPHS")
     endif()
 
     # 设置默认值
@@ -133,10 +149,12 @@ function(add_msdf_atlas_target TARGET_NAME)
         -json "${JSON_FILE}"
     )
 
-    # 添加字符集参数（优先使用 CHARS 内联）
-    if(ARG_CHARS)
+    # 添加字符/字形集参数（优先级：GLYPHS > CHARS > CHARSET）
+    if(NOT "${ARG_GLYPHS}" STREQUAL "")
+        list(APPEND ATLAS_CMD_ARGS -glyphs "${ARG_GLYPHS}")
+    elseif(NOT "${ARG_CHARS}" STREQUAL "")
         list(APPEND ATLAS_CMD_ARGS -chars "${ARG_CHARS}")
-    elseif(ARG_CHARSET)
+    elseif(NOT "${ARG_CHARSET}" STREQUAL "")
         list(APPEND ATLAS_CMD_ARGS -charset "${ARG_CHARSET}")
     endif()
 
@@ -156,25 +174,23 @@ function(add_msdf_atlas_target TARGET_NAME)
         DEPENDS
         ${MSDF_ATLAS_EXE}
         "${ARG_FONT_PATH}"
-        ${ARG_CHARSET}
         COMMENT "Generating MSDF atlas: ${ARG_OUTPUT_NAME}"
-        VERBATIM # ← 添加这一行
-        COMMAND_EXPAND_LISTS # ← 添加这一行
+        VERBATIM
+        COMMAND_EXPAND_LISTS
     )
 
     set(ALL_OUTPUTS ${PNG_FILE} ${JSON_FILE})
 
-    # ----- 字体子集化（仅当提供了字符集（内联或文件）且没有 -allglyphs 时）-----
+    # ----- 字体子集化（仅当提供了字符集且没有 -allglyphs 时）-----
     set(SUBSET_FONT_PATH "")
-
-    # 判断是否应该执行子集化
     set(SHOULD_SUBSET FALSE)
 
-    if(ARG_CHARS OR ARG_CHARSET)
+    # 只有使用 CHARS 或 CHARSET 时才进行子集化（GLYPHS 时跳过，因为工具不支持）
+    if(NOT "${ARG_GLYPHS}" STREQUAL "" OR NOT "${ARG_CHARSET}" STREQUAL "" OR NOT "${ARG_GLYPHS}" STREQUAL "")
         set(SHOULD_SUBSET TRUE)
     endif()
 
-    # # 检查是否有 -allglyphs
+    # 检查是否有 -allglyphs
     list(FIND ARG_EXTRA_ARGS "-allglyphs" allglyphs_idx)
 
     if(allglyphs_idx GREATER -1)
@@ -186,16 +202,16 @@ function(add_msdf_atlas_target TARGET_NAME)
             message(FATAL_ERROR "add_msdf_atlas_target: HB_SUBSET_TOOL_EXE is not defined")
         endif()
 
-        # 获取原始字体扩展名
         get_filename_component(FONT_EXT "${ARG_FONT_PATH}" LAST_EXT)
         set(SUBSET_FONT_PATH "${ARG_OUTPUT_DIR}/${ARG_OUTPUT_NAME}${FONT_EXT}")
 
-        # 构建子集化命令
         set(SUBSET_CMD_ARGS ${HB_SUBSET_TOOL_EXE} -font "${ARG_FONT_PATH}" -out "${SUBSET_FONT_PATH}")
 
-        if(ARG_CHARS)
+        if(NOT "${ARG_GLYPHS}" STREQUAL "")
+            list(APPEND SUBSET_CMD_ARGS -glyphs "${ARG_GLYPHS}")
+        elseif(NOT "${ARG_CHARS}" STREQUAL "")
             list(APPEND SUBSET_CMD_ARGS -chars "${ARG_CHARS}")
-        elseif(ARG_CHARSET)
+        elseif(NOT "${ARG_CHARSET}" STREQUAL "")
             list(APPEND SUBSET_CMD_ARGS -charset "${ARG_CHARSET}")
         endif()
 
@@ -208,18 +224,19 @@ function(add_msdf_atlas_target TARGET_NAME)
             COMMAND ${SUBSET_CMD_ARGS}
             COMMAND ${CMAKE_COMMAND} -E echo "====== Subsetting done ======"
             DEPENDS
-            ${PNG_FILE} # 确保图集先生成
+            ${PNG_FILE}
             ${HB_SUBSET_TOOL_EXE}
             "${ARG_FONT_PATH}"
-            ${ARG_CHARSET} # 文件依赖（如果有）
+            ${ARG_CHARSET}
             COMMENT "Subsetting font for ${ARG_OUTPUT_NAME}"
-
-            # NOTE: 这样才保留双引号，避免双引号被删除
-            VERBATIM # ← 添加这一行
-            COMMAND_EXPAND_LISTS # ← 添加这一行
+            VERBATIM
+            COMMAND_EXPAND_LISTS
         )
 
         list(APPEND ALL_OUTPUTS ${SUBSET_FONT_PATH})
+    elseif(ARG_GLYPHS)
+        # 当使用 GLYPHS 时，提示用户不进行子集化
+        message(STATUS "Note: GLYPHS specified for ${TARGET_NAME}, skipping font subsetting (subset tool only supports Unicode).")
     endif()
 
     # ----- 最终目标 -----
@@ -398,6 +415,15 @@ add_msdf_atlas_target(
     FONT_PATH "${FONT_INPUT_DIR}/TiroBangla-Regular.ttf"
     OUTPUT_NAME "test_single_char"
     CHARS "'A',65,0x41"
+)
+
+add_msdf_atlas_target(
+    generate_test_missing_char
+    FONT_PATH "C:/Windows/Fonts/msyh.ttc"
+    OUTPUT_NAME "missing_char"
+    GLYPHS "0" # 指定字形索引 0
+
+    # 可选其他参数：SIZE, PX_RANGE 等
 )
 
 # 测试字符范围格式（三种表示法）
