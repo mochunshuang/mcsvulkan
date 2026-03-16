@@ -93,5 +93,12 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_libunibreak3 test_emoji.vert test_emoji.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
+# utf8proc
+set(BASE_LIBS volk vma glfw glm stb ktx nlohmann_json
+    freetype harfbuzz SheenBidi libunibreak utf8proc
+)
+add_std_glsl_target(test_libunibreak4 test_emoji.vert test_emoji.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
 # end
 std_glsl_env_destroy()

@@ -39,6 +39,7 @@ include(third_party/rectpack2D.cmake)
 include(third_party/agg.cmake)
 
 # text layout
+include(third_party/utf8proc.cmake)
 include(third_party/SheenBidi.cmake)
 include(third_party/libraqm.cmake)
 include(third_party/libunibreak.cmake)
