@@ -59,3 +59,6 @@
 [submodule "third_party/rectpack2D"]
 	path = third_party/rectpack2D
 	url = https://gh-proxy.org/https://github.com/TeamHypersomnia/rectpack2D.git
+[submodule "third_party/utf8proc"]
+	path = third_party/utf8proc
+	url = https://gh-proxy.org/https://github.com/JuliaStrings/utf8proc.git
