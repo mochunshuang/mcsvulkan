@@ -29,7 +29,7 @@ struct GlyphInfo
     uint32_t unicode;
     int width, height;
     int bearingX, bearingY;
-    int advance;                 // 像素
+    double advance;              // 像素
     std::vector<uint8_t> bitmap; // RGBA
 };
 
@@ -339,7 +339,9 @@ int main(int argc, char *argv[])
         info.height = bmp.rows;
         info.bearingX = face->glyph->bitmap_left;
         info.bearingY = face->glyph->bitmap_top;
-        info.advance = static_cast<int>(face->glyph->metrics.horiAdvance / 64);
+
+        // === 关键修改：使用线性 advance（16.16 格式）获取未舍入的像素值 ===
+        info.advance = face->glyph->linearHoriAdvance / 65536.0;
 
         info.bitmap.resize(info.width * info.height * 4);
         uint8_t *dst = info.bitmap.data();

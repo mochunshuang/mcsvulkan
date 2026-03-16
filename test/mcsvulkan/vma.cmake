@@ -90,6 +90,8 @@ add_std_glsl_target(test_libunibreak test_emoji.vert test_emoji.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_libunibreak2 test_emoji.vert test_emoji.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
+add_std_glsl_target(test_libunibreak3 test_emoji.vert test_emoji.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
 
 # end
 std_glsl_env_destroy()

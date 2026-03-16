@@ -295,7 +295,7 @@ function(add_emoji_atlas_target TARGET_NAME)
     # 解析命名参数
     set(options "")
     set(oneValueArgs EXECUTABLE FONT_PATH CHARSET OUTPUT_NAME SIZE PADDING MAX_SIZE OUTPUT_DIR)
-    set(multiValueArgs DIMENSIONS) # 固定尺寸需要两个值
+    set(multiValueArgs DIMENSIONS EXTRA_ARGS) # 增加 EXTRA_ARGS 以支持类似 -allglyphs 等选项
     cmake_parse_arguments(ARG "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
     # 检查必需参数
@@ -314,15 +314,15 @@ function(add_emoji_atlas_target TARGET_NAME)
     # 可执行文件：优先使用传入的 EXECUTABLE，否则从父作用域获取
     if(NOT ARG_EXECUTABLE)
         if(NOT EMOJI_ATLAS_EXE)
-            message(FATAL_ERROR "add_emoji_atlas_target: No executable provided and EMOJI_ATLAS_GEN_EXE is not defined")
+            message(FATAL_ERROR "add_emoji_atlas_target: No executable provided and EMOJI_ATLAS_EXE is not defined")
         endif()
 
         set(ARG_EXECUTABLE "${EMOJI_ATLAS_EXE}")
     endif()
 
-    # 输出目录：优先使用传入的 OUTPUT_DIR，否则使用 EMOJI_OUTPUT_DIR 或默认
+    # 输出目录：优先使用传入的 OUTPUT_DIR，否则使用 MSDF_OUTPUT_DIR
     if(NOT ARG_OUTPUT_DIR)
-        set(ARG_OUTPUT_DIR "${MSDF_OUTPUT_DIR}") # 使用你已有的变量
+        set(ARG_OUTPUT_DIR "${MSDF_OUTPUT_DIR}")
     endif()
 
     # 设置默认参数
@@ -338,21 +338,72 @@ function(add_emoji_atlas_target TARGET_NAME)
         set(ARG_MAX_SIZE "4096")
     endif()
 
-    # 输出文件路径
+    # ----- 子集化判断（与 add_msdf_atlas_target 逻辑一致） -----
+    set(SUBSET_FONT_PATH "")
+    set(SHOULD_SUBSET FALSE)
+
+    # 如果提供了 CHARSET 且没有 -allglyphs，则进行子集化
+    if(ARG_CHARSET)
+        set(SHOULD_SUBSET TRUE)
+
+        # 检查 EXTRA_ARGS 中是否有 -allglyphs（模拟 msdf-atlas-gen 行为）
+        list(FIND ARG_EXTRA_ARGS "-allglyphs" allglyphs_idx)
+
+        if(allglyphs_idx GREATER -1)
+            set(SHOULD_SUBSET FALSE)
+        endif()
+    endif()
+
+    if(SHOULD_SUBSET)
+        if(NOT HB_SUBSET_TOOL_EXE)
+            message(FATAL_ERROR "add_emoji_atlas_target: CHARSET provided but HB_SUBSET_TOOL_EXE is not defined")
+        endif()
+
+        get_filename_component(FONT_EXT "${ARG_FONT_PATH}" LAST_EXT)
+        set(SUBSET_FONT_PATH "${ARG_OUTPUT_DIR}/${ARG_OUTPUT_NAME}${FONT_EXT}")
+
+        set(SUBSET_CMD_ARGS
+            ${HB_SUBSET_TOOL_EXE}
+            -font "${ARG_FONT_PATH}"
+            -charset "${ARG_CHARSET}"
+            -out "${SUBSET_FONT_PATH}"
+        )
+
+        # 如果 EXTRA_ARGS 中包含其他子集化参数（如 -glyphs），可在此扩展，但目前仅支持 -charset
+        add_custom_command(
+            OUTPUT ${SUBSET_FONT_PATH}
+            COMMAND ${CMAKE_COMMAND} -E echo "====== Subsetting emoji font for ${ARG_OUTPUT_NAME} ======"
+            COMMAND ${CMAKE_COMMAND} -E echo "cmd: ${SUBSET_CMD_ARGS}"
+            COMMAND ${SUBSET_CMD_ARGS}
+            COMMAND ${CMAKE_COMMAND} -E echo "====== Subsetting done ======"
+            DEPENDS
+            ${HB_SUBSET_TOOL_EXE}
+            "${ARG_FONT_PATH}"
+            "${ARG_CHARSET}"
+            COMMENT "Subsetting font for ${ARG_OUTPUT_NAME}"
+            VERBATIM
+            COMMAND_EXPAND_LISTS
+        )
+
+        # 图集生成时使用的字体改为子集字体
+        set(USED_FONT_PATH "${SUBSET_FONT_PATH}")
+    else()
+        set(USED_FONT_PATH "${ARG_FONT_PATH}")
+    endif()
+
+    # ----- 图集生成命令（始终生成 PNG 和 JSON） -----
     set(PNG_FILE "${ARG_OUTPUT_DIR}/${ARG_OUTPUT_NAME}.png")
     set(JSON_FILE "${ARG_OUTPUT_DIR}/${ARG_OUTPUT_NAME}.json")
 
-    # 构造命令列表
-    set(CMD_ARGS
+    set(ATLAS_CMD_ARGS
         "${ARG_EXECUTABLE}"
-        -font "${ARG_FONT_PATH}"
+        -font "${USED_FONT_PATH}"
         -charset "${ARG_CHARSET}"
         -size "${ARG_SIZE}"
         -padding "${ARG_PADDING}"
         -file_name "${ARG_OUTPUT_DIR}/${ARG_OUTPUT_NAME}"
     )
 
-    # 如果指定了固定尺寸，添加 -dimensions 参数
     if(ARG_DIMENSIONS)
         list(LENGTH ARG_DIMENSIONS DIM_LEN)
 
@@ -360,38 +411,52 @@ function(add_emoji_atlas_target TARGET_NAME)
             message(FATAL_ERROR "add_emoji_atlas_target: DIMENSIONS requires exactly two values (width height)")
         endif()
 
-        list(APPEND CMD_ARGS -dimensions ${ARG_DIMENSIONS})
+        list(APPEND ATLAS_CMD_ARGS -dimensions ${ARG_DIMENSIONS})
     endif()
 
-    # 添加 -max-size 参数（除非用户明确不想用，但这里我们总是指定）
-    list(APPEND CMD_ARGS -max-size "${ARG_MAX_SIZE}")
+    list(APPEND ATLAS_CMD_ARGS -max-size "${ARG_MAX_SIZE}")
 
-    # 将命令列表转换为空格分隔的字符串（仅用于显示）
-    string(JOIN " " CMD_DISPLAY ${CMD_ARGS})
+    # 如果有 EXTRA_ARGS，附加到命令末尾（允许用户传递额外参数）
+    if(ARG_EXTRA_ARGS)
+        list(APPEND ATLAS_CMD_ARGS ${ARG_EXTRA_ARGS})
+    endif()
 
-    # 添加自定义命令
+    # 图集生成依赖
+    set(ATLAS_DEPENDS
+        "${ARG_EXECUTABLE}"
+        "${USED_FONT_PATH}"
+        "${ARG_CHARSET}"
+    )
+
     add_custom_command(
         OUTPUT ${PNG_FILE} ${JSON_FILE}
         COMMAND ${CMAKE_COMMAND} -E echo "====== Starting emoji atlas generation for ${ARG_OUTPUT_NAME} ======"
-        COMMAND ${CMAKE_COMMAND} -E echo "cmd: ${CMD_DISPLAY}"
-        COMMAND ${CMD_ARGS}
-        COMMAND ${CMAKE_COMMAND} -E echo "====== Finished emoji atlas generation for ${ARG_OUTPUT_NAME} ======"
-        DEPENDS "${ARG_EXECUTABLE}" # 依赖可执行文件
-        "${ARG_FONT_PATH}" # 依赖字体文件
-        "${ARG_CHARSET}" # 依赖字符集文件
+        COMMAND ${CMAKE_COMMAND} -E echo "cmd: ${ATLAS_CMD_ARGS}"
+        COMMAND ${ATLAS_CMD_ARGS}
+        COMMAND ${CMAKE_COMMAND} -E echo "====== Finished emoji atlas generation ======"
+        DEPENDS ${ATLAS_DEPENDS}
         COMMENT "Generating emoji atlas: ${ARG_OUTPUT_NAME}"
-
-        # NOTE: 这样才保留双引号，避免双引号被删除
-        VERBATIM # ← 添加这一行
-        COMMAND_EXPAND_LISTS # ← 添加这一行
+        VERBATIM
+        COMMAND_EXPAND_LISTS
     )
 
-    # 创建自定义目标，并标记为 ALL 以便默认构建
-    add_custom_target(${TARGET_NAME} ALL DEPENDS ${PNG_FILE} ${JSON_FILE})
+    # 收集所有输出文件
+    set(ALL_OUTPUTS ${PNG_FILE} ${JSON_FILE})
 
-    # 如果可执行文件是由 CMake 目标生成的，添加目标依赖以确保构建顺序
-    if(TARGET ${EMOJI_ATLAS_NAME}) # 假设你的工具目标名为 gen_emoji_atlas（根据你的 add_tool_target 宏）
+    if(SHOULD_SUBSET)
+        list(APPEND ALL_OUTPUTS ${SUBSET_FONT_PATH})
+    endif()
+
+    # 创建最终目标
+    add_custom_target(${TARGET_NAME} ALL DEPENDS ${ALL_OUTPUTS})
+
+    # 添加依赖关系
+    if(TARGET ${EMOJI_ATLAS_NAME})
         add_dependencies(${TARGET_NAME} ${EMOJI_ATLAS_NAME})
+    endif()
+
+    if(SHOULD_SUBSET AND TARGET ${HB_SUBSET_TOOL_NAME})
+        add_dependencies(${TARGET_NAME} ${HB_SUBSET_TOOL_NAME})
     endif()
 endfunction()
 
