@@ -7,12 +7,10 @@
 #include <string_view>
 #include FT_FREETYPE_H
 #include <utf8proc.h>
-#include <SheenBidi/SheenBidi.h>
-#include <SheenBidi/SBScript.h>
-#include <SheenBidi/SBAlgorithm.h>
 
-#include <linebreak.h>   // libunibreak 核心头文件
-#include <unibreakdef.h> // 基础定义
+#include <unicode/ubidi.h>   // ICU BIDI 核心
+#include <unicode/ustring.h> // UTF-16 转换
+#include <unicode/uchar.h>   // u_charMirror 等
 
 #include <filesystem>
 #include <vector>
@@ -522,6 +520,7 @@ BidiResult analyze_bidi(const NormalizedText &norm, const FontMatcher &matcher)
     result.byte_offsets = norm.byte_offsets;
     size_t char_count = result.codepoints.size();
 
+    // 初始化输出数组
     result.bidi_levels.assign(char_count, 0);
     result.mirror.assign(char_count, 0);
     result.is_mirrored.assign(char_count, false);
@@ -531,156 +530,158 @@ BidiResult analyze_bidi(const NormalizedText &norm, const FontMatcher &matcher)
         result.hb_scripts[i] = matcher.get_script(result.codepoints[i]);
     }
 
-    SBCodepointSequence seq;
-    seq.stringEncoding = SBStringEncodingUTF32;
-    seq.stringBuffer = const_cast<SBCodepoint *>(result.codepoints.data());
-    seq.stringLength = result.codepoints.size();
-
-    SBAlgorithmRef algo = SBAlgorithmCreate(&seq);
-    std::vector<uint32_t> visual_cp;
-
-    SBUInteger cp_offset = 0;
-    while (cp_offset < char_count)
+    if (char_count == 0)
     {
-        SBUInteger actualLength, separatorLength;
-        SBAlgorithmGetParagraphBoundary(algo, cp_offset, char_count - cp_offset,
-                                        &actualLength, &separatorLength);
+        return result;
+    }
 
-        // --- 处理段落内容（actualLength > 0）---
-        if (actualLength > 0)
+    UErrorCode status = U_ZERO_ERROR;
+
+    // ---------- 将 UTF-32 转换为 UTF-16 ----------
+    int32_t u16_length = 0;
+    u_strFromUTF32(nullptr, 0, &u16_length,
+                   reinterpret_cast<const UChar32 *>(result.codepoints.data()),
+                   static_cast<int32_t>(char_count), &status);
+    if (status != U_BUFFER_OVERFLOW_ERROR)
+    {
+        std::println(stderr, "ICU: u_strFromUTF32 length calculation failed");
+        return result;
+    }
+    status = U_ZERO_ERROR;
+    std::vector<UChar> u16_buffer(u16_length);
+    u_strFromUTF32(u16_buffer.data(), u16_length, &u16_length,
+                   reinterpret_cast<const UChar32 *>(result.codepoints.data()),
+                   static_cast<int32_t>(char_count), &status);
+    if (U_FAILURE(status))
+    {
+        std::println(stderr, "ICU: u_strFromUTF32 conversion failed");
+        return result;
+    }
+
+    // ---------- ICU BIDI 分析 ----------
+    UBiDi *bidi = ubidi_open();
+    // 使用自动段落方向（对应 SheenBidi 的 SBLevelDefaultLTR）
+    ubidi_setPara(bidi, u16_buffer.data(), u16_length, UBIDI_DEFAULT_LTR, nullptr,
+                  &status);
+    if (U_FAILURE(status))
+    {
+        std::println(stderr, "ICU: ubidi_setPara failed");
+        ubidi_close(bidi);
+        return result;
+    }
+
+    // 获取每个 UTF-16 码元的级别
+    const UBiDiLevel *u16_levels = ubidi_getLevels(bidi, &status);
+    if (U_FAILURE(status))
+    {
+        std::println(stderr, "ICU: ubidi_getLevels failed");
+        ubidi_close(bidi);
+        return result;
+    }
+
+    // 建立 UTF-16 到码点的映射表
+    std::vector<int32_t> utf16_to_codepoint;
+    utf16_to_codepoint.reserve(u16_length);
+    for (size_t i = 0; i < char_count; ++i)
+    {
+        UChar32 c = result.codepoints[i];
+        int32_t len = U16_LENGTH(c);
+        for (int32_t j = 0; j < len; ++j)
         {
-            SBParagraphRef para = SBAlgorithmCreateParagraph(
-                algo, cp_offset, actualLength, SBLevelDefaultLTR);
-            if (para)
+            utf16_to_codepoint.push_back(static_cast<int32_t>(i));
+        }
+    }
+
+    // 转换为码点级别
+    for (size_t i = 0; i < char_count; ++i)
+    {
+        // 找到该码点对应的第一个 UTF-16 码元索引
+        for (int32_t u16_idx = 0; u16_idx < u16_length; ++u16_idx)
+        {
+            if (utf16_to_codepoint[u16_idx] == static_cast<int32_t>(i))
             {
-                SBUInteger para_cp_len = SBParagraphGetLength(para);
-                SBLineRef line = SBParagraphCreateLine(para, 0, para_cp_len);
-                if (line)
-                {
-                    // 镜像处理
-                    SBMirrorLocatorRef mirrorLocator = SBMirrorLocatorCreate();
-                    SBMirrorLocatorLoadLine(mirrorLocator, line, seq.stringBuffer);
-                    const SBMirrorAgent *agent = SBMirrorLocatorGetAgent(mirrorLocator);
-                    while (SBMirrorLocatorMoveNext(mirrorLocator))
-                    {
-                        size_t idx = agent->index;
-                        if (idx < char_count)
-                        {
-                            result.mirror[idx] = static_cast<uint32_t>(agent->mirror);
-                            result.is_mirrored[idx] = (result.mirror[idx] != 0);
-                        }
-                    }
-                    SBMirrorLocatorRelease(mirrorLocator);
-
-                    // 获取运行
-                    SBUInteger runCount = SBLineGetRunCount(line);
-                    const SBRun *runs = SBLineGetRunsPtr(line);
-
-                    // 记录运行
-                    for (SBUInteger i = 0; i < runCount; ++i)
-                    {
-                        const SBRun &run = runs[i];
-                        size_t start = cp_offset + run.offset;
-                        size_t end = cp_offset + run.offset + run.length;
-                        result.bidi_runs.push_back({start, end, run.level});
-                        for (size_t j = start; j < end; ++j)
-                        {
-                            result.bidi_levels[j] = run.level;
-                        }
-                    }
-
-                    // 构建视觉顺序（如果运行数为0，则手动添加）
-                    if (runCount == 0)
-                    {
-                        // 罕见情况：行中没有运行，则按逻辑顺序添加字符（视为 LTR）
-                        for (SBUInteger i = 0; i < para_cp_len; ++i)
-                        {
-                            size_t idx = cp_offset + i;
-                            visual_cp.push_back(result.codepoints[idx]);
-                        }
-                    }
-                    else
-                    {
-                        for (SBUInteger i = 0; i < runCount; ++i)
-                        {
-                            const SBRun &run = runs[i];
-                            size_t start = cp_offset + run.offset;
-                            size_t end = cp_offset + run.offset + run.length;
-                            if (run.level % 2)
-                            { // RTL
-                                for (size_t j = end; j > start; --j)
-                                {
-                                    size_t idx = j - 1;
-                                    uint32_t cp = result.mirror[idx]
-                                                      ? result.mirror[idx]
-                                                      : result.codepoints[idx];
-                                    visual_cp.push_back(cp);
-                                }
-                            }
-                            else
-                            { // LTR
-                                for (size_t j = start; j < end; ++j)
-                                {
-                                    uint32_t cp = result.mirror[j] ? result.mirror[j]
-                                                                   : result.codepoints[j];
-                                    visual_cp.push_back(cp);
-                                }
-                            }
-                        }
-                    }
-
-                    SBLineRelease(line);
-                }
-                else
-                {
-                    // line 创建失败：手动添加所有字符（视为 LTR）
-                    for (SBUInteger i = 0; i < para_cp_len; ++i)
-                    {
-                        size_t idx = cp_offset + i;
-                        visual_cp.push_back(result.codepoints[idx]);
-                        result.bidi_runs.push_back({idx, idx + 1, 0});
-                        result.bidi_levels[idx] = 0;
-                    }
-                }
-                SBParagraphRelease(para);
+                result.bidi_levels[i] = static_cast<uint8_t>(u16_levels[u16_idx]);
+                break;
             }
-            else
+        }
+    }
+
+    // 划分逻辑运行（基于级别变化）
+    if (char_count > 0)
+    {
+        size_t run_start = 0;
+        uint8_t current_level = result.bidi_levels[0];
+        for (size_t i = 1; i <= char_count; ++i)
+        {
+            if (i == char_count || result.bidi_levels[i] != current_level)
             {
-                // paragraph 创建失败：手动添加所有字符（视为 LTR）
-                for (SBUInteger i = 0; i < actualLength; ++i)
+                result.bidi_runs.push_back({run_start, i, current_level});
+                if (i < char_count)
                 {
-                    size_t idx = cp_offset + i;
-                    visual_cp.push_back(result.codepoints[idx]);
-                    result.bidi_runs.push_back({idx, idx + 1, 0});
-                    result.bidi_levels[idx] = 0;
+                    run_start = i;
+                    current_level = result.bidi_levels[i];
                 }
             }
         }
-
-        // --- 处理分隔符字符（separatorLength > 0）---
-        for (SBUInteger i = 0; i < separatorLength; ++i)
-        {
-            size_t idx = cp_offset + actualLength + i;
-            uint32_t cp =
-                result.mirror[idx] ? result.mirror[idx] : result.codepoints[idx];
-            visual_cp.push_back(cp);
-            result.bidi_runs.push_back({idx, idx + 1, 0});
-            result.bidi_levels[idx] = 0;
-        }
-
-        // --- 更新偏移量 ---
-        cp_offset += actualLength + separatorLength;
     }
 
-    SBAlgorithmRelease(algo);
-
-    // 将视觉码点转换为 UTF-8
-    result.visual_string.clear();
-    for (uint32_t cp : visual_cp)
+    // ---------- 使用 ubidi_writeReordered 生成视觉字符串 ----------
+    int32_t visual_u16_length =
+        ubidi_writeReordered(bidi, nullptr, 0, UBIDI_DO_MIRRORING, &status);
+    if (status != U_BUFFER_OVERFLOW_ERROR)
     {
-        result.visual_string += cp_to_utf8(cp);
+        std::println(stderr, "ICU: ubidi_writeReordered length calculation failed");
+        ubidi_close(bidi);
+        return result;
+    }
+    status = U_ZERO_ERROR;
+    std::vector<UChar> visual_u16_buffer(visual_u16_length);
+    ubidi_writeReordered(bidi, visual_u16_buffer.data(), visual_u16_length,
+                         UBIDI_DO_MIRRORING, &status);
+    if (U_FAILURE(status))
+    {
+        std::println(stderr, "ICU: ubidi_writeReordered failed");
+        ubidi_close(bidi);
+        return result;
     }
 
+    // 将视觉 UTF-16 转换为 UTF-8
+    int32_t visual_u8_length = 0;
+    u_strToUTF8(nullptr, 0, &visual_u8_length, visual_u16_buffer.data(),
+                visual_u16_length, &status);
+    if (status != U_BUFFER_OVERFLOW_ERROR)
+    {
+        std::println(stderr, "ICU: u_strToUTF8 length calculation failed");
+        ubidi_close(bidi);
+        return result;
+    }
+    status = U_ZERO_ERROR;
+    std::string visual_u8_buffer(visual_u8_length, '\0');
+    u_strToUTF8(visual_u8_buffer.data(), visual_u8_length, &visual_u8_length,
+                visual_u16_buffer.data(), visual_u16_length, &status);
+    if (U_FAILURE(status))
+    {
+        std::println(stderr, "ICU: u_strToUTF8 conversion failed");
+        ubidi_close(bidi);
+        return result;
+    }
+    result.visual_string = std::move(visual_u8_buffer);
+
+    // ---------- 计算镜像信息（用于打印）----------
+    for (size_t i = 0; i < char_count; ++i)
+    {
+        if (result.bidi_levels[i] % 2 == 1)
+        {
+            UChar32 mirror = u_charMirror(result.codepoints[i]);
+            if (mirror != static_cast<UChar32>(result.codepoints[i]))
+            {
+                result.mirror[i] = static_cast<uint32_t>(mirror);
+                result.is_mirrored[i] = true;
+            }
+        }
+    }
+
+    ubidi_close(bidi);
     return result;
 }
 // -----------------------------------------------------------------------------
@@ -940,6 +941,55 @@ int main()
     hb_tag_t preferred_tag = matcher.preferred_lang_tag();
     std::println("Preferred language tag: {}",
                  preferred_tag != HB_TAG_NONE ? tag_to_string(preferred_tag) : "none");
+
+    {
+        // 输入字符串：U+202E (RLO), 'a', 'b', 'c', U+202C (PDF)
+        // const UChar text[] = {0x202E, 'a', 'b', 'c', 0x202C, 0};
+        const UChar text[] = {0x2067, 'a', 'b', 'c', 0x2069, 0};
+        int32_t length = 5;
+
+        UErrorCode status = U_ZERO_ERROR;
+        UBiDi *bidi = ubidi_open();
+        ubidi_setPara(bidi, text, length, UBIDI_DEFAULT_LTR, nullptr, &status);
+        if (U_FAILURE(status))
+        {
+            printf("Error: %s\n", u_errorName(status));
+            return 1;
+        }
+
+        // 获取视觉顺序映射：logicalIndex -> visualPosition
+        int32_t visualIndexMap[5];
+        ubidi_getVisualMap(bidi, visualIndexMap, &status);
+        if (U_FAILURE(status))
+        {
+            printf("Error getting visual map: %s\n", u_errorName(status));
+            ubidi_close(bidi);
+            return 1;
+        }
+
+        printf("Logical order indices (logical pos -> visual pos):\n");
+        for (int i = 0; i < length; i++)
+        {
+            printf("  logical[%d] (U+%04X) -> visual[%d]\n", i, text[i],
+                   visualIndexMap[i]);
+        }
+
+        // 计算视觉顺序的逻辑索引
+        int32_t logicalIndexMap[5];
+        for (int i = 0; i < length; i++)
+        {
+            logicalIndexMap[visualIndexMap[i]] = i;
+        }
+
+        printf("\nVisual order indices (visual pos -> logical pos):\n");
+        for (int i = 0; i < length; i++)
+        {
+            printf("  visual[%d] -> logical[%d] (U+%04X)\n", i, logicalIndexMap[i],
+                   text[logicalIndexMap[i]]);
+        }
+
+        ubidi_close(bidi);
+    }
 
     // 测试用例
     constexpr std::array<const char8_t *, 42> test_strings = {

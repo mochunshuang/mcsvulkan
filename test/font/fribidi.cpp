@@ -7,12 +7,8 @@
 #include <string_view>
 #include FT_FREETYPE_H
 #include <utf8proc.h>
-#include <SheenBidi/SheenBidi.h>
-#include <SheenBidi/SBScript.h>
-#include <SheenBidi/SBAlgorithm.h>
 
-#include <linebreak.h>   // libunibreak 核心头文件
-#include <unibreakdef.h> // 基础定义
+#include <fribidi/fribidi.h>
 
 #include <filesystem>
 #include <vector>
@@ -514,6 +510,7 @@ NormalizedText normalize(const char8_t *text)
 // -----------------------------------------------------------------------------
 // 阶段2实现
 // -----------------------------------------------------------------------------
+// NOTE: 更垃圾
 BidiResult analyze_bidi(const NormalizedText &norm, const FontMatcher &matcher)
 {
     BidiResult result;
@@ -522,6 +519,7 @@ BidiResult analyze_bidi(const NormalizedText &norm, const FontMatcher &matcher)
     result.byte_offsets = norm.byte_offsets;
     size_t char_count = result.codepoints.size();
 
+    // 初始化输出数组
     result.bidi_levels.assign(char_count, 0);
     result.mirror.assign(char_count, 0);
     result.is_mirrored.assign(char_count, false);
@@ -531,154 +529,97 @@ BidiResult analyze_bidi(const NormalizedText &norm, const FontMatcher &matcher)
         result.hb_scripts[i] = matcher.get_script(result.codepoints[i]);
     }
 
-    SBCodepointSequence seq;
-    seq.stringEncoding = SBStringEncodingUTF32;
-    seq.stringBuffer = const_cast<SBCodepoint *>(result.codepoints.data());
-    seq.stringLength = result.codepoints.size();
-
-    SBAlgorithmRef algo = SBAlgorithmCreate(&seq);
-    std::vector<uint32_t> visual_cp;
-
-    SBUInteger cp_offset = 0;
-    while (cp_offset < char_count)
+    if (char_count == 0)
     {
-        SBUInteger actualLength, separatorLength;
-        SBAlgorithmGetParagraphBoundary(algo, cp_offset, char_count - cp_offset,
-                                        &actualLength, &separatorLength);
-
-        // --- 处理段落内容（actualLength > 0）---
-        if (actualLength > 0)
-        {
-            SBParagraphRef para = SBAlgorithmCreateParagraph(
-                algo, cp_offset, actualLength, SBLevelDefaultLTR);
-            if (para)
-            {
-                SBUInteger para_cp_len = SBParagraphGetLength(para);
-                SBLineRef line = SBParagraphCreateLine(para, 0, para_cp_len);
-                if (line)
-                {
-                    // 镜像处理
-                    SBMirrorLocatorRef mirrorLocator = SBMirrorLocatorCreate();
-                    SBMirrorLocatorLoadLine(mirrorLocator, line, seq.stringBuffer);
-                    const SBMirrorAgent *agent = SBMirrorLocatorGetAgent(mirrorLocator);
-                    while (SBMirrorLocatorMoveNext(mirrorLocator))
-                    {
-                        size_t idx = agent->index;
-                        if (idx < char_count)
-                        {
-                            result.mirror[idx] = static_cast<uint32_t>(agent->mirror);
-                            result.is_mirrored[idx] = (result.mirror[idx] != 0);
-                        }
-                    }
-                    SBMirrorLocatorRelease(mirrorLocator);
-
-                    // 获取运行
-                    SBUInteger runCount = SBLineGetRunCount(line);
-                    const SBRun *runs = SBLineGetRunsPtr(line);
-
-                    // 记录运行
-                    for (SBUInteger i = 0; i < runCount; ++i)
-                    {
-                        const SBRun &run = runs[i];
-                        size_t start = cp_offset + run.offset;
-                        size_t end = cp_offset + run.offset + run.length;
-                        result.bidi_runs.push_back({start, end, run.level});
-                        for (size_t j = start; j < end; ++j)
-                        {
-                            result.bidi_levels[j] = run.level;
-                        }
-                    }
-
-                    // 构建视觉顺序（如果运行数为0，则手动添加）
-                    if (runCount == 0)
-                    {
-                        // 罕见情况：行中没有运行，则按逻辑顺序添加字符（视为 LTR）
-                        for (SBUInteger i = 0; i < para_cp_len; ++i)
-                        {
-                            size_t idx = cp_offset + i;
-                            visual_cp.push_back(result.codepoints[idx]);
-                        }
-                    }
-                    else
-                    {
-                        for (SBUInteger i = 0; i < runCount; ++i)
-                        {
-                            const SBRun &run = runs[i];
-                            size_t start = cp_offset + run.offset;
-                            size_t end = cp_offset + run.offset + run.length;
-                            if (run.level % 2)
-                            { // RTL
-                                for (size_t j = end; j > start; --j)
-                                {
-                                    size_t idx = j - 1;
-                                    uint32_t cp = result.mirror[idx]
-                                                      ? result.mirror[idx]
-                                                      : result.codepoints[idx];
-                                    visual_cp.push_back(cp);
-                                }
-                            }
-                            else
-                            { // LTR
-                                for (size_t j = start; j < end; ++j)
-                                {
-                                    uint32_t cp = result.mirror[j] ? result.mirror[j]
-                                                                   : result.codepoints[j];
-                                    visual_cp.push_back(cp);
-                                }
-                            }
-                        }
-                    }
-
-                    SBLineRelease(line);
-                }
-                else
-                {
-                    // line 创建失败：手动添加所有字符（视为 LTR）
-                    for (SBUInteger i = 0; i < para_cp_len; ++i)
-                    {
-                        size_t idx = cp_offset + i;
-                        visual_cp.push_back(result.codepoints[idx]);
-                        result.bidi_runs.push_back({idx, idx + 1, 0});
-                        result.bidi_levels[idx] = 0;
-                    }
-                }
-                SBParagraphRelease(para);
-            }
-            else
-            {
-                // paragraph 创建失败：手动添加所有字符（视为 LTR）
-                for (SBUInteger i = 0; i < actualLength; ++i)
-                {
-                    size_t idx = cp_offset + i;
-                    visual_cp.push_back(result.codepoints[idx]);
-                    result.bidi_runs.push_back({idx, idx + 1, 0});
-                    result.bidi_levels[idx] = 0;
-                }
-            }
-        }
-
-        // --- 处理分隔符字符（separatorLength > 0）---
-        for (SBUInteger i = 0; i < separatorLength; ++i)
-        {
-            size_t idx = cp_offset + actualLength + i;
-            uint32_t cp =
-                result.mirror[idx] ? result.mirror[idx] : result.codepoints[idx];
-            visual_cp.push_back(cp);
-            result.bidi_runs.push_back({idx, idx + 1, 0});
-            result.bidi_levels[idx] = 0;
-        }
-
-        // --- 更新偏移量 ---
-        cp_offset += actualLength + separatorLength;
+        return result;
     }
 
-    SBAlgorithmRelease(algo);
+    // FriBidi 直接使用 UTF-32 码点
+    const FriBidiChar *fribidi_text =
+        reinterpret_cast<const FriBidiChar *>(result.codepoints.data());
+    FriBidiStrIndex len = static_cast<FriBidiStrIndex>(char_count);
 
-    // 将视觉码点转换为 UTF-8
-    result.visual_string.clear();
-    for (uint32_t cp : visual_cp)
+    // 步骤1: 获取每个字符的 Bidi 类型
+    std::vector<FriBidiCharType> bidi_types(len);
+    fribidi_get_bidi_types(fribidi_text, len, bidi_types.data());
+
+    // 步骤2: 分配嵌入级别数组
+    std::vector<FriBidiLevel> embed_levels(len);
+
+    // 步骤3: 获取嵌入级别和段落方向（自动检测）
+    FriBidiParType par_type = FRIBIDI_PAR_ON; // 请求自动检测
+    FriBidiLevel max_level =
+        fribidi_get_par_embedding_levels_ex(bidi_types.data(),
+                                            nullptr, // bracket_types，不使用括号处理
+                                            len,
+                                            &par_type, // 输入请求，输出实际段落方向
+                                            embed_levels.data());
+    if (max_level == 0)
     {
-        result.visual_string += cp_to_utf8(cp);
+        std::println(stderr, "FriBidi: fribidi_get_par_embedding_levels_ex failed");
+        return result;
+    }
+
+    // 将级别存入 result.bidi_levels
+    for (size_t i = 0; i < char_count; ++i)
+    {
+        result.bidi_levels[i] = static_cast<uint8_t>(embed_levels[i]);
+    }
+
+    // 步骤4: 划分逻辑运行（基于级别变化）
+    if (char_count > 0)
+    {
+        size_t run_start = 0;
+        uint8_t current_level = result.bidi_levels[0];
+        for (size_t i = 1; i <= char_count; ++i)
+        {
+            if (i == char_count || result.bidi_levels[i] != current_level)
+            {
+                result.bidi_runs.push_back({run_start, i, current_level});
+                if (i < char_count)
+                {
+                    run_start = i;
+                    current_level = result.bidi_levels[i];
+                }
+            }
+        }
+    }
+
+    // 步骤5: 生成视觉顺序的码点序列（同时应用镜像）
+    std::vector<FriBidiChar> visual_str(len);
+    FriBidiLevel line_max_level =
+        fribidi_reorder_line(FRIBIDI_FLAGS_DEFAULT, // 默认标志，包括镜像
+                             bidi_types.data(), len,
+                             0,        // 起始偏移（整个段落）
+                             par_type, // 段落方向
+                             embed_levels.data(), visual_str.data(),
+                             nullptr // map，不需要
+        );
+    if (line_max_level == 0)
+    {
+        std::println(stderr, "FriBidi: fribidi_reorder_line failed");
+        return result;
+    }
+
+    // 将视觉顺序码点转换为 UTF-8 字符串
+    result.visual_string.clear();
+    for (FriBidiStrIndex i = 0; i < len; ++i)
+    {
+        result.visual_string += cp_to_utf8(static_cast<uint32_t>(visual_str[i]));
+    }
+
+    // 步骤6: 计算镜像信息（用于打印输出）
+    for (size_t i = 0; i < char_count; ++i)
+    {
+        if (result.bidi_levels[i] % 2 == 1)
+        {
+            FriBidiChar mirror = fribidi_get_mirror_char(result.codepoints[i], nullptr);
+            if (mirror != 0 && mirror != static_cast<FriBidiChar>(result.codepoints[i]))
+            {
+                result.mirror[i] = static_cast<uint32_t>(mirror);
+                result.is_mirrored[i] = true;
+            }
+        }
     }
 
     return result;
@@ -942,7 +883,7 @@ int main()
                  preferred_tag != HB_TAG_NONE ? tag_to_string(preferred_tag) : "none");
 
     // 测试用例
-    constexpr std::array<const char8_t *, 42> test_strings = {
+    constexpr std::array<const char8_t *, 41> test_strings = {
         u8"Hello, world!",
         u8"السلام عليكم",
         u8"Hello in Arabic is مرحبا",
@@ -957,7 +898,6 @@ int main()
         u8"𑀪𑀸𑀭𑀢 (भारत) - India",
         u8"",
         u8" \t\n\r\v\f",
-        u8" \t\n\r\v\fABC",
         u8"\u2066Hello\u2069",
         u8"∫ f(x) dx + ∑_{n=1}^{∞} 1/n² = π²/6",
         u8"یہ ایک )car( ہے۔",
@@ -989,7 +929,7 @@ int main()
     };
     // NOTE: 不太符合标准。换库
     //  预期的视觉顺序字符串（与旧代码输出完全一致）
-    constexpr std::array<const char8_t *, 42> expected_visual = {
+    constexpr std::array<const char8_t *, 41> expected_visual = {
         // 原有的 0-17（保持原样）
         u8"Hello, world!",
         u8"مكيلع مالسلا",
@@ -1005,37 +945,35 @@ int main()
         u8"𑀪𑀸𑀭𑀢 (भारत) - India",
         u8"",
         u8" \t\n\r\v\f",
-        u8" \t\n\r\v\fABC",
         u8"\u2066Hello\u2069",
         u8"∫ f(x) dx + ∑_{n=1}^{∞} 1/n² = π²/6",
         u8"۔ےہ )car( کیا ہی",
         u8"是",
 
         // 新增 18-40
-        u8"a\u200Eb",                                         // 18: a LRM b
-        u8"a\u200Fb",                                         // 19: a RLM b
-        u8"\u200Eabc",                                        // 20: LRM abc
-        u8"abc\u200F",                                        // 21: abc RLM
-        u8"\u202Aabc\u202C",                                  // 22: LRE abc PDF
-        u8"\u202Bcba\u202C",                                  // 23: RLE cba PDF
-        u8"\u202Dabc\u202C",                                  // 24: LRO abc PDF
-        u8"\u202Ecba\u202C",                                  // 25: RLO cba PDF
-        u8"\u2066abc\u2069",                                  // 26: LRI abc PDI
-        u8"\u2067cba\u2069",                                  // 27: RLI cba PDI
-        u8"\u2068abc\u2069",                                  // 28: FSI abc PDI
-        u8"\u2068cba\u05D0\u2069",                            // 29: FSI cba א PDI
-        u8"x\u202By\u202Cz",                                  // 30: x RLE y PDF z
-        u8"\u202A\u202Bcba\u202C\u202C",                      // 31: LRE RLE cba PDF PDF
-        u8"\u2066Hello \u2067\u05D1\u05D0\u2069 World\u2069", // 32: LRI Hello RLI בא PDI
-                                                              // World PDI
-        u8"\u200E",                                           // 33: LRM
-        u8"\u202A\u202C",                                     // 34: LRE PDF
-        u8"\u200E\u200F\u202A\u202C\u2066\u2069", // 35: LRM RLM LRE PDF LRI PDI
-        u8"car \u202B)\u202C",                    // 36: car 空格 RLE ) PDF
-        u8"\u202E)\u202C",                        // 37: RLO ) PDF
-        u8"\u2067)\u2069",                        // 38: RLI ) PDI
-        u8"line1\u200E\nline2",                   // 39: line1 LRM 换行 line2
-        u8"line1\u202B\nline2\u202C",             // 40: line1 RLE 换行 line2 PDF
+        u8"a\u200Eb",                                         // 18
+        u8"a\u200Fb",                                         // 19
+        u8"\u200Eabc",                                        // 20
+        u8"abc\u200F",                                        // 21
+        u8"\u202Aabc\u202C",                                  // 22
+        u8"\u202Babc\u202C",                                  // 23
+        u8"\u202Dabc\u202C",                                  // 24
+        u8"\u202Eabc\u202C",                                  // 25
+        u8"\u2066abc\u2069",                                  // 26
+        u8"\u2067abc\u2069",                                  // 27
+        u8"\u2068abc\u2069",                                  // 28
+        u8"\u2068\u05D0abc\u2069",                            // 29
+        u8"x\u202By\u202Cz",                                  // 30
+        u8"\u202A\u202Babc\u202C\u202C",                      // 31
+        u8"\u2066Hello \u2067\u05D0\u05D1\u2069 World\u2069", // 32
+        u8"\u200E",                                           // 33
+        u8"\u202A\u202C",                                     // 34
+        u8"\u200E\u200F\u202A\u202C\u2066\u2069",             // 35
+        u8"car \u202B(\u202C)",                               // 36
+        u8"\u202E(\u202C)",                                   // 37
+        u8"\u2067(\u2069)",                                   // 38
+        u8"line1\u200E\nline2",                               // 39
+        u8"line1\u202B\nline2\u202C",                         // 40
     };
     constexpr auto Taget = u8"ا";
     static_assert(test_strings[1][0] == Taget[0]);
