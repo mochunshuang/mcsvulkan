@@ -531,136 +531,131 @@ BidiResult analyze_bidi(const NormalizedText &norm, const FontMatcher &matcher)
         result.hb_scripts[i] = matcher.get_script(result.codepoints[i]);
     }
 
-    // 标记每个字符是否已被运行覆盖
-    std::vector<bool> covered(char_count, false);
+    // 使用 UTF-32 编码的码点序列
+    SBCodepointSequence seq;
+    seq.stringEncoding = SBStringEncodingUTF32;
+    seq.stringBuffer = const_cast<SBCodepoint *>(result.codepoints.data());
+    seq.stringLength = result.codepoints.size();
 
-    // 创建 Bidi 算法对象
-    SBCodepointSequence seq = {SBStringEncodingUTF8, const_cast<char *>(norm.utf8.data()),
-                               norm.utf8.size()};
     SBAlgorithmRef algo = SBAlgorithmCreate(&seq);
 
-    // 使用字节偏移遍历段落
-    SBUInteger byte_offset = 0;
-    while (byte_offset < norm.utf8.size())
+    // 用于收集视觉顺序码点的容器
+    std::vector<uint32_t> visual_cp;
+
+    // 遍历段落（使用码点索引）
+    SBUInteger cp_offset = 0;
+    while (cp_offset < result.codepoints.size())
     {
+        // 使用自动段落方向检测
         SBParagraphRef para =
-            SBAlgorithmCreateParagraph(algo, byte_offset, UINTPTR_MAX, SBLevelDefaultLTR);
+            SBAlgorithmCreateParagraph(algo, cp_offset, UINTPTR_MAX, SBLevelDefaultLTR);
         if (!para)
             break;
 
-        SBUInteger para_byte_offset = SBParagraphGetOffset(para);
-        SBUInteger para_byte_len = SBParagraphGetLength(para);
+        SBUInteger para_cp_offset = SBParagraphGetOffset(para);
+        SBUInteger para_cp_len = SBParagraphGetLength(para);
         SBLevel para_base_level = SBParagraphGetBaseLevel(para);
 
-        // 将字节范围转换为字符范围（直接使用 lower_bound，不检查严格相等）
-        auto start_it = std::ranges::lower_bound(result.byte_offsets, para_byte_offset);
-        auto end_it = std::ranges::lower_bound(result.byte_offsets,
-                                               para_byte_offset + para_byte_len);
-        size_t logical_start = start_it - result.byte_offsets.begin();
-        size_t logical_end = end_it - result.byte_offsets.begin();
-
-        // 确保有字符需要处理
-        if (logical_start < logical_end)
+        // 处理空段落（例如单独的段落分隔符）
+        if (para_cp_len == 0)
         {
-            // 创建行（整个段落）
-            SBLineRef line = SBParagraphCreateLine(para, 0, para_byte_len);
-            if (line)
+            // 为该位置添加一个默认运行（使用段落基级）
+            size_t idx = para_cp_offset;
+            result.bidi_runs.push_back({idx, idx + 1, para_base_level});
+            result.bidi_levels[idx] = para_base_level;
+            // 添加到视觉字符串
+            uint32_t cp =
+                result.mirror[idx] ? result.mirror[idx] : result.codepoints[idx];
+            visual_cp.push_back(cp);
+            SBParagraphRelease(para);
+            cp_offset = para_cp_offset + 1; // 前进一个码点
+            continue;
+        }
+
+        size_t logical_start = para_cp_offset;
+        size_t logical_end = para_cp_offset + para_cp_len;
+
+        // 创建行（整个段落）
+        SBLineRef line = SBParagraphCreateLine(para, 0, para_cp_len);
+        if (line)
+        {
+            // 处理镜像：获取镜像信息并填充 result.mirror
+            SBMirrorLocatorRef mirrorLocator = SBMirrorLocatorCreate();
+            SBMirrorLocatorLoadLine(mirrorLocator, line, seq.stringBuffer);
+            const SBMirrorAgent *agent = SBMirrorLocatorGetAgent(mirrorLocator);
+            while (SBMirrorLocatorMoveNext(mirrorLocator))
             {
-                SBUInteger runCount = SBLineGetRunCount(line);
-                const SBRun *runs = SBLineGetRunsPtr(line);
-
-                if (runCount > 0)
+                size_t idx = agent->index;
+                if (idx < char_count)
                 {
-                    // 处理 SheenBidi 提供的运行
-                    for (SBUInteger i = 0; i < runCount; ++i)
-                    {
-                        const SBRun &run = runs[i];
-                        auto run_start_it = std::lower_bound(
-                            result.byte_offsets.begin(), result.byte_offsets.end(),
-                            para_byte_offset + run.offset);
-                        auto run_end_it = std::lower_bound(
-                            result.byte_offsets.begin(), result.byte_offsets.end(),
-                            para_byte_offset + run.offset + run.length);
-                        size_t run_logical_start =
-                            run_start_it - result.byte_offsets.begin();
-                        size_t run_logical_end = run_end_it - result.byte_offsets.begin();
-
-                        result.bidi_runs.push_back(
-                            {run_logical_start, run_logical_end, run.level});
-                        for (size_t j = run_logical_start; j < run_logical_end; ++j)
-                        {
-                            result.bidi_levels[j] = run.level;
-                            covered[j] = true;
-                        }
-                    }
-
-                    // 处理镜像
-                    SBMirrorLocatorRef mirrorLocator = SBMirrorLocatorCreate();
-                    SBMirrorLocatorLoadLine(mirrorLocator, line,
-                                            const_cast<char *>(norm.utf8.data()));
-                    const SBMirrorAgent *agent = SBMirrorLocatorGetAgent(mirrorLocator);
-                    while (SBMirrorLocatorMoveNext(mirrorLocator))
-                    {
-                        SBUInteger mirror_byte_idx = agent->index;
-                        auto it =
-                            std::lower_bound(result.byte_offsets.begin(),
-                                             result.byte_offsets.end(), mirror_byte_idx);
-                        if (it != result.byte_offsets.end() && *it == mirror_byte_idx)
-                        {
-                            size_t idx = it - result.byte_offsets.begin();
-                            result.mirror[idx] = static_cast<uint32_t>(agent->mirror);
-                            result.is_mirrored[idx] = (result.mirror[idx] != 0);
-                        }
-                    }
-                    SBMirrorLocatorRelease(mirrorLocator);
-                }
-                SBLineRelease(line);
-            }
-
-            // 为段落中未被覆盖的字符添加默认运行（使用段落基级）
-            for (size_t j = logical_start; j < logical_end; ++j)
-            {
-                if (!covered[j])
-                {
-                    result.bidi_runs.push_back({j, j + 1, para_base_level});
-                    result.bidi_levels[j] = para_base_level;
-                    covered[j] = true;
+                    result.mirror[idx] = static_cast<uint32_t>(agent->mirror);
+                    result.is_mirrored[idx] = (result.mirror[idx] != 0);
                 }
             }
+            SBMirrorLocatorRelease(mirrorLocator);
+
+            // 获取逻辑运行信息
+            SBUInteger runCount = SBLineGetRunCount(line);
+            const SBRun *runs = SBLineGetRunsPtr(line);
+
+            // 记录运行信息
+            for (SBUInteger i = 0; i < runCount; ++i)
+            {
+                const SBRun &run = runs[i];
+                size_t run_logical_start = para_cp_offset + run.offset;
+                size_t run_logical_end = para_cp_offset + run.offset + run.length;
+
+                result.bidi_runs.push_back(
+                    {run_logical_start, run_logical_end, run.level});
+                for (size_t j = run_logical_start; j < run_logical_end; ++j)
+                {
+                    result.bidi_levels[j] = run.level;
+                }
+            }
+
+            // 按运行构建视觉字符串（注意：运行是按逻辑顺序给出的，视觉顺序可能需根据段落基级重排，此处简化处理）
+            for (SBUInteger i = 0; i < runCount; ++i)
+            {
+                const SBRun &run = runs[i];
+                size_t run_logical_start = para_cp_offset + run.offset;
+                size_t run_logical_end = para_cp_offset + run.offset + run.length;
+
+                if (run.level % 2)
+                { // RTL 运行：内部字符反转
+                    for (size_t j = run_logical_end; j > run_logical_start; --j)
+                    {
+                        size_t idx = j - 1;
+                        uint32_t cp = result.mirror[idx] ? result.mirror[idx]
+                                                         : result.codepoints[idx];
+                        visual_cp.push_back(cp);
+                    }
+                }
+                else
+                { // LTR 运行：保持顺序
+                    for (size_t j = run_logical_start; j < run_logical_end; ++j)
+                    {
+                        uint32_t cp =
+                            result.mirror[j] ? result.mirror[j] : result.codepoints[j];
+                        visual_cp.push_back(cp);
+                    }
+                }
+            }
+
+            SBLineRelease(line);
         }
 
         SBParagraphRelease(para);
-        byte_offset = para_byte_offset + para_byte_len;
+        cp_offset = logical_end;
     }
 
     SBAlgorithmRelease(algo);
 
-    // 按逻辑运行顺序构建视觉字符串
-    std::vector<uint32_t> visual_cp;
-    for (const auto &run : result.bidi_runs)
-    {
-        if (run.level % 2)
-        { // RTL
-            for (size_t j = run.logical_end; j > run.logical_start; --j)
-            {
-                size_t idx = j - 1;
-                uint32_t cp =
-                    result.mirror[idx] ? result.mirror[idx] : result.codepoints[idx];
-                visual_cp.push_back(cp);
-            }
-        }
-        else
-        { // LTR
-            for (size_t j = run.logical_start; j < run.logical_end; ++j)
-            {
-                uint32_t cp = result.mirror[j] ? result.mirror[j] : result.codepoints[j];
-                visual_cp.push_back(cp);
-            }
-        }
-    }
+    // 将收集的视觉码点转换为 UTF-8 字符串
     result.visual_string.clear();
     for (uint32_t cp : visual_cp)
+    {
         result.visual_string += cp_to_utf8(cp);
+    }
 
     return result;
 }
@@ -967,7 +962,8 @@ int main()
         u8"line1\u200E\nline2",                               // 39
         u8"line1\u202B\nline2\u202C",                         // 40
     };
-    // 预期的视觉顺序字符串（与旧代码输出完全一致）
+    // NOTE: 不太符合标准。换库
+    //  预期的视觉顺序字符串（与旧代码输出完全一致）
     constexpr std::array<const char8_t *, 41> expected_visual = {
         // 原有的 0-17（保持原样）
         u8"Hello, world!",
@@ -1047,8 +1043,32 @@ int main()
             if (bidi.visual_string != expected)
             {
                 std::println(stderr, "ERROR: Visual string mismatch for test case {}", i);
-                std::println(stderr, "  Expected (UTF-8): \"{}\"", expected);
-                std::println(stderr, "  Got (UTF-8):      \"{}\"", bidi.visual_string);
+                // 辅助函数：将UTF-8字符串转换为逗号分隔的转义字符序列
+                auto format_codepoints = [](const std::string &s) -> std::string {
+                    std::string result;
+                    const unsigned char *p =
+                        reinterpret_cast<const unsigned char *>(s.data());
+                    const unsigned char *end = p + s.size();
+                    bool first = true;
+                    while (p < end)
+                    {
+                        utf8proc_int32_t cp;
+                        utf8proc_ssize_t bytes = utf8proc_iterate(p, end - p, &cp);
+                        if (bytes < 0)
+                            break;
+                        if (!first)
+                            result += ", ";
+                        result += cp_to_escaped(static_cast<uint32_t>(cp));
+                        p += bytes;
+                        first = false;
+                    }
+                    return result;
+                };
+
+                std::println(stderr, "  Expected (codepoints): {}",
+                             format_codepoints(expected));
+                std::println(stderr, "  Got (codepoints):      {}",
+                             format_codepoints(bidi.visual_string));
 
                 // 将 UTF-8 字符串转换为码点序列以便逐个比较
                 auto to_codepoints = [](const std::string &s) {
