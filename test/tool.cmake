@@ -80,7 +80,7 @@ function(add_msdf_atlas_target TARGET_NAME)
     set(multiValues EXTRA_ARGS)
     cmake_parse_arguments(${prefix} "${noValues}" "${singleValues}" "${multiValues}" ${ARGN})
 
-    message(STATUS "DEBUG: GLYPHS = '${ARG_GLYPHS}'") # 添加调试输出
+    # message(STATUS "DEBUG: GLYPHS = '${ARG_GLYPHS}'") # 添加调试输出
 
     # 检查必需参数
     if(NOT ARG_FONT_PATH OR NOT ARG_OUTPUT_NAME)
@@ -197,13 +197,28 @@ function(add_msdf_atlas_target TARGET_NAME)
         set(SHOULD_SUBSET FALSE)
     endif()
 
-    if(SHOULD_SUBSET)
+    message(NOTICE "${TARGET_NAME}: SHOULD_SUBSET: ${SHOULD_SUBSET}")
+
+    # ---------------------------手动复制font 到指定目录------------------------
+    get_filename_component(FONT_EXT "${ARG_FONT_PATH}" LAST_EXT)
+    set(SUBSET_FONT_PATH "${ARG_OUTPUT_DIR}/${ARG_OUTPUT_NAME}${FONT_EXT}")
+
+    if(NOT SHOULD_SUBSET)
+        message(STATUS "COPY ${ARG_FONT_PATH} TO ${SUBSET_FONT_PATH}")
+        add_custom_command(
+            OUTPUT "${SUBSET_FONT_PATH}"
+            COMMAND ${CMAKE_COMMAND} -E copy ${ARG_FONT_PATH} ${SUBSET_FONT_PATH}
+            DEPENDS ${ARG_FONT_PATH}
+            COMMENT "Copying font_file"
+        )
+        list(APPEND ALL_OUTPUTS ${SUBSET_FONT_PATH})
+    endif(NOT SHOULD_SUBSET)
+
+    # ---------------------------裁剪并复制font 到指定目录------------------------
+    if(SHOULD_SUBSET EQUAL TRUE)
         if(NOT HB_SUBSET_TOOL_EXE)
             message(FATAL_ERROR "add_msdf_atlas_target: HB_SUBSET_TOOL_EXE is not defined")
         endif()
-
-        get_filename_component(FONT_EXT "${ARG_FONT_PATH}" LAST_EXT)
-        set(SUBSET_FONT_PATH "${ARG_OUTPUT_DIR}/${ARG_OUTPUT_NAME}${FONT_EXT}")
 
         set(SUBSET_CMD_ARGS ${HB_SUBSET_TOOL_EXE} -font "${ARG_FONT_PATH}" -out "${SUBSET_FONT_PATH}")
 
@@ -234,9 +249,9 @@ function(add_msdf_atlas_target TARGET_NAME)
         )
 
         list(APPEND ALL_OUTPUTS ${SUBSET_FONT_PATH})
-    elseif(ARG_GLYPHS)
+    elseif(NOT "${ARG_GLYPHS}" STREQUAL "")
         # 当使用 GLYPHS 时，提示用户不进行子集化
-        message(STATUS "Note: GLYPHS specified for ${TARGET_NAME}, skipping font subsetting (subset tool only supports Unicode).")
+        message(WARNING "Note: GLYPHS specified for ${TARGET_NAME}, skipping font subsetting (subset tool only supports Unicode).")
     endif()
 
     # ----- 最终目标 -----
@@ -257,7 +272,7 @@ endfunction()
 add_msdf_atlas_target(
     generate_english_atlas
     FONT_PATH "${FONT_INPUT_DIR}/TiroBangla-Regular.ttf"
-    OUTPUT_NAME "tirobangla_ascii"
+    OUTPUT_NAME "english_atlas"
     EXTRA_ARGS -allglyphs # 传递额外参数
 )
 
@@ -354,13 +369,25 @@ function(add_emoji_atlas_target TARGET_NAME)
         endif()
     endif()
 
+    # ---------------------------手动复制font 到指定目录------------------------
+    get_filename_component(FONT_EXT "${ARG_FONT_PATH}" LAST_EXT)
+    set(SUBSET_FONT_PATH "${ARG_OUTPUT_DIR}/${ARG_OUTPUT_NAME}${FONT_EXT}")
+
+    if(NOT SHOULD_SUBSET)
+        message(STATUS "COPY ${ARG_FONT_PATH} TO ${SUBSET_FONT_PATH}")
+        add_custom_command(
+            OUTPUT "${SUBSET_FONT_PATH}"
+            COMMAND ${CMAKE_COMMAND} -E copy ${ARG_FONT_PATH} ${SUBSET_FONT_PATH}
+            DEPENDS ${ARG_FONT_PATH}
+            COMMENT "Copying font_file"
+        )
+        list(APPEND ALL_OUTPUTS ${SUBSET_FONT_PATH})
+    endif(NOT SHOULD_SUBSET)
+
     if(SHOULD_SUBSET)
         if(NOT HB_SUBSET_TOOL_EXE)
             message(FATAL_ERROR "add_emoji_atlas_target: CHARSET provided but HB_SUBSET_TOOL_EXE is not defined")
         endif()
-
-        get_filename_component(FONT_EXT "${ARG_FONT_PATH}" LAST_EXT)
-        set(SUBSET_FONT_PATH "${ARG_OUTPUT_DIR}/${ARG_OUTPUT_NAME}${FONT_EXT}")
 
         set(SUBSET_CMD_ARGS
             ${HB_SUBSET_TOOL_EXE}

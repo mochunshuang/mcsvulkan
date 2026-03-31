@@ -709,5 +709,11 @@ namespace mcs::vulkan
             table_.vkCmdResolveImage(commandBuffer, srcImage, srcImageLayout, dstImage,
                                      dstImageLayout, regionCount, pRegions);
         }
+        constexpr void cmdSetDepthWriteEnable(VkCommandBuffer commandBuffer,
+                                              VkBool32 depthWriteEnable) const noexcept
+        {
+            MCS_ASSERT(table_.vkCmdSetDepthWriteEnable != nullptr);
+            table_.vkCmdSetDepthWriteEnable(commandBuffer, depthWriteEnable);
+        }
     };
 }; // namespace mcs::vulkan

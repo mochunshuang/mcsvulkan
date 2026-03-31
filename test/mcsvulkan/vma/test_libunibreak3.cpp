@@ -1525,9 +1525,9 @@ try
     // diff: [test_texture3.cpp] start
     // diff: [test_texture2.cpp] start
     auto pre = std::string{MSDF_OUTPUT_DIR};
-    const std::string TEXTURE_PATH_0 = pre + "/tirobangla_ascii.png";
-    const std::string JSON_PATH_0 = pre + "/tirobangla_ascii.json";
-    const std::string FONT_PATH_0 = pre + "/tirobangla_ascii.ttf";
+    const std::string TEXTURE_PATH_0 = pre + "/english_atlas.png";
+    const std::string JSON_PATH_0 = pre + "/english_atlas.json";
+    const std::string FONT_PATH_0 = pre + "/english_atlas.ttf";
     // constexpr auto CHAR = U'g'; // NOTE: 注意有参数耦合着色器
     // constexpr auto CHAR = U' '; //NOTE: 空格就是什么都看不到
 

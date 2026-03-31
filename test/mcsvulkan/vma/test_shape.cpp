@@ -3,6 +3,7 @@
 #include <cassert>
 #include <codecvt>
 #include <optional>
+#include <print>
 #include <set>
 #include <string_view>
 #include <unordered_map>
@@ -1151,69 +1152,52 @@ try
 
     // ------------------------ 资产管理结束 ---------------------------------
 
-    // diff: [test_libunibreak2] start
-    // TODO(mcs): 初步判定字体选错导致的
-    // constexpr auto *rawText = u8"是的ABC";
-    // constexpr auto *rawText = u8"car";
-    // constexpr auto *rawText = u8"😃";
-    // constexpr auto *rawText = u8"لسلام";
-    // auto norm = font_ns::utf8proc::normalize(rawText);
-    // const std::vector<uint32_t> &codepoints = norm.codepoints;
-    // font_ns::utf8proc::print_normalized(norm, rawText);
-
-    // auto bidi_result = font_ns::bidi::analyze(codepoints);
-    // auto mirrored_codepoints =
-    //     font_ns::bidi::mirrored_codepoints(codepoints, bidi_result);
-    // auto visual_run = font_ns::bidi::get_visual_run(mirrored_codepoints, bidi_result);
-    // font_ns::bidi::print_visual_run(visual_run);
-
+    // diff: [test_shape] start: 证明了，确实 harfbuzz::shape 单一责任: 确定字形+连字
+    // NOTE: BIDI 以及 每段LTR 还是 RTL 等必须提取确定，和翻转，等等。 标准是vscode的画面
     constexpr auto ltr = 0; // NOLINT
     constexpr auto rtl = 1; // NOLINT
 
-    // constexpr auto test_text = U"是的是的ABC";
-    // constexpr auto test_text = U"ABC";
-    // constexpr auto test_text = U"😃😆😅😂🤣 😊";
-    // constexpr auto dirction = ltr; // NOLINT
+    // constexpr auto rawText = u8"是的是的ABC🤣"; // ✅
 
-    // constexpr auto test_text = U"لسلام";
-    constexpr auto test_text = U"یہ ایک )世界car🤣( ہے۔";
-    constexpr auto dirction = rtl; // NOLINT
+    // constexpr auto rawText = u8"السلام"; // ✅
+    // constexpr auto rawText = u8"3D 世界: مرحبا بالعالم!"; // ✅
 
-    constexpr auto test_span =
-        std::span{test_text, std::u32string_view{test_text}.size()};
-    std::vector<uint32_t> code;
-    if (dirction == rtl)
-    {
-        code = test_span | std::views::reverse |
-               std::views::transform([](char32_t v) { return uint32_t{v}; }) |
-               std::ranges::to<std::vector>();
-    }
-    else
-    {
-        code = test_span | std::views::transform([](char32_t v) { return uint32_t{v}; }) |
-               std::ranges::to<std::vector>();
-    }
+    // NOTE: 不确定是否BIDI正确
+    constexpr auto rawText = u8"یہ ایک )car( ہے۔"; // ✅
 
-    font_ns::bidi::visual_run test_visual_run{
-        .visual_codepoints = code,
-        .spans = {font_ns::bidi::visual_run::run_type{
-            .offset = 0, .size = test_span.size(), .level = dirction}}};
-    auto test_scrip_result = font_ns::harfbuzz::segment_scripts(test_visual_run);
-    auto test_text_runs =
-        font_ns::assign_fonts(test_scrip_result.scrip_runs, code, font_selct);
+    // constexpr auto rawText = u8"یہ ایک )世界car🤣( ہے۔"; // ✅
+    // constexpr auto expected = u8"\u06CC\u06C1 \u0627\u06CC\u06A9 "
+    //                           u8")\u4E16\u754Ccar\U0001F923( \u06C1\u06D2\u06D4";
+    // static_assert(std::u8string_view(rawText) == std::u8string_view(expected));
+
+    // constexpr auto rawText = u8"W3C (World) מעביר את שירותי- ERCIM."; // ✅
+    auto norm = font_ns::utf8proc::normalize(rawText);
+    const std::vector<uint32_t> &codepoints = norm.codepoints;
+    font_ns::utf8proc::print_normalized(norm, rawText);
+
+    // NOTE: 结果 [comments/test_shape2_4.png] [comments/test_shape2_5.png]
+    // [comments/test_shape2_6.png]
+    auto analyze_result = font_ns::bidi::analyze(codepoints, rtl);
+    font_ns::bidi::print_bidi_result(codepoints, analyze_result);
+
+    // auto bidi_result =
+    //     font_ns::bidi::get_bidi_result(codepoints, std::move(analyze_result));
+    // font_ns::bidi::print_bidi_result(bidi_result);
+
+    // BUG: 请不要猜，计算机一个小数点位置不对就是天差地别:
+    // [comments/test_shape2_0.png] [comments/test_shape2_1.png]
+    // 输入太讲究了： 最终应该使用BIDI的结果 得到脚本
+    // [comments/test_shape2_2.png]
+    // BIDI 之后再 分割脚本 手写是错误的，别乱来。默认是稳定的吧，不详细追究了
+    // [comments/test_shape2_3.png]
+
+    auto test_text_runs = font_ns::assign_fonts(analyze_result, font_selct);
     font_ns::print_text_runs(test_text_runs);
-    auto test_shape_result = font_ns::harfbuzz::shape(code, test_text_runs);
-    font_ns::harfbuzz::print_shape_result(code, test_shape_result);
 
-#if 0
-    auto scrip_result = font_ns::harfbuzz::segment_scripts(visual_run);
-    font_ns::harfbuzz::print_script_runs(scrip_result, visual_run.visual_codepoints);
-    auto text_runs =
-        font_ns::assign_fonts(scrip_result.scrip_runs, mirrored_codepoints, font_selct);
-    font_ns::print_text_runs(text_runs);
-    auto shape_result = font_ns::harfbuzz::shape(mirrored_codepoints, text_runs);
-    font_ns::harfbuzz::print_shape_result(mirrored_codepoints, shape_result);
-#endif
+    auto test_shape_result =
+        font_ns::harfbuzz::shape(analyze_result.mirrored_codepoints, test_text_runs);
+    font_ns::harfbuzz::print_shape_result(analyze_result.mirrored_codepoints,
+                                          test_shape_result);
 
     using RenderMeshes = std::vector<mesh_base>;
     auto generate_line_meshes =
@@ -1296,22 +1280,10 @@ try
 
         for (auto &run : shape_result)
         {
-            bool is_rtl = run[0].is_rtl();
-            if (is_rtl)
+            for (auto &g : run)
             {
-                for (auto &g : run | std::views::reverse)
-                {
-                    gen_mesh(cursorX, g);
-                    cursorX += static_cast<float>(g.advance_x * fontSize);
-                }
-            }
-            else
-            {
-                for (auto &g : run)
-                {
-                    gen_mesh(cursorX, g);
-                    cursorX += static_cast<float>(g.advance_x * fontSize);
-                }
+                gen_mesh(cursorX, g);
+                cursorX += static_cast<float>(g.advance_x * fontSize);
             }
         }
         assert(lineIndices.size() != 0);
@@ -1325,44 +1297,7 @@ try
     // 生成网格
     RenderMeshes objects = generate_line_meshes(allocator, commandPool,
                                                 GRAPHICS_AND_PRESENT, test_shape_result);
-
-    // NOTE: 测试纹理是否正常上传
-#if 0
-    constexpr auto texture_idx = 4;
-    //  手动创建一个铺满屏幕的矩形（NDC 坐标）
-    std::vector<Vertex> manual_vertices;
-    std::vector<uint32_t> manual_indices;
-    // NDC 坐标：覆盖整个屏幕 (-1 到 1)
-    float x = -1.0f, y = -1.0f;
-    float w = 2.0f, h = 2.0f;
-    float z = 0.0f;
-
-    // 完整纹理 UV (0,0) 到 (1,1)
-    glm::vec2 uv_lb(0.0f, 0.0f);
-    glm::vec2 uv_rb(1.0f, 0.0f);
-    glm::vec2 uv_rt(1.0f, 1.0f);
-    glm::vec2 uv_lt(0.0f, 1.0f);
-
-    manual_vertices.push_back({{x, y, z}, {1, 0, 0}, uv_lb, texture_idx, 0, 0, 8.0f, 0});
-    manual_vertices.push_back(
-        {{x + w, y, z}, {0, 1, 0}, uv_rb, texture_idx, 0, 0, 8.0f, 0});
-    manual_vertices.push_back(
-        {{x + w, y + h, z}, {0, 0, 1}, uv_rt, texture_idx, 0, 0, 8.0f, 0});
-    manual_vertices.push_back(
-        {{x, y + h, z}, {1, 0, 0}, uv_lt, texture_idx, 0, 0, 8.0f, 0});
-    manual_indices = {0, 1, 2, 0, 2, 3};
-    // 创建 mesh_base 对象
-    mesh_base manual_mesh(allocator, commandPool, GRAPHICS_AND_PRESENT,
-                          {std::move(manual_vertices), std::move(manual_indices)});
-    objects.clear();
-    objects.emplace_back(std::move(manual_mesh));
-#endif
-
-    // RenderMeshes objects =
-    //     generate_line_meshes(allocator, commandPool, GRAPHICS_AND_PRESENT,
-    //     shape_result);
-
-    // diff: [test_harfbuzz] end
+    // diff: [test_shape] end
 
     // 更新Uniform Buffer数据的函数
     auto updateUniformBuffer = [&](uint32_t currentFrame) {

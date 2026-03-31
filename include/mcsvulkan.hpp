@@ -8,6 +8,8 @@
 #include "detail/__input.hpp"
 #include "detail/__camera.hpp"
 #include "detail/__load.hpp"
+#include "detail/__font.hpp"
+
 #include "detail/raii_vulkan.hpp"
 #include "detail/Instance.hpp"
 #include "detail/surface_impl.hpp"

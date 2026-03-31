@@ -361,6 +361,11 @@ namespace mcs::vulkan
                                              dstImageLayout, regions.size(),
                                              regions.data());
         }
+        constexpr void setDepthWriteEnable(bool depthWriteEnable) const noexcept
+        {
+            pool_->device()->cmdSetDepthWriteEnable(
+                value_, static_cast<VkBool32>(depthWriteEnable));
+        }
     };
 
 }; // namespace mcs::vulkan

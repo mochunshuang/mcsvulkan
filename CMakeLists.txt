@@ -44,6 +44,9 @@ include(third_party/SheenBidi.cmake)
 include(third_party/libraqm.cmake)
 include(third_party/libunibreak.cmake)
 
+include(third_party/icu.cmake)
+include(third_party/fribidi.cmake)
+
 set(ASSETS_DIR ${CMAKE_SOURCE_DIR}/assets)
 
 # test add
