@@ -215,7 +215,7 @@ function(add_msdf_atlas_target TARGET_NAME)
     endif(NOT SHOULD_SUBSET)
 
     # ---------------------------裁剪并复制font 到指定目录------------------------
-    if(SHOULD_SUBSET EQUAL TRUE)
+    if(SHOULD_SUBSET)
         if(NOT HB_SUBSET_TOOL_EXE)
             message(FATAL_ERROR "add_msdf_atlas_target: HB_SUBSET_TOOL_EXE is not defined")
         endif()
@@ -511,7 +511,10 @@ add_msdf_atlas_target(
 
 add_msdf_atlas_target(
     generate_test_missing_char
-    FONT_PATH "C:/Windows/Fonts/msyh.ttc"
+
+    FONT_PATH "${FONT_INPUT_DIR}/TiroBangla-Regular.ttf"
+
+    # FONT_PATH "C:/Windows/Fonts/msyh.ttc"
     OUTPUT_NAME "missing_char"
     GLYPHS "0" # 指定字形索引 0
 

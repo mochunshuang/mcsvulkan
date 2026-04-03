@@ -36,67 +36,69 @@ namespace mcs::vulkan::font::bidi
             unique_handle<SBLineRef, [](SBLineRef value) constexpr noexcept {
                 SBLineRelease(value);
             }>;
-        // using SBMirrorLocatorPtr =
-        //     unique_handle<SBMirrorLocatorRef,
-        //                   [](SBMirrorLocatorRef value) constexpr noexcept {
-        //                       SBMirrorLocatorRelease(value);
-        //                   }>;
 
-        /* Create code point sequence for a sample bidirectional text. */
         SBCodepointSequence codepointSequence{SBStringEncodingUTF32, codepoints.data(),
                                               codepoints.size()};
-        /* Extract the first bidirectional paragraph. */
         auto RAIIAlog = SBAlgorithmPtr{SBAlgorithmCreate(&codepointSequence)};
         SBAlgorithmRef bidiAlgorithm = RAIIAlog.get();
         if (bidiAlgorithm == nullptr)
             return {};
 
-        auto RAIIParagraph = SBParagraphPtr{
-            SBAlgorithmCreateParagraph(bidiAlgorithm, 0, INT32_MAX, base_level)};
-        SBParagraphRef firstParagraph = RAIIParagraph.get();
-        SBUInteger paragraphLength = SBParagraphGetLength(firstParagraph);
-
-        /* Create a line consisting of the whole paragraph and get its runs. */
-        auto RAIILine =
-            SBLinePtr{SBParagraphCreateLine(firstParagraph, 0, paragraphLength)};
-        SBLineRef paragraphLine = RAIILine.get();
-        SBUInteger runCount = SBLineGetRunCount(paragraphLine);
-        const SBRun *runArray = SBLineGetRunsPtr(paragraphLine);
-
-        /* Create a mirror locator and load the line in it. */
-        // SBMirrorLocatorPtr RAIIMirrorLocator =
-        //     SBMirrorLocatorPtr{SBMirrorLocatorCreate()};
-        // SBMirrorLocatorRef mirrorLocator = RAIIMirrorLocator.get();
-        // SBMirrorLocatorLoadLine(mirrorLocator, paragraphLine, codepoints.data());
-        // const SBMirrorAgent *mirrorAgent = SBMirrorLocatorGetAgent(mirrorLocator);
-        // /* Log the details of each mirror in the line. */
-        // while (SBMirrorLocatorMoveNext(mirrorLocator) != 0)
-        // {
-        //     assert(codepoints[mirrorAgent->index] == mirrorAgent->codepoint);
-        //     codepoints[mirrorAgent->index] = mirrorAgent->mirror;
-        // }
-
-        /* Log the details of each run in the line. */
         std::vector<visual_run> visual_bidi_runs;
-        visual_bidi_runs.reserve(runCount);
-        for (SBUInteger i = 0; i < runCount; i++)
+        SBUInteger offset = 0;
+        const SBUInteger totalLength = codepoints.size(); // NOLINT
+        while (offset < totalLength)
         {
-            visual_bidi_runs.emplace_back(visual_run{
-                .offset = runArray[i].offset,
-                .length = runArray[i].length,
-                .level = runArray[i].level,
-                .script = segment_scripts_for_run(std::span{
-                    codepoints.data() + runArray[i].offset, runArray[i].length})});
+            // 获取当前段落的实际长度（不含分隔符）和分隔符长度
+            SBUInteger actualLength, separatorLength; // NOLINT
+            SBAlgorithmGetParagraphBoundary(bidiAlgorithm, offset, INT32_MAX,
+                                            &actualLength, &separatorLength);
+            if (actualLength == 0)
+                break;
+
+            // 创建段落：绝对偏移 offset，长度 actualLength
+            auto RAIIParagraph = SBParagraphPtr{SBAlgorithmCreateParagraph(
+                bidiAlgorithm, offset, actualLength, static_cast<SBLevel>(base_level))};
+            SBParagraphRef paragraph = RAIIParagraph.get();
+            if (paragraph == nullptr)
+                break;
+
+            // 创建行：使用绝对偏移 offset，长度 actualLength
+            auto RAIILine =
+                SBLinePtr{SBParagraphCreateLine(paragraph, offset, actualLength)};
+            SBLineRef line = RAIILine.get();
+            if (line == nullptr)
+                break;
+
+            SBUInteger runCount = SBLineGetRunCount(line);
+            const SBRun *runArray = SBLineGetRunsPtr(line);
+            for (SBUInteger i = 0; i < runCount; ++i)
+            {
+                visual_bidi_runs.emplace_back(visual_run{
+                    .offset = runArray[i].offset,
+                    .length = runArray[i].length,
+                    .level = runArray[i].level,
+                    .script = segment_scripts_for_run(std::span{
+                        codepoints.data() + runArray[i].offset, runArray[i].length})});
+            }
+
+            // 镜像部分保持注释（未启用）
+            // ...
+
+            // 移动到下一段落
+            offset += actualLength + separatorLength;
         }
 
+        // 注意：这里返回的 mirrored_codepoints 与原 codepoints 相同（未镜像）
         return {.mirrored_codepoints = std::move(codepoints),
                 .visual_bidi_runs = std::move(visual_bidi_runs)};
     }
-
     static constexpr void print_bidi_result(const std::vector<uint32_t> &codepoints,
                                             const visual_result &visual_result)
     {
         std::println("--- Stage 2: Bidi Analysis (UAX #9) ---");
+        std::println(" codepoints.size() == visual_result.mirrored_codepoints.size(): {}",
+                     codepoints.size() == visual_result.mirrored_codepoints.size());
         for (const auto &run : visual_result.visual_bidi_runs)
         {
             auto scripts = run.script | std::ranges::views::transform([](bidi_script s) {

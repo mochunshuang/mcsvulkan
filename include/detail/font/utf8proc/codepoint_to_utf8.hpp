@@ -2,7 +2,6 @@
 
 #include "../__utf8proc_import.hpp"
 #include <array>
-#include <span>
 #include <string>
 
 namespace mcs::vulkan::font::utf8proc

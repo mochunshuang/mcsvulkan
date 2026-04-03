@@ -2,6 +2,7 @@
 
 #include "FontContext.hpp"
 #include "FontFactory.hpp"
+#include <cassert>
 #include <cstddef>
 #include <optional>
 #include <string_view>
@@ -214,11 +215,39 @@ namespace mcs::vulkan::font
                        return atlas->texture.view();
                    });
         }
+        constexpr void initNotdefFont() noexcept
+        {
+            for (const auto *c : selectable_)
+            {
+                if (c->glyph_index_to_glyphs.size() == 1 &&
+                    c->glyph_index_to_glyphs.contains(0))
+                {
+                    notdefFont_ = c;
+                    break;
+                }
+            }
+        }
+
+        [[nodiscard]] constexpr const FontContext *notdefFont() const noexcept
+        {
+            return notdefFont_;
+        }
+
+        constexpr void setNotdefFont(const FontContext *newFont) noexcept
+        {
+            notdefFont_ = newFont;
+        }
+        constexpr void setNotdefFont(int index) noexcept
+        {
+            notdefFont_ = selectable_[index];
+            assert((notdefFont_->glyph_index_to_glyphs.contains(0)));
+        }
 
       private:
         FontFactory *factory_;
         harfbuzz::language_type language_;
         std::vector<const FontContext *> selectable_; // NOTE: 已经排好序
         std::vector<FontInfo> candidate_;
+        const FontContext *notdefFont_;
     };
 }; // namespace mcs::vulkan::font

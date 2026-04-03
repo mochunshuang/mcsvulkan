@@ -901,7 +901,7 @@ try
     // diff: [texture] start
     // diff: [test_libunibreak2] 改成+1.
     // TODO(mcs) 一个ttc 可能要生成两个纹理，因此提前约束纹理槽是有点难的
-    constexpr int TEXTURE_COUNT = 4; // diff: [test_texture2] msdf：测试纹理+着色器
+    constexpr int TEXTURE_COUNT = 5; // diff: [test_texture2] msdf：测试纹理+着色器
     constexpr int SAMPLER_COUNT = 2; // 创建2个不同的采样器
     // diff: [texture] end
     auto descriptorSetLayout =
@@ -1002,6 +1002,11 @@ try
     const std::string JSON_PATH_3 = pre + "/arial_all.json";
     const std::string FONT_PATH_3 = pre + "/arial_all.ttf";
 
+    const std::string TEXTURE_PATH_4 = pre + "/missing_char.png";
+    const std::string JSON_PATH_4 = pre + "/missing_char.json";
+    const std::string FONT_PATH_4 = pre + "/missing_char.ttf";
+    // const std::string FONT_PATH_4 = pre + "/missing_char.ttc";
+
     // diff: [test_bidi] end
 
     // 添加字体
@@ -1045,6 +1050,15 @@ try
                                              font::texture_info::stbi_image_type{
                                                  .image_format = STBI_rgb_alpha,
                                                  .image_path = TEXTURE_PATH_3}}},
+                    font::font_registration{
+                        .font_path = FONT_PATH_4,
+                        .json_path = JSON_PATH_4,
+                        .type = font::FontType::eMSDF,
+                        .texture_info = {.bind = {.texture_index = 4, .sampler_index = 0},
+                                         .image_variant =
+                                             font::texture_info::stbi_image_type{
+                                                 .image_format = STBI_rgb_alpha,
+                                                 .image_path = TEXTURE_PATH_4}}},
                 });
     auto font_factory = font::FontFactory{{.allocator = allocator,
                                            .device = &device,
@@ -1053,6 +1067,8 @@ try
                                           *loader};
     auto font_selct =
         font::FontSelector{&font_factory, "zh-CN"}.load(std::move(registe_fonts));
+    font_selct.initNotdefFont();
+    assert(font_selct.notdefFont() != nullptr);
 
     namespace font_ns = mcs::vulkan::font;
 
@@ -1163,7 +1179,7 @@ try
     // constexpr auto rawText = u8"3D 世界: مرحبا بالعالم!"; // ✅
 
     // NOTE: 不确定是否BIDI正确
-    constexpr auto rawText = u8"یہ ایک )car( ہے۔"; // ✅
+    // constexpr auto rawText = u8"یہ ایک )car( ہے۔"; // ✅
 
     // constexpr auto rawText = u8"یہ ایک )世界car🤣( ہے۔"; // ✅
     // constexpr auto expected = u8"\u06CC\u06C1 \u0627\u06CC\u06A9 "
@@ -1171,13 +1187,15 @@ try
     // static_assert(std::u8string_view(rawText) == std::u8string_view(expected));
 
     // constexpr auto rawText = u8"W3C (World) מעביר את שירותי- ERCIM."; // ✅
+    constexpr auto rawText =
+        u8"我W3C (World)👪 ﷲ é \nמעביר את שירותי- ERCIM."; // NOTE: BUG
     auto norm = font_ns::utf8proc::normalize(rawText);
     const std::vector<uint32_t> &codepoints = norm.codepoints;
     font_ns::utf8proc::print_normalized(norm, rawText);
 
     // NOTE: 结果 [comments/test_shape2_4.png] [comments/test_shape2_5.png]
     // [comments/test_shape2_6.png]
-    auto analyze_result = font_ns::bidi::analyze(codepoints, rtl);
+    auto analyze_result = font_ns::bidi::analyze(codepoints, ltr);
     font_ns::bidi::print_bidi_result(codepoints, analyze_result);
 
     // auto bidi_result =
@@ -1194,8 +1212,8 @@ try
     auto test_text_runs = font_ns::assign_fonts(analyze_result, font_selct);
     font_ns::print_text_runs(test_text_runs);
 
-    auto test_shape_result =
-        font_ns::harfbuzz::shape(analyze_result.mirrored_codepoints, test_text_runs);
+    auto test_shape_result = font_ns::harfbuzz::shape(
+        analyze_result.mirrored_codepoints, test_text_runs, font_selct.notdefFont());
     font_ns::harfbuzz::print_shape_result(analyze_result.mirrored_codepoints,
                                           test_shape_result);
 

@@ -42,7 +42,6 @@ namespace mcs::vulkan::font::harfbuzz
             hb_buffer_set_script(buf, run.script);
             hb_buffer_set_language(buf, run.language);
 
-            // TODO(mcs): run.font 可能是nullptr 也就是没有字体能渲染
             assert(run.font != nullptr);
             hb_shape(*run.font->hb_font, buf, nullptr, 0);
 
@@ -111,11 +110,68 @@ namespace mcs::vulkan::font::harfbuzz
                                  .plane_bounds = glyph.plane_bounds()});
             }
         }
+
+        static constexpr void replacement_shape_result(
+            std::vector<shape_result> &run_result, hb_buffer_t *buf,
+            hb_direction_t direction, const shape_info &run, const FontContext *font)
+        {
+            assert(font->glyph_index_to_glyphs.contains(0));
+
+            std::vector<uint32_t> logical_codepoints(run.length, 0);
+            hb_buffer_add_utf32(buf, logical_codepoints.data(), run.length, 0,
+                                run.length);
+            // If you know the direction, script, and language
+            hb_buffer_set_direction(buf, direction);
+            hb_buffer_set_script(buf, HB_SCRIPT_COMMON);
+            hb_buffer_set_language(buf, hb_language_get_default());
+            hb_shape(*font->hb_font, buf, nullptr, 0);
+
+            unsigned int glyph_count; // NOLINT
+            auto *info = hb_buffer_get_glyph_infos(buf, &glyph_count);
+            auto *pos = hb_buffer_get_glyph_positions(buf, &glyph_count);
+
+            const double fontSizePixels = font->font.atlas.size; // NOLINT
+            // HarfBuzz uses 26.6 fixed-point numbers for positions (1 unit = 1/64 pixel)
+            constexpr double fixed_point_value = 64.0; // NOLINT
+
+            for (unsigned i = 0; i < glyph_count; ++i)
+            {
+                size_t logical_idx = run.logical_start + info[i].cluster;
+                hb_glyph_position_t position = pos[i];
+                hb_glyph_info_t hb_info = info[i];
+                double pixelAdvanceX = position.x_advance / fixed_point_value;
+                double pixelAdvanceY = position.y_advance / fixed_point_value;
+                double pixelOffsetX = position.x_offset / fixed_point_value;
+                double pixelOffsetY = position.y_offset / fixed_point_value;
+                double normalizedAdvanceX = pixelAdvanceX / fontSizePixels;
+                double normalizedAdvanceY = pixelAdvanceY / fontSizePixels;
+                double normalizedOffsetX = pixelOffsetX / fontSizePixels;
+                double normalizedOffsetY = pixelOffsetY / fontSizePixels;
+
+                constexpr hb_codepoint_t replacement_index = 0; // NOLINT
+                // 获取字形元数据
+                auto it = font->glyph_index_to_glyphs.find(replacement_index);
+                GlyphInfo glyph = GlyphInfo::make(*it->second, *font);
+                run_result.emplace_back(
+                    shape_result{.glyph_index = replacement_index,
+                                 .logical_idx = logical_idx,
+                                 .font_ctx = font,
+                                 .advance_x = normalizedAdvanceX,
+                                 .advance_y = normalizedAdvanceY,
+                                 .offset_x = normalizedOffsetX,
+                                 .offset_y = normalizedOffsetY,
+                                 .direction = direction,
+                                 .mask = hb_info.mask,
+                                 .uv_bounds = glyph.uv_bounds(),
+                                 .plane_bounds = glyph.plane_bounds()});
+            }
+        }
+
     }; // namespace detail
 
     static constexpr std::vector<std::vector<shape_result>> shape(
         const std::vector<uint32_t> &logical_codepoints,
-        const std::vector<shape_run> &shape_runs)
+        const std::vector<shape_run> &shape_runs, const FontContext *notdefFont)
     {
         using HBBufferPtr = unique_handle<hb_buffer_t *, [](hb_buffer_t *value) noexcept {
             hb_buffer_destroy(value);
@@ -136,6 +192,12 @@ namespace mcs::vulkan::font::harfbuzz
                 for (const auto &run : shape_run.runs)
                 {
                     hb_buffer_reset(buf);
+                    if (run.font == nullptr)
+                    {
+                        detail::replacement_shape_result(run_result, buf, direction, run,
+                                                         notdefFont);
+                        continue;
+                    }
                     detail::add_shape_result(
                         run_result, logical_codepoints, direction, run,
                         detail::get_glyph_info(logical_codepoints, buf, direction, run));
@@ -146,6 +208,12 @@ namespace mcs::vulkan::font::harfbuzz
                 for (const auto &run : shape_run.runs | std::ranges::views::reverse)
                 {
                     hb_buffer_reset(buf);
+                    if (run.font == nullptr)
+                    {
+                        detail::replacement_shape_result(run_result, buf, direction, run,
+                                                         notdefFont);
+                        continue;
+                    }
                     detail::add_shape_result(
                         run_result, logical_codepoints, direction, run,
                         detail::get_glyph_info(logical_codepoints, buf, direction, run));
