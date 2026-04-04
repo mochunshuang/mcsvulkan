@@ -255,12 +255,12 @@ namespace mcs::vulkan::font::harfbuzz
                 uint32_t cp = logical_codepoints[index];
                 char utf8_buf[4]; // NOLINT
                 std::string_view char_str = utf8proc::codepoint_to_utf8(cp, utf8_buf);
-                std::print("[{} in run sequence] Char {}: U+{:04X} '{}' [is_rtl: {}] "
-                           "texture_index: {}, "
-                           "sampler_index: {}",
-                           i++, index, cp, char_str, run.is_rtl(),
-                           run.font_ctx->bind.texture_index,
-                           run.font_ctx->bind.sampler_index);
+                std::print(
+                    "[{} in run sequence] logical_idx {}: U+{:04X} '{}' [is_rtl: {}] "
+                    "texture_index: {}, "
+                    "sampler_index: {}",
+                    i++, index, cp, char_str, run.is_rtl(),
+                    run.font_ctx->bind.texture_index, run.font_ctx->bind.sampler_index);
                 auto it = char_to_glyphs.find(index);
                 if (it == char_to_glyphs.end() || it->second.empty())
                 {

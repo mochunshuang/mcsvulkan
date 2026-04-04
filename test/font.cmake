@@ -33,8 +33,10 @@ add_font_target("unibreak")
 set(LIB freetype harfbuzz utf8proc ICU::uc ICU::i18n ICU::dt)
 add_font_target("icu")
 
-set(LIB freetype harfbuzz utf8proc FriBiDi::FriBiDi)
-add_font_target("fribidi")
+if(TARGET FriBiDi::FriBiDi)
+    set(LIB freetype harfbuzz utf8proc FriBiDi::FriBiDi)
+    add_font_target("fribidi")
+endif()
 
 set(LIB freetype harfbuzz utf8proc SheenBidi libunibreak)
 add_font_target("unibreak2")
