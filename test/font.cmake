@@ -58,3 +58,5 @@ add_font_target("harfbuzz3")
 add_font_target("line_breaks")
 add_font_target("icu_line_breaks")
 add_font_target("line_breaks2")
+
+add_font_target("wordbreaks")
