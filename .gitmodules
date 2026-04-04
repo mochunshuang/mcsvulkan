@@ -62,3 +62,6 @@
 [submodule "third_party/utf8proc"]
 	path = third_party/utf8proc
 	url = https://gh-proxy.org/https://github.com/JuliaStrings/utf8proc.git
+[submodule "third_party/yoga"]
+	path = third_party/yoga
+	url = https://gh-proxy.org/https://github.com/facebook/yoga.git
