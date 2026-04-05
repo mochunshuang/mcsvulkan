@@ -1202,16 +1202,18 @@ try
     auto generate_line_meshes =
         [](VmaAllocator allocator, const CommandPool &pool, const Queue &queue,
            const std::vector<std::vector<font_ns::harfbuzz::shape_result>> &shape_results,
-           const std::vector<char> &break_types, // 长度 = 逻辑字符数
-           double maxLineWidth) -> RenderMeshes {
+           const std::vector<char> &break_types,
+           double maxLineWidth,     // 行宽（世界坐标系）
+           double fontSize = 0.2,   // 字体大小（整体缩放）
+           double originX = -0.8,   // 文本块左下角/基线起点 X
+           double originY = 0.0,    // 文本块第一行基线 Y
+           double originZ = 0.0,    // 文本块的 Z 深度（所有顶点共用）
+           double lineHeight = 0.25 // 行高（正值向下，负值向上）
+           ) -> RenderMeshes {
         RenderMeshes objects;
+        double currentY = originY; // 当前行基线 Y（世界坐标）
 
-        const double fontSize = 0.2;
-        const double startX = -0.8;
-        const double lineHeight = 0.25;
-        double currentY = 0.0; // 当前基线 Y
-
-        // 1. 展平视觉顺序的所有字形，并建立 逻辑索引 -> 字形指针 的映射（假设一对一）
+        // 1. 建立逻辑索引 -> 字形指针的映射（假设一对一）
         std::vector<const font_ns::harfbuzz::shape_result *> visual_glyphs;
         std::unordered_map<size_t, const font_ns::harfbuzz::shape_result *>
             logical_to_glyph;
@@ -1224,95 +1226,83 @@ try
             }
         }
 
-        // 2. 按逻辑顺序遍历，决定每行包含哪些逻辑索引
+        // 2. 按逻辑顺序决定每行的逻辑索引范围
         struct LineInfo
         {
-            std::vector<size_t> logical_indices; // 逻辑索引（有序）
-            double width = 0.0;
+            std::vector<size_t> logical_indices;
         };
         std::vector<LineInfo> lines;
         LineInfo current_line;
-        double cursorX = startX;
+        double cursorX = originX; // 当前行光标 X
 
         for (size_t log_idx = 0; log_idx < break_types.size(); ++log_idx)
         {
             char break_type = break_types[log_idx];
-
-            // 强制换行符：结束当前行（不绘制该字符）
             if (break_type == LINEBREAK_MUSTBREAK)
             {
                 if (!current_line.logical_indices.empty())
                 {
                     lines.push_back(std::move(current_line));
                     current_line = LineInfo{};
-                    cursorX = startX;
+                    cursorX = originX;
                 }
                 continue;
             }
 
-            // 获取该逻辑索引对应的字形（如果存在）
             auto it = logical_to_glyph.find(log_idx);
             if (it == logical_to_glyph.end())
-            {
-                // 没有字形（例如某些控制字符），跳过但不影响换行
                 continue;
-            }
+
             const auto *glyph = it->second;
             double advance = glyph->advance_x * fontSize;
-            double new_width = cursorX + advance - startX; // 当前行已占宽度
+            double new_width = cursorX + advance - originX;
 
-            // 如果当前行已有内容且加入该字形会超宽，则结束当前行，并开始新行
             if (!current_line.logical_indices.empty() && new_width > maxLineWidth)
             {
                 lines.push_back(std::move(current_line));
                 current_line = LineInfo{};
-                cursorX = startX;
+                cursorX = originX;
             }
 
-            // 将当前逻辑索引加入当前行
             current_line.logical_indices.push_back(log_idx);
             cursorX += advance;
         }
-        // 最后一行
         if (!current_line.logical_indices.empty())
         {
             lines.push_back(std::move(current_line));
         }
 
-        // 3. 对每一行，从视觉顺序中提取属于该行的字形（保持视觉顺序），生成网格
+        // 3. 为每一行生成网格
         for (const auto &line : lines)
         {
-            // 该行包含的逻辑索引集合
-            std::unordered_set<size_t> log_indices_set(line.logical_indices.begin(),
-                                                       line.logical_indices.end());
-
-            // 收集该行中视觉顺序的字形
+            std::unordered_set<size_t> log_set(line.logical_indices.begin(),
+                                               line.logical_indices.end());
             std::vector<const font_ns::harfbuzz::shape_result *> line_glyphs;
             for (const auto *glyph : visual_glyphs)
             {
-                if (log_indices_set.count(glyph->logical_idx))
+                if (log_set.count(glyph->logical_idx))
                 {
                     line_glyphs.push_back(glyph);
                 }
             }
 
-            // 生成网格
             std::vector<Vertex> vertices;
             std::vector<uint32_t> indices;
             uint32_t baseVertex = 0;
-            double cursorX = startX;
+            double cursorX = originX;
 
             for (const auto *g : line_glyphs)
             {
-                double originY = currentY + g->offset_y * fontSize;
-
+                double baselineY = currentY + g->offset_y * fontSize;
                 float left =
-                    cursorX + static_cast<float>(g->plane_bounds.left * fontSize);
+                    static_cast<float>(cursorX + g->plane_bounds.left * fontSize);
                 float bottom =
-                    originY + static_cast<float>(g->plane_bounds.bottom * fontSize);
+                    static_cast<float>(baselineY + g->plane_bounds.bottom * fontSize);
                 float right =
-                    cursorX + static_cast<float>(g->plane_bounds.right * fontSize);
-                float top = originY + static_cast<float>(g->plane_bounds.top * fontSize);
+                    static_cast<float>(cursorX + g->plane_bounds.right * fontSize);
+                float top =
+                    static_cast<float>(baselineY + g->plane_bounds.top * fontSize);
+                float z = static_cast<float>(originZ);
 
                 glm::vec2 uv_lb(g->uv_bounds.left, g->uv_bounds.bottom);
                 glm::vec2 uv_rb(g->uv_bounds.right, g->uv_bounds.bottom);
@@ -1325,7 +1315,7 @@ try
                 float pxRange = static_cast<float>(
                     g->font_ctx->font.atlas.distanceRange.value_or(0.0));
 
-                vertices.push_back({{left, bottom, 0.0f},
+                vertices.push_back({{left, bottom, z},
                                     {1, 0, 0},
                                     uv_lb,
                                     textureIdx,
@@ -1333,7 +1323,7 @@ try
                                     fontType,
                                     pxRange,
                                     0});
-                vertices.push_back({{right, bottom, 0.0f},
+                vertices.push_back({{right, bottom, z},
                                     {0, 1, 0},
                                     uv_rb,
                                     textureIdx,
@@ -1341,7 +1331,7 @@ try
                                     fontType,
                                     pxRange,
                                     0});
-                vertices.push_back({{right, top, 0.0f},
+                vertices.push_back({{right, top, z},
                                     {0, 0, 1},
                                     uv_rt,
                                     textureIdx,
@@ -1349,7 +1339,7 @@ try
                                     fontType,
                                     pxRange,
                                     0});
-                vertices.push_back({{left, top, 0.0f},
+                vertices.push_back({{left, top, z},
                                     {1, 0, 0},
                                     uv_lt,
                                     textureIdx,
@@ -1375,17 +1365,25 @@ try
                     allocator, pool, queue,
                     mesh_base::mesh_data{std::move(vertices), std::move(indices)});
             }
-            currentY -= lineHeight; // 下一行向下移动
+            currentY += lineHeight; // 行高（正负控制方向）
         }
 
         return objects;
     };
-
     // 设置行宽（世界坐标系），例如 1.6（从 -0.8 到 0.8）
-    const double maxLineWidth = 1.6; // 根据需要调整
-    RenderMeshes objects =
-        generate_line_meshes(allocator, commandPool, GRAPHICS_AND_PRESENT,
-                             test_shape_result, break_result.types, maxLineWidth);
+    const double maxLineWidth = 1.6; // 行宽限制
+    const double fontSize = 0.2;     // 正常大小
+    // const double fontSize = 0.4;     // 放大
+    // const double fontSize = 0.1;     // 缩小
+
+    RenderMeshes objects = generate_line_meshes(
+        allocator, commandPool, GRAPHICS_AND_PRESENT, test_shape_result,
+        break_result.types, maxLineWidth, fontSize,
+        -0.8, // originX（左下角 X）
+        0.0,  // originY（第一行基线 Y）
+        0.0,  // originZ（深度）
+        -0.25 // lineHeight（正值向下，负值向上）
+    );
     // diff: [test_line_breaks] end
     // diff: [test_shape] end
 
