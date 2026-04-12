@@ -1,7 +1,10 @@
 set(DIR_NAME "mcsvulkan/vma")
 set(EXE_DIR "${CMAKE_SOURCE_DIR}/test/${DIR_NAME}")
 
-set(BASE_LIBS volk vma glfw glm)
+# 头文件默认依赖
+set(BASE_LIBS volk vma glfw glm stb ktx nlohmann_json
+    freetype harfbuzz SheenBidi libunibreak utf8proc
+)
 
 macro(add_vulkan_vma_test fileName)
     string(REPLACE "/" "-" PREFIX_NAME ${DIR_NAME})
@@ -24,12 +27,15 @@ std_glsl_env_init("mcsvulkan/vma")
 auto_compile_glsl_shaders(${GLSL_SHADERS_NAME} ${SHADER_DIR} ${SHADER_OUTPUT_DIR})
 copy_dir_to_bindir("textures")
 
+# 头文件默认依赖
+set(BASE_LIBS volk vma glfw glm stb ktx nlohmann_json
+    freetype harfbuzz SheenBidi libunibreak utf8proc
+)
 add_std_glsl_target(test_buffer_base test_bindless_vertext.vert test_triangle.frag)
 add_std_glsl_target(test_uniform test_uniform.vert test_triangle.frag)
 add_std_glsl_target(test_depth test_depth.vert test_triangle.frag)
 add_std_glsl_target(test_msaa test_depth.vert test_triangle.frag)
 
-set(BASE_LIBS volk vma glfw glm stb)
 add_std_glsl_target(test_texture test_texture.vert test_texture.frag)
 add_std_glsl_target(test_mipmapping test_texture.vert test_texture.frag)
 add_std_glsl_target(test_update_texture test_texture.vert test_texture.frag)
@@ -52,7 +58,6 @@ add_std_glsl_target(test_picking test_model_matrix2.vert test_texture.frag)
 add_std_glsl_target(test_picking2 test_model_matrix2.vert test_texture.frag)
 add_std_glsl_target(test_picking3 test_model_matrix2.vert test_texture.frag)
 
-set(BASE_LIBS volk vma glfw glm stb ktx nlohmann_json msdfgen::msdfgen)
 add_std_glsl_target(test_texture2 test_texture.vert test_texture2.frag)
 add_std_glsl_target(test_texture3 test_texture.vert test_texture2.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
@@ -93,10 +98,6 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_libunibreak3 test_emoji.vert test_emoji.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
-# utf8proc
-set(BASE_LIBS volk vma glfw glm stb ktx nlohmann_json
-    freetype harfbuzz SheenBidi libunibreak utf8proc
-)
 add_std_glsl_target(test_libunibreak4 test_emoji.vert test_emoji.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
