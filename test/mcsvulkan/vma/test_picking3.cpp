@@ -1681,7 +1681,6 @@ but can only be on the last binding element (binding 2).
         {{0.5, 0.5, 0}, {0.0F, 0.0F, 1.0F}, {1.0F, 1.0F}},     // 右上
         {{-0.5, 0.5, 0}, {1.0F, 0.0F, 0.0F}, {0.0F, 1.0F}}     // 左上
     }; // diff: [texture] end
-
     // 索引数据
     const std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
 
@@ -2240,7 +2239,11 @@ but can only be on the last binding element (binding 2).
                                    .pCode = std::bit_cast<const uint32_t *>(code.data())},
                                   nullptr);
     std::cout << "stages VertshaderModule 完成\n";
-    // NOTE: 下面的总是出错
+    // NOTE: 下面的总是出错， 确实用到了几何。 因为： gl_PrimitiveID ？
+    /*
+     ...\mcsvulkan\vma\shaders> spirv-dis picking.frag.spv | findstr /i "geometry"
+                   OpCapability Geometry
+    */
     code = mcs::vulkan::read_file("shaders/picking.frag.spv");
     auto FragshaderModule =
         device.createShaderModule({.sType = sType<VkShaderModuleCreateInfo>(),
@@ -2302,7 +2305,10 @@ but can only be on the last binding element (binding 2).
     VkPipelineDepthStencilStateCreateInfo depthStencil = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
         .depthTestEnable = VK_TRUE,
-        .depthWriteEnable = VK_TRUE,
+        // .depthWriteEnable = VK_TRUE,
+        // NOTE: 耦合性很强。改为只读,VK_TRUE 可写 和 layout 的
+        // VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL就不能搭配
+        .depthWriteEnable = VK_FALSE,
         .depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL};
     VkPipelineColorBlendAttachmentState blendAttach = {
         .blendEnable = VK_FALSE,
@@ -2553,13 +2559,26 @@ but can only be on the last binding element (binding 2).
                 VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT);
             // diff: [test_picking3] end
 
-            // 转换拾取图像到 TRANSFER_SRC_OPTIMAL 供后续读取
+            /*// NOTE: 增加布局转化是有风险的
+            VUID-VkImageMemoryBarrier2-oldLayout-01197: vkCmdPipelineBarrier2():
+            pDependencyInfo->pImageMemoryBarriers[0].image (VkImage 0x720000000072) cannot
+            transition the layout of aspect=1, level=0, layer=0 from
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL when the previous known layout is
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL.
+            */
+            //  转换拾取图像到 TRANSFER_SRC_OPTIMAL 供后续读取
+            //  删除以下代码块（或注释掉）
+            /*
             my_render::transition_image_layout(
                 commandBuffer, pickingImage, VK_IMAGE_ASPECT_COLOR_BIT,
                 pickingImageCurrentLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                 VK_PIPELINE_STAGE_2_TRANSFER_BIT);
+            pickingImageCurrentLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            */
+
+            // 直接更新状态变量即可（因为之前已转换过）
             pickingImageCurrentLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
             // 拾取深度图像不需要进一步转换，保持原样（下一帧会从 UNDEFINED 转换）
@@ -2859,6 +2878,15 @@ but can only be on the last binding element (binding 2).
     constexpr float TARGET_FRAME_TIME = 1.0F / TARGET_FPS; // 目标帧间隔（秒）
     auto lastFrameTime = std::chrono::high_resolution_clock::now();
 
+    // NOTE: 解决COPY 可能 越界
+    //  在 while 循环之前添加
+    struct PickingRequest
+    {
+        bool active = false;
+        int x = 0;
+        int y = 0;
+    } pickingRequest;
+
     std::decay_t<decltype(input.cursorPos())> lastMouse =
         input.cursorPos(); // diff: [test_picking]
     while (window.shouldClose() == 0)
@@ -3004,26 +3032,64 @@ but can only be on the last binding element (binding 2).
             static bool isTriangle = true;
             if (isTriangle)
             {
-                // 只记录要更新的数据，不立即执行
-                // 切换到三角形 // NOLINTBEGIN //diff: [texture] start. 设置UV坐标
-                static const std::vector<Vertex> VERTICES = {
-                    // 左下角 - 红色
-                    {.pos = {-0.5f, -0.5f, 0.7f},
-                     .color = {1.0F, 0.0F, 0.0F},
-                     .texCoord = {0.0F, 0.0F}}, // UV: (0,0)
+                static int gridSize = 5;       // 初始 1x1 网格（即2个三角形）
+                gridSize = (gridSize % 8) + 1; // 循环 1,2,3,...,8 然后回到1
 
-                    // 右下角 - 绿色
-                    {.pos = {0.5f, -0.5f, 0.7f},
-                     .color = {0.0F, 1.0F, 0.0F},
-                     .texCoord = {1.0F, 0.0F}}, // UV: (1,0)
+                std::vector<Vertex> newVertices;
+                std::vector<uint32_t> newIndices;
 
-                    // 顶部中间 - 蓝色
-                    {.pos = {0.0F, 0.5f, 0.7f},
-                     .color = {0.0F, 0.0F, 1.0F},
-                     .texCoord = {0.5f, 1.0F}} // UV: (0.5,1)
-                }; // diff: [texture] end
-                static const std::vector<uint32_t> INDICES = {0, 1, 2}; // NOLINTEND
-                input_mesh.queueUpdate(VERTICES, INDICES);
+                int N = gridSize; // 每边分段数
+                int numVertices = (N + 1) * (N + 1);
+                int numTriangles = N * N * 2;
+                int numIndices = numTriangles * 3;
+
+                newVertices.reserve(numVertices);
+                newIndices.reserve(numIndices);
+
+                // 生成顶点网格（从左下角开始，行优先）
+                float step = 1.0f / N; // 边长1.0
+                for (int j = 0; j <= N; ++j)
+                {
+                    float y = -0.5f + j * step; // 从下往上
+                    for (int i = 0; i <= N; ++i)
+                    {
+                        float x = -0.5f + i * step; // 从左往右
+                        newVertices.push_back(
+                            {.pos = {x, y, 0.0f},
+                             .color = {1.0f, 1.0f, 1.0f}, // 白色，你可以随意
+                             .texCoord = {static_cast<float>(i) / N,
+                                          static_cast<float>(j) / N}});
+                    }
+                }
+
+                // 生成索引（每个小格子两个三角形）
+                for (int j = 0; j < N; ++j)
+                {
+                    for (int i = 0; i < N; ++i)
+                    {
+                        // 当前格子的四个顶点索引
+                        uint32_t topLeft = j * (N + 1) + i;
+                        uint32_t topRight = j * (N + 1) + i + 1;
+                        uint32_t bottomLeft = (j + 1) * (N + 1) + i;
+                        uint32_t bottomRight = (j + 1) * (N + 1) + i + 1;
+
+                        // 第一个三角形（左上-右下）
+                        newIndices.push_back(topLeft);
+                        newIndices.push_back(bottomLeft);
+                        newIndices.push_back(bottomRight);
+
+                        // 第二个三角形（左上-右上-右下）
+                        newIndices.push_back(topLeft);
+                        newIndices.push_back(bottomRight);
+                        newIndices.push_back(topRight);
+                    }
+                }
+
+                input_mesh.queueUpdate(newVertices, newIndices);
+
+                std::cout << "当前网格: " << N << "x" << N
+                          << "，三角形数量: " << numTriangles
+                          << "，primitiveId 范围: 0 ~ " << numTriangles - 1 << "\n";
             }
             else
             {
@@ -3033,29 +3099,59 @@ but can only be on the last binding element (binding 2).
         }
 
         // diff: [test_picking] start
+        /* //NOTE: 得约束 copy的条件
+[ ERROR ] [create_debugger.hpp:26:static VkBool32 __cdecl
+mcs::vulkan::tool::create_debugger::defaultDebugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT,
+VkDebugUtilsMessageTypeFlagsEXT, const VkDebugUtilsMessengerCallbackDataEXT *, void *)]:
+1465181769 Validation Layer: Error: VUID-vkCmdCopyImageToBuffer-imageSubresource-07971:
+vkCmdCopyImageToBuffer(): pRegions[0].imageOffset.x (-25) must be greater than zero. The
+Vulkan spec states: For each element of pRegions, imageOffset.x and (imageExtent.width +
+imageOffset.x) must both be greater than or equal to 0 and less than or equal to the width
+of the specified imageSubresource of srcImage
+(https://docs.vulkan.org/spec/latest/chapters/copies.html#VUID-vkCmdCopyImageToBuffer-imageSubresource-07971)
+*/
+
+        // ===== 拾取请求处理（仅记录坐标，不立即渲染）=====
         auto curPos = input.cursorPos();
         if (curPos != lastMouse)
         {
-            std::cout << "拾取开启，检查鼠标....\n";
             lastMouse = curPos;
-            auto [lastMouseX, lastMouseY] = curPos;
+            auto extent = swapchain.refImageExtent();
+            int px = static_cast<int>(std::round(curPos.xpos));
+            int py = static_cast<int>(std::round(curPos.ypos));
+            if (px >= 0 && px < static_cast<int>(extent.width) && py >= 0 &&
+                py < static_cast<int>(extent.height))
+            {
+                // 鼠标在窗口内 → 记录拾取请求
+                pickingRequest = {true, px, py};
+                std::cout << "拾取请求已记录: (" << px << ", " << py << ")\n";
+            }
+            else
+            {
+                // 鼠标在窗口外 → 忽略拾取（但仍正常渲染）
+                pickingRequest.active = false;
+            }
+        }
 
-            enable_picking = true; // 1. 标记下一帧需要拾取
-            lastMouse = curPos;
+        // ===== 设置拾取标志（供 recordCommandBuffer 使用）=====
+        enable_picking = pickingRequest.active;
 
-            // 2. 渲染包含拾取的帧
-            drawFrame();
+        // ===== 始终渲染一帧（可能包含拾取pass）=====
+        drawFrame();
 
-            // 3. 等待该帧完成（注意：drawFrame 内部已更新
-            // currentFrame，需等待提交前的帧）
+        // ===== 如果本帧执行了拾取，则读取结果 =====
+        if (pickingRequest.active)
+        {
+            // 等待刚才提交的帧完成
+            // 注意：drawFrame 内部在提交后会将 currentFrame 递增，所以刚刚提交的帧索引是
+            // (currentFrame - 1) % MAX_FRAMES
             uint32_t frameToWait =
                 (frameContext.currentFrame + MAX_FRAMES_IN_FLIGHT - 1) %
                 MAX_FRAMES_IN_FLIGHT;
             device.waitForFences(1, frameContext.inFlightFences[frameToWait], VK_TRUE,
                                  UINT64_MAX);
 
-            // 4. 从拾取图像读取像素（与之前相同，但此时图像已就绪）
-
+            // ---- 以下代码与原拾取分支中的复制/读取部分完全相同 ----
             // 创建 staging buffer
             VkBufferCreateInfo stagingInfo = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             stagingInfo.size = sizeof(uint32_t) * 2;
@@ -3071,7 +3167,7 @@ but can only be on the last binding element (binding 2).
             vmaCreateBuffer(allocator, &stagingInfo, &stagingAllocInfo, &stagingBuffer,
                             &stagingAlloc, &stagingInfoMapped);
 
-            // 记录一次性命令复制像素
+            // 记录复制命令
             CommandBuffer copyCmd = commandPool.allocateOneCommandBuffer(
                 {.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY});
             copyCmd.begin({.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -3082,12 +3178,10 @@ but can only be on the last binding element (binding 2).
                 .bufferRowLength = 0,
                 .bufferImageHeight = 0,
                 .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                .imageOffset = {int32_t(curPos.xpos), int32_t(curPos.ypos), 0},
+                .imageOffset = {pickingRequest.x, pickingRequest.y, 0}, // ← 已保证非负
                 .imageExtent = {1, 1, 1}};
-            // diff: [test_picking3] start
             copyCmd.copyImageToBuffer(resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                       stagingBuffer, std::span{&region, 1});
-            // diff: [test_picking3] end
             copyCmd.end();
 
             // 提交并等待
@@ -3100,17 +3194,18 @@ but can only be on the last binding element (binding 2).
             device.waitForFences(1, *copyFence, VK_TRUE, UINT64_MAX);
 
             // 读取数据
-            uint32_t *data = (uint32_t *)stagingInfoMapped.pMappedData;
-            std::println("Mouse at ({}, {}) -> objectId={}, primitiveId={}", curPos.xpos,
-                         curPos.ypos, data[0], data[1]);
+            uint32_t *data = static_cast<uint32_t *>(stagingInfoMapped.pMappedData);
+            std::println("Mouse at ({}, {}) -> objectId={}, primitiveId={}",
+                         pickingRequest.x, pickingRequest.y, data[0], data[1]);
 
             // 清理
             vmaDestroyBuffer(allocator, stagingBuffer, stagingAlloc);
-            // commandPool.freeCommandBuffers({copyCmd});
+            // commandPool.freeCommandBuffers({copyCmd});  // 如果需要复用，可保留
+
+            // 清除请求
+            pickingRequest.active = false;
         }
         // diff: [test_picking] end
-        else
-            drawFrame();
     }
     device.waitIdle();
     // diff: [Uniform] start
