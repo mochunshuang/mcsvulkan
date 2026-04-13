@@ -64,3 +64,6 @@
 [submodule "third_party/glfw"]
 	path = third_party/glfw
 	url = https://gh-proxy.com/https://github.com/glfw/glfw.git
+[submodule "third_party/manifold"]
+	path = third_party/manifold
+	url = https://gh-proxy.org/https://github.com/elalish/manifold.git
