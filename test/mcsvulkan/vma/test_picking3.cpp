@@ -2882,7 +2882,6 @@ but can only be on the last binding element (binding 2).
     //  在 while 循环之前添加
     struct PickingRequest
     {
-        bool active = false;
         int x = 0;
         int y = 0;
     } pickingRequest;
@@ -3123,24 +3122,22 @@ of the specified imageSubresource of srcImage
                 py < static_cast<int>(extent.height))
             {
                 // 鼠标在窗口内 → 记录拾取请求
-                pickingRequest = {true, px, py};
+                enable_picking = true;
+                pickingRequest = {px, py};
                 std::cout << "拾取请求已记录: (" << px << ", " << py << ")\n";
             }
             else
             {
                 // 鼠标在窗口外 → 忽略拾取（但仍正常渲染）
-                pickingRequest.active = false;
+                enable_picking = false;
             }
         }
-
-        // ===== 设置拾取标志（供 recordCommandBuffer 使用）=====
-        enable_picking = pickingRequest.active;
 
         // ===== 始终渲染一帧（可能包含拾取pass）=====
         drawFrame();
 
         // ===== 如果本帧执行了拾取，则读取结果 =====
-        if (pickingRequest.active)
+        if (enable_picking)
         {
             // 等待刚才提交的帧完成
             // 注意：drawFrame 内部在提交后会将 currentFrame 递增，所以刚刚提交的帧索引是
@@ -3203,7 +3200,7 @@ of the specified imageSubresource of srcImage
             // commandPool.freeCommandBuffers({copyCmd});  // 如果需要复用，可保留
 
             // 清除请求
-            pickingRequest.active = false;
+            enable_picking = false;
         }
         // diff: [test_picking] end
     }
