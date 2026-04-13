@@ -2878,15 +2878,6 @@ but can only be on the last binding element (binding 2).
     constexpr float TARGET_FRAME_TIME = 1.0F / TARGET_FPS; // 目标帧间隔（秒）
     auto lastFrameTime = std::chrono::high_resolution_clock::now();
 
-    // NOTE: 解决COPY 可能 越界
-    //  在 while 循环之前添加
-    struct PickingRequest
-    {
-        bool active = false;
-        int x = 0;
-        int y = 0;
-    } pickingRequest;
-
     std::decay_t<decltype(input.cursorPos())> lastMouse =
         input.cursorPos(); // diff: [test_picking]
     while (window.shouldClose() == 0)
