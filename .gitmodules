@@ -67,3 +67,6 @@
 [submodule "third_party/manifold"]
 	path = third_party/manifold
 	url = https://gh-proxy.org/https://github.com/elalish/manifold.git
+[submodule "third_party/oneTBB"]
+	path = third_party/oneTBB
+	url = https://gh-proxy.org/https://github.com/uxlfoundation/oneTBB.git
