@@ -2882,6 +2882,7 @@ but can only be on the last binding element (binding 2).
     //  在 while 循环之前添加
     struct PickingRequest
     {
+        bool active = false;
         int x = 0;
         int y = 0;
     } pickingRequest;
@@ -3098,57 +3099,40 @@ but can only be on the last binding element (binding 2).
         }
 
         // diff: [test_picking] start
-        /* //NOTE: 得约束 copy的条件
-[ ERROR ] [create_debugger.hpp:26:static VkBool32 __cdecl
-mcs::vulkan::tool::create_debugger::defaultDebugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT,
-VkDebugUtilsMessageTypeFlagsEXT, const VkDebugUtilsMessengerCallbackDataEXT *, void *)]:
-1465181769 Validation Layer: Error: VUID-vkCmdCopyImageToBuffer-imageSubresource-07971:
-vkCmdCopyImageToBuffer(): pRegions[0].imageOffset.x (-25) must be greater than zero. The
-Vulkan spec states: For each element of pRegions, imageOffset.x and (imageExtent.width +
-imageOffset.x) must both be greater than or equal to 0 and less than or equal to the width
-of the specified imageSubresource of srcImage
-(https://docs.vulkan.org/spec/latest/chapters/copies.html#VUID-vkCmdCopyImageToBuffer-imageSubresource-07971)
-*/
-
-        // ===== 拾取请求处理（仅记录坐标，不立即渲染）=====
         auto curPos = input.cursorPos();
         if (curPos != lastMouse)
         {
-            lastMouse = curPos;
             auto extent = swapchain.refImageExtent();
             int px = static_cast<int>(std::round(curPos.xpos));
             int py = static_cast<int>(std::round(curPos.ypos));
-            if (px >= 0 && px < static_cast<int>(extent.width) && py >= 0 &&
-                py < static_cast<int>(extent.height))
+            if (px < 0 || px >= extent.width || py < 0 || py >= extent.height)
             {
-                // 鼠标在窗口内 → 记录拾取请求
-                enable_picking = true;
-                pickingRequest = {px, py};
-                std::cout << "拾取请求已记录: (" << px << ", " << py << ")\n";
+                enable_picking = false; // 本次不进行拾取
+                lastMouse = curPos;
+                drawFrame();
+                continue; // 或直接返回
             }
-            else
-            {
-                // 鼠标在窗口外 → 忽略拾取（但仍正常渲染）
-                enable_picking = false;
-            }
-        }
 
-        // ===== 始终渲染一帧（可能包含拾取pass）=====
-        drawFrame();
+            std::cout << "拾取开启，检查鼠标....\n";
+            lastMouse = curPos;
+            auto [lastMouseX, lastMouseY] = curPos;
 
-        // ===== 如果本帧执行了拾取，则读取结果 =====
-        if (enable_picking)
-        {
-            // 等待刚才提交的帧完成
-            // 注意：drawFrame 内部在提交后会将 currentFrame 递增，所以刚刚提交的帧索引是
-            // (currentFrame - 1) % MAX_FRAMES
+            enable_picking = true; // 1. 标记下一帧需要拾取
+            lastMouse = curPos;
+
+            // 2. 渲染包含拾取的帧
+            drawFrame();
+
+            // 3. 等待该帧完成（注意：drawFrame 内部已更新
+            // currentFrame，需等待提交前的帧）
             uint32_t frameToWait =
                 (frameContext.currentFrame + MAX_FRAMES_IN_FLIGHT - 1) %
                 MAX_FRAMES_IN_FLIGHT;
             device.waitForFences(1, frameContext.inFlightFences[frameToWait], VK_TRUE,
                                  UINT64_MAX);
 
-            // ---- 以下代码与原拾取分支中的复制/读取部分完全相同 ----
+            // 4. 从拾取图像读取像素（与之前相同，但此时图像已就绪）
+
             // 创建 staging buffer
             VkBufferCreateInfo stagingInfo = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
             stagingInfo.size = sizeof(uint32_t) * 2;
@@ -3164,21 +3148,33 @@ of the specified imageSubresource of srcImage
             vmaCreateBuffer(allocator, &stagingInfo, &stagingAllocInfo, &stagingBuffer,
                             &stagingAlloc, &stagingInfoMapped);
 
-            // 记录复制命令
+            // 记录一次性命令复制像素
             CommandBuffer copyCmd = commandPool.allocateOneCommandBuffer(
                 {.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY});
             copyCmd.begin({.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT});
-
+            /* //NOTE: 得约束 copy的条件
+[ ERROR ] [create_debugger.hpp:26:static VkBool32 __cdecl
+mcs::vulkan::tool::create_debugger::defaultDebugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT,
+VkDebugUtilsMessageTypeFlagsEXT, const VkDebugUtilsMessengerCallbackDataEXT *, void *)]:
+1465181769 Validation Layer: Error: VUID-vkCmdCopyImageToBuffer-imageSubresource-07971:
+vkCmdCopyImageToBuffer(): pRegions[0].imageOffset.x (-25) must be greater than zero. The
+Vulkan spec states: For each element of pRegions, imageOffset.x and (imageExtent.width +
+imageOffset.x) must both be greater than or equal to 0 and less than or equal to the width
+of the specified imageSubresource of srcImage
+(https://docs.vulkan.org/spec/latest/chapters/copies.html#VUID-vkCmdCopyImageToBuffer-imageSubresource-07971)
+*/
             VkBufferImageCopy region = {
                 .bufferOffset = 0,
                 .bufferRowLength = 0,
                 .bufferImageHeight = 0,
                 .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                .imageOffset = {pickingRequest.x, pickingRequest.y, 0}, // ← 已保证非负
+                .imageOffset = {int32_t(curPos.xpos), int32_t(curPos.ypos), 0},
                 .imageExtent = {1, 1, 1}};
+            // diff: [test_picking3] start
             copyCmd.copyImageToBuffer(resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                       stagingBuffer, std::span{&region, 1});
+            // diff: [test_picking3] end
             copyCmd.end();
 
             // 提交并等待
@@ -3191,18 +3187,17 @@ of the specified imageSubresource of srcImage
             device.waitForFences(1, *copyFence, VK_TRUE, UINT64_MAX);
 
             // 读取数据
-            uint32_t *data = static_cast<uint32_t *>(stagingInfoMapped.pMappedData);
-            std::println("Mouse at ({}, {}) -> objectId={}, primitiveId={}",
-                         pickingRequest.x, pickingRequest.y, data[0], data[1]);
+            uint32_t *data = (uint32_t *)stagingInfoMapped.pMappedData;
+            std::println("Mouse at ({}, {}) -> objectId={}, primitiveId={}", curPos.xpos,
+                         curPos.ypos, data[0], data[1]);
 
             // 清理
             vmaDestroyBuffer(allocator, stagingBuffer, stagingAlloc);
-            // commandPool.freeCommandBuffers({copyCmd});  // 如果需要复用，可保留
-
-            // 清除请求
-            enable_picking = false;
+            // commandPool.freeCommandBuffers({copyCmd});
         }
         // diff: [test_picking] end
+        else
+            drawFrame();
     }
     device.waitIdle();
     // diff: [Uniform] start
