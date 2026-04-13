@@ -1368,9 +1368,9 @@ namespace yoga
             release();
         }
 
-        [[nodiscard]] YGConfigConstRef config() const noexcept
+        [[nodiscard]] auto &refConfig() noexcept
         {
-            return *config_;
+            return config_;
         }
         [[nodiscard]] const std::string &id() const noexcept
         {
@@ -1498,66 +1498,19 @@ namespace yoga::literals
     {
         return property::Pixels{static_cast<float>(v)};
     }
-    constexpr property::Percentage operator"" _pct(unsigned long long v) noexcept
+    constexpr property::Percentage operator"" _pc(unsigned long long v) noexcept
     {
         return property::Percentage{static_cast<float>(v)};
     }
-    constexpr property::Percentage operator"" _pct(long double v) noexcept
+    constexpr property::Percentage operator"" _pc(long double v) noexcept
     {
         return property::Percentage{static_cast<float>(v)};
     }
 } // namespace yoga::literals
 
-void test_yoga()
-{
-    using namespace yoga::literals;
-    using namespace yoga;
-
-    /*
-<Layout config={{useWebDefaults: false}}>
-<Node
-  style={{
-    width: 200,
-    height: 250,
-    padding: 10,
-    alignContent: 'flex-start',
-    flexWrap: 'wrap',
-  }}>
-  <Node style={{margin: 5, height: 50, width: 50}} />
-  <Node style={{margin: 5, height: 50, width: 50}} />
-  <Node style={{margin: 5, height: 50, width: 50}} />
-  <Node style={{margin: 5, height: 50, width: 50}} />
-</Node>
-</Layout>
-*/
-
-    // config.setPointScaleFactor();
-    Node root{
-        "root",
-        Config{YGConfigNew()}.setUseWebDefaults(false),
-        Style{
-            .align_content = {YGAlign::YGAlignFlexStart},
-            .flex_wrap = {YGWrap::YGWrapWrap},
-            .padding = {10_px},
-            .width = {Pixels{200}},
-            .height = {250_px},
-        },
-        Node{"child0", Style{.margin = {5_px}, .width = {50_px}, .height = {50_px}}},
-        Node{"child1", Style{.margin = {5_px}, .width = {50_px}, .height = {50_px}}},
-        Node{"child2", Style{.margin = {5_px}, .width = {50_px}, .height = {50_px}}},
-        Node{"child3", Style{.margin = {5_px}, .width = {50_px}, .height = {50_px}}}};
-
-    Layout layout{root};
-    layout.calculate({.available_width = 400, .available_height = 800});
-    layout.print();
-
-    // NOTE: 第一行两个盒子： 分别是child0 child3。 符合页面效果
-}
-
 int main()
 try
 {
-    test_yoga();
 #ifdef VERT_SHADER_PATH
     std::cout << "VERT_SHADER_PATH: " << VERT_SHADER_PATH << '\n';
 #endif
@@ -1810,28 +1763,60 @@ try
     // diff: [test_yoga_init3] start
     using namespace yoga::literals;
     using namespace yoga;
-    Node rootNode{
-        "root",
-        Config{YGConfigNew()}.setUseWebDefaults(false),
-        Style{
-            .align_content = {YGAlign::YGAlignFlexStart},
-            .flex_wrap = {YGWrap::YGWrapWrap},
-            .padding = {10_px},
-            .width = {Pixels{200}},
-            .height = {250_px},
-        },
-        Node{"child0", Style{.margin = {5_px}, .width = {50_px}, .height = {50_px}}},
-        Node{"child1", Style{.margin = {5_px}, .width = {50_px}, .height = {50_px}}},
-        Node{"child2", Style{.margin = {5_px}, .width = {50_px}, .height = {50_px}}},
-        Node{"child3", Style{.margin = {5_px}, .width = {50_px}, .height = {50_px}}}};
+    // diff: [base_position] start
+    /*
+<Layout config={{useWebDefaults: false}}>
+<Node
+  style={{
+    width: 200,
+    height: 200,
+    padding: 10,
+  }}>
+  <Node
+    style={{
+      margin: 5,
+      height: 50,
+      top: 20,
+      position: 'relative',
+    }}
+  />
+</Node>
+</Layout>
+*/
+    Node screen{
+        "screen",
+        Config{YGConfigNew()}.setUseWebDefaults(false).setPointScaleFactor(
+            window.getContentScale().xscale),
+        Style{.width = {Pixels{WIDTH}}, .height = {Pixels{HEIGHT}}},
+        Node{
+            "root",
+            Style{
+                .padding = {10_px},
+                .width = {200_px},
+                .height = {200_px},
+            },
+            Node{"child0", Style{.position = {YGPositionType::YGPositionTypeRelative},
+                                 .top = {20_px},
+                                 .margin = {5_px},
+                                 .height = {50_px}}},
+        }};
+    window.enableContentScaleCallback([&](void *self, float xscale, float yscale) {
+        MCSLOG_INFO("glfw change ContentScaleCallback");
+        screen.refConfig().setPointScaleFactor(xscale);
+    });
+    // diff: [base_position] end
 
-    Layout layout{rootNode};
+    Layout layout{screen};
     auto on_resize = [](Layout &layout, layout_size size) {
         layout.root()->refStyle().width = Pixels{size.available_width};
         layout.root()->refStyle().height = Pixels{size.available_height};
         layout.update();
     };
     layout.calculate({.available_width = 400, .available_height = 800});
+    std::println("layout.print [start]: ContentScale: [{},{}]",
+                 window.getContentScale().xscale, window.getContentScale().yscale);
+    layout.print();
+    std::println("layout.print [end]");
     auto generateVerticesFromLayout = [](Layout &layout, layout_size size,
                                          std::vector<Vertex> &outVerts,
                                          std::vector<uint32_t> &outIndices) {
@@ -1845,7 +1830,6 @@ try
         };
         size_t index{};
         auto getColor = [&]() -> glm::vec3 {
-            // 预定义颜色数组（可沿用原特殊节点的颜色，也可自定义）
             static const std::vector<glm::vec3> colors = {
                 {1.0f, 0.0f, 0.0f}, // 红
                 {0.0f, 1.0f, 0.0f}, // 绿
@@ -1859,12 +1843,7 @@ try
             };
             if (index > colors.size())
                 index = 0;
-
-            // static std::random_device rd;
-            // static std::mt19937 gen(rd());
-            // static std::uniform_int_distribution<> dis(0, colors.size() - 1);
-            // return colors[dis(gen)];
-            return colors[index++];
+            return colors[index]; // diff: [base_display] 改成尾部控制
         };
 
         auto traverse = [&](this auto &self, const Node &cur, float parentLeft,
@@ -1874,6 +1853,7 @@ try
             float top = YGNodeLayoutGetTop(node) + parentTop;
             float width = YGNodeLayoutGetWidth(node);
             float height = YGNodeLayoutGetHeight(node);
+
             if (width > 0.0f && height > 0.0f)
             {
                 float right = left + width;
@@ -1898,10 +1878,12 @@ try
                 outIndices.push_back(base + 3);
                 outIndices.push_back(base + 2);
             }
+            index++;
 
+            // NOTE: 是否必须迁移到上面的 if条件内部。
+            // 这样就，如果父组件不可见子组件也不可见了。反正 可能是错误布局
             if (cur.childrens().empty())
                 return;
-            // 递归子节点，传入当前节点的绝对坐标作为子节点的父偏移
             for (const auto &child : cur.childrens())
                 self(child, left, top);
         };
@@ -1910,7 +1892,6 @@ try
     std::vector<Vertex> yogaVertices;
     std::vector<uint32_t> yogaIndices;
     generateVerticesFromLayout(layout, {WIDTH, HEIGHT}, yogaVertices, yogaIndices);
-    // 创建 mesh_base（替换掉原来硬编码的 vertices/indices）
     mesh_base input_mesh{
         allocator, commandPool, GRAPHICS_AND_PRESENT, {yogaVertices, yogaIndices}};
     // diff: [test_yoga_init3] end
@@ -2078,35 +2059,24 @@ try
              .swapchainCount = 1,
              .pSwapchains = &(*swapchain),
              .pImageIndices = &imageIndex});
+
+        // diff: [base_gap] 集成DPI。 分辨率变化 会重建
         if (auto &framebufferResized = window.refFramebufferResized();
             result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR ||
-            framebufferResized)
+            framebufferResized || window.reContentScaleChange())
         {
             framebufferResized = false;
+            window.reContentScaleChange() = false;
             recreateSwapChain();
         }
+        // diff: [base_gap]
+
         semaphoreIndex = (semaphoreIndex + 1) % presentCompleteSemaphore.size();
         currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     };
     while (window.shouldClose() == 0)
     {
         surface::pollEvents();
-
-        // diff: [test_triangle] start
-        auto now = std::chrono::steady_clock::now();
-        static auto lastUpdate = std::chrono::steady_clock::now();
-        if (now - lastUpdate > std::chrono::seconds(2))
-        {
-            lastUpdate = now;
-
-            // 随机修改某个子节点的 flexGrow 或 margin
-            static std::mt19937 rng(
-                std::chrono::steady_clock::now().time_since_epoch().count());
-            static std::uniform_real_distribution<float> flexDist(0.5f, 3.0f);
-            static std::uniform_real_distribution<float> marginDist(0.0f, 15.0f);
-            // TODO(mcs): 简化不更新
-        }
-        // diff: [test_triangle] end
         drawFrame();
     }
     device.waitIdle();

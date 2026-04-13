@@ -2,8 +2,10 @@
 
 #include <cstddef>
 #include <format>
+#include <functional>
 #include <string_view>
 
+#include <utility>
 #include <vector>
 #include "../__vulkan.hpp"
 
@@ -177,6 +179,33 @@ namespace mcs::vulkan::wsi::glfw
             return framebufferResized_;
         }
 
+        using ContentScaleCallbackType =
+            std::function<void(void *self, float xscale, float yscale)>;
+        void enableContentScaleCallback(ContentScaleCallbackType fun) noexcept
+        {
+            contentScaleback_ = std::move(fun);
+            glfwSetWindowContentScaleCallback(window_, &onContentScaleChange);
+        }
+        void disableContentScaleCallback() const noexcept
+        {
+            glfwSetWindowContentScaleCallback(window_, nullptr);
+        }
+        [[nodiscard]] auto getContentScale() const noexcept
+        {
+            struct scale_factor
+            {
+                float xscale;
+                float yscale;
+            };
+            scale_factor ret; // NOLINT
+            glfwGetWindowContentScale(window_, &ret.xscale, &ret.yscale);
+            return ret;
+        }
+        [[nodiscard]] auto &reContentScaleChange() noexcept
+        {
+            return contentScaleChange_;
+        }
+
       private:
         window_pointer window_ = nullptr;
         bool framebufferResized_{};
@@ -187,6 +216,17 @@ namespace mcs::vulkan::wsi::glfw
         int x_{};
         int y_{};
         bool isFullscreen_ = false;
+
+        // ontentScale
+        bool contentScaleChange_ = false;
+        ContentScaleCallbackType contentScaleback_;
+        static void onContentScaleChange(GLFWwindow *window, float xscale,
+                                         float yscale) noexcept
+        {
+            auto *app = static_cast<Window *>(::glfwGetWindowUserPointer(window));
+            app->contentScaleChange_ = true;
+            app->contentScaleback_(app, xscale, yscale);
+        }
 
         void destroy() noexcept
         {
