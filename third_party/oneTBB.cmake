@@ -119,19 +119,7 @@ file(WRITE ${FAKE_TBB_DIR}/TBBConfigVersion.cmake
 # 2. 将伪造目录置于搜索路径最前
 list(PREPEND CMAKE_PREFIX_PATH ${FAKE_TBB_DIR})
 
-# 3. 确保 TBB::tbb 别名存在（如果不存在就创建）
-if(NOT TARGET TBB::tbb)
-    add_library(TBB::tbb ALIAS tbb)
-endif()
-
-# 4. 设置旧式 Find 模块变量（某些旧版依赖可能会用）
-set(TBB_FOUND TRUE)
-set(TBB_VERSION_MAJOR 2022)
-set(TBB_VERSION_MINOR 3)
-set(TBB_VERSION_PATCH 0)
-set(TBB_VERSION_STRING "2022.3.0")
-set(TBB_INCLUDE_DIRS ${CMAKE_CURRENT_LIST_DIR}/oneTBB/include)
-set(TBB_LIBRARIES tbb) # 5. 现在 find_package 必定成功
+# 3. 现在 find_package 必定成功
 find_package(TBB REQUIRED)
 
 # ============ 欺骗 find_package(TBB) [end]=============

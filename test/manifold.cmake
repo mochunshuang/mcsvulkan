@@ -36,5 +36,7 @@ foreach(lib IN LISTS ${test_link_deps})
     endif()
 endforeach()
 
+std_glsl_target(test_manifold test_bindless_vertext.vert test_triangle.frag)
+
 # end
 std_glsl_env_destroy()
