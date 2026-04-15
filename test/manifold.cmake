@@ -38,6 +38,8 @@ endforeach()
 
 std_glsl_target(test_manifold test_bindless_vertext.vert test_triangle.frag)
 std_glsl_target(base_triangulation test_bindless_vertext.vert test_triangle.frag)
+std_glsl_target(2d_square test_bindless_vertext.vert test_triangle.frag)
+std_glsl_target(2d_transform test_bindless_vertext.vert test_triangle.frag)
 
 # end
 std_glsl_env_destroy()
