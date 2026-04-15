@@ -40,6 +40,11 @@ std_glsl_target(test_manifold test_bindless_vertext.vert test_triangle.frag)
 std_glsl_target(base_triangulation test_bindless_vertext.vert test_triangle.frag)
 std_glsl_target(2d_square test_bindless_vertext.vert test_triangle.frag)
 std_glsl_target(2d_transform test_bindless_vertext.vert test_triangle.frag)
+std_glsl_target(2d_simplify test_bindless_vertext.vert test_triangle.frag)
+std_glsl_target(2d_bool test_bindless_vertext.vert test_triangle.frag)
+std_glsl_target(2d_topology test_bindless_vertext.vert test_triangle.frag)
+std_glsl_target(2d_hull test_bindless_vertext.vert test_triangle.frag)
+std_glsl_target(2d_sample test_bindless_vertext.vert test_triangle.frag)
 
 # end
 std_glsl_env_destroy()

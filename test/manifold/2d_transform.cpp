@@ -793,6 +793,7 @@ NOTE: 坐标映射已正确：Scale(scale) 就是像素到 NDC 的桥梁。
 像素坐标系（我们构建图形时用的）	屏幕左上角或中心？注意我们用了 Square({w, h}, true)，图形中心在原点 (0,0)，但尺寸是像素值。	[-width/2, width/2]	[-height/2, height/2]	                                    像素
 NDC（Vulkan 期望的）	        屏幕中心	                                                                             [-1, 1]	         [-1, 1]（Y 向下，但 Manifold 输出 Y 向上，我们最后会翻转）	    无单位比例
 */
+    //diff: [2d_transform] start
     // 1. Translate —— 阵列平移
     auto buildMeshTranslate = [&](std::vector<Vertex> &outVerts,
                                   std::vector<uint32_t> &outIndices,
@@ -1407,6 +1408,7 @@ NDC（Vulkan 期望的）	        屏幕中心	                                 
         // buildMeshTransform(outVerts, outIndices, screenSize);
         buildMeshWarp(outVerts, outIndices, screenSize);
     };
+    //diff: [2d_transform] end
     // 生成初始顶点/索引
     std::vector<Vertex> outVerts;
     std::vector<uint32_t> outIndices;
