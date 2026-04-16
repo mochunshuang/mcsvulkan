@@ -1,7 +1,8 @@
 std_glsl_env_init("mcsvulkan/integration")
-set(BASE_LIBS volk vma glfw glm stb nlohmann_json
-    freetype harfbuzz SheenBidi libunibreak utf8proc
-)
+
+# set(BASE_LIBS volk vma glfw glm stb nlohmann_json
+# freetype harfbuzz SheenBidi libunibreak utf8proc
+# )
 auto_compile_glsl_shaders(${GLSL_SHADERS_NAME} ${SHADER_DIR} ${SHADER_OUTPUT_DIR})
 
 std_glsl_target(test_triangle test_triangle.vert test_triangle.frag)

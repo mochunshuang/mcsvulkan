@@ -55,4 +55,6 @@ include(third_party/manifold.cmake)
 set(ASSETS_DIR ${CMAKE_SOURCE_DIR}/assets)
 
 # test add
+set(MCSVULKAN_LIBS volk vma glfw glm stb ktx nlohmann_json
+    freetype harfbuzz SheenBidi libraqm libunibreak utf8proc)
 include(test/all_test.cmake)

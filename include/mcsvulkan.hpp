@@ -9,6 +9,7 @@
 #include "detail/__camera.hpp"
 #include "detail/__load.hpp"
 #include "detail/__font.hpp"
+#include "detail/__conn.hpp"
 
 #include "detail/raii_vulkan.hpp"
 #include "detail/Instance.hpp"

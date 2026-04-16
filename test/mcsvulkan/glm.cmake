@@ -1,8 +1,7 @@
 set(DIR_NAME "mcsvulkan/glm")
 set(EXE_DIR "${CMAKE_SOURCE_DIR}/test/${DIR_NAME}")
 
-set(BASE_LIBS volk vma glfw glm)
-
+# set(BASE_LIBS volk vma glfw glm)
 macro(add_vulkan_glm_test fileName)
     string(REPLACE "/" "-" PREFIX_NAME ${DIR_NAME})
     set(TAGET_NAME "${PREFIX_NAME}-${fileName}")

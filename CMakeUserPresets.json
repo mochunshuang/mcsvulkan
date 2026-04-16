@@ -16,6 +16,7 @@
                 "CMAKE_INSTALL_PREFIX": "${sourceDir}/install/",
                 "CMAKE_C_COMPILER": "E:/mysoftware/llvm-mingw-20250910-ucrt-x86_64/bin/gcc.exe",
                 "CMAKE_CXX_COMPILER": "E:/mysoftware/llvm-mingw-20250910-ucrt-x86_64/bin/g++.exe",
+                "CMAKE_RC_COMPILER": "E:/mysoftware/llvm-mingw-20250910-ucrt-x86_64/bin/llvm-windres.exe",
                 "CMAKE_BUILD_TYPE": "Debug",
                 "CMAKE_MAKE_PROGRAM": "D:/mysoftware/ninja/ninja.exe"
             },

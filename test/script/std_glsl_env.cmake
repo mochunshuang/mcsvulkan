@@ -5,7 +5,7 @@ macro(std_glsl_env_init TEST_SUB_DIR)
     set(SHADER_DIR "${EXE_DIR}/shaders")
     set(OUTPUT_DIRECTORY ${TEST_EXECUTABLE_OUTPUT_PATH}/${DIR_NAME})
     set(SHADER_OUTPUT_DIR "${OUTPUT_DIRECTORY}/shaders")
-    set(BASE_LIBS volk vma glfw glm)
+    set(BASE_LIBS ${MCSVULKAN_LIBS})
 endmacro()
 
 macro(std_glsl_target fileName vertName fragName)
