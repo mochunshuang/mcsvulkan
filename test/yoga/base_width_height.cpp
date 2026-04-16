@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <concepts>
@@ -1060,7 +1061,7 @@ namespace yoga
         constexpr void release() noexcept
         {
             if (value_ != nullptr)
-                YGConfigFree(value_);
+                YGConfigFree(std::exchange(value_, {}));
         }
         Config() = default;
         constexpr explicit Config(value_type value) noexcept : value_{value} {}
@@ -1268,7 +1269,7 @@ namespace yoga
         Config config_;
         value_type value_;
         Style style_;
-        std::vector<Node> childrens_;
+        Node *parent_ = nullptr;
 
       public:
         constexpr operator bool() const noexcept // NOLINT
@@ -1287,10 +1288,75 @@ namespace yoga
         {
             return value_;
         }
+        // 移动构造函数：目标节点始终为孤儿，源节点失去所有权且 parent_ 置空
+        Node(Node &&o) noexcept
+            : id_{std::exchange(o.id_, {})}, config_{std::exchange(o.config_, {})},
+              value_{std::exchange(o.value_, {})}, style_{std::exchange(o.style_, {})},
+              parent_{std::exchange(o.parent_, {})}
+        {
+            if (value_ != nullptr)
+                YGNodeSetContext(value_, this);
+        }
+
+        // 移动赋值运算符
+        Node &operator=(Node &&o) noexcept
+        {
+            if (this != &o)
+            {
+                release(); // 清理当前资源
+                id_ = std::exchange(o.id_, {});
+                config_ = std::exchange(o.config_, {});
+                value_ = std::exchange(o.value_, {});
+                style_ = std::exchange(o.style_, {});
+                parent_ = std::exchange(o.parent_, {});
+                if (value_ != nullptr)
+                    YGNodeSetContext(value_, this);
+            }
+            return *this;
+        }
+
+        // append 保持不变，但更安全：要求 child 是孤儿
+        void append(Node child)
+        {
+            assert(child.parent_ == nullptr && "Child must be detached before appending");
+
+            child.parent_ = this;
+            auto *heapNode = new Node(std::move(child));
+            YGNodeInsertChild(value_, heapNode->value_, YGNodeGetChildCount(value_));
+        }
+
+        // detachFromParent 保持原样
+        void detachFromParent() noexcept
+        {
+            if ((parent_ != nullptr) && (value_ != nullptr))
+            {
+                YGNodeRemoveChild(parent_->value_, value_);
+                parent_ = nullptr;
+            }
+        }
+
+        // 清理所有子节点（在父节点析构前调用）
+        void clearChildren() noexcept
+        {
+            if (value_ == nullptr)
+                return;
+            while (YGNodeGetChildCount(value_) > 0)
+            {
+                YGNodeRef childRef = YGNodeGetChild(value_, 0);
+                auto *childNode = static_cast<Node *>(YGNodeGetContext(childRef));
+                YGNodeRemoveChild(value_, childRef); // 先移除
+                childNode->parent_ = nullptr;        // 可选，但 detach 已置空
+                delete childNode;                    // 再销毁
+            }
+        }
         constexpr void release() noexcept
         {
             if (value_ != nullptr)
-                YGNodeFree(std::exchange(value_, {}));
+            {
+                clearChildren();                       // ① 先清理所有子节点
+                detachFromParent();                    // ② 从父节点移除自己
+                YGNodeFree(std::exchange(value_, {})); // ③ 释放 Yoga 节点
+            }
         }
 
         void applyStyle() const noexcept
@@ -1302,70 +1368,44 @@ namespace yoga
             applyStyle();
         }
 
-        auto append(const Node &child)
-        {
-            YGNodeInsertChild(value_, child.value_, YGNodeGetChildCount(value_));
-        }
-
         Node(const Node &) = delete;
-        Node(Node &&o) noexcept
-            : id_{std::exchange(o.id_, {})}, config_{std::exchange(o.config_, {})},
-              value_{std::exchange(o.value_, {})}, style_{std::exchange(o.style_, {})},
-              childrens_{std::exchange(o.childrens_, {})}
-        {
-        }
         Node &operator=(const Node &) = delete;
-        Node &operator=(Node &&o) noexcept
-        {
-            if (&o != this)
-            {
-                this->release();
-                id_ = std::exchange(o.id_, {});
-                config_ = std::exchange(o.config_, {});
-                value_ = std::exchange(o.value_, {});
-                style_ = std::exchange(o.style_, {});
-                childrens_ = std::exchange(o.childrens_, {});
-            }
-            return *this;
-        }
         template <std::same_as<Node>... Children>
         Node(std::string id, Config config, Style style, Children... children)
             : id_{std::move(id)}, config_{std::move(config)},
               value_(YGNodeNewWithConfig(*config_)), style_{std::move(style)}
         {
+
+            YGNodeSetContext(value_, this);
             // 1. 应用当前节点的样式
             applyStyle();
-
-            // 2. 移动构造子节点列表
-            childrens_.reserve(sizeof...(Children));
-            (childrens_.emplace_back(std::forward<Children>(children)), ...);
-
-            // 3. 将所有子节点插入 Yoga 树
-            for (const auto &child : childrens_)
-            {
-                append(child);
-            }
+            // 2. 构造父子关系
+            (append(std::move(children)), ...);
         }
         template <std::same_as<Node>... Children>
         Node(std::string id, Style style, Children... children)
             : id_{std::move(id)}, value_(YGNodeNew()), style_{std::move(style)}
         {
+            YGNodeSetContext(value_, this);
+
             // 1. 应用当前节点的样式
             applyStyle();
-
-            // 2. 移动构造子节点列表
-            childrens_.reserve(sizeof...(Children));
-            (childrens_.emplace_back(std::forward<Children>(children)), ...);
-
-            // 3. 将所有子节点插入 Yoga 树
-            for (const auto &child : childrens_)
-            {
-                append(child);
-            }
+            // 2. 构造父子关系
+            (append(std::move(children)), ...);
         }
         ~Node() noexcept
         {
             release();
+        }
+
+        Node *remove(size_t i)
+        {
+            YGNodeRef rootYoga = YGNodeGetChild(value_, i);
+            if (rootYoga == nullptr)
+                return nullptr;
+            Node *childPtr = static_cast<Node *>(YGNodeGetContext(rootYoga));
+            childPtr->detachFromParent(); // 1. 解除父子关系
+            return childPtr;              // 2. 移动所有权
         }
 
         [[nodiscard]] auto &refConfig() noexcept
@@ -1382,11 +1422,6 @@ namespace yoga
                                   *style_.direction);
         }
 
-        [[nodiscard]] const std::vector<Node> &childrens() const noexcept
-        {
-            return childrens_;
-        }
-
         Style &refStyle() noexcept
         {
             return style_;
@@ -1398,9 +1433,9 @@ namespace yoga
     {
         Node *root_;
 
-        static void printNodeLayout(const Node &node, int depth = 0)
+        static void printNodeLayout(const Node *node, int depth = 0)
         {
-            YGNodeRef ygNode = node.get();
+            YGNodeRef ygNode = node->get();
 
             std::string indent(depth * 2, ' ');
 
@@ -1411,7 +1446,7 @@ namespace yoga
             float width = YGNodeLayoutGetWidth(ygNode);
             float height = YGNodeLayoutGetHeight(ygNode);
 
-            std::println("{}Node Layout [{}]:", indent, node.id());
+            std::println("{}Node Layout [{}]:", indent, node->id());
             std::println("{}  position: left={}, top={}, right={}, bottom={}", indent,
                          left, top, right, bottom);
             std::println("{}  size: width={}, height={}", indent, width, height);
@@ -1441,9 +1476,11 @@ namespace yoga
                          YGNodeLayoutGetPadding(ygNode, YGEdgeRight));
 
             // 递归打印子节点
-            for (const auto &child : node.childrens())
+            for (size_t i = 0, size = YGNodeGetChildCount(ygNode); i < size; ++i)
             {
-                printNodeLayout(child, depth + 1);
+                YGNodeRef childRef = YGNodeGetChild(ygNode, i);
+                auto *childNode = static_cast<Node *>(YGNodeGetContext(childRef));
+                printNodeLayout(childNode, depth + 1);
             }
         }
 
@@ -1459,7 +1496,7 @@ namespace yoga
         }
         void print()
         {
-            printNodeLayout(*root_);
+            printNodeLayout(root_);
         }
         // TODO(mcs): 应该得到信息的顶点数据？
         auto applyLayout(YGNodeRef node)
@@ -1507,10 +1544,49 @@ namespace yoga::literals
         return property::Percentage{static_cast<float>(v)};
     }
 } // namespace yoga::literals
+void base()
+{
+    using namespace yoga::literals;
+    using namespace yoga;
+
+    Node screen{
+        "screen", Config{YGConfigNew()}.setUseWebDefaults(false),
+        Style{.width = {Pixels{800}}, .height = {Pixels{600}}},
+        Node{
+            "root",
+            Style{
+                .padding = {10_px},
+                .width = {200_px},
+                .height = {200_px},
+            },
+            Node{"child0", Style{.margin = {5_px}, .width = {50_px}, .height = {50_px}}},
+        }};
+
+    Layout layout{screen};
+    layout.calculate({400, 800});
+    std::println("=== Before move ===");
+    layout.print();
+
+    // ---------- 正确的移动步骤 ----------
+    Node newRoot{
+        "newRoot", Style{.width = 500_px, .height = 400_px, .padding = 15_px},
+        std::move(*screen.remove(0)) // 3. 附加到新父节点
+    };
+
+    std::println("\n=== After move (subtree attached to newRoot) ===");
+    Layout newLayout{newRoot};
+    newLayout.calculate({500, 400});
+    newLayout.print();
+
+    std::println("\n=== Original tree after move ===");
+    layout.calculate({800, 600});
+    layout.print();
+}
 
 int main()
 try
 {
+    base();
 #ifdef VERT_SHADER_PATH
     std::cout << "VERT_SHADER_PATH: " << VERT_SHADER_PATH << '\n';
 #endif
@@ -1605,12 +1681,10 @@ try
                        query_vulkan13_features.dynamicRendering &&
                        query_vulkan13_features.synchronization2 &&
 
-                       query_vulkan12_features
-                           .bufferDeviceAddress && // diff: [new]
-                                                   // 检查Vulkan 1.2中的bufferDeviceAddress
-                       query_vulkan12_features
-                           .scalarBlockLayout && // diff: [new]
-                                                 // 检查scalarBlockLayout
+                       query_vulkan12_features.bufferDeviceAddress && // diff: [new]
+                       // 检查Vulkan 1.2中的bufferDeviceAddress
+                       query_vulkan12_features.scalarBlockLayout && // diff: [new]
+                       // 检查scalarBlockLayout
 
                        query_extended_dynamic_state_features.extendedDynamicState;
             })
@@ -1878,10 +1952,15 @@ try
 
             // NOTE: 是否必须迁移到上面的 if条件内部。
             // 这样就，如果父组件不可见子组件也不可见了。反正 可能是错误布局
-            if (cur.childrens().empty())
+            auto size = YGNodeGetChildCount(node);
+            if (size == 0)
                 return;
-            for (const auto &child : cur.childrens())
-                self(child, left, top);
+            for (size_t i = 0, size = YGNodeGetChildCount(node); i < size; ++i)
+            {
+                YGNodeRef child = YGNodeGetChild(node, i);
+                auto *childNode = static_cast<Node *>(YGNodeGetContext(child));
+                self(*childNode, left, top);
+            }
         };
         traverse(*layout.root(), 0.0f, 0.0f);
     };
