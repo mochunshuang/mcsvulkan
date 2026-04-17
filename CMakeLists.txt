@@ -56,5 +56,5 @@ set(ASSETS_DIR ${CMAKE_SOURCE_DIR}/assets)
 
 # test add
 set(MCSVULKAN_LIBS volk vma glfw glm stb ktx nlohmann_json
-    freetype harfbuzz SheenBidi libraqm libunibreak utf8proc)
+    freetype harfbuzz SheenBidi libraqm libunibreak utf8proc yogacore)
 include(test/all_test.cmake)

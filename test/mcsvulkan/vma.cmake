@@ -28,9 +28,9 @@ auto_compile_glsl_shaders(${GLSL_SHADERS_NAME} ${SHADER_DIR} ${SHADER_OUTPUT_DIR
 copy_dir_to_bindir("textures")
 
 # 头文件默认依赖
-set(BASE_LIBS volk vma glfw glm stb ktx nlohmann_json
-    freetype harfbuzz SheenBidi libunibreak utf8proc
-)
+# set(BASE_LIBS volk vma glfw glm stb ktx nlohmann_json
+# freetype harfbuzz SheenBidi libunibreak utf8proc
+# )
 add_std_glsl_target(test_buffer_base test_bindless_vertext.vert test_triangle.frag)
 add_std_glsl_target(test_uniform test_uniform.vert test_triangle.frag)
 add_std_glsl_target(test_depth test_depth.vert test_triangle.frag)
@@ -71,9 +71,9 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_msdf_atlas_gen2 test_msdf_atlas_gen.vert test_msdf_atlas_gen.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
-set(BASE_LIBS volk vma glfw glm stb ktx nlohmann_json msdfgen::msdfgen
-    freetype harfbuzz SheenBidi libraqm libunibreak utf8proc
-)
+# set(BASE_LIBS volk vma glfw glm stb ktx nlohmann_json msdfgen::msdfgen
+# freetype harfbuzz SheenBidi libraqm libunibreak utf8proc
+# )
 add_std_glsl_target(test_msdf_atlas_gen3 test_msdf_atlas_gen.vert test_msdf_atlas_gen.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
