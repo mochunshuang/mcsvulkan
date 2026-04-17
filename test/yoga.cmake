@@ -45,5 +45,7 @@ std_glsl_target(base_position test_bindless_vertext.vert test_triangle.frag)
 std_glsl_target(base_min_max_width_height test_bindless_vertext.vert test_triangle.frag)
 std_glsl_target(base_width_height test_bindless_vertext.vert test_triangle.frag)
 
+std_glsl_target(base_children test_bindless_vertext.vert test_triangle.frag)
+
 # end
 std_glsl_env_destroy()
