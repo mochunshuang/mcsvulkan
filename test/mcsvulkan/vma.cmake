@@ -107,5 +107,8 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_line_breaks test_emoji.vert test_emoji.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
+add_std_glsl_target(test_yoga test_emoji.vert test_emoji2.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
 # end
 std_glsl_env_destroy()

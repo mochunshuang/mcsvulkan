@@ -13,5 +13,6 @@ namespace mcs::vulkan::font
         eMSDF,
         eMTSDF,
         eBITMAP,
+        eNONE
     };
 } // namespace mcs::vulkan::font
