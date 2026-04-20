@@ -1026,7 +1026,8 @@ try
     constexpr auto rtl = 1; // NOLINT
 
     constexpr auto rawText =
-        u8"我你好世界🤣\nW3C (World)👪 ﷲ é \nמעביר את שירותי- ERCIM."; // NOTE: BUG
+        u8"我你好世界你好世界你好世界🤣\nW3C (World)👪 ﷲ é \nמעביר את "
+        u8"שירותי- ERCIM."; // NOTE: BUG
     auto norm = font_ns::utf8proc::normalize(rawText);
     const std::vector<uint32_t> &codepoints = norm.codepoints;
     font_ns::utf8proc::print_normalized(norm, rawText);
@@ -1051,41 +1052,53 @@ try
                                              analyze_result.mirrored_codepoints);
 
     using RenderMeshes = std::vector<mesh_base>;
+
+    constexpr float BASE_WIDTH = 800.0f;
+    constexpr float BASE_HEIGHT = 600.0f;
     auto generate_line_meshes =
         [](VmaAllocator allocator, const CommandPool &pool, const Queue &queue,
            const std::vector<std::vector<font_ns::harfbuzz::shape_result>> &shape_results,
            const std::vector<char> &break_types,
-           double maxLineWidth,     // 行宽（世界坐标系）
-           double fontSize = 0.2,   // 字体大小（整体缩放）
-           double originX = -0.8,   // 文本块左下角/基线起点 X
-           double originY = 0.0,    // 文本块第一行基线 Y
-           double originZ = 0.0,    // 文本块的 Z 深度（所有顶点共用）
-           double lineHeight = 0.25 // 行高（正值向下，负值向上）
-           ) -> RenderMeshes {
+           double maxLineWidth, // 基准世界行宽（已是最终 NDC 单位）
+           double fontSize,     // 基准世界字体大小（已是最终 NDC 单位）
+           double originX,      // 基准世界起始 X（已是最终 NDC 单位）
+           double originY,      // 基准世界起始 Y（已是最终 NDC 单位）
+           double originZ,      // Z 深度
+           double lineHeight)   // 行高（负值向下，已是最终 NDC 单位）
+        -> RenderMeshes {
         RenderMeshes objects;
-        double currentY = originY; // 当前行基线 Y（世界坐标）
 
-        // 1. 建立逻辑索引 -> 字形指针的映射（假设一对一）
+        // 字形原始最大高度（用于基线对齐）
+        double maxGlyphRawHeight = 0.0;
+        for (const auto &run : shape_results)
+            for (const auto &glyph : run)
+            {
+                double h = glyph.plane_bounds.top - glyph.plane_bounds.bottom;
+                if (h > maxGlyphRawHeight)
+                    maxGlyphRawHeight = h;
+            }
+
+        double currentY = originY - (maxGlyphRawHeight * fontSize) * 0.5;
+
+        // 建立逻辑索引到字形的映射
         std::vector<const font_ns::harfbuzz::shape_result *> visual_glyphs;
         std::unordered_map<size_t, const font_ns::harfbuzz::shape_result *>
             logical_to_glyph;
         for (const auto &run : shape_results)
-        {
             for (const auto &glyph : run)
             {
                 visual_glyphs.push_back(&glyph);
                 logical_to_glyph[glyph.logical_idx] = &glyph;
             }
-        }
 
-        // 2. 按逻辑顺序决定每行的逻辑索引范围
+        // 按逻辑顺序分行
         struct LineInfo
         {
             std::vector<size_t> logical_indices;
         };
         std::vector<LineInfo> lines;
         LineInfo current_line;
-        double cursorX = originX; // 当前行光标 X
+        double cursorX = originX;
 
         for (size_t log_idx = 0; log_idx < break_types.size(); ++log_idx)
         {
@@ -1120,23 +1133,17 @@ try
             cursorX += advance;
         }
         if (!current_line.logical_indices.empty())
-        {
             lines.push_back(std::move(current_line));
-        }
 
-        // 3. 为每一行生成网格
+        // 生成网格顶点（坐标已是基准世界单位，无需补偿）
         for (const auto &line : lines)
         {
             std::unordered_set<size_t> log_set(line.logical_indices.begin(),
                                                line.logical_indices.end());
             std::vector<const font_ns::harfbuzz::shape_result *> line_glyphs;
             for (const auto *glyph : visual_glyphs)
-            {
                 if (log_set.count(glyph->logical_idx))
-                {
                     line_glyphs.push_back(glyph);
-                }
-            }
 
             std::vector<Vertex> vertices;
             std::vector<uint32_t> indices;
@@ -1217,25 +1224,11 @@ try
                     allocator, pool, queue,
                     mesh_base::mesh_data{std::move(vertices), std::move(indices)});
             }
-            currentY += lineHeight; // 行高（正负控制方向）
+            currentY += lineHeight;
         }
 
         return objects;
     };
-    // 设置行宽（世界坐标系），例如 1.6（从 -0.8 到 0.8）
-    const double maxLineWidth = 1.6; // 行宽限制
-    const double fontSize = 0.2;     // 正常大小
-    // const double fontSize = 0.4;     // 放大
-    // const double fontSize = 0.1;     // 缩小
-
-    RenderMeshes objects = generate_line_meshes(
-        allocator, commandPool, GRAPHICS_AND_PRESENT, test_shape_result,
-        break_result.types, maxLineWidth, fontSize,
-        -0.8, // originX（左下角 X）
-        0.0,  // originY（第一行基线 Y）
-        0.0,  // originZ（深度）
-        -0.25 // lineHeight（正值向下，负值向上）
-    );
     // diff: [test_yoga] start
     using namespace mcs::vulkan::yoga::literals;
     using namespace mcs::vulkan::yoga;
@@ -1264,7 +1257,12 @@ try
                 .height = {200_px},
             },
             Node{"1", Style{.margin = {5_px}, .width = {100_px}, .height = {20_px}}},
-        }};
+        },
+        Node{"text_display", Style{
+                                 .padding = {10_px},
+                                 .width = {200_px},
+                                 .height = {200_px},
+                             }}};
     window.enableContentScaleCallback([&](void *self, float xscale, float yscale) {
         MCSLOG_INFO("glfw change ContentScaleCallback");
         screen.refConfig().setPointScaleFactor(xscale);
@@ -1299,6 +1297,7 @@ try
                  window.getContentScale().xscale, window.getContentScale().yscale);
     layout.print();
     std::println("layout.print [end]");
+
     auto generateVerticesFromLayout = [](Layout &layout, layout_size size,
                                          std::vector<Vertex> &outVerts,
                                          std::vector<uint32_t> &outIndices) {
@@ -1314,12 +1313,20 @@ try
         //     return {(x / screenWidth) * 2.0f - 1.0f, (y / screenHeight) * 2.0f - 1.0f,
         //             0.0f};
         // };
+        // auto screenToNDC = [=](float x, float y) -> glm::vec3 {
+        //     // 从“世界坐标系（Y 向上）”到“Vulkan NDC（Y 向下）”的转换。
+        //     float worldY = screenHeight - y; // 翻转 Y 轴
+        //     return {(x / screenWidth) * 2.0f - 1.0f,
+        //             (worldY / screenHeight) * 2.0f - 1.0f, 0.0f};
+        // };
         auto screenToNDC = [=](float x, float y) -> glm::vec3 {
-            // 从“世界坐标系（Y 向上）”到“Vulkan NDC（Y 向下）”的转换。
-            float worldY = screenHeight - y; // 翻转 Y 轴
-            return {(x / screenWidth) * 2.0f - 1.0f,
-                    (worldY / screenHeight) * 2.0f - 1.0f, 0.0f};
+            // 锚定左上角：屏幕像素(0,0)对应NDC(-1,1)
+            // 基于基准尺寸映射，内容大小固定
+            float ndcX = -1.0f + (x / BASE_WIDTH) * 2.0f;
+            float ndcY = 1.0f - (y / BASE_HEIGHT) * 2.0f;
+            return {ndcX, ndcY, 0.0f};
         };
+
         size_t index{};
         auto getColor = [&]() -> glm::vec3 {
             static const std::vector<glm::vec3> colors = {
@@ -1425,7 +1432,61 @@ try
     mesh_base layout_mesh{
         allocator, commandPool, GRAPHICS_AND_PRESENT, {yogaVertices, yogaIndices}};
 
-    //NOTE: 放文本 和 layout 的顶点数据在一起。 背景放在前面
+    // diff: [test_yoga2] start 可重用文本网格更新逻辑
+
+    auto updateTextMeshes = [&](float screenWidth, float screenHeight) {
+        constexpr float BASE_FONT_SIZE_PX = 16.0f;
+
+        // 获取文本显示节点的布局信息（Yoga 返回的像素坐标）
+        auto &text_display = screen.childrens()[2];
+        YGNodeRef textNode = **text_display;
+        float left = YGNodeLayoutGetLeft(textNode);
+        float top = YGNodeLayoutGetTop(textNode);
+        float width = YGNodeLayoutGetWidth(textNode);
+        float height = YGNodeLayoutGetHeight(textNode);
+
+        float padLeft = YGNodeStyleGetPadding(textNode, YGEdgeLeft).value;
+        float padRight = YGNodeStyleGetPadding(textNode, YGEdgeRight).value;
+        float padTop = YGNodeStyleGetPadding(textNode, YGEdgeTop).value;
+        float padBottom = YGNodeStyleGetPadding(textNode, YGEdgeBottom).value;
+
+        float contentLeft = left + padLeft;
+        float contentTop = top + padTop;
+        float contentWidth = width - padLeft - padRight;
+
+        // 基于基准尺寸直接计算 NDC 坐标（锚定左上角）
+        double originX = -1.0 + (contentLeft / BASE_WIDTH) * 2.0;
+        double originY = 1.0 - (contentTop / BASE_HEIGHT) * 2.0;
+        double maxLineWidth = (contentWidth / BASE_WIDTH) * 2.0; // 基准世界单位
+
+        // 字形原始最大高度
+        double maxGlyphRawHeight = 0.0;
+        for (const auto &run : test_shape_result)
+            for (const auto &glyph : run)
+            {
+                double h = glyph.plane_bounds.top - glyph.plane_bounds.bottom;
+                if (h > maxGlyphRawHeight)
+                    maxGlyphRawHeight = h;
+            }
+
+        // 基准世界字体大小（基于 BASE_HEIGHT 转换）
+        double baseFontSizeWorld = BASE_FONT_SIZE_PX * (2.0 / BASE_HEIGHT);
+        const double lineHeightFactor = 1.2;
+        double lineHeightWorld =
+            -baseFontSizeWorld * maxGlyphRawHeight * lineHeightFactor;
+
+        // 调用网格生成函数（已去除 screenWidth/screenHeight 参数）
+        return generate_line_meshes(allocator, commandPool, GRAPHICS_AND_PRESENT,
+                                    test_shape_result, break_result.types, maxLineWidth,
+                                    baseFontSizeWorld, originX, originY, 0.0,
+                                    lineHeightWorld);
+    };
+    VkExtent2D fbSize = window.getFramebufferSize();
+    float screenW = static_cast<float>(fbSize.width);
+    float screenH = static_cast<float>(fbSize.height);
+
+    RenderMeshes objects = updateTextMeshes(screenW, screenH);
+    // diff: [test_yoga2] end
     objects.insert(objects.begin(), std::move(layout_mesh));
     // diff: [test_yoga] end
 
@@ -1848,6 +1909,17 @@ try
                  .available_height = static_cast<float>(newHeight)},
                 newVerts, newIndices);
             objects[0].queueUpdate(std::move(newVerts), std::move(newIndices));
+
+            //diff: [test_yoga2] start
+            // 更新文本网格（替换索引1及之后的所有元素）
+            RenderMeshes newTextMeshes = updateTextMeshes(static_cast<float>(newWidth),
+                                                          static_cast<float>(newHeight));
+            // 保留 objects[0]，删除其余，再插入新文本网格
+            if (objects.size() > 1)
+                objects.erase(objects.begin() + 1, objects.end());
+            objects.insert(objects.end(), std::make_move_iterator(newTextMeshes.begin()),
+                           std::make_move_iterator(newTextMeshes.end()));
+            //diff: [test_yoga2] end
         }
         //diff: [test_yoga] end
 

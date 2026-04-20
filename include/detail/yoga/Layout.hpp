@@ -76,6 +76,10 @@ namespace mcs::vulkan::yoga
         {
             printNodeLayout(root_);
         }
+        static void print(const Node &node)
+        {
+            printNodeLayout(&node);
+        }
 
         [[nodiscard]] Node *root() const noexcept
         {

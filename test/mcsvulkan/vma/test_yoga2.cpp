@@ -1026,7 +1026,8 @@ try
     constexpr auto rtl = 1; // NOLINT
 
     constexpr auto rawText =
-        u8"我你好世界🤣\nW3C (World)👪 ﷲ é \nמעביר את שירותי- ERCIM."; // NOTE: BUG
+        u8"我你好世界你好世界你好世界🤣\nW3C (World)👪 ﷲ é \nמעביר את "
+        u8"שירותי- ERCIM."; // NOTE: BUG
     auto norm = font_ns::utf8proc::normalize(rawText);
     const std::vector<uint32_t> &codepoints = norm.codepoints;
     font_ns::utf8proc::print_normalized(norm, rawText);
@@ -1055,15 +1056,39 @@ try
         [](VmaAllocator allocator, const CommandPool &pool, const Queue &queue,
            const std::vector<std::vector<font_ns::harfbuzz::shape_result>> &shape_results,
            const std::vector<char> &break_types,
-           double maxLineWidth,     // 行宽（世界坐标系）
-           double fontSize = 0.2,   // 字体大小（整体缩放）
-           double originX = -0.8,   // 文本块左下角/基线起点 X
-           double originY = 0.0,    // 文本块第一行基线 Y
-           double originZ = 0.0,    // 文本块的 Z 深度（所有顶点共用）
-           double lineHeight = 0.25 // 行高（正值向下，负值向上）
+           double maxLineWidth,        // 行宽（世界坐标系）
+           double InputFontSize = 0.2, // 字体大小（整体缩放）
+           double originX = -0.8,      // 文本块左下角/基线起点 X
+           double originY = 0.0,       // 文本块第一行基线 Y
+           double originZ = 0.0,       // 文本块的 Z 深度（所有顶点共用）
+           double lineHeight = 0.25    // 行高（正值向下，负值向上）
            ) -> RenderMeshes {
         RenderMeshes objects;
-        double currentY = originY; // 当前行基线 Y（世界坐标）
+
+        // diff: [test_yoga2] start
+        // ----- 新增：计算最大字形原始高度 -----
+
+        double maxGlyphRawHeight = 0.0;
+        for (const auto &run : shape_results)
+        {
+            for (const auto &glyph : run)
+            {
+                double height = glyph.plane_bounds.top - glyph.plane_bounds.bottom;
+                if (height > maxGlyphRawHeight)
+                    maxGlyphRawHeight = height;
+            }
+        }
+
+        // 根据行高决定实际缩放（若 lineHeight 为 0 则退化处理）
+        double fontSize = InputFontSize;
+        if (maxGlyphRawHeight > 0.0 && lineHeight != 0.0)
+        {
+            double required = std::abs(lineHeight) / maxGlyphRawHeight;
+            fontSize = std::min(InputFontSize, required); // 保证不超出
+        }
+        double currentY = originY - (maxGlyphRawHeight * fontSize) *
+                                        0.5; // 向下偏移半高,避免上半部分溢出
+        // diff: [test_yoga2] end
 
         // 1. 建立逻辑索引 -> 字形指针的映射（假设一对一）
         std::vector<const font_ns::harfbuzz::shape_result *> visual_glyphs;
@@ -1222,20 +1247,7 @@ try
 
         return objects;
     };
-    // 设置行宽（世界坐标系），例如 1.6（从 -0.8 到 0.8）
-    const double maxLineWidth = 1.6; // 行宽限制
-    const double fontSize = 0.2;     // 正常大小
-    // const double fontSize = 0.4;     // 放大
-    // const double fontSize = 0.1;     // 缩小
 
-    RenderMeshes objects = generate_line_meshes(
-        allocator, commandPool, GRAPHICS_AND_PRESENT, test_shape_result,
-        break_result.types, maxLineWidth, fontSize,
-        -0.8, // originX（左下角 X）
-        0.0,  // originY（第一行基线 Y）
-        0.0,  // originZ（深度）
-        -0.25 // lineHeight（正值向下，负值向上）
-    );
     // diff: [test_yoga] start
     using namespace mcs::vulkan::yoga::literals;
     using namespace mcs::vulkan::yoga;
@@ -1264,7 +1276,12 @@ try
                 .height = {200_px},
             },
             Node{"1", Style{.margin = {5_px}, .width = {100_px}, .height = {20_px}}},
-        }};
+        },
+        Node{"text_display", Style{
+                                 .padding = {10_px},
+                                 .width = {200_px},
+                                 .height = {200_px},
+                             }}};
     window.enableContentScaleCallback([&](void *self, float xscale, float yscale) {
         MCSLOG_INFO("glfw change ContentScaleCallback");
         screen.refConfig().setPointScaleFactor(xscale);
@@ -1425,7 +1442,77 @@ try
     mesh_base layout_mesh{
         allocator, commandPool, GRAPHICS_AND_PRESENT, {yogaVertices, yogaIndices}};
 
-    //NOTE: 放文本 和 layout 的顶点数据在一起。 背景放在前面
+    // diff: [test_yoga2] start 可重用文本网格更新逻辑
+
+    auto updateTextMeshes = [&](float screenWidth, float screenHeight) {
+        auto screenToWorld = [=](float sx, float sy) -> glm::vec2 {
+            float worldX = (sx / screenWidth) * 2.0f - 1.0f;
+            float worldY = 1.0f - (sy / screenHeight) * 2.0f;
+            return {worldX, worldY};
+        };
+
+        auto &text_display = screen.childrens()[2];
+        YGNodeRef textNode = **text_display;
+        float left = YGNodeLayoutGetLeft(textNode);
+        float top = YGNodeLayoutGetTop(textNode);
+        float width = YGNodeLayoutGetWidth(textNode);
+        float height = YGNodeLayoutGetHeight(textNode);
+
+        float padLeft = YGNodeStyleGetPadding(textNode, YGEdgeLeft).value;
+        float padRight = YGNodeStyleGetPadding(textNode, YGEdgeRight).value;
+        float padTop = YGNodeStyleGetPadding(textNode, YGEdgeTop).value;
+        float padBottom = YGNodeStyleGetPadding(textNode, YGEdgeBottom).value;
+
+        float contentLeft = left + padLeft;
+        float contentTop = top + padTop;
+        float contentWidth = width - padLeft - padRight;
+        float contentHeight = height - padTop - padBottom;
+
+        glm::vec2 worldLeftTop = screenToWorld(contentLeft, contentTop);
+        double originX = worldLeftTop.x;
+        double originY = worldLeftTop.y;
+        double maxLineWidth = contentWidth * (2.0 / screenWidth);
+        double contentHeightWorld = contentHeight * (2.0 / screenHeight);
+
+        // 计算原始字形最大高度（用于归一化）
+        double maxGlyphRawHeight = 0.0;
+        for (const auto &run : test_shape_result)
+        {
+            for (const auto &glyph : run)
+            {
+                double h = glyph.plane_bounds.top - glyph.plane_bounds.bottom;
+                if (h > maxGlyphRawHeight)
+                    maxGlyphRawHeight = h;
+            }
+        }
+
+        // 期望盒子内最多显示的行数（可根据实际需求调整，例如 3 行）
+        const int desiredLines = 10;
+        // 行高系数（例如 1.2 倍）
+        const double lineHeightFactor = 1.2;
+
+        // 根据内容高度和期望行数计算目标行高（NDC 单位）
+        double targetLineHeightWorld =
+            contentHeightWorld / (desiredLines * lineHeightFactor);
+        // 反推字体缩放因子（字体大小 = 行高 / 原始字形最大高度）
+        double fontSize = targetLineHeightWorld / maxGlyphRawHeight;
+
+        // 附加约束：确保文本宽度不会超出盒子（若不超出则保持原值）
+        // 此处可加简单检查，若总宽度超限则进一步缩小 fontSize，但换行逻辑已处理大部分情况
+
+        double lineHeight = -fontSize * maxGlyphRawHeight * lineHeightFactor; // 负号向下
+        double originZ = 0.0;
+
+        return generate_line_meshes(allocator, commandPool, GRAPHICS_AND_PRESENT,
+                                    test_shape_result, break_result.types, maxLineWidth,
+                                    fontSize, originX, originY, originZ, lineHeight);
+    };
+    VkExtent2D fbSize = window.getFramebufferSize();
+    float screenW = static_cast<float>(fbSize.width);
+    float screenH = static_cast<float>(fbSize.height);
+
+    RenderMeshes objects = updateTextMeshes(screenW, screenH);
+    // diff: [test_yoga2] end
     objects.insert(objects.begin(), std::move(layout_mesh));
     // diff: [test_yoga] end
 
@@ -1848,6 +1935,17 @@ try
                  .available_height = static_cast<float>(newHeight)},
                 newVerts, newIndices);
             objects[0].queueUpdate(std::move(newVerts), std::move(newIndices));
+
+            //diff: [test_yoga2] start
+            // 更新文本网格（替换索引1及之后的所有元素）
+            RenderMeshes newTextMeshes = updateTextMeshes(static_cast<float>(newWidth),
+                                                          static_cast<float>(newHeight));
+            // 保留 objects[0]，删除其余，再插入新文本网格
+            if (objects.size() > 1)
+                objects.erase(objects.begin() + 1, objects.end());
+            objects.insert(objects.end(), std::make_move_iterator(newTextMeshes.begin()),
+                           std::make_move_iterator(newTextMeshes.end()));
+            //diff: [test_yoga2] end
         }
         //diff: [test_yoga] end
 
