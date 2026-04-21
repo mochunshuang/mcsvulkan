@@ -12,6 +12,7 @@ std_glsl_target(test_triangle2 test_triangle2.vert test_triangle.frag)
 std_glsl_target(test_bindless_vertext3 test_bindless_vertext3.vert test_triangle.frag)
 std_glsl_target(test_bindless_vertext4 test_bindless_vertext.vert test_triangle.frag)
 std_glsl_target(test_bindless_vertext5 test_bindless_vertext5.vert test_triangle.frag)
+std_glsl_target(test_bindless_vertext6 test_bindless_vertext5.vert test_triangle.frag)
 
 # end
 std_glsl_env_destroy()
