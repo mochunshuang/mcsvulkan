@@ -164,6 +164,8 @@ struct PushConstants
     // uint32_t samplerIndex; // 添加采样器索引
     // diff: [texture] end
     // diff: [test_msdf_atlas_gen1] end
+
+    glm::mat4 model; //diff: [test_yoga4] mesh级别的
 };
 struct Vertex // NOLINT
 {
@@ -387,7 +389,6 @@ static void updateVmaFlag(VmaAllocatorCreateFlags &vma_flags,
 class UniformBufferObject
 {
   public:
-    glm::mat4 model;
     glm::mat4 view;
     glm::mat4 proj;
 };
@@ -1052,75 +1053,47 @@ try
                                              analyze_result.mirrored_codepoints);
 
     using RenderMeshes = std::vector<mesh_base>;
-
-    constexpr float BASE_WIDTH = 800.0f;
-    constexpr float BASE_HEIGHT = 600.0f;
-    // ============================================================================
-    // 函数：generate_line_meshes
-    // 功能：根据 HarfBuzz 整形结果生成文本网格（顶点+索引）
-    // 原理：
-    //   1. 使用基准分辨率 (BASE_WIDTH, BASE_HEIGHT) 将像素坐标映射到 NDC 空间，
-    //      确保 UI 在窗口大小变化时相对位置和大小保持与设计一致。
-    //   2. 对顶点的 x 坐标乘以宽高比补偿系数 aspectComp = screenHeight / screenWidth，
-    //      抵消透视投影矩阵中除以宽高比带来的拉伸，使字形在屏幕上不随窗口宽高比变形。
-    //   3. 补偿在 CPU 端完成，着色器无需修改。
-    // ============================================================================
     auto generate_line_meshes =
         [](VmaAllocator allocator, const CommandPool &pool, const Queue &queue,
            const std::vector<std::vector<font_ns::harfbuzz::shape_result>> &shape_results,
            const std::vector<char> &break_types,
-           double maxLineWidth, // 基准世界行宽（基于 BASE_WIDTH 的 NDC 单位）
-           double fontSize,     // 基准世界字体大小（基于 BASE_HEIGHT 的 NDC 单位）
-           double originX,      // 基准世界起始 X（左上角 NDC.x）
-           double originY,      // 基准世界起始 Y（左上角 NDC.y）
-           double originZ,      // Z 深度
-           double lineHeight,   // 行高（负值向下，NDC 单位）
-           float screenWidth,   // 当前窗口/交换链宽度（像素）
-           float screenHeight)  // 当前窗口/交换链高度（像素）
-        -> RenderMeshes {
+           double maxLineWidth,        // 行宽（世界坐标系）
+           double InputFontSize = 0.2, // 字体大小（整体缩放）
+           double originX = -0.8,      // 文本块左下角/基线起点 X
+           double originY = 0.0,       // 文本块第一行基线 Y
+           double originZ = 0.0,       // 文本块的 Z 深度（所有顶点共用）
+           double lineHeight = 0.25    // 行高（正值向下，负值向上）
+           ) -> RenderMeshes {
         RenderMeshes objects;
 
-        // ---------- 宽高比补偿系数 ----------
-        // 屏幕宽高比 aspect = screenWidth / screenHeight
-        // 补偿系数 aspectComp = 1 / aspect = screenHeight / screenWidth
-        // 在顶点生成阶段，将 x 坐标乘以 aspectComp，即可抵消投影矩阵中除以 aspect 的拉伸。
-        float aspectComp = screenHeight / screenWidth;
+        // diff: [test_yoga2] start
+        // ----- 新增：计算最大字形原始高度 -----
 
-        // 打印当前窗口尺寸和补偿系数，方便验算
-        std::println("[generate_line_meshes] screenSize: {}x{}, aspectComp = {:.6f}",
-                     screenWidth, screenHeight, aspectComp);
+        double fontSize = InputFontSize;
+        double currentY = originY; // 向下偏移半高,避免上半部分溢出
+        // diff: [test_yoga2] end
 
-        // ---------- 计算字形原始最大高度（用于基线对齐） ----------
-        double maxGlyphRawHeight = 0.0;
-        for (const auto &run : shape_results)
-            for (const auto &glyph : run)
-            {
-                double h = glyph.plane_bounds.top - glyph.plane_bounds.bottom;
-                if (h > maxGlyphRawHeight)
-                    maxGlyphRawHeight = h;
-            }
-
-        double currentY = originY - (maxGlyphRawHeight * fontSize) * 0.5;
-
-        // ---------- 建立逻辑索引到字形的映射 ----------
+        // 1. 建立逻辑索引 -> 字形指针的映射（假设一对一）
         std::vector<const font_ns::harfbuzz::shape_result *> visual_glyphs;
         std::unordered_map<size_t, const font_ns::harfbuzz::shape_result *>
             logical_to_glyph;
         for (const auto &run : shape_results)
+        {
             for (const auto &glyph : run)
             {
                 visual_glyphs.push_back(&glyph);
                 logical_to_glyph[glyph.logical_idx] = &glyph;
             }
+        }
 
-        // ---------- 按逻辑顺序分行 ----------
+        // 2. 按逻辑顺序决定每行的逻辑索引范围
         struct LineInfo
         {
             std::vector<size_t> logical_indices;
         };
         std::vector<LineInfo> lines;
         LineInfo current_line;
-        double cursorX = originX;
+        double cursorX = originX; // 当前行光标 X
 
         for (size_t log_idx = 0; log_idx < break_types.size(); ++log_idx)
         {
@@ -1155,20 +1128,23 @@ try
             cursorX += advance;
         }
         if (!current_line.logical_indices.empty())
+        {
             lines.push_back(std::move(current_line));
+        }
 
-        // 打印分行信息，便于调试
-        std::println("[generate_line_meshes] total lines: {}", lines.size());
-
-        // ---------- 生成网格顶点（坐标已是基准世界单位，并应用宽高比补偿） ----------
+        // 3. 为每一行生成网格
         for (const auto &line : lines)
         {
             std::unordered_set<size_t> log_set(line.logical_indices.begin(),
                                                line.logical_indices.end());
             std::vector<const font_ns::harfbuzz::shape_result *> line_glyphs;
             for (const auto *glyph : visual_glyphs)
+            {
                 if (log_set.count(glyph->logical_idx))
+                {
                     line_glyphs.push_back(glyph);
+                }
+            }
 
             std::vector<Vertex> vertices;
             std::vector<uint32_t> indices;
@@ -1178,31 +1154,15 @@ try
             for (const auto *g : line_glyphs)
             {
                 double baselineY = currentY + g->offset_y * fontSize;
-
-                // 计算未补偿的屏幕坐标（基于基准分辨率，此时尚未考虑宽高比）
-                float left_raw =
+                float left =
                     static_cast<float>(cursorX + g->plane_bounds.left * fontSize);
-                float bottom_raw =
+                float bottom =
                     static_cast<float>(baselineY + g->plane_bounds.bottom * fontSize);
-                float right_raw =
+                float right =
                     static_cast<float>(cursorX + g->plane_bounds.right * fontSize);
-                float top_raw =
+                float top =
                     static_cast<float>(baselineY + g->plane_bounds.top * fontSize);
-
-                // 应用宽高比补偿：将 x 坐标乘以 aspectComp
-                float left = left_raw * aspectComp;
-                float right = right_raw * aspectComp;
-                float bottom = bottom_raw;
-                float top = top_raw;
                 float z = static_cast<float>(originZ);
-
-                // 可选：打印第一个字形补偿前后的 x 坐标，便于验算
-                if (baseVertex == 0 && line_glyphs.size() > 0 && g == line_glyphs[0])
-                {
-                    std::println("[generate_line_meshes] first glyph: left_raw={:.4f}, "
-                                 "left_comp={:.4f}, aspectComp={:.4f}",
-                                 left_raw, left, aspectComp);
-                }
 
                 glm::vec2 uv_lb(g->uv_bounds.left, g->uv_bounds.bottom);
                 glm::vec2 uv_rb(g->uv_bounds.right, g->uv_bounds.bottom);
@@ -1215,7 +1175,6 @@ try
                 float pxRange = static_cast<float>(
                     g->font_ctx->font.atlas.distanceRange.value_or(0.0));
 
-                // 顶点顺序：左下、右下、右上、左上
                 vertices.push_back({{left, bottom, z},
                                     {1, 0, 0},
                                     uv_lb,
@@ -1249,7 +1208,6 @@ try
                                     pxRange,
                                     0});
 
-                // 索引（两个三角形组成四边形）
                 indices.push_back(baseVertex + 0);
                 indices.push_back(baseVertex + 1);
                 indices.push_back(baseVertex + 2);
@@ -1267,11 +1225,12 @@ try
                     allocator, pool, queue,
                     mesh_base::mesh_data{std::move(vertices), std::move(indices)});
             }
-            currentY += lineHeight;
+            currentY += lineHeight; // 行高（正负控制方向）
         }
 
         return objects;
     };
+
     // diff: [test_yoga] start
     using namespace mcs::vulkan::yoga::literals;
     using namespace mcs::vulkan::yoga;
@@ -1340,166 +1299,148 @@ try
                  window.getContentScale().xscale, window.getContentScale().yscale);
     layout.print();
     std::println("layout.print [end]");
+    auto generateVerticesFromLayout = [](Layout &layout, layout_size size,
+                                         std::vector<Vertex> &outVerts,
+                                         std::vector<uint32_t> &outIndices) {
+        // 先让 Yoga 计算布局（传入当前屏幕宽高）
+        layout.calculate(size);
+        auto [screenWidth, screenHeight] = size;
+        //NOTE: 字符串顶点目前没有翻转，我们也要适应
+        //NOTE:当前做法（统一使用“世界 Y 向上”生成顶点，再通过投影矩阵统一翻转）更符合图形学惯例.
+        // NDC 的 Y 向下是 Vulkan 规范的根本属性，不是代码主动“翻转”的结果。代码中的翻转操作，是为了将世界坐标系的 Y 向上映射到 NDC 的 Y 向下，以满足规范要求。
+        // NOTE: 已经统一在 MVP 做-Y翻转了；
+        // 返回 glm::vec3，z 分量设为 0.0f（或根据深度需求调整）
+        // auto screenToNDC = [=](float x, float y) -> glm::vec3 {
+        //     return {(x / screenWidth) * 2.0f - 1.0f, (y / screenHeight) * 2.0f - 1.0f,
+        //             0.0f};
+        // };
+        // auto screenToNDC = [=](float x, float y) -> glm::vec3 {
+        //     // 从“世界坐标系（Y 向上）”到“Vulkan NDC（Y 向下）”的转换。
+        //     float worldY = screenHeight - y; // 翻转 Y 轴
+        //     return {(x / screenWidth) * 2.0f - 1.0f,
+        //             (worldY / screenHeight) * 2.0f - 1.0f, 0.0f};
+        // };
 
-    // ============================================================================
-    // 函数：generateVerticesFromLayout
-    // 功能：根据 Yoga 布局结果生成矩形网格（用于 UI 调试/布局可视化）
-    // 原理：
-    //   1. 使用基准分辨率 (BASE_WIDTH, BASE_HEIGHT) 将 Yoga 输出的像素坐标映射到 NDC，
-    //      确保 UI 布局在窗口大小变化时保持设计比例和位置。
-    //   2. 对 NDC 的 x 分量乘以宽高比补偿系数 aspectComp = screenHeight / screenWidth，
-    //      抵消后续视口变换导致的横向拉伸，使矩形不随窗口宽高比变形。
-    //   3. 补偿在 CPU 端完成，不依赖着色器修改。
-    // ============================================================================
-    auto generateVerticesFromLayout =
-        [&](Layout &layout, layout_size size, std::vector<Vertex> &outVerts,
-            std::vector<uint32_t> &outIndices, float screenWidth, float screenHeight) {
-            // 先让 Yoga 计算布局（传入当前屏幕宽高）
-            layout.calculate(size);
-            auto [available_width, available_height] = size;
-
-            // 宽高比补偿系数
-            float aspectComp = screenHeight / screenWidth;
-
-            // 打印信息，方便验算
-            std::println("[generateVerticesFromLayout] layoutSize: {}x{}, screenSize: "
-                         "{}x{}, aspectComp = {:.6f}",
-                         available_width, available_height, screenWidth, screenHeight,
-                         aspectComp);
-
-            // 将屏幕像素坐标转换为 NDC，并应用宽高比补偿
-            auto screenToNDC = [=](float x, float y) -> glm::vec3 {
-                // 基于基准分辨率计算 NDC，锚定左上角（像素 (0,0) 对应 NDC (-1,1)）
-                float ndcX = -1.0f + (x / BASE_WIDTH) * 2.0f;
-                float ndcY = 1.0f - (y / BASE_HEIGHT) * 2.0f;
-
-                // 宽高比补偿：抵消透视投影和视口变换带来的横向拉伸
-                float compNdcX = ndcX * aspectComp;
-                float compNdcY = ndcY;
-
-                // 可选：打印第一个顶点转换信息
-                static bool first_vertex_printed = false;
-                if (!first_vertex_printed)
-                {
-                    std::println(
-                        "[generateVerticesFromLayout] first vertex: pixel({:.1f},{:.1f}) "
-                        "-> NDC({:.4f},{:.4f}) -> compNDC({:.4f},{:.4f})",
-                        x, y, ndcX, ndcY, compNdcX, compNdcY);
-                    first_vertex_printed = true;
-                }
-
-                return {compNdcX, compNdcY, 0.0f};
+        auto screenToNDC = [=](float x, float y) -> glm::vec3 {
+            // 从“世界坐标系（Y 向上）”到“Vulkan NDC（Y 向下）”的转换。
+            float worldY = screenHeight - y; // 翻转 Y 轴
+            return {x, worldY, 0};
+        };
+        size_t index{};
+        auto getColor = [&]() -> glm::vec3 {
+            static const std::vector<glm::vec3> colors = {
+                {1.0f, 0.0f, 0.0f}, // 红
+                {0.0f, 1.0f, 0.0f}, // 绿
+                {0.0f, 0.0f, 1.0f}, // 蓝
+                {1.0f, 1.0f, 0.0f}, // 黄
+                {0.5f, 0.5f, 0.5f}, // 灰
+                {0.0f, 1.0f, 1.0f}, // 青
+                {1.0f, 0.0f, 1.0f}, // 品红
+                {1.0f, 0.5f, 0.0f}, // 橙
+                {0.5f, 0.0f, 1.0f}  // 紫
             };
-
-            size_t index{};
-            auto getColor = [&]() -> glm::vec3 {
-                static const std::vector<glm::vec3> colors = {
-                    {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f},
-                    {1.0f, 1.0f, 0.0f}, {0.5f, 0.5f, 0.5f}, {0.0f, 1.0f, 1.0f},
-                    {1.0f, 0.0f, 1.0f}, {1.0f, 0.5f, 0.0f}, {0.5f, 0.0f, 1.0f}};
-                if (index > colors.size())
-                    index = 0;
-                return colors[index];
-            };
-
-            auto traverse = [&](this auto &self, const Node *cur, float parentLeft,
-                                float parentTop) {
-                if (cur == nullptr)
-                    return;
-                auto node = **cur;
-                float left = YGNodeLayoutGetLeft(node) + parentLeft;
-                float top = YGNodeLayoutGetTop(node) + parentTop;
-                float width = YGNodeLayoutGetWidth(node);
-                float height = YGNodeLayoutGetHeight(node);
-
-                if (width > 0.0f && height > 0.0f)
-                {
-                    float right = left + width;
-                    float bottom = top + height;
-
-                    glm::vec3 p0 = screenToNDC(left, bottom);
-                    glm::vec3 p1 = screenToNDC(right, bottom);
-                    glm::vec3 p2 = screenToNDC(left, top);
-                    glm::vec3 p3 = screenToNDC(right, top);
-                    glm::vec3 color = getColor();
-
-                    uint32_t base = static_cast<uint32_t>(outVerts.size());
-                    outVerts.push_back(
-                        Vertex{.pos = p0,
-                               .color = color,
-                               .texCoord = {},
-                               .textureIndex = {},
-                               .samplerIndex = {},
-                               .fontType = static_cast<uint32_t>(font::FontType::eNONE),
-                               .pxRange = {}});
-                    outVerts.push_back(
-                        Vertex{.pos = p1,
-                               .color = color,
-                               .texCoord = {},
-                               .textureIndex = {},
-                               .samplerIndex = {},
-                               .fontType = static_cast<uint32_t>(font::FontType::eNONE),
-                               .pxRange = {}});
-                    outVerts.push_back(
-                        Vertex{.pos = p2,
-                               .color = color,
-                               .texCoord = {},
-                               .textureIndex = {},
-                               .samplerIndex = {},
-                               .fontType = static_cast<uint32_t>(font::FontType::eNONE),
-                               .pxRange = {}});
-                    outVerts.push_back(
-                        Vertex{.pos = p3,
-                               .color = color,
-                               .texCoord = {},
-                               .textureIndex = {},
-                               .samplerIndex = {},
-                               .fontType = static_cast<uint32_t>(font::FontType::eNONE),
-                               .pxRange = {}});
-
-                    outIndices.push_back(base + 0);
-                    outIndices.push_back(base + 1);
-                    outIndices.push_back(base + 2);
-                    outIndices.push_back(base + 1);
-                    outIndices.push_back(base + 3);
-                    outIndices.push_back(base + 2);
-                }
-                index++;
-
-                for (const auto &child : cur->childrens())
-                {
-                    self(child.get(), left, top);
-                }
-            };
-            traverse(layout.root(), 0.0f, 0.0f);
+            if (index > colors.size())
+                index = 0;
+            return colors[index];
         };
 
+        auto traverse = [&](this auto &self, const Node *cur, float parentLeft,
+                            float parentTop) {
+            if (cur == nullptr)
+                return;
+            auto node = **cur;
+            float left = YGNodeLayoutGetLeft(node) + parentLeft;
+            float top = YGNodeLayoutGetTop(node) + parentTop;
+            float width = YGNodeLayoutGetWidth(node);
+            float height = YGNodeLayoutGetHeight(node);
+
+            if (width > 0.0f && height > 0.0f)
+            {
+                float right = left + width;
+                float bottom = top + height;
+                glm::vec3 p0 = screenToNDC(left, bottom);
+                glm::vec3 p1 = screenToNDC(right, bottom);
+                glm::vec3 p2 = screenToNDC(left, top);
+                glm::vec3 p3 = screenToNDC(right, top);
+                glm::vec3 color = getColor();
+
+                uint32_t base = static_cast<uint32_t>(outVerts.size());
+                outVerts.push_back(
+                    Vertex{.pos = p0,
+                           .color = color,
+                           .texCoord = {},
+                           .textureIndex = {},
+                           .samplerIndex = {},
+                           .fontType = static_cast<uint32_t>(font::FontType::eNONE),
+                           .pxRange = {}});
+                outVerts.push_back(
+                    Vertex{.pos = p1,
+                           .color = color,
+                           .texCoord = {},
+                           .textureIndex = {},
+                           .samplerIndex = {},
+                           .fontType = static_cast<uint32_t>(font::FontType::eNONE),
+                           .pxRange = {}});
+                outVerts.push_back(
+                    Vertex{.pos = p2,
+                           .color = color,
+                           .texCoord = {},
+                           .textureIndex = {},
+                           .samplerIndex = {},
+                           .fontType = static_cast<uint32_t>(font::FontType::eNONE),
+                           .pxRange = {}});
+                outVerts.push_back(
+                    Vertex{.pos = p3,
+                           .color = color,
+                           .texCoord = {},
+                           .textureIndex = {},
+                           .samplerIndex = {},
+                           .fontType = static_cast<uint32_t>(font::FontType::eNONE),
+                           .pxRange = {}});
+
+                outIndices.push_back(base + 0);
+                outIndices.push_back(base + 1);
+                outIndices.push_back(base + 2);
+                outIndices.push_back(base + 1);
+                outIndices.push_back(base + 3);
+                outIndices.push_back(base + 2);
+
+                // // 三角形1: p0 → p2 → p1
+                // outIndices.push_back(base + 0);
+                // outIndices.push_back(base + 2);
+                // outIndices.push_back(base + 1);
+
+                // // 三角形2: p1 → p2 → p3
+                // outIndices.push_back(base + 1);
+                // outIndices.push_back(base + 2);
+                // outIndices.push_back(base + 3);
+            }
+            index++;
+
+            // NOTE: 是否必须迁移到上面的 if条件内部。
+            for (const auto &child : cur->childrens())
+            {
+                self(child.get(), left, top);
+            }
+        };
+        traverse(layout.root(), 0.0f, 0.0f);
+    };
     std::vector<Vertex> yogaVertices;
     std::vector<uint32_t> yogaIndices;
-    generateVerticesFromLayout(layout, {WIDTH, HEIGHT}, yogaVertices, yogaIndices,
-                               static_cast<float>(WIDTH), static_cast<float>(HEIGHT));
+    generateVerticesFromLayout(layout, {WIDTH, HEIGHT}, yogaVertices, yogaIndices);
     mesh_base layout_mesh{
         allocator, commandPool, GRAPHICS_AND_PRESENT, {yogaVertices, yogaIndices}};
 
     // diff: [test_yoga2] start 可重用文本网格更新逻辑
 
-    // ============================================================================
-    // Lambda：updateTextMeshes
-    // 功能：根据 Yoga 布局中文本显示节点的位置和尺寸，重新生成文本网格
-    // 原理：
-    //   1. 从 Yoga 布局获取文本节点的像素坐标和可用内容宽度。
-    //   2. 基于基准分辨率 (BASE_WIDTH, BASE_HEIGHT) 将像素坐标映射到 NDC 空间。
-    //   3. 调用 generate_line_meshes 生成网格，该函数内部会应用宽高比补偿。
-    //   4. 返回新生成的网格列表，用于替换旧的文本网格。
-    // ============================================================================
-    auto updateTextMeshes = [&](float screenWidth, float screenHeight) -> RenderMeshes {
-        constexpr float BASE_FONT_SIZE_PX = 16.0f; // 设计基准字体大小（像素）
-        constexpr float LINE_HEIGHT_FACTOR = 1.2f; // 行高系数
+    auto updateTextMeshes = [&](float screenWidth, float screenHeight) {
+        auto screenToWorld = [=](float sx, float sy) -> glm::vec2 {
+            float worldY = screenHeight - sy;
+            return {sx, worldY};
+        };
 
-        // 获取 Yoga 布局中文本显示节点的信息
         auto &text_display = screen.childrens()[2];
         YGNodeRef textNode = **text_display;
-
         float left = YGNodeLayoutGetLeft(textNode);
         float top = YGNodeLayoutGetTop(textNode);
         float width = YGNodeLayoutGetWidth(textNode);
@@ -1513,52 +1454,18 @@ try
         float contentLeft = left + padLeft;
         float contentTop = top + padTop;
         float contentWidth = width - padLeft - padRight;
+        float contentHeight = height - padTop - padBottom;
 
-        // 打印 Yoga 布局信息，方便验算
-        std::println("[updateTextMeshes] textNode layout: left={:.1f}, top={:.1f}, "
-                     "width={:.1f}, height={:.1f}",
-                     left, top, width, height);
-        std::println("[updateTextMeshes] padding: L={:.1f} R={:.1f} T={:.1f} B={:.1f}",
-                     padLeft, padRight, padTop, padBottom);
-        std::println(
-            "[updateTextMeshes] content region: left={:.1f}, top={:.1f}, width={:.1f}",
-            contentLeft, contentTop, contentWidth);
+        glm::vec2 worldLeftTop = screenToWorld(contentLeft, contentTop);
+        double originX = worldLeftTop.x;
+        double originY = worldLeftTop.y;
+        double maxLineWidth = contentWidth * (2.0 / screenWidth);
+        double contentHeightWorld = contentHeight * (2.0 / screenHeight);
 
-        // 基于基准分辨率计算 NDC 坐标（锚定左上角）
-        // originX, originY 为文本区域左上角在基准世界空间中的位置
-        double originX = -1.0 + (contentLeft / BASE_WIDTH) * 2.0;
-        double originY = 1.0 - (contentTop / BASE_HEIGHT) * 2.0;
-
-        // 基准世界单位下的最大行宽（NDC 单位）
-        double maxLineWidth = (contentWidth / BASE_WIDTH) * 2.0;
-
-        // 计算字形原始最大高度（用于基线对齐）
-        double maxGlyphRawHeight = 0.0;
-        for (const auto &run : test_shape_result)
-            for (const auto &glyph : run)
-            {
-                double h = glyph.plane_bounds.top - glyph.plane_bounds.bottom;
-                if (h > maxGlyphRawHeight)
-                    maxGlyphRawHeight = h;
-            }
-
-        // 基准世界字体大小（基于 BASE_HEIGHT 转换）
-        double baseFontSizeWorld = BASE_FONT_SIZE_PX * (2.0 / BASE_HEIGHT);
-        // 行高（负值表示向下）
-        double lineHeightWorld =
-            -baseFontSizeWorld * maxGlyphRawHeight * LINE_HEIGHT_FACTOR;
-
-        std::println("[updateTextMeshes] origin (NDC) = ({:.4f}, {:.4f})", originX,
-                     originY);
-        std::println("[updateTextMeshes] maxLineWidth = {:.4f}, baseFontSizeWorld = "
-                     "{:.4f}, lineHeightWorld = {:.4f}",
-                     maxLineWidth, baseFontSizeWorld, lineHeightWorld);
-
-        // 调用文本网格生成函数，传递屏幕尺寸用于宽高比补偿
+        //diff: [test_yoga4] 全是BUG。验证到 字符和box不随窗口变化OK了.需要重构
         return generate_line_meshes(allocator, commandPool, GRAPHICS_AND_PRESENT,
-                                    test_shape_result, break_result.types, maxLineWidth,
-                                    baseFontSizeWorld, originX, originY, 0.0,
-                                    lineHeightWorld, screenWidth, screenHeight);
+                                    test_shape_result, break_result.types, 100, 10,
+                                    originX, originY, 0, 10);
     };
     VkExtent2D fbSize = window.getFramebufferSize();
     float screenW = static_cast<float>(fbSize.width);
@@ -1608,7 +1515,7 @@ try
 #else
         // NOTE: 无副作用操作
         UniformBufferObject ubo{};
-        ubo.model = glm::mat4(1.0f); // 单位矩阵
+        // ubo.model = glm::mat4(1.0f); // 单位矩阵
         ubo.view = glm::mat4(1.0f);
         ubo.proj = glm::mat4(1.0f);
         // 若仍需保持 Vulkan 的 Y 轴翻转，可取消下面注释：
@@ -1732,7 +1639,7 @@ try
                       //   .cullMode =
                       //       VK_CULL_MODE_BACK_BIT, // TODO(mcs): [test_yoga] 文本和布局顶点不兼容
                       //   .frontFace = VK_FRONT_FACE_CLOCKWISE,
-                      .cullMode = VK_CULL_MODE_BACK_BIT,            // 恢复背面剔除
+                      .cullMode = {},                               // 恢复背面剔除
                       .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, // 逆时针为正面
                       .depthBiasEnable = VK_FALSE,
                       .lineWidth = 1.0F},
@@ -1938,13 +1845,28 @@ try
             // 绘制单个 字符
             for (auto &input_mesh : objects)
             {
+                //diff: [test_bindless_vertext6] start 通过矩阵化NDC表达合并到 MVP的中
+                float w = static_cast<float>(imageExtent.width);
+                float h = static_cast<float>(imageExtent.height);
+
+                // 构造 NDC 补偿矩阵：像素坐标 → Vulkan NDC（Y 向上）
+                // 像素坐标系：原点左上角，Y 向下
+                // Vulkan NDC：原点中心，Y 向下（-1 顶部，1 底部）
+                glm::mat4 ndcMatrix = glm::mat4(1.0f);
+                ndcMatrix[0][0] = 2.0f / w; // X: [0, w] → [-1, 1]
+                ndcMatrix[1][1] = 2.0f / h; // Y: [0, h] → [-1, 1]
+                ndcMatrix[3][0] = -1.0f;
+                ndcMatrix[3][1] = -1.0f;
+
+                //diff: [test_bindless_vertext6] end
 
                 // 推送常量
                 uint64_t vertexBufferAddress =
                     input_mesh.getVertexBufferAddress(currentFrame);
+                PushConstants push{.vertexBufferAddress = vertexBufferAddress,
+                                   .model = ndcMatrix};
                 commandBuffer.pushConstants(*pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
-                                            0, sizeof(PushConstants),
-                                            &vertexBufferAddress);
+                                            0, sizeof(PushConstants), &push);
 
                 // diff: [test_libunibreak3] start
                 //  绑定索引缓冲区（全局）
@@ -1986,8 +1908,7 @@ try
                 layout,
                 {.available_width = static_cast<float>(newWidth),
                  .available_height = static_cast<float>(newHeight)},
-                newVerts, newIndices, static_cast<float>(newWidth),
-                static_cast<float>(newHeight));
+                newVerts, newIndices);
             objects[0].queueUpdate(std::move(newVerts), std::move(newIndices));
 
             //diff: [test_yoga2] start

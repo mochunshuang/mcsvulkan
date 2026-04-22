@@ -113,7 +113,7 @@ add_std_glsl_target(test_yoga2 test_emoji.vert test_emoji2.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_yoga3 test_emoji.vert test_emoji2.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
-add_std_glsl_target(test_yoga4 test_emoji.vert test_emoji2.frag)
+add_std_glsl_target(test_yoga4 test_yoga4.vert test_emoji2.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
 # end
