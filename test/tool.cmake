@@ -273,17 +273,18 @@ add_msdf_atlas_target(
     generate_english_atlas
     FONT_PATH "${FONT_INPUT_DIR}/TiroBangla-Regular.ttf"
     OUTPUT_NAME "english_atlas"
-    EXTRA_ARGS -allglyphs # 传递额外参数
+    EXTRA_ARGS -allglyphs -yorigin top # 传递额外参数
 )
 
 # 生成中文图集，指定尺寸和字符集
 add_msdf_atlas_target(
     generate_chinese_atlas
     FONT_PATH "C:/Windows/Fonts/msyh.ttc"
-    OUTPUT_NAME "msyh_chinese"
+    OUTPUT_NAME "msyh_chinese" # 中文字体
     SIZE 64
     PX_RANGE 2
     CHARSET "${CHASET_INPUT_DIR}/small_chinese_common.txt"
+    EXTRA_ARGS -yorigin top
 )
 
 # 阿拉伯字
@@ -294,15 +295,16 @@ add_msdf_atlas_target(
     OUTPUT_NAME "arial_all"
     SIZE 64
     PX_RANGE 2
-    EXTRA_ARGS -allglyphs # 传递额外参数
+    EXTRA_ARGS -allglyphs -yorigin top # 传递额外参数
 )
 add_msdf_atlas_target(
     generate_segoeui_atlas
-    FONT_PATH "C:/Windows/Fonts/segoeui.ttf" # 中文字体
+    FONT_PATH "C:/Windows/Fonts/segoeui.ttf"
     OUTPUT_NAME "segoe_arabic"
     PX_RANGE 2 # 默认值
     SIZE 64 # 建议提高精度
     CHARSET "${CHASET_INPUT_DIR}/arabic_charset.txt"
+    EXTRA_ARGS -yorigin top
 )
 
 # ------------------------------------------ bitmap ----------------------------------------------------------
@@ -498,6 +500,7 @@ add_emoji_atlas_target(
     # DIMENSIONS 4096 4096 # 可选，固定尺寸
 
     # MAX_SIZE 4096        # 可选，默认已设
+    EXTRA_ARGS -yorigin top
 )
 
 # -----------------------------------测试-----------------------------------
@@ -519,6 +522,7 @@ add_msdf_atlas_target(
     GLYPHS "0" # 指定字形索引 0
 
     # 可选其他参数：SIZE, PX_RANGE 等
+    EXTRA_ARGS -yorigin top
 )
 
 # 测试字符范围格式（三种表示法）

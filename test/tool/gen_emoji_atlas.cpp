@@ -219,6 +219,9 @@ int main(int argc, char *argv[])
     int fixedWidth = -1;
     int fixedHeight = -1;
 
+    // 新增枚举或使用 bool 表示 Y 方向（true = top origin, false = bottom origin）
+    bool yDown = false; // 默认为 bottom (Y_UPWARD)
+
     // 解析命令行
     for (int i = 1; i < argc; ++i)
     {
@@ -251,6 +254,20 @@ int main(int argc, char *argv[])
         else if (arg == "-max-size" && i + 1 < argc)
         {
             MAX_SIZE = std::stoi(argv[++i]);
+        } // ==== 新增 -yorigin 参数解析 ====
+        else if (arg == "-yorigin" && i + 1 < argc)
+        {
+            std::string origin = argv[++i];
+            if (origin == "top")
+                yDown = true;
+            else if (origin == "bottom")
+                yDown = false;
+            else
+            {
+                std::cerr << "Invalid -yorigin value: " << origin
+                          << " (must be 'top' or 'bottom')\n";
+                return 1;
+            }
         }
         else if (arg == "-help" || arg == "--help")
         {
@@ -425,15 +442,18 @@ int main(int argc, char *argv[])
 
     // ---------- 生成 JSON ----------
     json j;
-    j["atlas"] = {{"type", "bitmap"}, {"distanceRange", 0}, {"size", fontSize},
-                  {"width", w},       {"height", h},        {"yOrigin", "bottom"}};
+    j["atlas"] = {{"type", "bitmap"}, {"distanceRange", 0},
+                  {"size", fontSize}, {"width", w},
+                  {"height", h},      {"yOrigin", yDown ? "top" : "bottom"}};
+    // 字体度量，根据 Y 方向翻转符号
+    double ySign = yDown ? -1.0 : 1.0;
     j["metrics"] = {
         {"emSize", static_cast<double>(face->units_per_EM)},
         {"lineHeight", static_cast<double>(face->height) / face->units_per_EM},
-        {"ascender", static_cast<double>(face->ascender) / face->units_per_EM},
-        {"descender", static_cast<double>(face->descender) / face->units_per_EM},
+        {"ascender", ySign * static_cast<double>(face->ascender) / face->units_per_EM},
+        {"descender", ySign * static_cast<double>(face->descender) / face->units_per_EM},
         {"underlineY",
-         static_cast<double>(face->underline_position) / face->units_per_EM},
+         ySign * static_cast<double>(face->underline_position) / face->units_per_EM},
         {"underlineThickness",
          static_cast<double>(face->underline_thickness) / face->units_per_EM}};
 
@@ -446,16 +466,42 @@ int main(int argc, char *argv[])
         const auto &g = *p.glyph;
         int left = r.x + padding;
         int right = left + g.width - 1;
-        int bottom = h - (r.y + padding + g.height); // 转换为底部原点
-        int top = bottom + g.height - 1;
+
+        // 根据 Y 方向计算 atlasBounds 中的 bottom/top
+        int bottom, top; // NOLINT
+        if (yDown)
+        {
+            // 顶部原点：直接使用像素坐标
+            top = r.y + padding;
+            bottom = top + g.height - 1;
+        }
+        else
+        {
+            // 底部原点：翻转 Y
+            bottom = h - (r.y + padding + g.height);
+            top = bottom + g.height - 1;
+        }
 
         json glyphObj;
         glyphObj["unicode"] = g.unicode;
         glyphObj["advance"] = g.advance * emScale;
-        glyphObj["planeBounds"] = {{"left", g.bearingX * emScale},
-                                   {"bottom", (g.bearingY - g.height) * emScale},
-                                   {"right", (g.bearingX + g.width) * emScale},
-                                   {"top", g.bearingY * emScale}};
+
+        // 根据 Y 方向调整 planeBounds 中的 bottom/top
+        if (yDown)
+        {
+            glyphObj["planeBounds"] = {{"left", g.bearingX * emScale},
+                                       {"top", -g.bearingY * emScale},
+                                       {"right", (g.bearingX + g.width) * emScale},
+                                       {"bottom", -(g.bearingY - g.height) * emScale}};
+        }
+        else
+        {
+            glyphObj["planeBounds"] = {{"left", g.bearingX * emScale},
+                                       {"bottom", (g.bearingY - g.height) * emScale},
+                                       {"right", (g.bearingX + g.width) * emScale},
+                                       {"top", g.bearingY * emScale}};
+        }
+
         glyphObj["atlasBounds"] = {
             {"left", left}, {"bottom", bottom}, {"right", right}, {"top", top}};
         j["glyphs"].push_back(glyphObj);

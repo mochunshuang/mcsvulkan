@@ -624,12 +624,10 @@ try
                        query_vulkan13_features.dynamicRendering &&
                        query_vulkan13_features.synchronization2 &&
 
-                       query_vulkan12_features
-                           .bufferDeviceAddress && // diff: [new]
-                                                   // 检查Vulkan 1.2中的bufferDeviceAddress
-                       query_vulkan12_features
-                           .scalarBlockLayout && // diff: [new]
-                                                 // 检查scalarBlockLayout
+                       query_vulkan12_features.bufferDeviceAddress && // diff: [new]
+                       // 检查Vulkan 1.2中的bufferDeviceAddress
+                       query_vulkan12_features.scalarBlockLayout && // diff: [new]
+                       // 检查scalarBlockLayout
 
                        query_extended_dynamic_state_features.extendedDynamicState;
             })
