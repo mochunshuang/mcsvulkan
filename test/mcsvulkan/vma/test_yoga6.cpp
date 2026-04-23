@@ -1094,8 +1094,8 @@ try
            double originX = -0.8,      // 文本块左下角/基线起点 X
            double originY = 0.0,       // 文本块第一行基线 Y
            double originZ = 0.0,       // 文本块的 Z 深度（所有顶点共用）
-           double lineHeight = 0.25    // 行高（正值向下，负值向上）
-           ) -> RenderMeshes {
+           double lineHeight = 0.25,   // 行高（正值向下，负值向上）
+           bool modulateFlag = false) -> RenderMeshes {
         RenderMeshes objects;
 
         // diff: [test_yoga2] start
@@ -1196,65 +1196,10 @@ try
                     static_cast<float>(baselineY + g->plane_bounds.top * fontSize);
                 float z = static_cast<float>(originZ);
 
-                /*
-字体度量数据的坐标系（以 OpenType/FreeType 为准）
-Y 轴方向：向上为正。
-
-plane_bounds.top 是字形最高点（数值大），plane_bounds.bottom 是最低点（数值小）。
-
-例如字符 世：top = 0.835938, bottom = -0.117188，显然 top > bottom。
-
-Vulkan NDC 坐标系
-Y 轴方向：向下为正。
-
-屏幕顶部 Y = -1.0，屏幕底部 Y = +1.0。
-
-因此，字形顶部应该对应更小的 Y 值，底部对应更大的 Y 值。
-
-原代码（加法）为何错误
-cpp
-float top    = baselineY + g->plane_bounds.top    * fontSize;
-float bottom = baselineY + g->plane_bounds.bottom * fontSize;
-假设 baselineY = 0, fontSize = 0.04，则：
-
-top = 0 + 0.835938 * 0.04 = 0.0334
-
-bottom = 0 + (-0.117188) * 0.04 = -0.0047
-
-结果 top (0.0334) > bottom (-0.0047)。在 NDC 中，Y 值小的在上方，因此 bottom 反而跑到了 top 的上方 → 字形上下颠倒。
-
-减法如何修正
-cpp
-float top    = baselineY - g->plane_bounds.top    * fontSize;
-float bottom = baselineY - g->plane_bounds.bottom * fontSize;
-同样假设：
-
-top = 0 - 0.835938 * 0.04 = -0.0334
-
-bottom = 0 - (-0.117188) * 0.04 = 0.0047
-
-现在 top (-0.0334) < bottom (0.0047)，在 NDC 中，Y 值小的在上方 → 字形正立。
-*/
-                // diff: [test_yoga5]  整体-Y解决方案 引入新BUG。 源头资源 Y正方向入手
-                // 将加法改为减法，抵消字体度量数据中 Y 轴向上的问题
-                // float top =
-                //     static_cast<float>(baselineY - g->plane_bounds.top * fontSize);
-                // float bottom =
-                //     static_cast<float>(baselineY - g->plane_bounds.bottom * fontSize);
-
                 glm::vec2 uv_lb(g->uv_bounds.left, g->uv_bounds.bottom);
                 glm::vec2 uv_rb(g->uv_bounds.right, g->uv_bounds.bottom);
                 glm::vec2 uv_rt(g->uv_bounds.right, g->uv_bounds.top);
                 glm::vec2 uv_lt(g->uv_bounds.left, g->uv_bounds.top);
-
-                // diff: [test_yoga5]  uv 上下颠倒的解决方案
-                // 修改为（交换 bottom 和 top）//NOTE: UV 上下颠倒的解决方案
-                // glm::vec2 uv_lb(g->uv_bounds.left, g->uv_bounds.top);  // 左下顶点用 top
-                // glm::vec2 uv_rb(g->uv_bounds.right, g->uv_bounds.top); // 右下顶点用 top
-                // glm::vec2 uv_rt(g->uv_bounds.right,
-                //                 g->uv_bounds.bottom); // 右上顶点用 bottom
-                // glm::vec2 uv_lt(g->uv_bounds.left,
-                //                 g->uv_bounds.bottom); // 左上顶点用 bottom
 
                 uint32_t textureIdx = g->font_ctx->bind.texture_index;
                 uint32_t samplerIdx = g->font_ctx->bind.sampler_index;
@@ -1262,38 +1207,39 @@ bottom = 0 - (-0.117188) * 0.04 = 0.0047
                 float pxRange = static_cast<float>(
                     g->font_ctx->font.atlas.distanceRange.value_or(0.0));
 
-                auto VArray = std::array<Vertex, 4>{Vertex{.pos = {left, top, z},
-                                                           .color = {1, 0, 0},
-                                                           .texCoord = uv_lt,
-                                                           .textureIndex = textureIdx,
-                                                           .samplerIndex = samplerIdx,
-                                                           .fontType = fontType,
-                                                           .pxRange = pxRange,
-                                                           .modulateFlag = 1},
-                                                    Vertex{.pos = {right, top, z},
-                                                           .color = {0, 1, 0},
-                                                           .texCoord = uv_rt,
-                                                           .textureIndex = textureIdx,
-                                                           .samplerIndex = samplerIdx,
-                                                           .fontType = fontType,
-                                                           .pxRange = pxRange,
-                                                           .modulateFlag = 1},
-                                                    Vertex{.pos = {right, bottom, z},
-                                                           .color = {0, 0, 1},
-                                                           .texCoord = uv_rb,
-                                                           .textureIndex = textureIdx,
-                                                           .samplerIndex = samplerIdx,
-                                                           .fontType = fontType,
-                                                           .pxRange = pxRange,
-                                                           .modulateFlag = 1},
-                                                    Vertex{.pos = {left, bottom, z},
-                                                           .color = {1, 1, 1},
-                                                           .texCoord = uv_lb,
-                                                           .textureIndex = textureIdx,
-                                                           .samplerIndex = samplerIdx,
-                                                           .fontType = fontType,
-                                                           .pxRange = pxRange,
-                                                           .modulateFlag = 1}};
+                auto VArray = std::array<Vertex, 4>{
+                    Vertex{.pos = {left, top, z},
+                           .color = {1, 0, 0},
+                           .texCoord = uv_lt,
+                           .textureIndex = textureIdx,
+                           .samplerIndex = samplerIdx,
+                           .fontType = fontType,
+                           .pxRange = pxRange,
+                           .modulateFlag = static_cast<uint32_t>(modulateFlag)},
+                    Vertex{.pos = {right, top, z},
+                           .color = {0, 1, 0},
+                           .texCoord = uv_rt,
+                           .textureIndex = textureIdx,
+                           .samplerIndex = samplerIdx,
+                           .fontType = fontType,
+                           .pxRange = pxRange,
+                           .modulateFlag = static_cast<uint32_t>(modulateFlag)},
+                    Vertex{.pos = {right, bottom, z},
+                           .color = {0, 0, 1},
+                           .texCoord = uv_rb,
+                           .textureIndex = textureIdx,
+                           .samplerIndex = samplerIdx,
+                           .fontType = fontType,
+                           .pxRange = pxRange,
+                           .modulateFlag = static_cast<uint32_t>(modulateFlag)},
+                    Vertex{.pos = {left, bottom, z},
+                           .color = {1, 1, 1},
+                           .texCoord = uv_lb,
+                           .textureIndex = textureIdx,
+                           .samplerIndex = samplerIdx,
+                           .fontType = fontType,
+                           .pxRange = pxRange,
+                           .modulateFlag = static_cast<uint32_t>(modulateFlag)}};
                 vertices.append_range(VArray);
 
                 // diff: [test_yoga5]  顶点剔除的 解决方案 逆时针
@@ -1369,7 +1315,7 @@ bottom = 0 - (-0.117188) * 0.04 = 0.0047
         auto &child0 = screen.childrens()[0];
         auto &child1 = screen.childrens()[1];
 
-        constexpr auto test_insert = false;
+        constexpr auto test_insert = true;
         if constexpr (not test_insert)
         {
             if (!child0->childrens().empty())
@@ -1392,20 +1338,41 @@ bottom = 0 - (-0.117188) * 0.04 = 0.0047
     layout.print();
     std::println("layout.print [end]");
     constexpr auto test_layout_ndc = true;
+    // diff: [test_yoga6] 布局改成yoga 生成即可
     auto generateVerticesFromLayout = [](Layout &layout, layout_size size,
                                          std::vector<Vertex> &outVerts,
                                          std::vector<uint32_t> &outIndices) {
-        auto fontType = static_cast<uint32_t>(font::FontType::eNONE);
-        if constexpr (test_layout_ndc)
-        {
-            float w = static_cast<float>(size.available_width);
-            float h = static_cast<float>(size.available_height);
-            /*
-            //NOTE: 屏幕中心为中心：左上角[0,0] 右下角[w,h]
-            outVerts = {
+        layout.calculate(size);
+        size_t index{};
+        auto getColor = [&]() -> glm::vec3 {
+            static const std::vector<glm::vec3> colors = {
+                {1.0f, 0.0f, 0.0f}, // 红
+                {0.0f, 1.0f, 0.0f}, // 绿
+                {0.0f, 0.0f, 1.0f}, // 蓝
+                {1.0f, 1.0f, 0.0f}, // 黄
+                {0.5f, 0.5f, 0.5f}, // 灰
+                {0.0f, 1.0f, 1.0f}, // 青
+                {1.0f, 0.0f, 1.0f}, // 品红
+                {1.0f, 0.5f, 0.0f}, // 橙
+                {0.5f, 0.0f, 1.0f}  // 紫
+            };
+            if (index > colors.size())
+                index = 0;
+            return colors[index];
+        };
+
+        auto appendRect = [&](float x, float y, float w, float h,
+                              std::vector<Vertex> &outVerts,
+                              std::vector<uint32_t> &outIndices) {
+            // NOLINTNEXTLINE
+            constexpr auto fontType = static_cast<uint32_t>(font::FontType::eNONE);
+            uint32_t base = outVerts.size();
+
+            auto color = getColor();
+            auto vert = std::array{
                 // 左上 (0,0) 红
-                Vertex{.pos = {0, 0, 0},
-                       .color = {1, 0, 0},
+                Vertex{.pos = {x, y, 0},
+                       .color = index == 0 ? glm::vec3{1, 0, 0} : color,
                        .texCoord = {0, 0},
                        .textureIndex = 0,
                        .samplerIndex = 0,
@@ -1413,8 +1380,8 @@ bottom = 0 - (-0.117188) * 0.04 = 0.0047
                        .pxRange = 0,
                        .modulateFlag = 0},
                 // 右上 (w,0) 绿
-                Vertex{.pos = {w, 0, 0},
-                       .color = {0, 1, 0},
+                Vertex{.pos = {x + w, y, 0},
+                       .color = index == 0 ? glm::vec3{0, 1, 0} : color,
                        .texCoord = {0, 0},
                        .textureIndex = 0,
                        .samplerIndex = 0,
@@ -1422,8 +1389,8 @@ bottom = 0 - (-0.117188) * 0.04 = 0.0047
                        .pxRange = 0,
                        .modulateFlag = 0},
                 // 右下 (w,h) 蓝
-                Vertex{.pos = {w, h, 0},
-                       .color = {0, 0, 1},
+                Vertex{.pos = {x + w, y + h, 0},
+                       .color = index == 0 ? glm::vec3{0, 0, 1} : color,
                        .texCoord = {0, 0},
                        .textureIndex = 0,
                        .samplerIndex = 0,
@@ -1431,8 +1398,8 @@ bottom = 0 - (-0.117188) * 0.04 = 0.0047
                        .pxRange = 0,
                        .modulateFlag = 0},
                 // 左下 (0,h) 白
-                Vertex{.pos = {0, h, 0},
-                       .color = {1, 1, 1},
+                Vertex{.pos = {x, y + h, 0},
+                       .color = index == 0 ? glm::vec3{1, 1, 1} : color,
                        .texCoord = {0, 0},
                        .textureIndex = 0,
                        .samplerIndex = 0,
@@ -1440,177 +1407,36 @@ bottom = 0 - (-0.117188) * 0.04 = 0.0047
                        .pxRange = 0,
                        .modulateFlag = 0},
             };
-            outIndices = {0, 2, 1, 0, 3, 2};
+            outVerts.append_range(vert);
+
+            auto indices =
+                std::array{base + 0, base + 2, base + 1, base + 0, base + 3, base + 2};
+            outIndices.append_range(indices);
+        };
+
+        auto traverse = [&](this auto &self, const Node *cur, float parentLeft,
+                            float parentTop) {
+            if (cur == nullptr)
+                return;
+            auto *node = **cur;
+            float x = YGNodeLayoutGetLeft(node) + parentLeft;
+            float y = YGNodeLayoutGetTop(node) + parentTop;
+            float width = YGNodeLayoutGetWidth(node);
+            float height = YGNodeLayoutGetHeight(node);
+
+            if (width > 0.0f && height > 0.0f)
             {
-                assert(validateMeshWinding({outVerts.data(), outVerts.size()},
-                                           {outIndices.data(), outIndices.size()}) &&
-                       "in generateVerticesFromLayout");
-            }*/
+                appendRect(x, y, width, height, outVerts, outIndices);
+            }
+            index++;
 
-            auto appendRect = [&](float x, float y, float w, float h,
-                                  std::vector<Vertex> &outVerts,
-                                  std::vector<uint32_t> &outIndices) {
-                uint32_t base = (uint32_t)outVerts.size();
-
-                auto vert = std::array{
-                    // 左上 (0,0) 红
-                    Vertex{.pos = {x, y, 0},
-                           .color = {1, 0, 0},
-                           .texCoord = {0, 0},
-                           .textureIndex = 0,
-                           .samplerIndex = 0,
-                           .fontType = fontType,
-                           .pxRange = 0,
-                           .modulateFlag = 0},
-                    // 右上 (w,0) 绿
-                    Vertex{.pos = {x + w, y, 0},
-                           .color = {0, 1, 0},
-                           .texCoord = {0, 0},
-                           .textureIndex = 0,
-                           .samplerIndex = 0,
-                           .fontType = fontType,
-                           .pxRange = 0,
-                           .modulateFlag = 0},
-                    // 右下 (w,h) 蓝
-                    Vertex{.pos = {x + w, y + h, 0},
-                           .color = {0, 0, 1},
-                           .texCoord = {0, 0},
-                           .textureIndex = 0,
-                           .samplerIndex = 0,
-                           .fontType = fontType,
-                           .pxRange = 0,
-                           .modulateFlag = 0},
-                    // 左下 (0,h) 白
-                    Vertex{.pos = {x, y + h, 0},
-                           .color = {1, 1, 1},
-                           .texCoord = {0, 0},
-                           .textureIndex = 0,
-                           .samplerIndex = 0,
-                           .fontType = fontType,
-                           .pxRange = 0,
-                           .modulateFlag = 0},
-                };
-                outVerts.append_range(vert);
-
-                auto indices = std::array{base + 0, base + 2, base + 1,
-                                          base + 0, base + 3, base + 2};
-                outIndices.append_range(indices);
-
-                {
-                    //NOTE: 不通过. 不过背面确实开启了很奇怪。 或许这个公式是错误的，可能依赖X,Y的正方向？
-                    // assert(validateMeshWinding({vert.data(), vert.size()},
-                    //                            {indices.data(), indices.size()}) &&
-                    //        "in generateVerticesFromLayout");
-                }
-            };
-            appendRect(0, 0, w, h, outVerts, outIndices);
-            appendRect(w / 2, h / 2, w / 2, h / 2, outVerts, outIndices);
-        }
-        else
-        {
-            //NOTE: NOTE: [-1,-1] [1,-1] [1,1] [-1,+1]. NDC 无MVP变换的顶点数据，和写死在着色器一样
-            const std::vector<Vertex> vertices3D = {
-                Vertex{.pos = {-0.5f, -0.5f, 0},
-                       .color = {1.0f, 0.0f, 0.0f},
-                       .texCoord = {0, 0},
-                       .textureIndex = 0,
-                       .samplerIndex = 0,
-                       .fontType = fontType,
-                       .pxRange = 0,
-                       .modulateFlag = 1} // 左上
-                ,
-                Vertex{.pos = {0.5f, -0.5f, 0},
-                       .color = {0.0f, 1.0f, 0.0f},
-                       .texCoord = {0, 0},
-                       .textureIndex = 0,
-                       .samplerIndex = 0,
-                       .fontType = fontType,
-                       .pxRange = 0,
-                       .modulateFlag = 1}, // 右上
-                Vertex{.pos = {0.5f, +0.5f, 0},
-                       .color = {0.0f, 0.0f, 1.0f},
-                       .texCoord = {0, 0},
-                       .textureIndex = 0,
-                       .samplerIndex = 0,
-                       .fontType = fontType,
-                       .pxRange = 0,
-                       .modulateFlag = 1}, // 右下
-
-                Vertex{.pos = {-0.5f, +0.5f, 0},
-                       .color = {1.0f, 1.0f, 1.0f},
-                       .texCoord = {0, 0},
-                       .textureIndex = 0,
-                       .samplerIndex = 0,
-                       .fontType = fontType,
-                       .pxRange = 0,
-                       .modulateFlag = 1}, // 左下
-
-            };
-
-            // 索引数据
-            /*
-顶点坐标清单（Y向上）
-0: (-0.5, 0.5) 左上
-
-1: (0.5, 0.5) 右上
-
-2: (0.5, -0.5) 右下
-
-3: (-0.5, -0.5) 左下
-
-索引序列 {0, 2, 1} 的绕序计算
-第一个三角形顶点顺序：v0 → v2 → v1
-
-v0 = (-0.5, 0.5)
-
-v2 = (0.5, -0.5)
-
-v1 = (0.5, 0.5)
-
-边向量：
-
-e1 = v2 - v0 = (0.5 - (-0.5), -0.5 - 0.5) = (1.0, -1.0)
-
-e2 = v1 - v2 = (0.5 - 0.5, 0.5 - (-0.5)) = (0.0, 1.0)
-
-二维叉积（Z分量）：
-cross = e1.x * e2.y - e1.y * e2.x
-= (1.0 * 1.0) - (-1.0 * 0.0)
-= 1.0 - 0.0 = 1.0
-
-结果：叉积为正（+1.0） → 逆时针（CCW）
-
-索引序列 {0, 3, 2} 的绕序计算
-第二个三角形顶点顺序：v0 → v3 → v2
-
-v0 = (-0.5, 0.5)
-
-v3 = (-0.5, -0.5)
-
-v2 = (0.5, -0.5)
-
-边向量：
-
-e1 = v3 - v0 = (-0.5 - (-0.5), -0.5 - 0.5) = (0.0, -1.0)
-
-e2 = v2 - v3 = (0.5 - (-0.5), -0.5 - (-0.5)) = (1.0, 0.0)
-
-二维叉积：
-cross = (0.0 * 0.0) - (-1.0 * 1.0)
-= 0.0 - (-1.0) = 1.0
-
-结果：叉积为正（+1.0） → 逆时针（CCW）
-
-*/
-            const std::vector<uint32_t> indices3D = {0, 2, 1, 0, 3, 2};
-            // 第一个三角形：左上(0) → 右下(2) → 右上(1)  （逆时针）
-            // 第二个三角形：左上(0) → 左下(3) → 右下(2)  （逆时针）
-            outVerts.append_range(vertices3D);
-            outIndices.append_range(indices3D);
-
-            validateMeshWinding({outVerts.data(), outVerts.size()},
-                                {outIndices.data(), outIndices.size()});
-        }
+            // NOTE: 是否必须迁移到上面的 if条件内部。
+            for (const auto &child : cur->childrens())
+            {
+                self(child.get(), x, y);
+            }
+        };
+        traverse(layout.root(), 0.0f, 0.0f);
     };
     std::vector<Vertex> yogaVertices;
     std::vector<uint32_t> yogaIndices;
@@ -1619,15 +1445,32 @@ cross = (0.0 * 0.0) - (-1.0 * 1.0)
         allocator, commandPool, GRAPHICS_AND_PRESENT, {yogaVertices, yogaIndices}};
 
     // diff: [test_yoga2] start 可重用文本网格更新逻辑
-
+    // diff: [test_yoga6] 位置锚定到指定 x,y
     auto updateTextMeshes = [&](float screenWidth, float screenHeight) {
         if constexpr (test_layout_ndc)
         {
-            const double FONT_SIZE_PX = 24.0;
+            auto &text_display = screen.childrens()[2];
+            YGNodeRef textNode = **text_display;
+            float left = YGNodeLayoutGetLeft(textNode);
+            float top = YGNodeLayoutGetTop(textNode);
+            float width = YGNodeLayoutGetWidth(textNode);
+            float height = YGNodeLayoutGetHeight(textNode);
+
+            float padLeft = YGNodeStyleGetPadding(textNode, YGEdgeLeft).value;
+            float padRight = YGNodeStyleGetPadding(textNode, YGEdgeRight).value;
+            float padTop = YGNodeStyleGetPadding(textNode, YGEdgeTop).value;
+            float padBottom = YGNodeStyleGetPadding(textNode, YGEdgeBottom).value;
+
+            float x = left + padLeft;
+            float y = top + padTop;
+            float contentWidth = width - padLeft - padRight;
+            float contentHeight = height - padTop - padBottom;
+
+            const double FONT_SIZE_PX = (std::min<double>)(contentHeight, 12);
             const double LINE_HEIGHT_PX = FONT_SIZE_PX * 1.5;
-            const double ORIGIN_X = 0;
-            const double ORIGIN_Y = 0; // 第一行基线 Y（向下为正）
-            const double MAX_LINE_WIDTH = screenWidth - 20.0;
+            const double ORIGIN_X = x;
+            const double ORIGIN_Y = y + FONT_SIZE_PX;
+            const double MAX_LINE_WIDTH = contentWidth;
             return generate_line_meshes(allocator, commandPool, GRAPHICS_AND_PRESENT,
                                         test_shape_result, break_result.types,
                                         MAX_LINE_WIDTH, FONT_SIZE_PX, ORIGIN_X, ORIGIN_Y,
