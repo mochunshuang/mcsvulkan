@@ -35,6 +35,22 @@ namespace mcs::vulkan::tool
         frame_context &operator=(const frame_context &) = delete;
         frame_context &operator=(frame_context &&) = delete;
 
+        constexpr void rebuild(size_t swapChainImagesSize)
+        {
+            // 销毁旧的信号量和栅栏
+            destroySyncObject();
+
+            // 调整数组大小
+            presentCompleteSemaphore.resize(swapChainImagesSize);
+            renderFinishedSemaphore.resize(swapChainImagesSize);
+
+            // 重新创建信号量和栅栏（此时状态一定是 unsignaled）
+            createSyncObjects(*device_);
+            // 重置索引
+            semaphoreIndex = 0;
+            currentFrame = 0;
+        }
+
       private:
         void createSyncObjects(const LogicalDevice &device)
         {

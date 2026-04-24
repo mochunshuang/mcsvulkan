@@ -62,6 +62,15 @@ namespace mcs::vulkan::vma
         {
             return imageCreateInfo_.extent;
         }
+        vma_image rebuild()
+        {
+            VkImage image = VK_NULL_HANDLE;
+            VmaAllocation allocation = VK_NULL_HANDLE;
+            auto &allocCI = createInfo_.allocationCreateInfo;
+            check_vkresult(::vmaCreateImage(allocator_, &imageCreateInfo_, &allocCI,
+                                            &image, &allocation, nullptr));
+            return vma_image{image, allocator_, allocation};
+        }
 
         vma_image makeImage()
         {
