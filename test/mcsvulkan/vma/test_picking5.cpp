@@ -84,6 +84,7 @@ struct my_render
         VkPipelineStageFlags2 dstStageMask // NOLINT
         ) noexcept
     {
+        // https://docs.vulkan.org/guide/latest/extensions/VK_KHR_synchronization2.html
         VkImageMemoryBarrier2 barrier = {
             .sType = sType<VkImageMemoryBarrier2>(),
             // Specify the pipeline stages and access masks for the barrier
@@ -109,6 +110,8 @@ struct my_render
                                             .dependencyFlags = {},
                                             .imageMemoryBarrierCount = 1,
                                             .pImageMemoryBarriers = &barrier};
+        // [comments/synchronization_overview.png]
+        // [comments/synchronization_pipeline_barrieres.png]
         commandBuffer.pipelineBarrier2(dependency_info);
     }
 };
@@ -2482,6 +2485,8 @@ but can only be on the last binding element (binding 2).
             VkImage depthImg = depthResource.image();
             VkImageView depthView = depthResource.imageView();
 
+            //diff: [test_picking5] 同步2要求由单个 xxxStageMask 分解成 xxxStageMask + xxxAccessMask. 注意有规律 draw前做布局转换，成环就是最好的，src dest 开源转换
+            // https://docs.vulkan.org/guide/latest/extensions/VK_KHR_synchronization2.html#:~:text=VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR%3B%0A%20%20.dstAccessMask%20%3D%20VK_ACCESS_2_NONE_KHR%3B-,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,-%E5%9C%A8%E7%AC%AC%E4%B8%80%E5%90%8C%E6%AD%A5
             // ① 拾取图像 → COLOR_ATTACHMENT
             my_render::transition_image_layout(
                 commandBuffer, *pickingImage, VK_IMAGE_ASPECT_COLOR_BIT,
