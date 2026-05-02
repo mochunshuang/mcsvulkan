@@ -2136,6 +2136,7 @@ try
     auto pickingImageView = build_pick.makeImageView(*pickingImage);
     auto pickingResolveImageView = build_resolve.makeImageView(*resolveImage);
 
+    // diff: [test_indirectdraw] start 大改
     // ========== 拾取管线布局 ==========
 
     // 拾取描述符集布局（binding 0 = UBO, binding 1 = SSBO）
@@ -2177,10 +2178,6 @@ try
         buffer_base objectInfoBuffer{}; // SSBO: PickObjectInfo[]
         void *objectInfoMapped = nullptr;
         VkDeviceSize objectInfoSize = 0;
-
-        buffer_base indirectDrawBuffer{}; // 间接绘制命令
-        void *indirectDrawMapped = nullptr;
-        VkDeviceSize indirectDrawSize = 0;
     };
     std::array<PickingBatch, MAX_FRAMES_IN_FLIGHT> pickingBatches;
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
@@ -2196,18 +2193,6 @@ try
                                     VMA_ALLOCATION_CREATE_MAPPED_BIT,
                            .usage = VMA_MEMORY_USAGE_AUTO});
         pb.objectInfoMapped = pb.objectInfoBuffer.map();
-
-        pb.indirectDrawBuffer =
-            create_buffer(allocator,
-                          {.sType = sType<VkBufferCreateInfo>(),
-                           .size = 16,
-                           .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-                                    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                           .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                          {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                                    VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                           .usage = VMA_MEMORY_USAGE_AUTO});
-        pb.indirectDrawMapped = pb.indirectDrawBuffer.map();
 
         VkDescriptorBufferInfo uboInfo{uniformBuffers[i].buffer(), 0,
                                        sizeof(UniformBufferObject)};
@@ -2267,6 +2252,7 @@ try
                 .renderPass = VK_NULL_HANDLE,
             })
             .build(device);
+    // diff: [test_indirectdraw] end
 
     // NOLINTNEXTLINE
     const auto recordCommandBuffer = [&](const CommandBufferView &commandBuffer,
@@ -2462,18 +2448,19 @@ try
             commandBuffer.setScissor(
                 0, std::array<VkRect2D, 1>{VkRect2D{{0, 0}, imageExtent}});
 
-            //diff: [test_indirectdraw] start
+            //diff: [test_indirectdraw] start . picking的顶点数据 和 主管线一样？
             // 绑定主渲染的合并索引缓冲（因为拾取使用同样的顶点数据）
             commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                              *pickingPipelineLayout, 0, 1,
                                              &pickingDescSets[currentFrame], 0, nullptr);
-            auto &batch = batches[currentFrame];
-            commandBuffer.bindIndexBuffer(batch.mergedIndexBuffer.buffer(), 0,
+
+            // diff: 拾取复用主渲染的间接命令缓冲
+            auto &mainBatch = batches[currentFrame];
+            commandBuffer.bindIndexBuffer(mainBatch.mergedIndexBuffer.buffer(), 0,
                                           VK_INDEX_TYPE_UINT32);
-            // 使用拾取专用间接绘制缓冲
-            commandBuffer.drawIndexedIndirect(
-                pickingBatches[currentFrame].indirectDrawBuffer.buffer(), 0,
-                batch.drawCount, sizeof(VkDrawIndexedIndirectCommand));
+            commandBuffer.drawIndexedIndirect(mainBatch.indirectDrawBuffer.buffer(), 0,
+                                              mainBatch.drawCount,
+                                              sizeof(VkDrawIndexedIndirectCommand));
             //diff: [test_indirectdraw] end
 
             commandBuffer.endRendering();
@@ -2544,7 +2531,7 @@ try
         commandBuffer.end();
     };
 
-    // diff: [test_indirectdraw] prepareBatch：动态分配合批资源并填充数据
+    // diff: [test_indirectdraw] start prepareBatch：动态分配合批资源并填充数据
     auto prepareBatch = [&](uint32_t currentFrame) {
         auto &batch = batches[currentFrame];
 
@@ -2705,6 +2692,7 @@ try
             pb.objectInfoMapped = pb.objectInfoBuffer.map();
             pb.objectInfoSize = needObj;
 
+            // 更新描述符绑定
             VkDescriptorBufferInfo ssboInfo = {pb.objectInfoBuffer.buffer(), 0,
                                                VK_WHOLE_SIZE};
             VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -2720,53 +2708,16 @@ try
             device.updateDescriptorSets(1, &write, 0, nullptr);
         }
 
-        // 重建间接绘制命令缓冲
-        VkDeviceSize needCmd = objectCount * sizeof(VkDrawIndexedIndirectCommand);
-        if (pb.indirectDrawSize < needCmd)
-        {
-            if (pb.indirectDrawMapped)
-            {
-                pb.indirectDrawBuffer.unmap();
-                pb.indirectDrawBuffer.destroy();
-            }
-            pb.indirectDrawBuffer =
-                create_buffer(allocator,
-                              {.sType = sType<VkBufferCreateInfo>(),
-                               .size = needCmd,
-                               .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                               .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                              {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                                        VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                               .usage = VMA_MEMORY_USAGE_AUTO});
-            pb.indirectDrawMapped = pb.indirectDrawBuffer.map();
-            pb.indirectDrawSize = needCmd;
-        }
-
-        // 填充数据
+        // 填充数据（仅 SSBO）
         std::vector<PickObjectInfo> pickInfos(objectCount);
-        std::vector<VkDrawIndexedIndirectCommand> cmds(objectCount);
-
         pickInfos[0] = {input_mesh.getVertexBufferAddress(currentFrame),
                         glm::rotate(glm::mat4(1.0f), mesh1_model, glm::vec3(0, 0, 1)),
                         input_mesh_id};
-        cmds[0] = {.indexCount = input_mesh.frameBuffers[currentFrame].indexCount,
-                   .instanceCount = 1,
-                   .firstIndex = 0,
-                   .vertexOffset = 0,
-                   .firstInstance = 0};
-
         pickInfos[1] = {input_mesh2.getVertexBufferAddress(currentFrame), mesh2_model,
                         input_mesh2_id};
-        cmds[1] = {.indexCount = input_mesh2.frameBuffers[currentFrame].indexCount,
-                   .instanceCount = 1,
-                   .firstIndex = input_mesh.frameBuffers[currentFrame].indexCount,
-                   .vertexOffset = 0,
-                   .firstInstance = 1};
-
         memcpy(pb.objectInfoMapped, pickInfos.data(), needObj);
-        memcpy(pb.indirectDrawMapped, cmds.data(), needCmd);
     };
+    // diff: [test_indirectdraw] end
 
     // NOLINTNEXTLINE
     const auto recreateSwapChain = [&]() constexpr {
@@ -3106,11 +3057,6 @@ try
         {
             pb.objectInfoBuffer.unmap();
             pb.objectInfoMapped = nullptr;
-        }
-        if (pb.indirectDrawMapped)
-        {
-            pb.indirectDrawBuffer.unmap();
-            pb.indirectDrawMapped = nullptr;
         }
     }
     // -------------------------------------------------------
