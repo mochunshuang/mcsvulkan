@@ -366,6 +366,13 @@ namespace mcs::vulkan
             pool_->device()->cmdSetDepthWriteEnable(
                 value_, static_cast<VkBool32>(depthWriteEnable));
         }
+        constexpr void drawIndexedIndirect(VkBuffer buffer, VkDeviceSize offset,
+                                           uint32_t drawCount,
+                                           uint32_t stride) const noexcept
+        {
+            pool_->device()->cmdDrawIndexedIndirect(value_, buffer, offset, drawCount,
+                                                    stride);
+        }
     };
 
 }; // namespace mcs::vulkan

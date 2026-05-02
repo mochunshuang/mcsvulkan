@@ -715,5 +715,15 @@ namespace mcs::vulkan
             MCS_ASSERT(table_.vkCmdSetDepthWriteEnable != nullptr);
             table_.vkCmdSetDepthWriteEnable(commandBuffer, depthWriteEnable);
         }
+
+        constexpr void cmdDrawIndexedIndirect(VkCommandBuffer commandBuffer,
+                                              VkBuffer buffer, VkDeviceSize offset,
+                                              uint32_t drawCount,
+                                              uint32_t stride) const noexcept
+        {
+            MCS_ASSERT(table_.vkCmdDrawIndexedIndirect != nullptr);
+            table_.vkCmdDrawIndexedIndirect(commandBuffer, buffer, offset, drawCount,
+                                            stride);
+        }
     };
 }; // namespace mcs::vulkan

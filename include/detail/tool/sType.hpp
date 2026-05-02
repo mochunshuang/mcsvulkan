@@ -2,6 +2,7 @@
 
 #include <type_traits>
 #include <exception>
+#include <vulkan/vulkan_core.h>
 
 #include "../__vulkan.hpp"
 
@@ -144,6 +145,9 @@ namespace mcs::vulkan::tool
             return VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
         else if constexpr (std::is_same_v<T, VkDescriptorSetLayoutBindingFlagsCreateInfo>)
             return VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+        else if constexpr (std::is_same_v<T,
+                                          VkPhysicalDeviceShaderDrawParametersFeatures>)
+            return VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES;
         else
             // static_assert(false, "Unknown Vulkan structure type");
             std::terminate();

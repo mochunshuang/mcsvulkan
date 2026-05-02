@@ -177,9 +177,10 @@ namespace mcs::vulkan::vma
         {
             return imageCreateInfo_.format;
         };
-        constexpr void updateImageExtent(const VkExtent3D &extent) noexcept
+        constexpr auto &updateImageExtent(const VkExtent3D &extent) noexcept
         {
             imageCreateInfo_.extent = extent;
+            return *this;
         }
 
         static bool hasStencilComponent(VkFormat format) noexcept

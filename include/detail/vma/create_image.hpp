@@ -49,9 +49,10 @@ namespace mcs::vulkan::vma
         {
             return imageCreateInfo_.format;
         };
-        constexpr void updateImageExtent(const VkExtent3D &extent) noexcept
+        constexpr auto &updateImageExtent(const VkExtent3D &extent) noexcept
         {
             imageCreateInfo_.extent = extent;
+            return *this;
         }
         [[nodiscard]] VkExtent2D extent2D() const noexcept
         {

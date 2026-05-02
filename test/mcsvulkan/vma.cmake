@@ -122,6 +122,9 @@ ADD_MSDF_DEF(${TARGET_NAME})
 
 add_std_glsl_target(test_picking4 test_model_matrix2.vert test_texture.frag)
 add_std_glsl_target(test_picking5 test_model_matrix2.vert test_texture.frag)
+add_std_glsl_target(test_picking6 test_model_matrix2.vert test_texture.frag)
+
+add_std_glsl_target(test_indirectdraw test_indirectdraw.vert test_texture.frag)
 
 # end
 std_glsl_env_destroy()
