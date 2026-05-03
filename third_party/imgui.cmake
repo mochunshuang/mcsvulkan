@@ -37,16 +37,12 @@ message(STATUS "IMGUI_BACKENDS: ${IMGUI_BACKENDS}")
 
 set(GLFW_DIR ${CMAKE_CURRENT_LIST_DIR}/glfw/include)
 
-add_library(imgui STATIC ${IMGUI_SRC} ${IMGUI_BACKENDS})
-
-# target_compile_features(imgui PRIVATE c_std_23 cxx_std_20)
-target_include_directories(imgui SYSTEM PUBLIC ${IMGUI_DIR} ${IMGUI_VULKAN_BACKENDS_DIR} ${Vulkan_Include_DIR} ${GLFW_DIR})
-target_link_libraries(imgui PRIVATE glfw vulkan)
-
+# ----------------------------------------
+# 着色器编译（不变）
+# ----------------------------------------
 set(IMGUI_VULKAN_SHADER_DIR "${IMGUI_VULKAN_BACKENDS_DIR}/vulkan")
-set(SHADER_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders) # 生成到构建树
+set(SHADER_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 
-# 顶点着色器
 add_custom_command(
     OUTPUT ${SHADER_OUTPUT_DIR}/glsl_shader.vert.spv
     COMMAND ${Vulkan_glslc_EXECUTABLE}
@@ -58,7 +54,6 @@ add_custom_command(
     COMMENT "Compiling vertex shader"
 )
 
-# 片段着色器
 add_custom_command(
     OUTPUT ${SHADER_OUTPUT_DIR}/glsl_shader.frag.spv
     COMMAND ${Vulkan_glslc_EXECUTABLE}
@@ -70,22 +65,44 @@ add_custom_command(
     COMMENT "Compiling fragment shader"
 )
 
-# 虚拟目标触发编译
 add_custom_target(imgui_shaders ALL
     DEPENDS
     ${SHADER_OUTPUT_DIR}/glsl_shader.vert.spv
     ${SHADER_OUTPUT_DIR}/glsl_shader.frag.spv
 )
 
-# 保证 imgui 链接前着色器已生成
-add_dependencies(imgui imgui_shaders)
+# -------------------------------
+# 1. 标准版 imgui 库（无任何特殊宏）
+# -------------------------------
+add_library(imgui STATIC ${IMGUI_SRC} ${IMGUI_BACKENDS})
+target_include_directories(imgui SYSTEM PUBLIC
+    ${IMGUI_DIR} ${IMGUI_VULKAN_BACKENDS_DIR} ${Vulkan_Include_DIR} ${GLFW_DIR}
+)
+target_link_libraries(imgui PRIVATE glfw vulkan)
 target_compile_definitions(imgui
     PUBLIC
     IMGUI_VULKAN_SHADER_DIR="${SHADER_OUTPUT_DIR}"
-
-    # NOTE: 不需要手动编译了
-    # IMGUI_IMPL_VULKAN_NO_EMBEDDED_SHADER
 )
+add_dependencies(imgui imgui_shaders)
 
+# -------------------------------
+# 2. volk 专用版 imgui 库（加 NO_PROTOTYPES）
+# -------------------------------
+add_library(imgui_volk STATIC ${IMGUI_SRC} ${IMGUI_BACKENDS})
+target_include_directories(imgui_volk SYSTEM PUBLIC
+    ${IMGUI_DIR} ${IMGUI_VULKAN_BACKENDS_DIR} ${Vulkan_Include_DIR} ${GLFW_DIR}
+)
+target_link_libraries(imgui_volk PRIVATE glfw vulkan)
+target_compile_definitions(imgui_volk
+    PUBLIC
+    IMGUI_VULKAN_SHADER_DIR="${SHADER_OUTPUT_DIR}"
+    PRIVATE
+    IMGUI_IMPL_VULKAN_NO_PROTOTYPES
+)
+add_dependencies(imgui_volk imgui_shaders)
+
+# -------------------------------
+# 官方示例（链接标准版）
+# -------------------------------
 add_executable(example_glfw_vulkan ${IMGUI_DIR}/examples/example_glfw_vulkan/main.cpp)
 target_link_libraries(example_glfw_vulkan PRIVATE imgui)
