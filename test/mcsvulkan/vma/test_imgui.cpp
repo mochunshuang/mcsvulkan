@@ -2262,7 +2262,7 @@ try
     // diff: [test_indirectdraw] end
 
     // diff: [test_imgui] start
-    // 创建专供 ImGui 使用的描述符池
+    // 创建专供 ImGui 使用的描述符池。 也可以不传，让其内建
     auto imguiDescPool =
         create_descriptor_pool{}
             .setCreateInfo(
@@ -3012,6 +3012,7 @@ try
         {
             lastUpdate = now;
 
+            //NOTE: 会内存递增 一张图 可能 10M。571M停止
             //NOTE: 保证更新再 draw 之前 肯定是安全的
             // 选择下一个未占用的槽位（循环使用，或按需指定）
             uint32_t newSlot = 0;
