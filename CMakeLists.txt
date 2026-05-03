@@ -52,6 +52,8 @@ include(third_party/oneTBB.cmake)
 include(third_party/Clipper2.cmake)
 include(third_party/manifold.cmake)
 
+include(third_party/imgui.cmake)
+
 set(ASSETS_DIR ${CMAKE_SOURCE_DIR}/assets)
 
 # test add
