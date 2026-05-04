@@ -8,7 +8,7 @@ message(STATUS "manifold IMPORTED_LINK_INTERFACE_LIBRARIES: ${manifold_imported_
 
 std_glsl_env_init("manifold")
 set(BASE_LIBS volk vma glfw glm stb nlohmann_json
-    freetype harfbuzz SheenBidi libunibreak utf8proc manifold
+    freetype harfbuzz SheenBidi libunibreak utf8proc manifold yogacore
 )
 auto_compile_glsl_shaders(${GLSL_SHADERS_NAME} ${SHADER_DIR} ${SHADER_OUTPUT_DIR})
 

@@ -104,6 +104,11 @@ namespace mcs::vulkan::vma
             return ImageView{*device_, imageView};
         }
 
+        [[nodiscard]] VmaAllocator allocator() const noexcept
+        {
+            return allocator_;
+        }
+
       private:
         const LogicalDevice *device_;
         VmaAllocator allocator_;

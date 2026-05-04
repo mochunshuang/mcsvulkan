@@ -81,6 +81,70 @@ namespace mcs::vulkan::tool
             return {device, device.createSampler(createInfo_(), device.allocator())};
         }
 
+        // 采样器类型0：线性过滤，重复寻址
+        constexpr static create_info templateLinear() noexcept
+        {
+            return {
+                .magFilter = VK_FILTER_LINEAR,
+                .minFilter = VK_FILTER_LINEAR,
+                .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+                .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                .mipLodBias = 0.0F,
+                .anisotropyEnable = VK_FALSE,
+                .maxAnisotropy = 1.0F,
+                .compareEnable = VK_FALSE,
+                .compareOp = VK_COMPARE_OP_ALWAYS,
+                .minLod = 0.0F,
+                .maxLod = 0.0F,
+                .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+                .unnormalizedCoordinates = VK_FALSE,
+            };
+        }
+
+        // 采样器类型1：最近邻过滤，钳位到边缘
+        constexpr static create_info templateNearest() noexcept
+        {
+            return {
+                .magFilter = VK_FILTER_NEAREST,
+                .minFilter = VK_FILTER_NEAREST,
+                .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+                .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                .mipLodBias = 0.0F,
+                .anisotropyEnable = VK_FALSE,
+                .maxAnisotropy = 1.0F,
+                .compareEnable = VK_FALSE,
+                .compareOp = VK_COMPARE_OP_ALWAYS,
+                .minLod = 0.0F,
+                .maxLod = 0.0F,
+                .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+                .unnormalizedCoordinates = VK_FALSE,
+            };
+        }
+        decltype(auto) enableAnisotropy(this auto &&self,
+                                        float maxSamplerAnisotropy) noexcept
+        {
+            self.createInfo_.anisotropyEnable = VK_TRUE;
+            self.createInfo_.maxAnisotropy = maxSamplerAnisotropy;
+            return std::forward<decltype(self)>(self);
+        }
+        decltype(auto) disEnableAnisotropy(this auto &&self) noexcept
+        {
+            self.createInfo_.anisotropyEnable = VK_FALSE;
+            self.createInfo_.maxAnisotropy = 1.0F;
+            return std::forward<decltype(self)>(self);
+        }
+
+        decltype(auto) updateMaxLodByMipmap(this auto &&self, uint32_t mipLevels) noexcept
+        {
+            self.createInfo_.maxLod =
+                (mipLevels > 1) ? static_cast<float>(mipLevels - 1) : 0.0F;
+            return std::forward<decltype(self)>(self);
+        }
+
         [[nodiscard]] auto &createInfo() const noexcept
         {
             return createInfo_;

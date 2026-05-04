@@ -2,7 +2,7 @@ set(DIR_NAME yoga)
 set(EXE_DIR ${CMAKE_SOURCE_DIR}/test/${DIR_NAME})
 set(OUTPUT_DIRECTORY ${TEST_EXECUTABLE_OUTPUT_PATH}/${DIR_NAME})
 
-set(LIB yogacore glfw)
+set(LIB yogacore glfw glm)
 
 macro(add_yoga_target NAME)
     set(TARGET_NAME "${DIR_NAME}-${NAME}")

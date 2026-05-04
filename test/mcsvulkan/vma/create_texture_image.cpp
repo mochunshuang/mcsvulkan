@@ -1013,12 +1013,10 @@ try
                        query_vulkan13_features.dynamicRendering &&
                        query_vulkan13_features.synchronization2 &&
 
-                       query_vulkan12_features
-                           .bufferDeviceAddress && // diff: [new]
-                                                   // 检查Vulkan 1.2中的bufferDeviceAddress
-                       query_vulkan12_features
-                           .scalarBlockLayout && // diff: [new]
-                                                 // 检查scalarBlockLayout
+                       query_vulkan12_features.bufferDeviceAddress && // diff: [new]
+                       // 检查Vulkan 1.2中的bufferDeviceAddress
+                       query_vulkan12_features.scalarBlockLayout && // diff: [new]
+                       // 检查scalarBlockLayout
                        // diff: [texture] start 检查Vulkan 1.2中的描述符索引特性
                        query_vulkan12_features.runtimeDescriptorArray &&
                        //    query_vulkan12_features.descriptorBindingPartiallyBound &&
@@ -1350,7 +1348,7 @@ try
             textures | std::views::transform([](const auto &t) constexpr noexcept {
                 return VkDescriptorImageInfo{
                     .sampler = nullptr,
-                    .imageView = *t.imageView(),
+                    .imageView = t.imageView(),
                     .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             }) |
             std::ranges::to<std::vector>();

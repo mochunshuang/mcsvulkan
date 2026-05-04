@@ -1,30 +1,9 @@
 #pragma once
 
-#include "vma_image.hpp"
-#include "../ImageView.hpp"
-#include <utility>
+#include "resource.hpp"
 
 namespace mcs::vulkan::vma
 {
-    struct texture_image_base
-    {
-        texture_image_base() = default;
-        constexpr texture_image_base(vma_image textureImage, ImageView imageView) noexcept
-            : textureImage_{std::move(textureImage)}, imageView_{std::move(imageView)}
-        {
-        }
-        [[nodiscard]] auto &imageView() const noexcept
-        {
-            return imageView_;
-        }
-        [[nodiscard]] auto &image() const noexcept
-        {
-            return textureImage_;
-        }
-
-      private:
-        vma_image textureImage_;
-        ImageView imageView_;
-    };
+    using texture_image_base = resource;
 
 }; // namespace mcs::vulkan::vma

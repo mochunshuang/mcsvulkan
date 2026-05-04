@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../vma/texture_image_base.hpp"
+#include "../vma/resource.hpp"
 #include "../vma/create_texture_image.hpp"
 #include "../vma/create_image.hpp"
 #include "../load/raw_stbi_image.hpp"
@@ -12,7 +12,7 @@ namespace mcs::vulkan::font
     class FontTexture
     {
         using raw_stbi_image = load::raw_stbi_image;
-        using texture_image_base = vma::texture_image_base;
+        using texture_image_base = vma::resource;
         using create_image = vma::create_image;
         using create_texture_image = vma::create_texture_image;
         texture_image_base texture_;
@@ -30,9 +30,8 @@ namespace mcs::vulkan::font
             auto width = raw_data.width();
             auto height = raw_data.height();
             uint32_t mipLevels = 1; // 字体无需 mipmap
-            auto create_texture =
-                create_texture_image{allocator, *pool, *queue}.setEnableMipmapping(false);
-            create_image build =
+            auto create_texture = create_texture_image{
+                *pool, *queue,
                 create_image{*device, allocator}
                     .setCreateInfo(
                         {.imageType = VK_IMAGE_TYPE_2D,
@@ -56,9 +55,9 @@ namespace mcs::vulkan::font
                                               .baseMipLevel = 0,
                                               .levelCount = mipLevels,
                                               .baseArrayLayer = 0,
-                                              .layerCount = 1}});
+                                              .layerCount = 1}})};
             texture_ = create_texture.build(
-                build, std::span<const unsigned char>{raw_data.data(), raw_data.size()});
+                std::span<const unsigned char>{raw_data.data(), raw_data.size()});
         }
         [[nodiscard]] const texture_image_base &view() const noexcept
         {

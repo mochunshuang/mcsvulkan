@@ -16,79 +16,13 @@
 #include "texture_image_base.hpp"
 #include "create_image.hpp"
 
+#include "../load/raw_stbi_image.hpp"
+#include "../tool/sType.hpp"
+
 namespace mcs::vulkan::vma
 {
     struct create_texture_image
     {
-        using create_info = create_image::create_info;
-        using view_create_info = create_image::view_create_info;
-
-        template <typename T>
-        static uint32_t mipLevels(T width, T height) noexcept
-        {
-            return get_mip_levels(width, height);
-        }
-        create_texture_image(VmaAllocator allocator, const CommandPool &pool,
-                             const Queue &queue) noexcept
-            : allocator_{allocator}, pool_{&pool}, queue_{&queue}
-        {
-        }
-
-        texture_image_base build(create_image &build,
-                                 const std::span<const unsigned char> &pixels) const
-        {
-            const auto &pool = *pool_;
-            const auto &queue = *queue_;
-            auto *allocator = allocator_;
-
-            auto textureImage_ = build.makeImage();
-            const auto MIP_LEVELS = build.createInfo().mipLevels;
-            const auto [width, height] = build.extent2D();
-
-            transitionImageLayout(
-                pool, queue, *textureImage_, VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED,
-                VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, MIP_LEVELS);
-
-            // init image data
-            {
-                const void *data = pixels.data();
-                const VkDeviceSize IMAGE_SIZE = pixels.size();
-                auto stagingBuffer = staging_buffer(allocator, IMAGE_SIZE);
-                stagingBuffer.copyDataToBuffer(data, IMAGE_SIZE);
-                copyBufferToImage(pool, queue, *stagingBuffer, *textureImage_,
-                                  VkExtent2D{.width = width, .height = height});
-            }
-
-            if (enableMipmapping())
-                generateMipmaps(pool, queue, *textureImage_, build.refImageFormat(),
-                                mipmap_param{.tex_width = static_cast<int32_t>(width),
-                                             .tex_height = static_cast<int32_t>(height),
-                                             .mip_levels = MIP_LEVELS});
-            else
-                transitionImageLayout(
-                    pool, queue, *textureImage_,
-                    VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, MIP_LEVELS);
-            auto textureImageView = build.makeImageView(*textureImage_);
-            return {std::move(textureImage_), std::move(textureImageView)};
-        }
-
-        [[nodiscard]] constexpr bool enableMipmapping() const noexcept
-        {
-            return enableMipmapping_;
-        }
-        constexpr auto &&setEnableMipmapping(bool enableMipmapping) noexcept
-        {
-            enableMipmapping_ = enableMipmapping;
-            return std::move(*this);
-        }
-
-      private:
-        bool enableMipmapping_{};
-        VmaAllocator allocator_;
-        const CommandPool *pool_;
-        const Queue *queue_;
-
         static CommandBuffer beginSingleTimeCommand(const CommandPool &commandpool)
         {
             using tool::sType;
@@ -137,7 +71,7 @@ namespace mcs::vulkan::vma
                 .subresourceRange = VkImageSubresourceRange{
                     .aspectMask = VkImageAspectFlagBits::VK_IMAGE_ASPECT_COLOR_BIT,
                     .baseMipLevel = 0,
-                    .levelCount = mipLevels, // diff: [test_mipmapping]
+                    .levelCount = mipLevels,
                     .baseArrayLayer = 0,
                     .layerCount = 1}};
 
@@ -171,8 +105,7 @@ namespace mcs::vulkan::vma
             {
                 throw std::invalid_argument("unsupported layout transition!");
             }
-            // NOTE: 4.
-            // 执行布局转换的最常见方法之一是使用映像内存屏障。设置不同掩码来优化速度
+            // NOTE: 4. 执行布局转换的最常见方法之一是使用映像内存屏障。设置不同掩码来优化速度
             commandBuffer.pipelineBarrier(sourceStage, destinationStage, {}, {}, {},
                                           std::array<VkImageMemoryBarrier, 1>{barrier});
             endSingleTimeCommand(pool, queue, commandBuffer);
@@ -197,9 +130,15 @@ namespace mcs::vulkan::vma
             endSingleTimeCommand(commandpool, queue, commandBuffer);
         }
 
+        template <typename T>
+        constexpr static auto getMipLevels(T w, T h) noexcept
+        {
+            return static_cast<uint32_t>(std::floor(std::log2(std::max(w, h)))) + 1;
+        }
+
         struct mipmap_param
         {
-            int32_t tex_width, tex_height;
+            int32_t width, height;
             uint32_t mip_levels;
         };
 
@@ -214,15 +153,14 @@ namespace mcs::vulkan::vma
             const auto *logicalDevice = commandpool.device();
 
             /*
-            这样的内置函数生成所有mip级别非常方便，
-            但遗憾的是不能保证所有平台都支持，它需要我们使用的纹理图像格式来支持线性过滤
-            */
+        这样的内置函数生成所有mip级别非常方便，
+        但遗憾的是不能保证所有平台都支持，它需要我们使用的纹理图像格式来支持线性过滤
+        */
             // NOTE: 4. 要求线性滤波
             //  Check if image format supports linear blit-ing
-            VkFormatProperties formatProperties =
-                logicalDevice->physicalDevice()->getFormatProperties(imageFormat);
-
-            if ((formatProperties.optimalTilingFeatures &
+            if (VkFormatProperties formatProperties =
+                    logicalDevice->physicalDevice()->getFormatProperties(imageFormat);
+                (formatProperties.optimalTilingFeatures &
                  VkFormatFeatureFlagBits::
                      VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) == 0)
             {
@@ -267,29 +205,28 @@ namespace mcs::vulkan::vma
                     std::span{&barrier, 1});
 
                 // 设置blit操作的参数
-                VkImageBlit blit = {
-                    .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                                       .mipLevel = i - 1,
-                                       .baseArrayLayer = 0,
-                                       .layerCount = 1},
-                    .srcOffsets = {{.x = 0, .y = 0, .z = 0},
-                                   {.x = mipWidth, .y = mipHeight, .z = 1}},
-                    .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                                       .mipLevel = i,
-                                       .baseArrayLayer = 0,
-                                       .layerCount = 1},
-                    .dstOffsets = {{.x = 0, .y = 0, .z = 0},
-                                   {.x = mipWidth > 1 ? mipWidth / 2 : 1,
-                                    .y = mipHeight > 1 ? mipHeight / 2 : 1,
-                                    .z = 1}}};
-
                 // NOTE: 该命令执行复制、缩放和过滤操作。
                 // 我们的纹理图像现在有多个mip级别，但是暂存缓冲区只能用于填充mip级别0
                 // 如果您使用专用传输队列（如顶点缓冲区中建议的），请注意：vkCmdBlitImage必须提交到具有图形功能的队列
                 commandBuffer.blitImage(
                     image, VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image,
                     VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    std::span{&blit, 1}, VK_FILTER_LINEAR);
+                    std::array<VkImageBlit, 1>{VkImageBlit{
+                        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                           .mipLevel = i - 1,
+                                           .baseArrayLayer = 0,
+                                           .layerCount = 1},
+                        .srcOffsets = {{.x = 0, .y = 0, .z = 0},
+                                       {.x = mipWidth, .y = mipHeight, .z = 1}},
+                        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                           .mipLevel = i,
+                                           .baseArrayLayer = 0,
+                                           .layerCount = 1},
+                        .dstOffsets = {{.x = 0, .y = 0, .z = 0},
+                                       {.x = mipWidth > 1 ? mipWidth / 2 : 1,
+                                        .y = mipHeight > 1 ? mipHeight / 2 : 1,
+                                        .z = 1}}}},
+                    VK_FILTER_LINEAR);
 
                 // 将第i-1级从TRANSFER_SRC_OPTIMAL转换为SHADER_READ_ONLY_OPTIMAL
                 barrier.oldLayout = VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
@@ -327,5 +264,133 @@ namespace mcs::vulkan::vma
 
             // NOTE:总之，每个mip级别都要像加载原始图像一样加载到图像中。
         }
+
+        constexpr create_texture_image(const CommandPool &pool, const Queue &queue,
+                                       create_image create) noexcept
+            : pool_{&pool}, queue_{&queue}, creator_{std::move(create)}
+        {
+        }
+        constexpr resource build(const std::span<const uint8_t> &pixels)
+        {
+            uint32_t width = creator_.createInfo().extent.width;
+            uint32_t height = creator_.createInfo().extent.height;
+            uint32_t mipLevels = creator_.createInfo().mipLevels;
+            VmaAllocator allocator = creator_.allocator();
+
+            // 创建暂存缓冲区
+            auto stagingBuffer = staging_buffer(allocator, pixels.size());
+            stagingBuffer.copyDataToBuffer(pixels.data(), pixels.size());
+
+            auto textureImage_ = creator_.makeImage();
+            transitionImageLayout(
+                *pool_, *queue_, *textureImage_, VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED,
+                VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mipLevels);
+            copyBufferToImage(*pool_, *queue_, *stagingBuffer, *textureImage_,
+                              VkExtent2D{.width = width, .height = height});
+
+            if (mipLevels == 1)
+                transitionImageLayout(
+                    *pool_, *queue_, *textureImage_,
+                    VkImageLayout::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VkImageLayout::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, mipLevels);
+            else
+                generateMipmaps(*pool_, *queue_, *textureImage_,
+                                creator_.refImageFormat(),
+                                mipmap_param{.width = static_cast<int32_t>(width),
+                                             .height = static_cast<int32_t>(height),
+                                             .mip_levels = mipLevels});
+            auto imageView_ = creator_.makeImageView(*textureImage_);
+            return {std::move(textureImage_), std::move(imageView_)};
+        }
+
+        constexpr auto &updateImageExtent(const VkExtent3D &extent) noexcept
+        {
+            creator_.createInfo().extent = extent;
+            return *this;
+        }
+
+        constexpr auto &updateFormat(VkFormat format) noexcept
+        {
+            creator_.createInfo().format = format;
+            return *this;
+        }
+        auto formImage(load::raw_stbi_image img)
+        {
+            return build({img.data(), img.size()});
+        }
+
+        decltype(auto) refCreator(this auto &&self) noexcept
+        {
+            return std::forward_like<decltype(self)>(self.creator_);
+        }
+        [[nodiscard]] auto *pool() const noexcept
+        {
+            return pool_;
+        }
+        [[nodiscard]] auto *queue() const noexcept
+        {
+            return queue_;
+        }
+        [[nodiscard]] auto mipLevels() const noexcept
+        {
+            return creator_.createInfo().mipLevels;
+        }
+
+        [[nodiscard]] auto &refCreator() const noexcept
+        {
+            return creator_;
+        }
+        [[nodiscard]] auto &refCreator() noexcept
+        {
+            return creator_;
+        }
+        decltype(auto) setCreator(this auto &&self, create_image creator) noexcept
+        {
+            self.creator_ = std::move(creator);
+            return std::forward<decltype(self)>(self);
+        }
+
+        [[nodiscard]] auto templateForImage2d(const std::string &path,
+                                              bool mipmap = false) const
+        {
+            load::raw_stbi_image img{path.c_str(), STBI_rgb_alpha};
+            VkExtent3D extent{.width = static_cast<uint32_t>(img.width()),
+                              .height = static_cast<uint32_t>(img.height()),
+                              .depth = 1};
+            auto mipLevels = mipmap ? getMipLevels(extent.width, extent.height) : 1;
+            auto create =
+                create_image{*queue_->device(), creator_.allocator()}
+                    .setCreateInfo(
+                        {.imageType = VK_IMAGE_TYPE_2D,
+                         .format = VK_FORMAT_R8G8B8A8_SRGB,
+                         .extent = extent,
+                         .mipLevels = mipLevels,
+                         .arrayLayers = 1,
+                         .samples = VK_SAMPLE_COUNT_1_BIT,
+                         .tiling = VK_IMAGE_TILING_OPTIMAL,
+                         .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                  VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                  VK_IMAGE_USAGE_SAMPLED_BIT,
+                         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                         // VMA 配置
+                         .allocationCreateInfo =
+                             {.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+                              .usage = VMA_MEMORY_USAGE_AUTO}})
+                    .setViewCreateInfo(
+                        {.viewType = VK_IMAGE_VIEW_TYPE_2D,
+                         .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                              .baseMipLevel = 0,
+                                              .levelCount = mipLevels,
+                                              .baseArrayLayer = 0,
+                                              .layerCount = 1}});
+            return create_texture_image{*this->pool_, *this->queue_, std::move(create)}
+                .build({img.data(), img.size()});
+        }
+
+      private:
+        const CommandPool *pool_;
+        const Queue *queue_;
+        create_image creator_;
     };
 }; // namespace mcs::vulkan::vma

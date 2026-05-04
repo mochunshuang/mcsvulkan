@@ -2,9 +2,7 @@ set(DIR_NAME "mcsvulkan/vma")
 set(EXE_DIR "${CMAKE_SOURCE_DIR}/test/${DIR_NAME}")
 
 # 头文件默认依赖
-set(BASE_LIBS volk vma glfw glm stb ktx nlohmann_json
-    freetype harfbuzz SheenBidi libunibreak utf8proc
-)
+set(BASE_LIBS ${MCSVULKAN_LIBS})
 
 macro(add_vulkan_vma_test fileName)
     string(REPLACE "/" "-" PREFIX_NAME ${DIR_NAME})
@@ -31,6 +29,7 @@ copy_dir_to_bindir("textures")
 # set(BASE_LIBS volk vma glfw glm stb ktx nlohmann_json
 # freetype harfbuzz SheenBidi libunibreak utf8proc
 # )
+set(BASE_LIBS ${MCSVULKAN_LIBS} msdfgen::msdfgen)
 add_std_glsl_target(test_buffer_base test_bindless_vertext.vert test_triangle.frag)
 add_std_glsl_target(test_uniform test_uniform.vert test_triangle.frag)
 add_std_glsl_target(test_depth test_depth.vert test_triangle.frag)
