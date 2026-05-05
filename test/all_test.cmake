@@ -19,3 +19,5 @@ include(test/font.cmake)
 include(test/agg.cmake)
 include(test/yoga.cmake)
 include(test/manifold.cmake)
+
+include(test/no_test.cmake)

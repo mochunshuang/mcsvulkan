@@ -5,15 +5,20 @@ If: # 收集信息的范围
 CompileFlags: # Tweak the parse settings
   # List of flags to append to the compile command.d
   Add: [
-     -Wall,-Wno-missing-braces
+     -Wall,-Wno-missing-braces,
     # ,-std=gnu++20
   ] # treat all files as C++, enable more warnings
   # Remove: -W* # strip all other warning-related flags
   # 全局移除编译参数:Clangd 无法解析的命令参数如下：
-  # Remove: [-fmodules-ts,-fdeps-format=p1689r5,-fmodule-mapper*]
-  # 看起来.clangd 优先级最高
+  Remove: 
+  [
+    -fmodules-ts,
+    -fdeps-format=p1689r5,
+    -fmodule-mapper*,-freflection
+  ]
+  # 看起来.clangd 优先级最高. 两个一起配置：--query-driver=E:/mysoftware/gcc-v16.1.0-mingw-v14.0.0-ucrt-x86_64/bin/g++.exe
   # Compiler: clang++               # Change argv[0] of compile flags to `clang++`
-  Compiler: E:/mysoftware/llvm-mingw-20250910-ucrt-x86_64/bin/clang++.exe
+  Compiler: E:/mysoftware/gcc-v16.1.0-mingw-v14.0.0-ucrt-x86_64/bin/g++.exe
 
 
 
@@ -89,7 +94,17 @@ Diagnostics:
       readability-identifier-naming.GlobalFunctionIgnoredRegexp: "^__.*"
       # 命名空间
       readability-identifier-naming.NamespaceCase: 'lower_case'
-
+  Suppress:
+    # 反射语法导致的常见误报
+    - typename_requires_specqual
+    - blocks_disable
+    - nonfunction_block_type
+    - expected_expression
+    # 如果还有其他，可以继续追加. 全部来自clangd的提示
+    - expected_namespace_name
+    - undeclared_var_use   # 或者 err_undeclared_var_use（任选一个）
+    - static_assert_expression_is_not_constant
+    - ovl_no_viable_function_in_call
       
   UnusedIncludes: Strict
   MissingIncludes: None

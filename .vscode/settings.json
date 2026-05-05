@@ -16,9 +16,10 @@
     "terminal.integrated.defaultProfile.windows": "PowerShell -NoProfile",
     // clangd 也有差距。请使用和编译期绑定的
     // "clangd.path": "D:/mysoftware/clangd_20.1.8/bin/clangd.exe",
-    "clangd.path": "E:/mysoftware/llvm-mingw-20250910-ucrt-x86_64/bin/clangd.exe",
+    "clangd.path": "E:/mysoftware/clangd_22.1.0/bin/clangd.exe",
     "clangd.arguments": [
         "--compile-commands-dir=${workspaceFolder}/build",
+        "--query-driver=E:/mysoftware/gcc-v16.1.0-mingw-v14.0.0-ucrt-x86_64/bin/g++.exe",
         "--log=verbose",
         "--pretty",
         "-j=8",
@@ -515,5 +516,8 @@
     },
     "glsllint.glslangValidatorArgs": [
         "-V"
-    ]
+    ],
+    // c-cpp-compile-run 的 debug 调试
+    "c-cpp-compile-run.debugger-path": "E:/mysoftware/gcc-v16.1.0-mingw-v14.0.0-ucrt-x86_64/bin/gdb.exe",
+    "c-cpp-compile-run.debugger-mimode": "gdb"
 }

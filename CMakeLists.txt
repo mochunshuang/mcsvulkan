@@ -7,11 +7,11 @@ project("mcsvulkan"
 )
 
 # Set language version used
-set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(CMAKE_C_STANDARD 17)
+set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED YES)
 set(CMAKE_C_EXTENSIONS OFF)
 
@@ -49,12 +49,25 @@ include(third_party/icu.cmake)
 include(third_party/yoga.cmake)
 
 include(third_party/oneTBB.cmake)
+
+# 引入了 googletest 无法全部构建
 include(third_party/Clipper2.cmake)
 include(third_party/manifold.cmake)
 
 include(third_party/imgui.cmake)
 
 set(ASSETS_DIR ${CMAKE_SOURCE_DIR}/assets)
+
+# NOTE: 放到最下面 仅仅影响 我的 目标
+# 将stdc++exp库链接到以后添加的所有目标。
+if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    link_libraries(stdc++exp)
+
+    # 2. 全局添加反射编译选项（仅对 C++ 生效）
+    add_compile_options(
+        "$<$<COMPILE_LANGUAGE:CXX>:-freflection>"
+    )
+endif()
 
 # test add
 set(MCSVULKAN_LIBS volk vma glfw glm stb ktx nlohmann_json
