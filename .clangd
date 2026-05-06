@@ -105,6 +105,25 @@ Diagnostics:
     - undeclared_var_use   # 或者 err_undeclared_var_use（任选一个）
     - static_assert_expression_is_not_constant
     - ovl_no_viable_function_in_call
+    - expected_qualified_after_typename
+    - missing_type_specifier
+    - expected_type
+    - expected_unqualified_id
+    - no_member
+    - undeclared_var_use_suggest
+    - expr_not_cce
+    - expected_less_after
+    - expected_member_name_or_semi
+    - mem_init_not_member_or_class
+    - auto_var_requires_init
+    - typecheck_decl_incomplete_type
+    - constexpr_var_non_literal
+    - template_instantiate_undefined
+    - implicit_instantiate_member_undefined
+    - expected
+    - constexpr_var_requires_const_init
+    - missing_param
+    - expected_capture
       
   UnusedIncludes: Strict
   MissingIncludes: None
