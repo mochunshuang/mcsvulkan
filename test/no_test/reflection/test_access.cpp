@@ -1,3 +1,4 @@
+#include <iostream>
 #include <meta>
 #include <span>
 using namespace std::meta;
@@ -126,5 +127,6 @@ static_assert(Outer::test_nested());
 
 int main()
 {
+    std::cout << "main done\n";
     return 0;
 }
