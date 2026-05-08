@@ -61,4 +61,5 @@ int main()
     std::cout << "y = " << y << '\n';
     std::cout << "z = " << z << '\n';
     std::cout << "Compile-time ticket counter works.\n";
+    return 0;
 }

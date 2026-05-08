@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <iostream>
 #include <meta>
 
@@ -18,6 +19,25 @@ struct Incomplete
 {
 }; // 变完整
 static_assert(is_complete_type(^^Incomplete));
+
+template <uint32_t i>
+struct gen_id
+{
+    static constexpr auto id = i;
+};
+static_assert(is_complete_type(^^gen_id<0>));
+
+template <typename T>
+consteval bool is_instantiated_impl()
+{
+    // 尝试获取成员；如果T未实例化，此操作在编译时可能失败
+    // 注意：此方法高度依赖编译器实现，可能不稳定
+    auto members = members_of(^^T, access_context::current());
+    return !members.empty(); // 或其它能证明实例化成功的逻辑
+}
+//NOTE: 隐式自动实例化
+static_assert(is_instantiated_impl<gen_id<0>>());
+static_assert(is_instantiated_impl<gen_id<1>>());
 
 // ===== is_enumerable_type =====
 // 1. 前向声明不可枚举

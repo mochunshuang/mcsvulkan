@@ -92,6 +92,19 @@ static_assert(meta::has_identifier(inject_members[1]) &&
 static_assert(meta::has_identifier(inject_members[2]) &&
               meta::identifier_of(inject_members[2]) == "flag");
 
+struct AB;
+consteval
+{
+    meta::define_aggregate(^^AB, {
+                                     desc_x});
+}
+//NOTE: 只能定义一次
+// consteval
+// {
+//     meta::define_aggregate(^^AB, {
+//                                      desc_y});
+// }
+
 int main()
 {
     MyAgg a{1, 2.0, 7}; // 聚合初始化
