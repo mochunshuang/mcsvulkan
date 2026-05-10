@@ -16,7 +16,7 @@ consteval auto make_named_tuple(
     std::vector<meta::info> nsdms;
     for (auto [mem_type, name] : members)
     {
-        nsdms.push_back(meta::data_member_spec(mem_type, {.name = std::string(name)}));
+        nsdms.push_back(meta::data_member_spec(mem_type, {.name = name}));
     }
     return meta::define_aggregate(type, nsdms);
 }

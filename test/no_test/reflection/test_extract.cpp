@@ -193,6 +193,31 @@ consteval bool test_extract_constexpr()
 static_assert(test_extract_constexpr());
 
 // ============================================================
+// 测试 6：从 T... 生成 info 集合，并通过 extract 取回
+// ============================================================
+template <typename... Ts>
+consteval bool test_extract_array_of_infos()
+{
+    constexpr std::size_t N = sizeof...(Ts);
+    using Aarry = std::array<std::meta::info, N>;
+    // using Aarry = std::span<const std::meta::info>;
+    // 1. 用类型包生成 array<meta::info, N>
+    Aarry original = {^^Ts...};
+
+    // 2. 打包成单一 info
+    std::meta::info packed = std::meta::reflect_constant(original);
+
+    // 3. 提取回 array<meta::info, N>
+    auto extracted = extract<Aarry>(packed);
+
+    // 4. 利用 array 自身的 operator== 一次完成全量比较
+    return original == extracted;
+}
+
+static_assert(test_extract_array_of_infos<int, double, char>());
+static_assert(test_extract_array_of_infos<>()); // 空包也 OK
+
+// ============================================================
 int main()
 {
     std::cout << "All extract tests passed.\n";
