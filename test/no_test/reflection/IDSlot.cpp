@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cassert>
 #include <cstddef>
 #include <iostream>
 #include <exception>
@@ -12,18 +13,20 @@
 
 // NOLINTBEGIN
 
-struct type_string
+struct static_string
 {
-    const char *value;
+    const char *value{};
+
     template <size_t N>
-    consteval type_string(const char (&str)[N]) : value{std::define_static_string(str)}
+    constexpr static_string(const char (&str)[N]) noexcept // NOLINT
+        : value{std::define_static_string(str)}
     {
     }
-    consteval bool operator==(const std::string_view &o) const noexcept
+    constexpr bool operator==(const std::string_view &o) const noexcept
     {
         return std::string_view{value} == o;
     }
-    consteval operator std::string_view() const noexcept
+    constexpr operator std::string_view() const noexcept
     {
         return std::string_view{value};
     }
@@ -32,7 +35,7 @@ struct type_string
 struct member_info
 {
     std::meta::info info;
-    type_string name;
+    static_string name;
 
     template <size_t N>
     consteval member_info(std::meta::info info, const char (&str)[N])
@@ -58,6 +61,50 @@ struct make_aggregate
 };
 template <member_info... infos>
 using make_aggregate_t = make_aggregate<infos...>::aggregate_type;
+
+template <size_t N>
+struct fixed_string
+{
+    char data[N]{};
+    constexpr fixed_string(const char (&str)[N])
+    {
+        std::copy_n(str, N, data);
+    }
+    constexpr bool operator==(const std::string_view &o) const noexcept
+    {
+        return std::string_view{data, N - 1} == o;
+    }
+    constexpr operator std::string_view() const noexcept
+    {
+        return {data, N - 1};
+    }
+};
+template <size_t N>
+struct member_info2
+{
+    std::meta::info info;
+    fixed_string<N> name;
+    consteval member_info2(std::meta::info info, const char (&str)[N])
+        : info{info}, name{str}
+    {
+    }
+};
+template <member_info2... infos>
+struct make_aggregate2
+{
+    struct aggregate_type;
+    consteval
+    {
+        std::vector<std::meta::info> nsdms;
+        template for (const auto &spec : {infos...})
+        {
+            nsdms.push_back(std::meta::data_member_spec(spec.info, {.name = spec.name}));
+        }
+        std::meta::define_aggregate(^^aggregate_type, nsdms);
+    }
+};
+template <member_info2... infos>
+using make_aggregate_t2 = make_aggregate2<infos...>::aggregate_type;
 
 template <typename... T>
 consteval bool unique_type_set()
@@ -101,7 +148,7 @@ struct type_registry_info
     {
         return std::meta::display_string_of(std::meta::dealias(infos...[I]));
     }
-    static consteval size_t get_index_by_name(type_string name)
+    static consteval size_t get_index_by_name(static_string name)
     {
         template for (constexpr auto I : std::define_static_array(
                           std::ranges::views::iota(std::size_t{0}, sizeof...(infos))))
@@ -112,7 +159,7 @@ struct type_registry_info
         return ~0;
     }
 
-    template <type_string name>
+    template <static_string name>
         requires(get_index_by_name(name) != ~0)
     using type = type_of_info<infos...[get_index_by_name(name)]>;
 };
@@ -175,10 +222,10 @@ void test_type_of_info()
     static_assert(MyRegistry::get_index_by_name("nonexistent") == ~size_t{0});
 
     // 测试 type<name> 别名
-    using T0 = MyRegistry::type<type_string("A")>;
-    using T1 = MyRegistry::type<type_string("B")>;
-    using T2 = MyRegistry::type<type_string("int")>;
-    using T3 = MyRegistry::type<type_string("char")>;
+    using T0 = MyRegistry::type<static_string("A")>;
+    using T1 = MyRegistry::type<static_string("B")>;
+    using T2 = MyRegistry::type<static_string("int")>;
+    using T3 = MyRegistry::type<static_string("char")>;
 
     static_assert(std::is_same_v<T0, A>);
     static_assert(std::is_same_v<T1, B>);
@@ -205,6 +252,25 @@ try
     using T = make_aggregate_t<{^^int, "x"}, {^^double, "y"}, {^^float, "z"}>;
     T a{.x = 1, .y = 2, .z = 3};
     {
+        using T = make_aggregate_t2<{^^int, "x"}, {^^double, "y"}, {^^float, "z"}>;
+        T a{.x = 1, .y = 2, .z = 3};
+    }
+    {
+        static_string str{"123"};
+    }
+    {
+        fixed_string str{"223"};
+        fixed_string str2 = str;
+        assert(str2 == "223");
+    }
+    {
+        //NOTE: 地址是相同的
+        std::println("hellp ptr: {}", (void *)("hello"));
+        std::println("hellp ptr: {}", (void *)("hello"));
+
+        //NOTE: 下面相同
+        std::println("hellp ptr: {}", (void *)(std::define_static_string("hello")));
+        std::println("hellp ptr: {}", (void *)(std::define_static_string("hello")));
     }
     std::cout << "main done\n";
     return 0;

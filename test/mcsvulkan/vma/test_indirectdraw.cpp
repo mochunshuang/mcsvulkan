@@ -1101,8 +1101,9 @@ try
         enablefeatureChain = {
             {.features =
                  {
-                     .samplerAnisotropy = VK_TRUE,
+                     //NOTE: gcc 要求。严格的初始化顺序。 multiDrawIndirect 要在前面
                      .multiDrawIndirect = VK_TRUE, //diff: [test_indirectdraw]
+                     .samplerAnisotropy = VK_TRUE,
                      .shaderInt64 = VK_TRUE,
                  }},
             {.synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE},

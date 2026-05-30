@@ -129,6 +129,63 @@ consteval bool test_return_type()
     return true;
 }
 static_assert(test_return_type());
+
+template <int P1, const int &P2>
+struct fn;
+
+static constexpr int p[2] = {1, 2};
+constexpr auto spec = ^^fn<p[0], p[1]>;
+
+static_assert(is_value(template_arguments_of(spec)[0]));
+static_assert(is_object(template_arguments_of(spec)[1]));
+static_assert(!is_variable(template_arguments_of(spec)[1]));
+
+static_assert([:template_arguments_of(spec)[0]:] == 1);
+static_assert(&[:template_arguments_of(spec)[1]:] == &p[1]);
+
+template <typename spec>
+consteval auto test_funn()
+{
+    constexpr auto args_info = ^^spec;
+
+    static_assert(is_value(template_arguments_of(args_info)[0]));
+    static_assert(is_object(template_arguments_of(args_info)[1]));
+    static_assert(!is_variable(template_arguments_of(args_info)[1]));
+    static_assert([:template_arguments_of(args_info)[0]:] == 1);
+    static_assert(&[:template_arguments_of(args_info)[1]:] == &p[1]);
+
+    constexpr auto args_size = template_arguments_of(args_info).size(); // NOLINT
+
+    return true;
+};
+static_assert(test_funn<fn<p[0], p[1]>>());
+
+template <int... P1>
+struct args;
+
+template <typename spec>
+struct test_funn_type
+{
+    template <int v>
+    static consteval bool test()
+    {
+        constexpr auto args_info = ^^spec;
+        constexpr auto args_size = template_arguments_of(args_info).size(); // NOLINT
+
+        for (const auto &value : template_arguments_of(args_info))
+        {
+            if (v == std::meta::extract<int>(value))
+                return true;
+        }
+
+        return false;
+    }
+};
+using test_fun2 = test_funn_type<args<0, 1>>;
+static_assert(test_fun2::test<1>());
+static_assert(test_fun2::test<0>());
+static_assert(not test_fun2::test<3>());
+
 int main()
 {
     std::cout << "main done\n";

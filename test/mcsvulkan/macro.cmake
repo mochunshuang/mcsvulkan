@@ -18,6 +18,7 @@ endmacro()
 
 add_vulkan_macro_test(test_volk)
 add_vulkan_macro_test(test_vma)
+add_vulkan_macro_test(test_no_unique_address)
 
 unset(BASE_LIBS)
 unset(EXE_DIR)

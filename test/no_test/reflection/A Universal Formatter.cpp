@@ -18,7 +18,7 @@ struct universal_formatter
     }
 
     template <typename T>
-    auto format(T const &t, auto &ctx) const
+    auto format(const T &t, auto &ctx) const
     {
         auto out =
             std::format_to(ctx.out(), "{}{{",

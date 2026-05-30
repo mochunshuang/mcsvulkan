@@ -5,7 +5,7 @@ If: # 收集信息的范围
 CompileFlags: # Tweak the parse settings
   # List of flags to append to the compile command.d
   Add: [
-     -Wall,-Wno-missing-braces,
+     -Wall,-Wno-missing-braces,-std=c++26
     # ,-std=gnu++20
   ] # treat all files as C++, enable more warnings
   # Remove: -W* # strip all other warning-related flags
@@ -125,6 +125,10 @@ Diagnostics:
     - missing_param
     - expected_capture
     - unknown_typename
+    - no_member_suggest
+    - typename_nested_not_found
+    - invalid_non_static_member_use
+    - fatal_too_many_errors
       
   UnusedIncludes: Strict
   MissingIncludes: None

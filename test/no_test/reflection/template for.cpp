@@ -103,10 +103,19 @@ void print()
         std::println("{}", e);
     }
 }
+template <size_t N>
+void print2()
+{
+    template for (constexpr auto e : std::ranges::views::indices(N))
+    {
+        std::println("{}", e);
+    }
+}
 
 int main()
 try
 {
+    print2<3>();
     std::cout << "main done\n";
     return 0;
 }
