@@ -82,66 +82,56 @@ namespace mcs::vulkan::input
             impl->cursorEnter_ = std::move(enter); // NOLINT
         }
 
-        [[nodiscard]] const auto &keyboards() const noexcept
+        [[nodiscard]] decltype(auto) keyboards(this auto &&self) noexcept
         {
-            return keyboards_;
+            return std::forward_like<decltype(self)>(self.keyboards_);
         }
 
-        [[nodiscard]] scroll_event &scroll() noexcept
+        [[nodiscard]] decltype(auto) scroll(this auto &&self) noexcept
         {
-            return scroll_;
+            return std::forward_like<decltype(self)>(self.scroll_);
         }
 
-        [[nodiscard]] const position2d_event &cursorPos() const noexcept
+        [[nodiscard]] decltype(auto) cursorPos(this auto &&self) noexcept
         {
-            return cursorPos_;
-        }
-        [[nodiscard]] const cursor_enter_event &cursorEnter() const noexcept
-        {
-            return cursorEnter_;
+            return std::forward_like<decltype(self)>(self.cursorPos_);
         }
 
         // NOLINTBEGIN
-
-        [[nodiscard]] const auto &get_keyboard_event(const event::Key &key) const noexcept
+        [[nodiscard]] decltype(auto) get_keyboard_event(this auto &&self,
+                                                        event::Key key) noexcept
         {
-            return keyboards_[static_cast<keyboard_event::key_store_type>(key)]; // NOLINT
-        }
-        [[nodiscard]] auto &get_keyboard_event(const event::Key &key) noexcept // NOLINT
-        {
-            return keyboards_[static_cast<keyboard_event::key_store_type>(key)]; // NOLINT
+            return std::forward_like<decltype(self)>(
+                self.keyboards_[static_cast<keyboard_event::key_store_type>(key)]);
         }
 
-        [[nodiscard]] const auto &get_mousebutton_event(
-            const event::MouseButtons &btn) const noexcept
+        [[nodiscard]] decltype(auto) get_mousebutton_event(
+            this auto &&self, event::MouseButtons btn) noexcept
         {
-            return mousebuttons_[static_cast<mousebutton_event::key_store_type>(btn)];
-        }
-        [[nodiscard]] auto &get_mousebutton_event(const event::MouseButtons &btn) noexcept
-        {
-            return mousebuttons_[static_cast<mousebutton_event::key_store_type>(btn)];
+            return std::forward_like<decltype(self)>(
+                self.mousebuttons_[static_cast<mousebutton_event::key_store_type>(btn)]);
         }
         // NOLINTEND
 
         // API::
-        auto isKeyPressedOrRepeat(event::Key key) noexcept
+        [[nodiscard]] auto isKeyPressedOrRepeat(event::Key key) const noexcept
         {
             const auto &event = get_keyboard_event(key);
             return event.press() || event.repeat();
         };
-        auto isKeyPressed(event::Key key) noexcept
+        [[nodiscard]] auto isKeyPressed(event::Key key) const noexcept
         {
             return get_keyboard_event(key).press();
         };
-        auto isKeyRepeat(event::Key key) noexcept
+        [[nodiscard]] auto isKeyRepeat(event::Key key) const noexcept
         {
             return get_keyboard_event(key).repeat();
         };
-        auto isMouseButtonPressed(event::MouseButtons key) noexcept
+        [[nodiscard]] auto isMouseButtonPressed(event::MouseButtons key) const noexcept
         {
             return get_mousebutton_event(key).press();
         };
-        auto isMouseButtonRelease(event::MouseButtons key) noexcept
+        [[nodiscard]] auto isMouseButtonRelease(event::MouseButtons key) const noexcept
         {
             return get_mousebutton_event(key).release();
         };

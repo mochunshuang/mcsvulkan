@@ -6,3 +6,5 @@
 #include "./meta/is_info.hpp"
 #include "./meta/contains_annotations.hpp"
 #include "./meta/contains_nonstatic_data_members.hpp"
+#include "./meta/static_nsdms_of.hpp"
+#include "./meta/static_parameters_of.hpp"

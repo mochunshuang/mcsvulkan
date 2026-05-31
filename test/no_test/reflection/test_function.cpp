@@ -1,5 +1,6 @@
 #include <meta>
 #include <iostream>
+#include <string_view>
 using namespace std::meta;
 
 // 测试结构体
@@ -203,6 +204,45 @@ static_assert(!is_move_assignment(copy_assign_info));
 // is_destructor
 static_assert(is_destructor(dtor_info));
 static_assert(!is_destructor(f_info));
+
+// ============ Lambda 反射测试 ============
+consteval bool test_lambda_reflection()
+{
+    // 1. 简单无捕获 lambda
+    {
+        auto simple = [](int x) {
+            return x;
+        };
+        // 获取 operator() 的反射
+        constexpr info op = ^^decltype(simple)::operator();
+
+        // 是函数
+        if (!is_function(op))
+            return false;
+
+        // 是运算符函数
+        if (!is_operator_function(op))
+            return false;
+        // 不是转换函数
+        if (is_conversion_function(op))
+            return false;
+        // 不是字面量运算符
+        if (is_literal_operator(op))
+            return false;
+        // 参数列表
+        constexpr auto params = std::define_static_array(parameters_of(op));
+        if (params.size() != 1)
+            return false;
+        if (!is_function_parameter(params[0]))
+            return false;
+        static_assert(std::string_view{"x"} == std::string_view{"x"});
+        static_assert(std::meta::identifier_of(params[0]) == std::string_view{"x"});
+    }
+
+    return true;
+}
+
+static_assert(test_lambda_reflection());
 
 int main()
 {

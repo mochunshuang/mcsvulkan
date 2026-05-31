@@ -910,8 +910,9 @@ try
                                  static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT),
                          }, //diff: [test_indirectdraw] start
                          VkDescriptorPoolSize{
-                             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                             MAX_FRAMES_IN_FLIGHT}, //diff: [test_indirectdraw] end
+                             .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                             .descriptorCount =
+                                 MAX_FRAMES_IN_FLIGHT}, //diff: [test_indirectdraw] end
                      }})
             .build(device);
     auto descriptorSets = descriptorPool.allocateDescriptorSets(
@@ -1031,7 +1032,7 @@ try
 
     auto updateDescriptorSets =
         [&](const LogicalDevice &device, VkDescriptorSet descriptorSet,
-            VkDescriptorBufferInfo bufferInfo,
+            VkDescriptorBufferInfo uniformInfo,
             const std::vector<VkDescriptorImageInfo> &textureInfos,
             const std::vector<VkDescriptorImageInfo> &samplerInfos) {
             std::vector<VkWriteDescriptorSet> writes;
@@ -1043,7 +1044,7 @@ try
                 .dstArrayElement = 0,
                 .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                .pBufferInfo = &bufferInfo,
+                .pBufferInfo = &uniformInfo,
             });
 
             // 绑定 1：Sampled Images —— 仅更新活跃的槽位（0, 3, 9 ...）
@@ -1076,10 +1077,10 @@ try
 
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
     {
-        VkDescriptorBufferInfo bufferInfo = {
-            .buffer = uniformBuffers[i].buffer(), .offset = 0, .range = BUFFER_SIZE};
-        updateDescriptorSets(device, descriptorSets[i], bufferInfo,
-                             textureInfosPerFrame[i], samplerInfosPerFrame[i]);
+        updateDescriptorSets(
+            device, descriptorSets[i],
+            {.buffer = uniformBuffers[i].buffer(), .offset = 0, .range = BUFFER_SIZE},
+            textureInfosPerFrame[i], samplerInfosPerFrame[i]);
     }
 
     // diff: [test_indirectdraw] start 为每个帧初始化 SSBO（binding 3）占位缓冲，并更新描述符
@@ -1309,7 +1310,7 @@ try
 
     glfw_input input{};
 
-    auto views_matrix_update = [&camera](glfw_input &input) {
+    auto views_matrix_update = [&camera](const glfw_input &input) {
         using mcs::vulkan::event::Key;
         const float step = 0.1f; // 移动步长，可根据需要调整
 
@@ -1414,7 +1415,7 @@ try
         };
     };
 
-    auto views_perspective_update = [&camera](glfw_input &input) {
+    auto views_perspective_update = [&camera](const glfw_input &input) {
         using mcs::vulkan::event::Key;
 
         if (input.isKeyPressedOrRepeat(Key::eR))
@@ -1469,7 +1470,7 @@ try
     model_matrix modelMatrix_{};
     auto model_update = [&camera, &modelMatrix_, &swapchain, &isMiddleButtonPressed,
                          &isLeftButtonPressed, &rightButtonPressedLast, &lastLeftPos,
-                         &lastPos, &input_mesh2, &frameContext](glfw_input &input) {
+                         &lastPos, &input_mesh2, &frameContext](const glfw_input &input) {
         using mcs::vulkan::event::MouseButtons;
         using mcs::vulkan::event::Key;
         using mcs::vulkan::event::scroll_event;

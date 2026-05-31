@@ -95,6 +95,18 @@ consteval bool test_vararg_function()
     return true;
 }
 
+constexpr auto get_call_op = [](info closure_type) consteval -> info {
+    // 遍历所有成员，找到名字为 "operator()" 的函数
+    for (info mem : members_of(closure_type, std::meta::access_context::current()))
+    {
+        if (has_identifier(mem) && identifier_of(mem) == "operator()")
+            return mem;
+    }
+    // 理论上 lambda 一定有 operator()，若未找到则返回空 info（测试会失败）
+    return info{};
+};
+static_assert(get_call_op(^^decltype([](int x) { return x; })) == info{});
+
 static_assert(test_function_parameter());
 static_assert(test_explicit_object_parameter());
 static_assert(test_has_default_argument());
