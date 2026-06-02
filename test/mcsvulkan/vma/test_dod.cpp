@@ -864,10 +864,11 @@ try
                  .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,
                  .bindings =
                      {
-                         {.binding = 0,
-                          .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                          .descriptorCount = 1,
-                          .stageFlags = VK_SHADER_STAGE_VERTEX_BIT},
+                         VkDescriptorSetLayoutBinding{
+                             .binding = 0,
+                             .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                             .descriptorCount = 1,
+                             .stageFlags = VK_SHADER_STAGE_VERTEX_BIT},
                          VkDescriptorSetLayoutBinding{
                              .binding = 1,
                              .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
@@ -1109,7 +1110,7 @@ try
             .range = VK_WHOLE_SIZE,
         };
         VkWriteDescriptorSet write = {
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .sType = sType<VkWriteDescriptorSet>(),
             .dstSet = descriptorSets[i],
             .dstBinding = 3,
             .dstArrayElement = 0,
@@ -1269,9 +1270,6 @@ try
     };
     // 索引数据
     std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
-
-    constexpr auto input_mesh_id = 0;
-    constexpr auto input_mesh2_id = 1;
 
     std::vector<mesh_base> mesh_array;
     mesh_array.reserve(2);
@@ -1569,14 +1567,16 @@ try
     auto pickingDescSetLayout =
         create_descriptor_set_layout{}
             .setCreateInfo(
-                {.bindings = {{.binding = 0,
-                               .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                               .descriptorCount = 1,
-                               .stageFlags = VK_SHADER_STAGE_VERTEX_BIT},
-                              {.binding = 1,
-                               .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                               .descriptorCount = 1,
-                               .stageFlags = VK_SHADER_STAGE_VERTEX_BIT}}})
+                {.bindings = {VkDescriptorSetLayoutBinding{
+                                  .binding = 0,
+                                  .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                  .descriptorCount = 1,
+                                  .stageFlags = VK_SHADER_STAGE_VERTEX_BIT},
+                              VkDescriptorSetLayoutBinding{
+                                  .binding = 1,
+                                  .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                  .descriptorCount = 1,
+                                  .stageFlags = VK_SHADER_STAGE_VERTEX_BIT}}})
             .build(device);
     // 推送常量范围：mat4 + uint
     auto pickingPipelineLayout =
@@ -1622,7 +1622,8 @@ try
         VkDescriptorBufferInfo uboInfo{.buffer = uniformBuffers[i].buffer(),
                                        .offset = 0,
                                        .range = sizeof(UniformBufferObject)};
-        VkDescriptorBufferInfo ssboInfo{pb.objectInfoBuffer.buffer(), 0, VK_WHOLE_SIZE};
+        VkDescriptorBufferInfo ssboInfo{
+            .buffer = pb.objectInfoBuffer.buffer(), .offset = 0, .range = VK_WHOLE_SIZE};
         std::array<VkWriteDescriptorSet, 2> writes = {
             VkWriteDescriptorSet{
                 VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, pickingDescSets[i], 0, 0,
@@ -1630,7 +1631,6 @@ try
             VkWriteDescriptorSet{
                 VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, pickingDescSets[i], 1, 0,
                 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ssboInfo, nullptr}};
-        // vkUpdateDescriptorSets(device, 2, writes.data(), 0, nullptr);
         device.updateDescriptorSets(2, writes.data(), 0, nullptr);
     }
 
@@ -2169,8 +2169,13 @@ try
 
             commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pickingPipeline);
             commandBuffer.setViewport(
-                0, std::array<VkViewport, 1>{VkViewport{
-                       0, 0, (float)imageExtent.width, (float)imageExtent.height, 0, 1}});
+                0, std::array<VkViewport, 1>{
+                       VkViewport{.x = 0,
+                                  .y = 0,
+                                  .width = static_cast<float>(imageExtent.width),
+                                  .height = static_cast<float>(imageExtent.height),
+                                  .minDepth = 0,
+                                  .maxDepth = 1}});
             commandBuffer.setScissor(
                 0, std::array<VkRect2D, 1>{VkRect2D{{0, 0}, imageExtent}});
 
@@ -2332,7 +2337,7 @@ try
                 .range = VK_WHOLE_SIZE,
             };
             VkWriteDescriptorSet write{
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .sType = sType<VkWriteDescriptorSet>(),
                 .dstSet = descriptorSets[currentFrame],
                 .dstBinding = 3,
                 .dstArrayElement = 0,
@@ -2396,9 +2401,14 @@ try
         batch.drawCount = objectCount;
     };
 
-    auto preparePickingBatch = [&pickingBatches, &world, &allocator, &pickingDescSets,
-                                &device](uint32_t currentFrame,
-                                         const std::span<const glm::mat4> &models) {
+    auto preparePickingBatch = [&pickingBatches, &globalCtx, &pickCtx,
+                                &world](uint32_t currentFrame,
+                                        const std::span<const glm::mat4> &models) {
+        auto &allocator = globalCtx.allocator;
+        auto &device = globalCtx.device;
+
+        auto &pickingDescSets = pickCtx.descSets;
+
         auto &pb = pickingBatches[currentFrame];
         constexpr uint32_t objectCount = 2;
 
@@ -2424,18 +2434,20 @@ try
             pb.objectInfoSize = needObj;
 
             // 更新描述符绑定
-            VkDescriptorBufferInfo ssboInfo = {pb.objectInfoBuffer.buffer(), 0,
-                                               VK_WHOLE_SIZE};
-            VkWriteDescriptorSet write = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                                          nullptr,
-                                          pickingDescSets[currentFrame],
-                                          1,
-                                          0,
-                                          1,
-                                          VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                          nullptr,
-                                          &ssboInfo,
-                                          nullptr};
+            VkDescriptorBufferInfo ssboInfo = {.buffer = pb.objectInfoBuffer.buffer(),
+                                               .offset = 0,
+                                               .range = VK_WHOLE_SIZE};
+            VkWriteDescriptorSet write = {.sType = sType<VkWriteDescriptorSet>(),
+                                          .pNext = nullptr,
+                                          .dstSet = pickingDescSets[currentFrame],
+                                          .dstBinding = 1,
+                                          .dstArrayElement = 0,
+                                          .descriptorCount = 1,
+                                          .descriptorType =
+                                              VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                          .pImageInfo = nullptr,
+                                          .pBufferInfo = &ssboInfo,
+                                          .pTexelBufferView = nullptr};
             device.updateDescriptorSets(1, &write, 0, nullptr);
         }
 
