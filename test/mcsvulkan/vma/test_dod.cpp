@@ -15,6 +15,7 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "../head.hpp"
 
@@ -67,6 +68,8 @@ using mcs::vulkan::vma::create_resources;
 using mcs::vulkan::vma::create_image;
 
 using mcs::vulkan::tool::simple_copy_buffer;
+
+using mcs::vulkan::meta::make_aggregate_ref;
 
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
@@ -1250,7 +1253,7 @@ try
                  .layout = *pipelineLayout})
             .build(device);
 
-    constexpr auto MAX_FRAMES_IN_FLIGHT = 2;
+    static constexpr auto MAX_FRAMES_IN_FLIGHT = 2;
     CommandBuffers commandBuffers =
         commandPool.allocateCommandBuffers({.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
                                             .commandBufferCount = MAX_FRAMES_IN_FLIGHT});
@@ -1267,33 +1270,41 @@ try
     // 索引数据
     std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
 
-    mesh_base input_mesh{
-        allocator, commandPool, GRAPHICS_AND_PRESENT, {vertices, indices}};
-    mesh_base input_mesh2{allocator,
-                          commandPool,
-                          GRAPHICS_AND_PRESENT,
-                          {.vertices = vertices |
-                                       std::views::transform([](const Vertex &vertex) {
-                                           auto newvertex = vertex;
-                                           newvertex.pos[2] = 0.5;
-                                           return newvertex;
-                                       }) |
-                                       std::ranges::to<std::vector<Vertex>>(),
-                           .indices = indices}};
     constexpr auto input_mesh_id = 0;
     constexpr auto input_mesh2_id = 1;
 
+    std::vector<mesh_base> mesh_array;
+    mesh_array.reserve(2);
+    mesh_array.emplace_back(
+        mesh_base{allocator, commandPool, GRAPHICS_AND_PRESENT, {vertices, indices}});
+    mesh_array.emplace_back(
+        mesh_base{allocator,
+                  commandPool,
+                  GRAPHICS_AND_PRESENT,
+                  {.vertices = vertices | std::views::transform([](const Vertex &vertex) {
+                                   auto newvertex = vertex;
+                                   newvertex.pos[2] = 0.5;
+                                   return newvertex;
+                               }) |
+                               std::ranges::to<std::vector<Vertex>>(),
+                   .indices = indices}});
+
+    mesh_base &input_mesh = mesh_array[0];
+    mesh_base &input_mesh2 = mesh_array[1];
+
+    std::vector<uint32_t> texture_array = {0, 3};
+    std::vector<uint32_t> sampler_array = {0, 1};
+
     // 随机生成两个纹理索引和采样器索引
-    uint32_t textureIndex1 = 0;
-    uint32_t textureIndex2 = 3;
-    uint32_t samplerIndex1 = 0;
-    uint32_t samplerIndex2 = 1;
+    uint32_t &textureIndex1 = texture_array[0];
+    uint32_t &textureIndex2 = texture_array[1];
+    uint32_t &samplerIndex1 = sampler_array[0];
+    uint32_t &samplerIndex2 = sampler_array[1];
 
     struct record_info
     {
         uint32_t current_frame;
         uint32_t image_index;
-        VkDescriptorSet descriptor_set;
     };
 
     camera_interface camera =
@@ -1462,241 +1473,6 @@ try
         }
     };
 
-    mcs::vulkan::event::position2d_event lastPos{};
-    bool isMiddleButtonPressed = false;
-    bool isLeftButtonPressed = false;
-    bool rightButtonPressedLast = false; // 新增：记录上一帧右键状态
-    mcs::vulkan::event::position2d_event lastLeftPos{};
-    model_matrix modelMatrix_{};
-    auto model_update = [&camera, &modelMatrix_, &swapchain, &isMiddleButtonPressed,
-                         &isLeftButtonPressed, &rightButtonPressedLast, &lastLeftPos,
-                         &lastPos, &input_mesh2, &frameContext](const glfw_input &input) {
-        using mcs::vulkan::event::MouseButtons;
-        using mcs::vulkan::event::Key;
-        using mcs::vulkan::event::scroll_event;
-        const auto cur = input.cursorPos();
-        const auto windowSize = swapchain.refImageExtent();
-
-        const bool curMiddlePressed =
-            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_MIDDLE);
-        const bool curLeftPressed =
-            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_LEFT);
-        const bool curRightPressed =
-            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_RIGHT);
-
-        if (scroll_event{} != input.scroll())
-        {
-            std::println("input.scroll(): {}", input.scroll());
-            // 获取修饰键状态
-            bool ctrlPressed = input.isKeyPressedOrRepeat(Key::eLEFT_CONTROL) ||
-                               input.isKeyPressedOrRepeat(Key::eRIGHT_CONTROL);
-            bool altPressed = input.isKeyPressedOrRepeat(Key::eLEFT_ALT) ||
-                              input.isKeyPressedOrRepeat(Key::eRIGHT_ALT);
-            bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
-                                input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
-            auto scroll = input.scroll();
-            float delta = scroll.yoffset; // +1 向上滚（放大），-1 向下滚（缩小）
-
-            if (delta != 0.0f)
-            {
-                // 缩放因子：每格 ±10%
-                const float factor = (delta > 0) ? 1.1f : (1.0f / 1.1f);
-
-                // 统计按下修饰键的数量
-                int modCount =
-                    (ctrlPressed ? 1 : 0) + (altPressed ? 1 : 0) + (shiftPressed ? 1 : 0);
-
-                if (modCount == 1)
-                {
-                    // 仅一个修饰键按下：缩放对应的轴
-                    if (ctrlPressed)
-                        modelMatrix_.scale.x *= factor;
-                    else if (altPressed)
-                        modelMatrix_.scale.y *= factor;
-                    else if (shiftPressed)
-                        modelMatrix_.scale.z *= factor;
-                }
-                else
-                {
-                    // 无修饰键或多个修饰键：均匀缩放所有轴
-                    modelMatrix_.scale *= factor;
-                }
-
-                // 可选：限制缩放范围，避免过小或过大
-                // modelMatrix_.scale = glm::clamp(modelMatrix_.scale, 0.01f, 100.0f);
-            }
-        }
-
-        // ========== 右键单击复位物体 ==========
-        if (curRightPressed && !rightButtonPressedLast)
-        {
-            // 按下瞬间：平移归零，旋转归单位四元数
-            modelMatrix_.translation = glm::vec3(0.0f);
-            modelMatrix_.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
-            // scale 保持 (1,1,1) 不变
-            modelMatrix_.scale = {1, 1, 1};
-        }
-        rightButtonPressedLast = curRightPressed; // 更新状态供下一帧使用
-
-        // ========== 左键旋转处理（支持修饰键分离轴） ==========
-        if (curLeftPressed)
-        {
-            if (!isLeftButtonPressed)
-            {
-                lastLeftPos = cur;
-                isLeftButtonPressed = true;
-            }
-            else
-            {
-                float dx = static_cast<float>(cur.xpos - lastLeftPos.xpos);
-                float dy = static_cast<float>(cur.ypos - lastLeftPos.ypos);
-
-                if (dx != 0.0f || dy != 0.0f)
-                {
-                    glm::mat4 view = camera.viewsMatrix();
-                    glm::mat4 viewInv = glm::inverse(view);
-                    glm::vec3 worldRight = viewInv[0]; // 屏幕右方向（水平轴）
-                    glm::vec3 worldUp = viewInv[1];    // 屏幕上方向（垂直轴）
-                    glm::vec3 worldForward = -glm::vec3(viewInv[2]); // 视线方向
-
-                    const float rotSensitivity = 0.01f;
-
-                    bool ctrlPressed = input.isKeyPressedOrRepeat(Key::eLEFT_CONTROL) ||
-                                       input.isKeyPressedOrRepeat(Key::eRIGHT_CONTROL);
-                    bool altPressed = input.isKeyPressedOrRepeat(Key::eLEFT_ALT) ||
-                                      input.isKeyPressedOrRepeat(Key::eRIGHT_ALT);
-                    bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
-                                        input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
-
-                    glm::quat deltaRot(1.0f, 0.0f, 0.0f, 0.0f);
-
-                    if (ctrlPressed)
-                    {
-                        // Ctrl + 水平移动：绕屏幕垂直轴（左右旋转）
-                        deltaRot = glm::angleAxis(dx * rotSensitivity, worldUp);
-                    }
-                    else if (altPressed)
-                    {
-                        // Alt + 垂直移动：绕屏幕水平轴（上下翻转）
-                        deltaRot = glm::angleAxis(dy * rotSensitivity, worldRight);
-                    }
-                    else if (shiftPressed)
-                    {
-                        // Shift + 水平移动：绕视线方向（滚动）
-                        deltaRot = glm::angleAxis(dx * rotSensitivity, worldForward);
-                    }
-                    else
-                    {
-                        // 无修饰键：水平绕 worldUp，垂直绕 worldRight
-                        glm::quat rotY = glm::angleAxis(dx * rotSensitivity, worldUp);
-                        glm::quat rotX = glm::angleAxis(dy * rotSensitivity, worldRight);
-                        deltaRot = rotY * rotX;
-                    }
-
-                    if (deltaRot != glm::quat(1.0f, 0.0f, 0.0f, 0.0f))
-                    {
-                        modelMatrix_.rotation = deltaRot * modelMatrix_.rotation;
-                    }
-                }
-                lastLeftPos = cur;
-            }
-        }
-        else
-        {
-            isLeftButtonPressed = false;
-        }
-        if (curMiddlePressed)
-        {
-            // 检测 Shift 键（独立于左键修饰键）
-            bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
-                                input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
-
-            glm::mat4 view = camera.viewsMatrix();
-            glm::mat4 proj = camera.perspectiveMatrix();
-            glm::mat4 viewInv = glm::inverse(view);
-            glm::vec4 viewport(0.0f, 0.0f, static_cast<float>(windowSize.width),
-                               static_cast<float>(windowSize.height));
-
-            glm::vec3 currentScale = modelMatrix_.scale;
-            glm::quat currentRot = modelMatrix_.rotation;
-            glm::vec3 localTopLeft = input_mesh2.topLeftLocal(frameContext.currentFrame);
-            glm::vec3 scaledTopLeft = currentScale * localTopLeft;
-            glm::vec3 rotatedOffset =
-                currentRot * scaledTopLeft; // 从平移位置指向左上角的偏移量
-            glm::vec3 currentTopLeftWorld = modelMatrix_.translation + rotatedOffset;
-
-            glm::vec3 winNear(static_cast<float>(cur.xpos),
-                              static_cast<float>(windowSize.height - cur.ypos), 0.0f);
-            glm::vec3 winFar(static_cast<float>(cur.xpos),
-                             static_cast<float>(windowSize.height - cur.ypos), 1.0f);
-            glm::vec3 nearWorld = glm::unProject(winNear, view, proj, viewport);
-            glm::vec3 farWorld = glm::unProject(winFar, view, proj, viewport);
-            glm::vec3 dirWorld = glm::normalize(farWorld - nearWorld);
-
-            const float eps = 1e-6f;
-            const float maxT = 1000.0f;   // 最大射线距离，根据场景调整
-            const float maxDelta = 10.0f; // 单次最大平移变化量（可选）
-
-            glm::vec3 newTranslation = modelMatrix_.translation; // 默认不变
-
-            if (shiftPressed)
-            {
-                // ========== 旧模式：世界 XY 平面平移（固定世界 Z） ==========
-                float targetZ = currentTopLeftWorld.z; // 保持当前左上角的世界 Z
-                if (std::fabs(dirWorld.z) > eps)
-                {
-                    float t = (targetZ - nearWorld.z) / dirWorld.z;
-                    if (t >= 0.0f && t < maxT)
-                    {
-                        glm::vec3 worldPoint = nearWorld + t * dirWorld;
-                        newTranslation = worldPoint - rotatedOffset;
-                    }
-                }
-            }
-            else
-            {
-                // ========== 新模式：屏幕空间平移（固定相机空间 Z） ==========
-                // 将当前左上角转换到相机空间，获取其深度
-                glm::vec4 currentTopLeftView =
-                    view * glm::vec4(currentTopLeftWorld, 1.0f);
-                float depthView = currentTopLeftView.z; // 相机空间 Z
-
-                // 将射线端点转换到相机空间
-                glm::vec4 nearView = view * glm::vec4(nearWorld, 1.0f);
-                glm::vec4 farView = view * glm::vec4(farWorld, 1.0f);
-                glm::vec3 dirView = glm::vec3(farView - nearView); // 相机空间射线方向
-
-                if (std::fabs(dirView.z) > eps)
-                {
-                    float t = (depthView - nearView.z) / dirView.z;
-                    if (t >= 0.0f && t <= 1.0f) // 交点在射线范围内
-                    {
-                        glm::vec3 pointView = glm::vec3(nearView) + t * dirView;
-                        glm::vec4 pointWorld = viewInv * glm::vec4(pointView, 1.0f);
-                        glm::vec3 worldPoint = glm::vec3(pointWorld) / pointWorld.w;
-                        newTranslation = worldPoint - rotatedOffset;
-                    }
-                }
-            }
-
-            // 可选：限制平移变化量，防止跳变
-            glm::vec3 delta = newTranslation - modelMatrix_.translation;
-            if (glm::length(delta) < maxDelta)
-            {
-                modelMatrix_.translation = newTranslation;
-            }
-            // 若超过限制，可以忽略本次更新，或按比例缩放
-
-            if (!isMiddleButtonPressed)
-                isMiddleButtonPressed = true;
-            lastPos = cur;
-        }
-        else
-        {
-            isMiddleButtonPressed = false;
-        }
-    };
-
     // ========== 拾取资源 ==========
     // 创建拾取图像（R32G32_UINT）
     auto build_pick =
@@ -1758,8 +1534,12 @@ try
     };
     std::array<PickingPerFrame, MAX_FRAMES_IN_FLIGHT> pickingFrames;
     // 当前鼠标位置（已翻转 Y 轴，与 Vulkan 视口一致）
-    glm::ivec2 mousePos{0, 0};
-    bool mouseValid = false;
+    struct pick_mouse
+    {
+        glm::ivec2 pos{0, 0};
+        bool valid = false;
+    };
+    pick_mouse pickMouse;
     for (auto &pf : pickingFrames)
     {
         pf.stagingBuffer =
@@ -1900,10 +1680,311 @@ try
             .build(device);
     // diff: [test_indirectdraw] end
 
+    auto pickCtx =
+        make_aggregate_ref<"pickCtx", "pipeline", "pipelineLayout", "descSets",
+                           "imageBuild", "image", "imageView", "resolveImageBuild",
+                           "resolveImage", "resolveImageView", "frames", "mouse">(
+            pickingPipeline, pickingPipelineLayout, pickingDescSets, build_pick,
+            pickingImage, pickingImageView, build_resolve, resolveImage,
+            pickingResolveImageView, pickingFrames, pickMouse);
+    auto globalCtx =
+        make_aggregate_ref<"globalCtx", "allocator", "device", "window", "surface",
+                           "swapchainBuild", "swapchain", "camera", "frameContext",
+                           "commandBuffers", "graphics_and_present_queue">(
+            allocator, device, window, surface, swapchainBuild, swapchain, camera,
+            frameContext, commandBuffers, GRAPHICS_AND_PRESENT);
+
+    auto mainCtx = make_aggregate_ref<"mainCtx", "pipeline", "pipelineLayout", "descSets",
+                                      "depthResourcesBuild", "depthResource",
+                                      "msaaResourcesBuild", "msaaResource">(
+        graphicsPipeline, pipelineLayout, descriptorSets, depthResourcesBuild,
+        depthResource, msaaResourcesBuild, msaaResource);
+
+    auto world =
+        make_aggregate_ref<"world", "mesh_array", "texture_array", "sampler_array">(
+            mesh_array, texture_array, sampler_array);
+
+    struct model_state
+    {
+        mcs::vulkan::event::position2d_event last_pos{};
+        bool is_middle_button_pressed = false;
+        bool is_left_button_pressed = false;
+        bool is_right_button_pressed_last = false; // 新增：记录上一帧右键状态
+        mcs::vulkan::event::position2d_event last_left_pos{};
+        model_matrix model_matrix{};
+    };
+    model_state modelState;
+
+    class BatchObj
+    {
+      public:
+        mesh_base *mesh;
+        uint32_t tex;
+        uint32_t samp;
+    };
+
+    auto model_update = [&globalCtx, &modelState, &input_mesh2](const glfw_input &input) {
+        auto &camera = globalCtx.camera;
+        auto &swapchain = globalCtx.swapchain;
+        auto &frameContext = globalCtx.frameContext;
+
+        auto &[lastPos, isMiddleButtonPressed, isLeftButtonPressed,
+               rightButtonPressedLast, lastLeftPos, modelMatrix] = modelState;
+        using mcs::vulkan::event::MouseButtons;
+        using mcs::vulkan::event::Key;
+        using mcs::vulkan::event::scroll_event;
+        const auto cur = input.cursorPos();
+        const auto windowSize = swapchain.refImageExtent();
+
+        const bool curMiddlePressed =
+            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_MIDDLE);
+        const bool curLeftPressed =
+            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_LEFT);
+        const bool curRightPressed =
+            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_RIGHT);
+
+        if (scroll_event{} != input.scroll())
+        {
+            std::println("input.scroll(): {}", input.scroll());
+            // 获取修饰键状态
+            bool ctrlPressed = input.isKeyPressedOrRepeat(Key::eLEFT_CONTROL) ||
+                               input.isKeyPressedOrRepeat(Key::eRIGHT_CONTROL);
+            bool altPressed = input.isKeyPressedOrRepeat(Key::eLEFT_ALT) ||
+                              input.isKeyPressedOrRepeat(Key::eRIGHT_ALT);
+            bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
+                                input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
+            auto scroll = input.scroll();
+            float delta = scroll.yoffset; // +1 向上滚（放大），-1 向下滚（缩小）
+
+            if (delta != 0.0f)
+            {
+                // 缩放因子：每格 ±10%
+                const float factor = (delta > 0) ? 1.1f : (1.0f / 1.1f);
+
+                // 统计按下修饰键的数量
+                int modCount =
+                    (ctrlPressed ? 1 : 0) + (altPressed ? 1 : 0) + (shiftPressed ? 1 : 0);
+
+                if (modCount == 1)
+                {
+                    // 仅一个修饰键按下：缩放对应的轴
+                    if (ctrlPressed)
+                        modelMatrix.scale.x *= factor;
+                    else if (altPressed)
+                        modelMatrix.scale.y *= factor;
+                    else if (shiftPressed)
+                        modelMatrix.scale.z *= factor;
+                }
+                else
+                {
+                    // 无修饰键或多个修饰键：均匀缩放所有轴
+                    modelMatrix.scale *= factor;
+                }
+
+                // 可选：限制缩放范围，避免过小或过大
+                // modelMatrix_.scale = glm::clamp(modelMatrix_.scale, 0.01f, 100.0f);
+            }
+        }
+
+        // ========== 右键单击复位物体 ==========
+        if (curRightPressed && !rightButtonPressedLast)
+        {
+            // 按下瞬间：平移归零，旋转归单位四元数
+            modelMatrix.translation = glm::vec3(0.0f);
+            modelMatrix.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+            // scale 保持 (1,1,1) 不变
+            modelMatrix.scale = {1, 1, 1};
+        }
+        rightButtonPressedLast = curRightPressed; // 更新状态供下一帧使用
+
+        // ========== 左键旋转处理（支持修饰键分离轴） ==========
+        if (curLeftPressed)
+        {
+            if (!isLeftButtonPressed)
+            {
+                lastLeftPos = cur;
+                isLeftButtonPressed = true;
+            }
+            else
+            {
+                float dx = static_cast<float>(cur.xpos - lastLeftPos.xpos);
+                float dy = static_cast<float>(cur.ypos - lastLeftPos.ypos);
+
+                if (dx != 0.0f || dy != 0.0f)
+                {
+                    glm::mat4 view = camera.viewsMatrix();
+                    glm::mat4 viewInv = glm::inverse(view);
+                    glm::vec3 worldRight = viewInv[0]; // 屏幕右方向（水平轴）
+                    glm::vec3 worldUp = viewInv[1];    // 屏幕上方向（垂直轴）
+                    glm::vec3 worldForward = -glm::vec3(viewInv[2]); // 视线方向
+
+                    const float rotSensitivity = 0.01f;
+
+                    bool ctrlPressed = input.isKeyPressedOrRepeat(Key::eLEFT_CONTROL) ||
+                                       input.isKeyPressedOrRepeat(Key::eRIGHT_CONTROL);
+                    bool altPressed = input.isKeyPressedOrRepeat(Key::eLEFT_ALT) ||
+                                      input.isKeyPressedOrRepeat(Key::eRIGHT_ALT);
+                    bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
+                                        input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
+
+                    glm::quat deltaRot(1.0f, 0.0f, 0.0f, 0.0f);
+
+                    if (ctrlPressed)
+                    {
+                        // Ctrl + 水平移动：绕屏幕垂直轴（左右旋转）
+                        deltaRot = glm::angleAxis(dx * rotSensitivity, worldUp);
+                    }
+                    else if (altPressed)
+                    {
+                        // Alt + 垂直移动：绕屏幕水平轴（上下翻转）
+                        deltaRot = glm::angleAxis(dy * rotSensitivity, worldRight);
+                    }
+                    else if (shiftPressed)
+                    {
+                        // Shift + 水平移动：绕视线方向（滚动）
+                        deltaRot = glm::angleAxis(dx * rotSensitivity, worldForward);
+                    }
+                    else
+                    {
+                        // 无修饰键：水平绕 worldUp，垂直绕 worldRight
+                        glm::quat rotY = glm::angleAxis(dx * rotSensitivity, worldUp);
+                        glm::quat rotX = glm::angleAxis(dy * rotSensitivity, worldRight);
+                        deltaRot = rotY * rotX;
+                    }
+
+                    if (deltaRot != glm::quat(1.0f, 0.0f, 0.0f, 0.0f))
+                    {
+                        modelMatrix.rotation = deltaRot * modelMatrix.rotation;
+                    }
+                }
+                lastLeftPos = cur;
+            }
+        }
+        else
+        {
+            isLeftButtonPressed = false;
+        }
+        if (curMiddlePressed)
+        {
+            // 检测 Shift 键（独立于左键修饰键）
+            bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
+                                input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
+
+            glm::mat4 view = camera.viewsMatrix();
+            glm::mat4 proj = camera.perspectiveMatrix();
+            glm::mat4 viewInv = glm::inverse(view);
+            glm::vec4 viewport(0.0f, 0.0f, static_cast<float>(windowSize.width),
+                               static_cast<float>(windowSize.height));
+
+            glm::vec3 currentScale = modelMatrix.scale;
+            glm::quat currentRot = modelMatrix.rotation;
+            glm::vec3 localTopLeft = input_mesh2.topLeftLocal(frameContext.currentFrame);
+            glm::vec3 scaledTopLeft = currentScale * localTopLeft;
+            glm::vec3 rotatedOffset =
+                currentRot * scaledTopLeft; // 从平移位置指向左上角的偏移量
+            glm::vec3 currentTopLeftWorld = modelMatrix.translation + rotatedOffset;
+
+            glm::vec3 winNear(static_cast<float>(cur.xpos),
+                              static_cast<float>(windowSize.height - cur.ypos), 0.0f);
+            glm::vec3 winFar(static_cast<float>(cur.xpos),
+                             static_cast<float>(windowSize.height - cur.ypos), 1.0f);
+            glm::vec3 nearWorld = glm::unProject(winNear, view, proj, viewport);
+            glm::vec3 farWorld = glm::unProject(winFar, view, proj, viewport);
+            glm::vec3 dirWorld = glm::normalize(farWorld - nearWorld);
+
+            const float eps = 1e-6f;
+            const float maxT = 1000.0f;   // 最大射线距离，根据场景调整
+            const float maxDelta = 10.0f; // 单次最大平移变化量（可选）
+
+            glm::vec3 newTranslation = modelMatrix.translation; // 默认不变
+
+            if (shiftPressed)
+            {
+                // ========== 旧模式：世界 XY 平面平移（固定世界 Z） ==========
+                float targetZ = currentTopLeftWorld.z; // 保持当前左上角的世界 Z
+                if (std::fabs(dirWorld.z) > eps)
+                {
+                    float t = (targetZ - nearWorld.z) / dirWorld.z;
+                    if (t >= 0.0f && t < maxT)
+                    {
+                        glm::vec3 worldPoint = nearWorld + t * dirWorld;
+                        newTranslation = worldPoint - rotatedOffset;
+                    }
+                }
+            }
+            else
+            {
+                // ========== 新模式：屏幕空间平移（固定相机空间 Z） ==========
+                // 将当前左上角转换到相机空间，获取其深度
+                glm::vec4 currentTopLeftView =
+                    view * glm::vec4(currentTopLeftWorld, 1.0f);
+                float depthView = currentTopLeftView.z; // 相机空间 Z
+
+                // 将射线端点转换到相机空间
+                glm::vec4 nearView = view * glm::vec4(nearWorld, 1.0f);
+                glm::vec4 farView = view * glm::vec4(farWorld, 1.0f);
+                glm::vec3 dirView = glm::vec3(farView - nearView); // 相机空间射线方向
+
+                if (std::fabs(dirView.z) > eps)
+                {
+                    float t = (depthView - nearView.z) / dirView.z;
+                    if (t >= 0.0f && t <= 1.0f) // 交点在射线范围内
+                    {
+                        glm::vec3 pointView = glm::vec3(nearView) + t * dirView;
+                        glm::vec4 pointWorld = viewInv * glm::vec4(pointView, 1.0f);
+                        glm::vec3 worldPoint = glm::vec3(pointWorld) / pointWorld.w;
+                        newTranslation = worldPoint - rotatedOffset;
+                    }
+                }
+            }
+
+            // 可选：限制平移变化量，防止跳变
+            glm::vec3 delta = newTranslation - modelMatrix.translation;
+            if (glm::length(delta) < maxDelta)
+            {
+                modelMatrix.translation = newTranslation;
+            }
+            // 若超过限制，可以忽略本次更新，或按比例缩放
+
+            if (!isMiddleButtonPressed)
+                isMiddleButtonPressed = true;
+            lastPos = cur;
+        }
+        else
+        {
+            isMiddleButtonPressed = false;
+        }
+    };
+
     // NOLINTNEXTLINE
-    const auto recordCommandBuffer = [&](const CommandBufferView &commandBuffer,
-                                         record_info info) {
-        auto [currentFrame, imageIndex, descriptorSet] = info;
+    const auto recordCommandBuffer = [&globalCtx, &mainCtx, &pickCtx,
+                                      &uniformBuffersMapped,
+                                      &batches](const CommandBufferView &commandBuffer,
+                                                record_info info) {
+        auto &swapchain = globalCtx.swapchain;
+        auto &camera = globalCtx.camera;
+
+        auto &graphicsPipeline = mainCtx.pipeline;
+        auto &pipelineLayout = mainCtx.pipelineLayout;
+        auto &depthResource = mainCtx.depthResource;
+        auto &msaaResource = mainCtx.msaaResource;
+        auto &descriptorSets = mainCtx.descSets;
+
+        auto &pickingPipeline = pickCtx.pipeline;
+        auto &pickingPipelineLayout = pickCtx.pipelineLayout;
+        auto &pickingDescSets = pickCtx.descSets;
+        auto &pickingImage = pickCtx.image;
+        auto &pickingImageView = pickCtx.imageView;
+        auto &resolveImage = pickCtx.resolveImage;
+        auto &pickingResolveImageView = pickCtx.resolveImageView;
+        auto &pickingFrames = pickCtx.frames;
+        auto &pickMouse = pickCtx.mouse;
+
+        auto &mouseValid = pickMouse.valid;
+        auto &mousePos = pickMouse.pos;
+        auto [currentFrame, imageIndex] = info;
+
+        auto descriptorSet = descriptorSets[currentFrame];
         VkImage image = swapchain.image(imageIndex);
         VkImageView imageView = swapchain.imageView(imageIndex);
         auto imageExtent = swapchain.imageExtent();
@@ -2015,7 +2096,6 @@ try
         // diff: [test_indirectdraw] start
 
         commandBuffer.endRendering();
-
         if (mouseValid)
         {
             VkImage depthImg = depthResource.image();
@@ -2178,20 +2258,23 @@ try
     };
 
     // diff: [test_indirectdraw] start prepareBatch：动态分配合批资源并填充数据
-    auto prepareBatch = [&](uint32_t currentFrame) {
+    auto prepareBatch = [&batches, &globalCtx, &mainCtx, &world](uint32_t currentFrame) {
+        auto &allocator = globalCtx.allocator;
+        auto &device = globalCtx.device;
+
+        auto &descriptorSets = mainCtx.descSets;
+
         auto &batch = batches[currentFrame];
 
         // 收集当前帧所有要绘制的物体（您可以随意增减）
-        struct Obj
-        {
-            mesh_base *mesh;
-            uint32_t tex;
-            uint32_t samp;
-        };
-        std::vector<Obj> objects = {
-            {.mesh = &input_mesh, .tex = textureIndex1, .samp = samplerIndex1},
-            {.mesh = &input_mesh2, .tex = textureIndex2, .samp = samplerIndex2}};
-        uint32_t objectCount = static_cast<uint32_t>(objects.size());
+        auto objects =
+            std::views::zip(world.mesh_array, world.texture_array, world.sampler_array) |
+            std::views::transform([](auto &&tuple) {
+                auto &[mesh, tex, samp] = tuple;
+                return BatchObj{.mesh = &mesh, .tex = tex, .samp = samp};
+            }) |
+            std::ranges::to<std::vector<BatchObj>>();
+        auto objectCount = static_cast<uint32_t>(objects.size());
 
         // 计算总索引数
         uint32_t totalIndexCount = 0;
@@ -2313,8 +2396,9 @@ try
         batch.drawCount = objectCount;
     };
 
-    auto preparePickingBatch = [&](uint32_t currentFrame, auto mesh1_model,
-                                   auto mesh2_model) {
+    auto preparePickingBatch = [&pickingBatches, &world, &allocator, &pickingDescSets,
+                                &device](uint32_t currentFrame,
+                                         const std::span<const glm::mat4> &models) {
         auto &pb = pickingBatches[currentFrame];
         constexpr uint32_t objectCount = 2;
 
@@ -2356,18 +2440,43 @@ try
         }
 
         // 填充数据（仅 SSBO）
-        std::vector<PickObjectInfo> pickInfos(objectCount);
-        pickInfos[0] = {input_mesh.getVertexBufferAddress(currentFrame),
-                        glm::rotate(glm::mat4(1.0f), mesh1_model, glm::vec3(0, 0, 1)),
-                        input_mesh_id};
-        pickInfos[1] = {input_mesh2.getVertexBufferAddress(currentFrame), mesh2_model,
-                        input_mesh2_id};
+        std::vector<PickObjectInfo> pickInfos =
+            std::views::zip(std::ranges::views::indices(
+                                static_cast<uint32_t>(world.mesh_array.size())),
+                            world.mesh_array, models) |
+            std::views::transform([&](auto &&tup) {
+                auto &&[index, mesh, model] = tup;
+                return PickObjectInfo{mesh.getVertexBufferAddress(currentFrame), model,
+                                      index};
+            }) |
+            std::ranges::to<std::vector<PickObjectInfo>>();
+
         memcpy(pb.objectInfoMapped, pickInfos.data(), needObj);
     };
     // diff: [test_indirectdraw] end
 
     // NOLINTNEXTLINE
-    const auto recreateSwapChain = [&]() constexpr {
+    const auto recreateSwapChain = [&globalCtx, &mainCtx, &pickCtx]() constexpr {
+        auto &device = globalCtx.device;
+        auto &surface = globalCtx.surface;
+        auto &swapchainBuild = globalCtx.swapchainBuild;
+        auto &swapchain = globalCtx.swapchain;
+        auto &camera = globalCtx.camera;
+        auto &frameContext = globalCtx.frameContext;
+
+        auto &msaaResourcesBuild = mainCtx.msaaResourcesBuild;
+        auto &depthResource = mainCtx.depthResource;
+        auto &depthResourcesBuild = mainCtx.depthResourcesBuild;
+        auto &msaaResource = mainCtx.msaaResource;
+
+        auto &build_pick = pickCtx.imageBuild;
+        auto &pickingImage = pickCtx.image;
+        auto &pickingImageView = pickCtx.imageView;
+        auto &build_resolve = pickCtx.resolveImageBuild;
+        auto &resolveImage = pickCtx.resolveImage;
+        auto &pickingResolveImageView = pickCtx.resolveImageView;
+        auto &pickMouse = pickCtx.mouse;
+
         surface.waitGoodFramebufferSize();
         device.waitIdle();
 
@@ -2385,25 +2494,37 @@ try
         pickingImageView = build_pick.makeImageView(*pickingImage);
         resolveImage = build_resolve.updateImageExtent(imageExtent).rebuild();
         pickingResolveImageView = build_resolve.makeImageView(*resolveImage);
-        mouseValid = false;
+        pickMouse.valid = false;
 
         frameContext.rebuild(swapchain.imagesSize());
     };
     // NOLINTNEXTLINE
-    const auto drawFrame = [&]() constexpr {
+    const auto drawFrame = [&globalCtx, &pickCtx, &modelState, &world, &prepareBatch,
+                            &preparePickingBatch, &recreateSwapChain,
+                            &recordCommandBuffer]() constexpr {
+        auto &device = globalCtx.device;
+        auto &allocator = globalCtx.allocator;
+        auto &swapchain = globalCtx.swapchain;
+        auto &frameContext = globalCtx.frameContext;
+        auto &window = globalCtx.window;
+        auto &commandBuffers = globalCtx.commandBuffers;
+        const auto &GRAPHICS_AND_PRESENT = globalCtx.graphics_and_present_queue;
+
+        auto &pickingFrames = pickCtx.frames;
+        auto &pickMouse = pickCtx.mouse;
+
         auto &inFlightFences = frameContext.inFlightFences;
         auto &currentFrame = frameContext.currentFrame;
         auto &presentCompleteSemaphore = frameContext.presentCompleteSemaphore;
         auto &semaphoreIndex = frameContext.semaphoreIndex;
         auto &renderFinishedSemaphore = frameContext.renderFinishedSemaphore;
 
-        const LogicalDevice *logicalDevice = frameContext.device_;
-        while (logicalDevice->waitForFences(1, inFlightFences[currentFrame], VK_TRUE,
-                                            UINT64_MAX) == VK_TIMEOUT)
+        while (device.waitForFences(1, inFlightFences[currentFrame], VK_TRUE,
+                                    UINT64_MAX) == VK_TIMEOUT)
             ;
 
         // 等待栅栏后，正式获取图像前
-        if (currentFrame > 0 && mouseValid)
+        if (currentFrame > 0 && pickMouse.valid)
         {
             uint32_t readIdx =
                 (currentFrame - 1 + MAX_FRAMES_IN_FLIGHT) % MAX_FRAMES_IN_FLIGHT;
@@ -2423,22 +2544,25 @@ try
                          currentTime - startTime)
                          .count();
         auto mesh1_model = time * glm::radians(90.0F);
-        auto mesh2_model = modelMatrix_();
+        auto mesh2_model = modelState.model_matrix();
         // 写的是物体私有的 mapped 缓冲，与合批无关，仍须保留，只是移出绘制块。将其移到 uploadUniformBuffers() 调用之后、合批绘制之前
         // 更新两个物体的模型矩阵（映射内存，不涉及合批）
-        mesh_base::updateObjectData(input_mesh.frameBuffers[currentFrame], [&] {
+        mesh_base::updateObjectData(world.mesh_array[0].frameBuffers[currentFrame], [&] {
             return glm::rotate(glm::mat4(1.0F), mesh1_model, glm::vec3(0.0F, 0.0F, 1.0F));
         });
-        mesh_base::updateObjectData(input_mesh2.frameBuffers[currentFrame],
+        mesh_base::updateObjectData(world.mesh_array[1].frameBuffers[currentFrame],
                                     [&] { return mesh2_model; });
         // diff: [test_indirectdraw] end
 
         // diff: [test_indirectdraw] start
-        input_mesh.requestUpdate(allocator, currentFrame);
-        input_mesh2.requestUpdate(
+        world.mesh_array[0].requestUpdate(allocator, currentFrame);
+        world.mesh_array[1].requestUpdate(
             allocator, currentFrame); // 如果 input_mesh2 也可能动态更新，保持一致
         prepareBatch(currentFrame);
-        preparePickingBatch(currentFrame, mesh1_model, mesh2_model); // 新增
+        preparePickingBatch(
+            currentFrame, std::vector<glm::mat4>{glm::rotate(glm::mat4(1.0F), mesh1_model,
+                                                             glm::vec3(0, 0, 1)),
+                                                 mesh2_model}); // 新增
         // diff: [test_indirectdraw] end
 
         auto [result, imageIndex] = swapchain.acquireNextImage(
@@ -2451,15 +2575,13 @@ try
         }
         if (result != VK_SUCCESS)
             throw std::runtime_error("failed to acquire swap chain image!");
-        logicalDevice->resetFences(1, inFlightFences[currentFrame]);
+        device.resetFences(1, inFlightFences[currentFrame]);
 
         const auto &commandBuffer = commandBuffers[currentFrame];
         commandBuffer.reset({});
 
         recordCommandBuffer(commandBuffer,
-                            {.current_frame = currentFrame,
-                             .image_index = imageIndex,
-                             .descriptor_set = descriptorSets[currentFrame]});
+                            {.current_frame = currentFrame, .image_index = imageIndex});
 
         // NOLINTNEXTLINE
         VkPipelineStageFlags waitDestinationStageMask[] = {
@@ -2498,7 +2620,7 @@ try
     constexpr float TARGET_FRAME_TIME = 1.0F / TARGET_FPS; // 目标帧间隔（秒）
     auto lastFrameTime = std::chrono::high_resolution_clock::now();
 
-    while (window.shouldClose() == 0)
+    while (globalCtx.window.shouldClose() == 0)
     {
         // 1. 计算当前帧开始时间
         auto currentFrameStart = std::chrono::high_resolution_clock::now();
@@ -2531,12 +2653,12 @@ try
         if (cur.xpos >= 0 && cur.xpos < static_cast<int>(ext.width) && cur.ypos >= 0 &&
             cur.ypos < static_cast<int>(ext.height))
         {
-            mousePos = {cur.xpos, cur.ypos};
-            mouseValid = true;
+            pickMouse.pos = {cur.xpos, cur.ypos};
+            pickMouse.valid = true;
         }
         else
         {
-            mouseValid = false;
+            pickMouse.valid = false;
         }
 
         views_matrix_update(input);

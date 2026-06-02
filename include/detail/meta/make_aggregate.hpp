@@ -126,4 +126,11 @@ namespace mcs::vulkan::meta
         return {std::forward<T>(member)...};
     }
 
+    template <static_string... name, typename... T>
+    static constexpr auto make_aggregate_ref(T &...member)
+        -> aggregate<aggregate_info<name...>, T &...>
+    {
+        return {std::forward<T &>(member)...};
+    }
+
 }; // namespace mcs::vulkan::meta
