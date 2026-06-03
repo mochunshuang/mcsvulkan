@@ -555,6 +555,7 @@ struct ObjectInfo
     uint64_t objectDataAddress;
     uint32_t textureIndex;
     uint32_t samplerIndex;
+    uint32_t objectId; // diff: [test_indirectdraw_no_pick] 新增
 };
 
 struct PerFrameBatch
@@ -695,10 +696,18 @@ try
         enablefeatureChain = {
             {.features =
                  {
+                     /*
+                    当不同附件的混合状态（包括 colorWriteMask）不同时，即使所有附件的 blendEnable 都是 VK_FALSE，也必须启用 independentBlend 特性，否则就是非法。
+                    你的两个附件 colorWriteMask 不同（一个包含 A，一个只有 R|G），因此需要该特性
+                    */
+                     //diff: [test_indirectdraw_no_pick] start
+                     .independentBlend = VK_TRUE, // 新增
+                     //diff: [test_indirectdraw_no_pick] end
                      //NOTE: gcc 要求。严格的初始化顺序。 multiDrawIndirect 要在前面
                      .multiDrawIndirect = VK_TRUE, //diff: [test_indirectdraw]
                      .samplerAnisotropy = VK_TRUE,
                      .shaderInt64 = VK_TRUE,
+
                  }},
             {.synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE},
             {
@@ -751,6 +760,8 @@ try
                 return features2.features.samplerAnisotropy &&
                        features2.features.shaderInt64 &&
                        features2.features.multiDrawIndirect && //diff: [test_indirectdraw]
+                       features2.features
+                           .independentBlend && //diff: [test_indirectdraw_no_pick]
                        query_vulkan13_features.dynamicRendering &&
                        query_vulkan13_features.synchronization2 &&
                        query_vulkan12_features.bufferDeviceAddress &&
@@ -1183,12 +1194,23 @@ try
             .build(device);
 
     using stage_info = create_graphics_pipeline::stage_info;
+
+    //diff: [test_indirectdraw_no_pick] start
+    // 定义两个颜色附件格式
+    std::array<VkFormat, 2> mainColorFormats = {
+        swapchainBuild.refImageFormat(), // location 0 (swapchain)
+        VK_FORMAT_R32G32_UINT            // location 1 (picking)
+    }; //diff: [test_indirectdraw_no_pick] end
+
     auto graphicsPipeline =
         create_graphics_pipeline{}
             .setCreateInfo(
                 {.pNext = make_pNext(structure_chain<VkPipelineRenderingCreateInfo>{
-                     {.colorAttachmentCount = 1,
-                      .pColorAttachmentFormats = &swapchainBuild.refImageFormat(),
+                     {//diff: [test_indirectdraw_no_pick] start
+                      .colorAttachmentCount =
+                          static_cast<uint32_t>(mainColorFormats.size()),
+                      .pColorAttachmentFormats = mainColorFormats.data(),
+                      //diff: [test_indirectdraw_no_pick] end
                       .depthAttachmentFormat = depthFormat_ref}}),
                  .stages = create_graphics_pipeline::makeStages(
                      stage_info{.stage = VK_SHADER_STAGE_VERTEX_BIT,
@@ -1230,12 +1252,20 @@ try
                                        .maxDepthBounds = 1.0F},
                  .colorBlendState = {.logicOpEnable = VK_FALSE,
                                      .logicOp = VkLogicOp::VK_LOGIC_OP_COPY,
-                                     .attachments = {{.blendEnable = VK_FALSE, // 关闭混合
-                                                      .colorWriteMask =
-                                                          VK_COLOR_COMPONENT_R_BIT |
-                                                          VK_COLOR_COMPONENT_G_BIT |
-                                                          VK_COLOR_COMPONENT_B_BIT |
-                                                          VK_COLOR_COMPONENT_A_BIT}}},
+                                     .attachments =
+                                         {
+                                             {.blendEnable = VK_FALSE, // 关闭混合
+                                              .colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
+                                                                VK_COLOR_COMPONENT_G_BIT |
+                                                                VK_COLOR_COMPONENT_B_BIT |
+                                                                VK_COLOR_COMPONENT_A_BIT},
+                                             //diff: [test_indirectdraw_no_pick] start
+                                             // location 1 (R32G32_UINT，不能混合)
+                                             {.blendEnable = VK_FALSE,
+                                              .colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
+                                                                VK_COLOR_COMPONENT_G_BIT},
+                                             //diff: [test_indirectdraw_no_pick] end
+                                         }},
                  .dynamicState = {.dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT,
                                                     VK_DYNAMIC_STATE_SCISSOR}},
                  .layout = *pipelineLayout})
@@ -1471,8 +1501,10 @@ try
                  .samples =
                      physical_device.getMaxUsableSampleCount(), //NOTE: 和主管线一样
                  .tiling = VK_IMAGE_TILING_OPTIMAL,
-                 .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                 .usage =
+                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT //diff: [test_indirectdraw_no_pick] 没有任何代码从 pickingImage 进行拷贝或读取，因此 TRANSFER_SRC_BIT 完全没有必要
+                 // | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                 ,
                  .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
                  .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
                  .allocationCreateInfo = {.flags =
@@ -1486,8 +1518,6 @@ try
                                       .baseArrayLayer = 0,
                                       .layerCount = 1}});
 
-    auto pickingImage = build_pick.makeImage();
-
     //  创建解析图像（单样本）
     auto build_resolve =
         create_image{device, allocator}
@@ -1499,9 +1529,10 @@ try
                  .arrayLayers = build_pick.createInfo().arrayLayers,
                  .samples = VK_SAMPLE_COUNT_1_BIT,
                  .tiling = build_pick.createInfo().tiling,
-                 .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |    // 作为 resolve 目标
-                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT |    // 用于复制像素到缓冲区
-                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, // ← 必须！
+                 .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |   // 作为 resolve 目标
+                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT |   // 用于复制像素到缓冲区
+                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT // ← 必须！
+                 ,
                  .sharingMode = build_pick.createInfo().sharingMode,
                  .initialLayout = build_pick.createInfo().initialLayout,
                  // VMA 配置
@@ -1509,7 +1540,6 @@ try
             .setViewCreateInfo(
                 {.viewType = build_pick.viewCreateInfo().viewType,
                  .subresourceRange = build_pick.viewCreateInfo().subresourceRange});
-    auto resolveImage = build_resolve.makeImage();
 
     // 每个飞行帧的暂存缓冲区（8 字节 = R32G32_UINT 像素）
     struct PickingPerFrame
@@ -1537,147 +1567,25 @@ try
                            .usage = VMA_MEMORY_USAGE_AUTO});
         pf.mappedPtr = pf.stagingBuffer.map();
     }
-
+    auto pickingImage = build_pick.makeImage();
     auto pickingImageView = build_pick.makeImageView(*pickingImage);
+    auto resolveImage = build_resolve.makeImage();
     auto pickingResolveImageView = build_resolve.makeImageView(*resolveImage);
 
     // diff: [test_indirectdraw] start 大改
     // ========== 拾取管线布局 ==========
-
-    // 拾取描述符集布局（binding 0 = UBO, binding 1 = SSBO）
-    struct PickObjectInfo
-    {
-        uint64_t vertexBufferAddress; // 新增：顶点缓冲的设备地址
-        glm::mat4 model;
-        uint32_t objectId;
-    };
-    auto pickingDescSetLayout =
-        create_descriptor_set_layout{}
-            .setCreateInfo(
-                {.bindings = {VkDescriptorSetLayoutBinding{
-                                  .binding = 0,
-                                  .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                                  .descriptorCount = 1,
-                                  .stageFlags = VK_SHADER_STAGE_VERTEX_BIT},
-                              VkDescriptorSetLayoutBinding{
-                                  .binding = 1,
-                                  .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                  .descriptorCount = 1,
-                                  .stageFlags = VK_SHADER_STAGE_VERTEX_BIT}}})
-            .build(device);
-    // 推送常量范围：mat4 + uint
-    auto pickingPipelineLayout =
-        create_pipeline_layout{}
-            .setCreateInfo({.setLayouts = {*pickingDescSetLayout}, // 改为拾取专用
-                            .pushConstantRanges = {}})             // 无推送常量
-            .build(device);
-
-    auto pickingDescPool =
-        create_descriptor_pool{}
-            .setCreateInfo({.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-                            .maxSets = MAX_FRAMES_IN_FLIGHT,
-                            .poolSizes = {{.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                                           .descriptorCount = MAX_FRAMES_IN_FLIGHT},
-                                          {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                           .descriptorCount = MAX_FRAMES_IN_FLIGHT}}})
-            .build(device);
-
-    auto pickingDescSets = pickingDescPool.allocateDescriptorSets(
-        {.descriptorSets = std::vector<VkDescriptorSetLayout>{MAX_FRAMES_IN_FLIGHT,
-                                                              *pickingDescSetLayout}});
-    struct PickingBatch
-    {
-        buffer_base objectInfoBuffer{}; // SSBO: PickObjectInfo[]
-        void *objectInfoMapped = nullptr;
-        VkDeviceSize objectInfoSize = 0;
-    };
-    std::array<PickingBatch, MAX_FRAMES_IN_FLIGHT> pickingBatches;
-    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
-    {
-        auto &pb = pickingBatches[i];
-        pb.objectInfoBuffer =
-            create_buffer(allocator,
-                          {.sType = sType<VkBufferCreateInfo>(),
-                           .size = 16,
-                           .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                           .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                          {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                                    VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                           .usage = VMA_MEMORY_USAGE_AUTO});
-        pb.objectInfoMapped = pb.objectInfoBuffer.map();
-    }
-    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
-    {
-        VkDescriptorBufferInfo uboInfo{.buffer = uniformBuffers[i].buffer(),
-                                       .offset = 0,
-                                       .range = sizeof(UniformBufferObject)};
-        VkDescriptorBufferInfo ssboInfo{.buffer =
-                                            pickingBatches[i].objectInfoBuffer.buffer(),
-                                        .offset = 0,
-                                        .range = VK_WHOLE_SIZE};
-        std::array<VkWriteDescriptorSet, 2> writes = {
-            VkWriteDescriptorSet{
-                sType<VkWriteDescriptorSet>(), nullptr, pickingDescSets[i], 0, 0, 1,
-                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, nullptr, &uboInfo, nullptr},
-            VkWriteDescriptorSet{
-                sType<VkWriteDescriptorSet>(), nullptr, pickingDescSets[i], 1, 0, 1,
-                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ssboInfo, nullptr}};
-        device.updateDescriptorSets(2, writes.data(), 0, nullptr);
-    }
-
+    // NOTE: 完全删除拾取管线，一个附件替换管线 是很便宜的
     // ========== 拾取管线 ==========
-    auto pickingPipeline =
-        create_graphics_pipeline{}
-            .setCreateInfo({
-                .pNext = make_pNext(structure_chain<VkPipelineRenderingCreateInfo>{
-                    {.colorAttachmentCount = 1,
-                     .pColorAttachmentFormats = &build_pick.refImageFormat(),
-                     .depthAttachmentFormat = depthFormat_ref}}),
-                .stages = create_graphics_pipeline::makeStages(
-                    stage_info{.stage = VK_SHADER_STAGE_VERTEX_BIT,
-                               .filePath = "shaders/picking2.vert.spv",
-                               .pName = "main"},
-                    stage_info{.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-                               .filePath = "shaders/picking2.frag.spv",
-                               .pName = "main"}),
-                .vertexInputState = {}, //不需要 layout(location=0) in vec3 inPosition 了
-                .inputAssemblyState = {.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST},
-                .viewportState = {.viewports = {{}}, .scissors = {{}}}, //至少一个
-                .rasterizationState = {.depthClampEnable = VK_FALSE,
-                                       .rasterizerDiscardEnable = VK_FALSE,
-                                       .polygonMode = VK_POLYGON_MODE_FILL,
-                                       .cullMode = VK_CULL_MODE_NONE,
-                                       .frontFace = VK_FRONT_FACE_CLOCKWISE,
-                                       .lineWidth = 1.0F},
-                .multisampleState =
-                    {
-                        .rasterizationSamples = physical_device.getMaxUsableSampleCount(),
-                    },
-                .depthStencilState = {.depthTestEnable = VK_TRUE,
-                                      .depthWriteEnable = VK_FALSE,
-                                      .depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL},
-                .colorBlendState = {.logicOp = {},
-                                    .attachments = {{.blendEnable = VK_FALSE,
-                                                     .colorWriteMask =
-                                                         VK_COLOR_COMPONENT_R_BIT |
-                                                         VK_COLOR_COMPONENT_G_BIT |
-                                                         VK_COLOR_COMPONENT_B_BIT |
-                                                         VK_COLOR_COMPONENT_A_BIT}}},
-                .dynamicState = {.dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT,
-                                                   VK_DYNAMIC_STATE_SCISSOR}},
-                .layout = *pickingPipelineLayout,
-                .renderPass = VK_NULL_HANDLE,
-            })
-            .build(device);
+    //diff: [test_indirectdraw_no_pick] start 全部删除
+    //diff: [test_indirectdraw_no_pick] end
+
     // diff: [test_indirectdraw] end
 
-    auto pickCtx =
-        make_aggregate_ref<"pickCtx", "pipeline", "pipelineLayout", "descSets",
-                           "imageBuild", "image", "imageView", "resolveImageBuild",
-                           "resolveImage", "resolveImageView", "frames", "mouse">(
-            pickingPipeline, pickingPipelineLayout, pickingDescSets, build_pick,
-            pickingImage, pickingImageView, build_resolve, resolveImage,
-            pickingResolveImageView, pickingFrames, pickMouse);
+    auto pickCtx = make_aggregate_ref<"pickCtx", "imageBuild", "image", "imageView",
+                                      "resolveImageBuild", "resolveImage",
+                                      "resolveImageView", "frames", "mouse">(
+        build_pick, pickingImage, pickingImageView, build_resolve, resolveImage,
+        pickingResolveImageView, pickingFrames, pickMouse);
     auto globalCtx =
         make_aggregate_ref<"globalCtx", "allocator", "device", "window", "surface",
                            "swapchainBuild", "swapchain", "camera", "frameContext",
@@ -1961,9 +1869,6 @@ try
         auto &msaaResource = mainCtx.msaaResource;
         auto &descriptorSets = mainCtx.descSets;
 
-        auto &pickingPipeline = pickCtx.pipeline;
-        auto &pickingPipelineLayout = pickCtx.pipelineLayout;
-        auto &pickingDescSets = pickCtx.descSets;
         auto &pickingImage = pickCtx.image;
         auto &pickingImageView = pickCtx.imageView;
         auto &resolveImage = pickCtx.resolveImage;
@@ -2032,18 +1937,55 @@ try
                 .dst = {.layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
                         .access_mask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                         .stage_mask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                                      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT}});
+                                      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT}},
+            //diff: [test_indirectdraw_no_pick] start  转换拾取 MSAA 图像布局
+            my_render::image_info{
+                .image = *pickingImage,
+                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .src = {VK_IMAGE_LAYOUT_UNDEFINED, VK_ACCESS_2_NONE,
+                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                .dst = {VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}},
+            my_render::image_info{
+                .image = *resolveImage,
+                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .src = {VK_IMAGE_LAYOUT_UNDEFINED, VK_ACCESS_2_NONE,
+                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                .dst = {VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}}
+            //diff: [test_indirectdraw_no_pick] end
+        );
 
         VkRenderingAttachmentInfo colorAttachment = {
             .sType = sType<VkRenderingAttachmentInfo>(),
             .imageView = msaaImageView,
             .imageLayout = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             .resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT,
-            .resolveImageView = imageView,
+            .resolveImageView =
+                imageView, //NOTE: 将msaaImageView的输出替换到imageView，这就是关键
             .resolveImageLayout = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
             .clearValue = {.color = {.float32 = {0.0F, 0.0F, 0.0F, 1.0F}}}};
+        //diff: [test_indirectdraw_no_pick] start
+        // 拾取附件（location=1）
+        VkRenderingAttachmentInfo pickAttachment{
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = *pickingImageView,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT, // 整数格式必须用 SAMPLE_ZERO
+            .resolveImageView = *pickingResolveImageView,
+            .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = {
+                .color = {.uint32 = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0}}}}; // NOLINT
+        std::array attachments = {colorAttachment, pickAttachment};
+        //                        ^ 索引 0          ^ 索引 1
+        //diff: [test_indirectdraw_no_pick] end
+
         VkRenderingAttachmentInfo depthAttachment = {
             .sType = sType<VkRenderingAttachmentInfo>(),
             .imageView = depthImageView,
@@ -2051,12 +1993,15 @@ try
             .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
             .clearValue = {.depthStencil = {.depth = 1.0F}}};
+
         commandBuffer.beginRendering(
             {.sType = sType<VkRenderingInfo>(),
              .renderArea = {.offset = {.x = 0, .y = 0}, .extent = imageExtent},
              .layerCount = 1,
-             .colorAttachmentCount = 1,
-             .pColorAttachments = &colorAttachment,
+             //diff: [test_indirectdraw_no_pick] start
+             .colorAttachmentCount = static_cast<uint32_t>(attachments.size()),
+             .pColorAttachments = attachments.data(),
+             //diff: [test_indirectdraw_no_pick] end
              .pDepthAttachment = &depthAttachment});
 
         commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *graphicsPipeline);
@@ -2089,119 +2034,20 @@ try
         commandBuffer.endRendering();
         if (mouseValid)
         {
-            VkImage depthImg = depthResource.image();
-            VkImageView depthView = depthResource.imageView();
-
-            //diff: [test_picking5] 同步2要求由单个 xxxStageMask 分解成 xxxStageMask + xxxAccessMask. 注意有规律 draw前做布局转换，成环就是最好的，src dest 开源转换
-            // https://docs.vulkan.org/guide/latest/extensions/VK_KHR_synchronization2.html#:~:text=VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR%3B%0A%20%20.dstAccessMask%20%3D%20VK_ACCESS_2_NONE_KHR%3B-,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,-%E5%9C%A8%E7%AC%AC%E4%B8%80%E5%90%8C%E6%AD%A5
-
-            // ① 拾取图像 → COLOR_ATTACHMENT
-            // ② 深度 → 只读
-            // ③ 解析图像 → COLOR_ATTACHMENT（作为 resolve 目标）
-            my_render::transition_image_layout(
-                commandBuffer,
-                my_render::image_info{
-                    .image = *pickingImage,
-                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
-                            .access_mask = VK_ACCESS_2_NONE,
-                            .stage_mask =
-                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
-                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                            .stage_mask =
-                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}},
-                my_render::image_info{
-                    .image = depthImg,
-                    .aspect_mask = VK_IMAGE_ASPECT_DEPTH_BIT,
-                    .src = {.layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                            .stage_mask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                                          VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT},
-                    .dst = {.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
-                            .stage_mask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT}},
-                my_render::image_info{
-                    .image = *resolveImage,
-                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
-                            .access_mask = VK_ACCESS_2_NONE,
-                            .stage_mask =
-                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
-                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                            .stage_mask =
-                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
-
-            // ④ 开始拾取渲染
-            VkRenderingAttachmentInfo pickColorAtt{
-                .sType = sType<VkRenderingAttachmentInfo>(),
-                .imageView = *pickingImageView,
-                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
-                .resolveImageView = *pickingResolveImageView,
-                .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-                .clearValue = {.color = {.uint32 = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0}}}};
-            VkRenderingAttachmentInfo pickDepthAtt{
-                .sType = sType<VkRenderingAttachmentInfo>(),
-                .imageView = depthView,
-                .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
-                .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-                .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
-            commandBuffer.beginRendering(
-                {.sType = sType<VkRenderingInfo>(),
-                 .renderArea = {.offset = {0, 0}, .extent = imageExtent},
-                 .layerCount = 1,
-                 .colorAttachmentCount = 1,
-                 .pColorAttachments = &pickColorAtt,
-                 .pDepthAttachment = &pickDepthAtt});
-
-            commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pickingPipeline);
-            commandBuffer.setViewport(
-                0, std::array<VkViewport, 1>{
-                       VkViewport{.x = 0,
-                                  .y = 0,
-                                  .width = static_cast<float>(imageExtent.width),
-                                  .height = static_cast<float>(imageExtent.height),
-                                  .minDepth = 0,
-                                  .maxDepth = 1}});
-            commandBuffer.setScissor(
-                0, std::array<VkRect2D, 1>{VkRect2D{{0, 0}, imageExtent}});
-
-            //diff: [test_indirectdraw] start . picking的顶点数据 和 主管线一样？
-            // 绑定主渲染的合并索引缓冲（因为拾取使用同样的顶点数据）
-            commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                             *pickingPipelineLayout, 0, 1,
-                                             &pickingDescSets[currentFrame], 0, nullptr);
-
-            // diff: 拾取复用主渲染的间接命令缓冲
-            auto &mainBatch = batches[currentFrame];
-            commandBuffer.bindIndexBuffer(mainBatch.mergedIndexBuffer.buffer(), 0,
-                                          VK_INDEX_TYPE_UINT32);
-            commandBuffer.drawIndexedIndirect(mainBatch.indirectDrawBuffer.buffer(), 0,
-                                              mainBatch.drawCount,
-                                              sizeof(VkDrawIndexedIndirectCommand));
-            //diff: [test_indirectdraw] end
-
-            commandBuffer.endRendering();
-
-            // ⑤ 解析图像 → TRANSFER_SRC
+            //diff: [test_indirectdraw_no_pick] start
+            // 转换 resolve 目标到 TRANSFER_SRC
             my_render::transition_image_layout(
                 commandBuffer,
                 my_render::image_info{
                     .image = *resolveImage,
                     .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                            .stage_mask =
-                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
-                    .dst = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
-                            .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
-
-            // ⑥ 复制指定像素到暂存缓冲区
+                    .src = {VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                    .dst = {VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_ACCESS_2_TRANSFER_READ_BIT,
+                            VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
+            //NOTE: 复制到 pickingFrames，就可以读取了，拿到着色器的输出
             commandBuffer.copyImageToBuffer(
                 *resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 pickingFrames[currentFrame].stagingBuffer.buffer(),
@@ -2211,31 +2057,7 @@ try
                     .imageOffset = {mousePos.x, mousePos.y, 0},
                     .imageExtent = {1, 1, 1}}});
 
-            // ⑦ 解析图像：TRANSFER_SRC → COLOR_ATTACHMENT（为下一帧 resolve 目标做好准备）
-            // ⑧ 深度图像：只读 → DEPTH_ATTACHMENT_OPTIMAL（交还给主渲染）
-            my_render::transition_image_layout(
-                commandBuffer,
-                my_render::image_info{
-                    .image = *resolveImage,
-                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .src = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_NONE,
-                            .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT},
-                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                            .stage_mask =
-                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}},
-                my_render::image_info{
-                    .image = depthImg,
-                    .aspect_mask = VK_IMAGE_ASPECT_DEPTH_BIT,
-                    .src = {.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_NONE,
-                            .stage_mask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                                          VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT},
-                    .dst = {.layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                            .stage_mask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                                          VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT}});
+            //diff: [test_indirectdraw_no_pick] end
         }
 
         // After rendering, transition the swapchain image to PRESENT_SRC
@@ -2381,10 +2203,14 @@ try
                 .vertexOffset = 0,
                 .firstInstance = i, // 关键：每个物体不同的 firstInstance
             };
-            infos[i] = {.vertexBufferAddress = m.getVertexBufferAddress(currentFrame),
-                        .objectDataAddress = m.getObjectDataAddress(currentFrame),
-                        .textureIndex = objects[i].tex,
-                        .samplerIndex = objects[i].samp};
+            infos[i] = {
+                .vertexBufferAddress = m.getVertexBufferAddress(currentFrame),
+                .objectDataAddress = m.getObjectDataAddress(currentFrame),
+                .textureIndex = objects[i].tex,
+                .samplerIndex = objects[i].samp,
+                .objectId =
+                    i, //diff: [test_indirectdraw_no_pick]. 直接用数组索引. 可以从object中拿到自定义
+            };
             idxOff += cnt;
         }
         memcpy(batch.objectInfoMapped, infos.data(), needObj);
@@ -2392,70 +2218,6 @@ try
         batch.drawCount = objectCount;
     };
 
-    auto preparePickingBatch = [&pickingBatches, &globalCtx, &pickCtx,
-                                &world](uint32_t currentFrame,
-                                        const std::span<const glm::mat4> &models) {
-        auto &allocator = globalCtx.allocator;
-        auto &device = globalCtx.device;
-
-        auto &pickingDescSets = pickCtx.descSets;
-
-        auto &pb = pickingBatches[currentFrame];
-        constexpr uint32_t objectCount = 2;
-
-        // 重建拾取 SSBO
-        VkDeviceSize needObj = objectCount * sizeof(PickObjectInfo);
-        if (pb.objectInfoSize < needObj)
-        {
-            if (pb.objectInfoMapped)
-            {
-                pb.objectInfoBuffer.unmap();
-                pb.objectInfoBuffer.destroy();
-            }
-            pb.objectInfoBuffer =
-                create_buffer(allocator,
-                              {.sType = sType<VkBufferCreateInfo>(),
-                               .size = needObj,
-                               .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                               .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                              {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                                        VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                               .usage = VMA_MEMORY_USAGE_AUTO});
-            pb.objectInfoMapped = pb.objectInfoBuffer.map();
-            pb.objectInfoSize = needObj;
-
-            // 更新描述符绑定
-            VkDescriptorBufferInfo ssboInfo = {.buffer = pb.objectInfoBuffer.buffer(),
-                                               .offset = 0,
-                                               .range = VK_WHOLE_SIZE};
-            VkWriteDescriptorSet write = {.sType = sType<VkWriteDescriptorSet>(),
-                                          .pNext = nullptr,
-                                          .dstSet = pickingDescSets[currentFrame],
-                                          .dstBinding = 1,
-                                          .dstArrayElement = 0,
-                                          .descriptorCount = 1,
-                                          .descriptorType =
-                                              VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                                          .pImageInfo = nullptr,
-                                          .pBufferInfo = &ssboInfo,
-                                          .pTexelBufferView = nullptr};
-            device.updateDescriptorSets(1, &write, 0, nullptr);
-        }
-
-        // 填充数据（仅 SSBO）
-        std::vector<PickObjectInfo> pickInfos =
-            std::views::zip(std::ranges::views::indices(
-                                static_cast<uint32_t>(world.mesh_array.size())),
-                            world.mesh_array, models) |
-            std::views::transform([&](auto &&tup) {
-                auto &&[index, mesh, model] = tup;
-                return PickObjectInfo{mesh.getVertexBufferAddress(currentFrame), model,
-                                      index};
-            }) |
-            std::ranges::to<std::vector<PickObjectInfo>>();
-
-        memcpy(pb.objectInfoMapped, pickInfos.data(), needObj);
-    };
     // diff: [test_indirectdraw] end
 
     // NOLINTNEXTLINE
@@ -2503,8 +2265,7 @@ try
     };
     // NOLINTNEXTLINE
     const auto drawFrame = [&globalCtx, &pickCtx, &modelState, &world, &prepareBatch,
-                            &preparePickingBatch, &recreateSwapChain,
-                            &recordCommandBuffer]() constexpr {
+                            &recreateSwapChain, &recordCommandBuffer]() constexpr {
         auto &device = globalCtx.device;
         auto &allocator = globalCtx.allocator;
         auto &swapchain = globalCtx.swapchain;
@@ -2562,10 +2323,6 @@ try
         world.mesh_array[1].requestUpdate(
             allocator, currentFrame); // 如果 input_mesh2 也可能动态更新，保持一致
         prepareBatch(currentFrame);
-        preparePickingBatch(
-            currentFrame, std::vector<glm::mat4>{glm::rotate(glm::mat4(1.0F), mesh1_model,
-                                                             glm::vec3(0, 0, 1)),
-                                                 mesh2_model}); // 新增
         // diff: [test_indirectdraw] end
 
         auto [result, imageIndex] = swapchain.acquireNextImage(
@@ -2824,14 +2581,6 @@ try
         }
     }
 
-    for (auto &pb : pickingBatches)
-    {
-        if (pb.objectInfoMapped)
-        {
-            pb.objectInfoBuffer.unmap();
-            pb.objectInfoMapped = nullptr;
-        }
-    }
     // -------------------------------------------------------
 
     std::cout << "main done\n";
