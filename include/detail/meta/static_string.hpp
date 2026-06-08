@@ -9,6 +9,8 @@ namespace mcs::vulkan::meta
     {
         const char *value{}; // NOLINT
 
+        static_string() = default;
+        consteval explicit static_string(const char *value) noexcept : value{value} {}
         template <size_t N>
         consteval static_string(const char (&str)[N]) noexcept // NOLINT
             : value{std::define_static_string(str)}
@@ -30,6 +32,11 @@ namespace mcs::vulkan::meta
         consteval bool operator==(const char (&str)[N]) const noexcept // NOLINT
         {
             return view() == std::string_view{str, N - 1};
+        }
+
+        constexpr bool operator<(const static_string &o) const noexcept
+        {
+            return view() < o.view();
         }
     };
 }; // namespace mcs::vulkan::meta

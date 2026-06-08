@@ -2,6 +2,9 @@
 
 #include "static_string.hpp"
 #include "size_type.hpp"
+#include "nsdms_of.hpp"
+#include <cassert>
+#include <ranges>
 
 namespace mcs::vulkan::ecs
 {

@@ -1,4 +1,3 @@
-
 #include "head.hpp"
 #include <array>
 #include <cassert>
@@ -14,26 +13,23 @@ using mcs::vulkan::ecs::make_runtime_type;
 using mcs::vulkan::ecs::static_string;
 using mcs::vulkan::ecs::soa_class;
 using mcs::vulkan::ecs::world;
-using mcs::vulkan::ecs::gen_soa_store;
-using mcs::vulkan::ecs::gen_soa_sparse_store;
+using mcs::vulkan::ecs::gen_soa_vector;
 using mcs::vulkan::ecs::proxy_value;
 using mcs::vulkan::ecs::name_spec;
 
-// 简单的测试宏
 #define TEST(name) std::cout << "[TEST] " << name << " ... "
 #define PASS() std::cout << "PASSED\n"
-#define CHECK(cond)                                                           \
-    do                                                                        \
-    {                                                                         \
-        if (!(cond))                                                          \
-        {                                                                     \
-            std::cerr << "FAILED at line " << __LINE__ << ": " #cond << "\n"; \
-            std::abort();                                                     \
-        }                                                                     \
+#define CHECK(cond)                                                              \
+    do                                                                           \
+    {                                                                            \
+        if (!(cond))                                                             \
+        {                                                                        \
+            std::cerr << "FAILED at line " << __LINE__ << ": " << #cond << "\n"; \
+            std::abort();                                                        \
+        }                                                                        \
     } while (false)
 #define REQUIRE(cond) CHECK(cond)
 
-// 测试结构体
 struct SimplePod
 {
     int x;
@@ -52,343 +48,500 @@ struct NonTrivial
     NonTrivial &operator=(NonTrivial &&) noexcept = default;
 };
 
+void test_gen_soa_vector()
+{
+    // 1. 基本分配与构造
+    {
+        gen_soa_vector<SimplePod> vec(4);
+        auto e0 = vec.allocate();
+        REQUIRE(e0.has_value());
+        auto e1 = vec.allocate();
+        REQUIRE(e1.has_value());
+        vec.construct_at(*e0, 10, 3.14, 'A');
+        vec.construct_at(*e1, 20, 2.71, 'B');
+        CHECK(vec.template get<"x">(*e0) == 10);
+        CHECK(vec.template get<"y">(*e1) == 2.71);
+        std::cout << "Test 1 passed\n";
+    }
+
+    // 2. 删除与令牌稳定性
+    {
+        gen_soa_vector<SimplePod> vec(4);
+        auto e0 = vec.allocate();
+        REQUIRE(e0);
+        auto e1 = vec.allocate();
+        REQUIRE(e1);
+        vec.construct_at(*e0, 100, 1.1, 'X');
+        vec.construct_at(*e1, 200, 2.2, 'Y');
+        vec.release(*e0);
+        CHECK(vec.size() == 1);
+        CHECK(vec.template get<"x">(*e1) == 200);
+
+        auto e2 = vec.allocate();
+        REQUIRE(e2.has_value());
+        vec.construct_at(*e2, 300, 3.3, 'Z');
+        CHECK(vec.template get<"x">(*e1) == 200);
+        CHECK(vec.template get<"x">(*e2) == 300);
+        std::cout << "Test 2 passed\n";
+    }
+
+    // 3. 遍历 (view)
+    {
+        gen_soa_vector<SimplePod> vec(4);
+        for (int i = 0; i < 3; ++i)
+        {
+            auto e = vec.allocate();
+            REQUIRE(e);
+            vec.construct_at(*e, i + 1, (i + 1) * 1.0, char('a' + i));
+        }
+        int count = 0;
+        for (auto [x, z] : vec.view<"x", "z">())
+        {
+            std::cout << "x=" << x << ", z=" << z << '\n';
+            ++count;
+        }
+        CHECK(count == 3);
+        std::cout << "Test 3 passed\n";
+    }
+
+    // 4. 扩容
+    {
+        gen_soa_vector<SimplePod> vec(2);
+        auto e0 = vec.allocate();
+        REQUIRE(e0);
+        vec.construct_at(*e0, 0, 0.0, '0');
+        auto e1 = vec.allocate();
+        REQUIRE(e1);
+        vec.construct_at(*e1, 1, 0.0, '1');
+        vec.grow(5);
+        auto e2 = vec.allocate();
+        REQUIRE(e2);
+        vec.construct_at(*e2, 2, 0.0, '2');
+        CHECK(vec.size() == 3);
+        CHECK(vec.template get<"x">(*e0) == 0);
+        CHECK(vec.template get<"x">(*e1) == 1);
+        std::cout << "Test 4 passed\n";
+    }
+
+    // 5. 移动与复制
+    {
+        gen_soa_vector<NonTrivial> a(4);
+        auto id = a.allocate();
+        REQUIRE(id);
+        a.construct_at(*id, 42, "hello");
+        auto b = std::move(a);
+        CHECK(a.size() == 0);
+        CHECK(b.size() == 1);
+        CHECK(b.template get<"id">(*id) == 42);
+        CHECK(b.template get<"name">(*id) == "hello");
+        std::cout << "Test 5 passed\n";
+    }
+
+    // 6. 迭代器（安全遍历，无空洞）
+    {
+        gen_soa_vector<SimplePod> vec(4);
+        auto e0 = vec.allocate();
+        REQUIRE(e0);
+        vec.construct_at(*e0, 10, 1.0, 'A');
+        auto e1 = vec.allocate();
+        REQUIRE(e1);
+        vec.construct_at(*e1, 20, 2.0, 'B');
+        int count = 0;
+        for (auto item : vec)
+        {
+            item.x += 1;
+            ++count;
+        }
+        CHECK(count == 2);
+        CHECK(vec.template get<"x">(*e0) == 11);
+        std::cout << "Test 6 passed\n";
+    }
+
+    // 7. 复制构造与赋值
+    {
+        gen_soa_vector<SimplePod> a(4);
+        auto e0 = a.allocate();
+        REQUIRE(e0);
+        a.construct_at(*e0, 100, 1.0, 'X');
+        auto e1 = a.allocate();
+        REQUIRE(e1);
+        a.construct_at(*e1, 200, 2.0, 'Y');
+
+        // 复制构造
+        auto b = a;
+        CHECK(b.size() == 2);
+        CHECK(b.template get<"x">(*e0) == 100);
+        CHECK(b.template get<"x">(*e1) == 200);
+
+        // 原容器修改不影响副本
+        a.release(*e0);
+        CHECK(a.size() == 1);
+        CHECK(b.size() == 2);                   // 副本仍完整
+        CHECK(b.template get<"x">(*e0) == 100); // 副本中的实体仍可访问
+
+        // 赋值运算
+        gen_soa_vector<SimplePod> c;
+        c = b; // 拷贝赋值
+        CHECK(c.size() == 2);
+        CHECK(c.template get<"x">(*e0) == 100);
+        b.release(*e1);
+        CHECK(c.size() == 2); // 赋值后的对象独立
+
+        std::cout << "Test 7 (copy) passed\n";
+    }
+
+    // 8. 构造/销毁/重新构造 (destroy_at 安全用法)
+    {
+        gen_soa_vector<SimplePod> vec(4);
+        auto e = vec.allocate();
+        REQUIRE(e);
+        vec.construct_at(*e, 42, 3.14, '?');
+        CHECK(vec.template get<"x">(*e) == 42);
+
+        vec.destroy_at(*e); // 只析构，实体仍然存在于 dense_ 中
+        // 此时不能通过 get/operator[] 访问，因为对象已析构（UB），
+        // 正确做法是紧接着 construct_at 或 release。
+        vec.construct_at(*e, 99, 9.9, '!'); // 重新构造
+        CHECK(vec.template get<"x">(*e) == 99);
+        CHECK(vec.size() == 1); // 实体数未变
+
+        vec.release(*e); // 正常释放
+        CHECK(vec.size() == 0);
+        std::cout << "Test 8 (destroy/reconstruct) passed\n";
+    }
+
+    // 9. 全字段视图 (无模板参数的 view())
+    {
+        gen_soa_vector<SimplePod> vec(4);
+        for (int i = 0; i < 3; ++i)
+        {
+            auto e = vec.allocate();
+            REQUIRE(e);
+            vec.construct_at(*e, i + 1, (i + 1) * 1.0, char('a' + i));
+        }
+        int count = 0;
+        for (auto item : vec.view())
+        {
+            // item 是 bind_result 临时对象，字段可读写
+            item.x += 1;
+            ++count;
+        }
+        CHECK(count == 3);
+        // 验证修改已写回 SoA
+        CHECK(vec.template get<"x">(0) == 2); // 第一个实体 x=1+1
+        CHECK(vec.template get<"x">(1) == 3); // 第二个实体 x=2+1
+        CHECK(vec.template get<"x">(2) == 4); // 第三个实体 x=3+1
+        std::cout << "Test 9 (full view) passed\n";
+    }
+
+    // 10. 删除后的迭代器安全遍历（无空洞）
+    {
+        gen_soa_vector<SimplePod> vec(4);
+        auto e0 = vec.allocate();
+        REQUIRE(e0);
+        vec.construct_at(*e0, 10, 1.0, '0');
+        auto e1 = vec.allocate();
+        REQUIRE(e1);
+        vec.construct_at(*e1, 20, 2.0, '1');
+        auto e2 = vec.allocate();
+        REQUIRE(e2);
+        vec.construct_at(*e2, 30, 3.0, '2');
+        auto e3 = vec.allocate();
+        REQUIRE(e3);
+        vec.construct_at(*e3, 40, 4.0, '3');
+
+        vec.release(*e1); // 删除中间实体，物理槽位应被最后一个实体填充
+        // 此时存活实体：e0, e3, e2（顺序取决于 swap-pop）
+        // 但无论如何，size() == 3，迭代器只访问前 3 个物理槽位，都是有效对象。
+        int count = 0;
+        for (auto item : vec)
+        {
+            // 确保每个 item 的字段都可以正常读写
+            item.x += 1;
+            ++count;
+        }
+        CHECK(count == 3);
+        // 验证所有实体都仍然存在且数据正确（仅检查 x 字段，因为已 +1）
+        // 由于我们不知道内部顺序，可以用 used_slots() 和 get 来验证
+        bool found_e0 = false, found_e2 = false, found_e3 = false;
+        for (size_t id : vec.used_slots())
+        {
+            int val = vec.template get<"x">(id);
+            if (id == *e0 && val == 11)
+                found_e0 = true;
+            if (id == *e2 && val == 31)
+                found_e2 = true;
+            if (id == *e3 && val == 41)
+                found_e3 = true;
+        }
+        CHECK(found_e0 && found_e2 && found_e3);
+        std::cout << "Test 10 (safe iteration after deletion) passed\n";
+    }
+
+    // 11. free_size / capacity 查询
+    {
+        gen_soa_vector<SimplePod> vec(4);
+        CHECK(vec.capacity() == 4);
+        CHECK(vec.free_size() == 4);
+        auto e0 = vec.allocate();
+        CHECK(vec.free_size() == 3);
+        auto e1 = vec.allocate();
+        CHECK(vec.free_size() == 2);
+        vec.release(*e0);
+        CHECK(vec.free_size() == 3);
+        vec.release(*e1);
+        CHECK(vec.free_size() == 4);
+        std::cout << "Test 11 (capacity/free) passed\n";
+    }
+
+    // 12. construct_at 移动重载
+    {
+        gen_soa_vector<SimplePod> vec(4);
+        auto e = vec.allocate();
+        REQUIRE(e);
+        SimplePod obj{77, 7.7, 'M'};
+        vec.construct_at(*e, std::move(obj)); // 移动构造
+        CHECK(vec.template get<"x">(*e) == 77);
+        CHECK(vec.template get<"y">(*e) == 7.7);
+        CHECK(vec.template get<"z">(*e) == 'M');
+        std::cout << "Test 12 (move construct_at) passed\n";
+    }
+
+    // 13. 全字段视图在删除/重用后的安全性（覆盖之前的漏洞）
+    {
+        gen_soa_vector<SimplePod> vec(4);
+        auto e0 = vec.allocate();
+        vec.construct_at(*e0, 1, 0.0, 'a');
+        auto e1 = vec.allocate();
+        vec.construct_at(*e1, 2, 0.0, 'b');
+        auto e2 = vec.allocate();
+        vec.construct_at(*e2, 3, 0.0, 'c');
+
+        vec.release(*e1);         // dense 变为 {0, 2}（实体 ID）
+        auto e3 = vec.allocate(); // 可能重用 1 或分配 3
+        vec.construct_at(*e3, 4, 0.0, 'd');
+
+        int count = 0;
+        for (auto item : vec.view())
+        { // 遍历物理槽位，应无越界
+            item.x += 1;
+            ++count;
+        }
+        CHECK(count == 3);
+        // 通过 used_slots() 验证数据，而非依赖实体ID顺序
+        bool ok = true;
+        for (auto id : vec.used_slots())
+        {
+            if (id == *e0 && vec.template get<"x">(id) != 2)
+                ok = false;
+            if (id == *e2 && vec.template get<"x">(id) != 4)
+                ok = false;
+            if (id == *e3 && vec.template get<"x">(id) != 5)
+                ok = false;
+        }
+        CHECK(ok);
+        std::cout << "Test 13 (safe view after reuse) passed\n";
+    }
+
+    // 14. release 后移动操作的正确性（针对非平凡类型）
+    {
+        gen_soa_vector<NonTrivial> vec(4);
+        auto e0 = vec.allocate();
+        vec.construct_at(*e0, 1, "first");
+        auto e1 = vec.allocate();
+        vec.construct_at(*e1, 2, "second");
+        auto e2 = vec.allocate();
+        vec.construct_at(*e2, 3, "third");
+
+        vec.release(*e1); // 释放中间元素，应安全
+        CHECK(vec.size() == 2);
+
+        // 验证剩余两个实体的字符串正确
+        bool has_first = false, has_third = false;
+        for (auto id : vec.used_slots())
+        {
+            auto &name = vec.template get<"name">(id);
+            if (id == *e0 && name == "first")
+                has_first = true;
+            if (id == *e2 && name == "third")
+                has_third = true;
+        }
+        CHECK(has_first && has_third);
+        std::cout << "Test 14 (non-trivial release correctness) passed\n";
+    }
+}
+
 int main()
 {
-    using soa_list =
-        soa_class<name_spec{"SimplePod", ^^gen_soa_store<SimplePod>},
-                  name_spec{"NonTrivial", ^^gen_soa_sparse_store<NonTrivial>}>;
+    test_gen_soa_vector();
+
+    // ---- world 集成测试 (全部基于 gen_soa_vector) ----
+    using soa_list = soa_class<name_spec{"SimplePod", ^^gen_soa_vector<SimplePod>},
+                               name_spec{"NonTrivial", ^^gen_soa_vector<NonTrivial>}>;
     using world_type = world<soa_list>;
+
+    // proxy_value 大小不变
+    static_assert(sizeof(proxy_value<gen_soa_vector<SimplePod>>) == 16);
+    static_assert(sizeof(std::optional<proxy_value<gen_soa_vector<SimplePod>>>) == 24);
 
     world_type w;
 
-    // ======== 1. 通过名字和类型获取 SOA 存储 ========
+    // 1. get_soa 按名称和类型
     {
         auto &store1 = w.get_soa<"SimplePod">();
         auto &store2 = w.get_soa<SimplePod>();
-        assert(&store1 == &store2);
+        CHECK(&store1 == &store2);
         static_assert(
             std::is_same_v<std::decay_t<decltype(store1)>::value_type, SimplePod>);
         std::println("Test1 (get_soa) passed.");
     }
 
-    // ======== 2. 基本分配/构造/访问（通过 proxy_value） ========
+    // 2. 基本分配/构造/访问 (proxy_value)
     {
         auto opt = w.make_soa_value<SimplePod>(10, 3.14, 'A');
-        assert(opt.has_value());
-        auto proxy = std::move(*opt); // 移动 proxy
-        auto [x, y, z] = *proxy;      // 解引用返回 tuple<字段引用...>
-        assert(x == 10 && y == 3.14 && z == 'A');
-        // proxy 离开作用域自动释放槽位
+        CHECK(opt.has_value());
+        auto proxy = std::move(*opt);
+        auto [x, y, z] = *proxy;
+        CHECK(x == 10 && y == 3.14 && z == 'A');
     }
-    // 槽位已释放，应可重用
     {
         auto opt2 = w.make_soa_value<SimplePod>(20, 2.71, 'B');
-        assert(opt2.has_value());
+        CHECK(opt2.has_value());
         auto proxy2 = std::move(*opt2);
         auto [x, y, z] = *proxy2;
-        assert(x == 20);
+        CHECK(x == 20);
     }
-    std::println("Test2 (basic allocate/construct/release) passed.");
+    std::println("Test2 (basic proxy) passed.");
 
-    // ======== 3. 容量耗尽时返回 nullopt ========
+    // 3. 容量耗尽
     {
         auto &store = w.get_soa<SimplePod>();
-        // 初始 capacity=4，已无存活元素（上面 proxy 已析构），应能再分配 4 个
-        auto p1 = w.make_soa_value<SimplePod>(1, 0.0, '1');
-        auto p2 = w.make_soa_value<SimplePod>(2, 0.0, '2');
-        auto p3 = w.make_soa_value<SimplePod>(3, 0.0, '3');
-        auto p4 = w.make_soa_value<SimplePod>(4, 0.0, '4');
-        assert(p1.has_value() && p2.has_value() && p3.has_value() && p4.has_value());
-        auto p5 = w.make_soa_value<SimplePod>(5, 0.0, '5');
-        assert(!p5.has_value()); // 容量满，分配失败
-    }
-    std::println("Test3 (exhaust capacity) passed.");
-
-    // ======== 4. proxy 移动语义：源对象不再释放 ========
-    {
-        auto &store = w.get_soa<SimplePod>();
-        size_t before = store.size();
-
-        auto opt = w.make_soa_value<SimplePod>(100, 1.1, 'X');
-        assert(opt.has_value());
-        auto proxy1 = std::move(*opt);
-        assert(store.size() == before + 1);
-
-        auto proxy2 = std::move(proxy1);    // 移动构造
-        assert(store.size() == before + 1); // 仍然存活
-
-        auto [x, y, z] = *proxy2;
-        assert(x == 100);
-        // proxy2 析构，释放元素
-    }
-    assert(w.get_soa<SimplePod>().size() == 0);
-    std::println("Test4 (proxy move semantics) passed.");
-
-    // ======== 5. NonTrivial 只可移动类型 ========
-    {
-        auto opt = w.make_soa_value<NonTrivial>(42, "hello");
-        assert(opt.has_value());
-        auto proxy = std::move(*opt);
-        auto [id, name] = *proxy;
-        assert(id == 42 && name == "hello");
-        // proxy 析构正确调用 release（销毁 NonTrivial）
-    }
-    std::println("Test5 (NonTrivial move-only) passed.");
-
-    // ======== 6. 扩容后继续分配 ========
-    {
-        auto &store = w.get_soa<SimplePod>();
-        store.grow(6); // 扩容到 6
-        std::vector<decltype(w.make_soa_value<SimplePod>(0, 0.0, ' '))> proxies;
-        for (int i = 0; i < 6; ++i)
+        std::vector<proxy_value<gen_soa_vector<SimplePod>>> proxies;
+        for (int i = 0; i < 4; ++i)
         {
-            auto opt = w.make_soa_value<SimplePod>(i, i * 1.0, 'a' + i);
-            assert(opt.has_value());
+            auto opt = w.make_soa_value<SimplePod>(i, i * 1.0, char('a' + i));
+            REQUIRE(opt.has_value());
             proxies.push_back(std::move(*opt));
         }
-        // 释放中间两个
+        CHECK(store.size() == 4);
+        auto full = w.make_soa_value<SimplePod>(99, 0.0, 'X');
+        CHECK(!full.has_value());
+    }
+    std::println("Test3 (capacity) passed.");
+
+    // 4. proxy 移动语义
+    {
+        auto &store = w.get_soa<SimplePod>();
+        auto opt = w.make_soa_value<SimplePod>(100, 1.1, 'X');
+        REQUIRE(opt.has_value());
+        auto p1 = std::move(*opt);
+        CHECK(store.size() == 1);
+        auto p2 = std::move(p1);
+        CHECK(store.size() == 1);
+        auto [x, y, z] = *p2;
+        CHECK(x == 100);
+    }
+    std::println("Test4 (proxy move) passed.");
+
+    // 5. NonTrivial 移动
+    {
+        auto opt = w.make_soa_value<NonTrivial>(42, "hello");
+        REQUIRE(opt.has_value());
+        auto proxy = std::move(*opt);
+        auto [id, name] = *proxy;
+        CHECK(id == 42 && name == "hello");
+    }
+    std::println("Test5 (NonTrivial) passed.");
+
+    // 6. 扩容后继续分配
+    {
+        auto &store = w.get_soa<SimplePod>();
+        store.grow(6);
+        std::vector<proxy_value<gen_soa_vector<SimplePod>>> proxies;
+        for (int i = 0; i < 6; ++i)
+        {
+            auto opt = w.make_soa_value<SimplePod>(i, i * 1.0, char('a' + i));
+            REQUIRE(opt.has_value());
+            proxies.push_back(std::move(*opt));
+        }
         proxies.erase(proxies.begin() + 2);
-        proxies.erase(proxies.begin() + 2); // 存活 4 个
-        // 再分配应成功，使用刚释放的槽位
+        proxies.erase(proxies.begin() + 2); // 存活 4
         auto opt_new = w.make_soa_value<SimplePod>(99, 9.9, '!');
-        assert(opt_new.has_value());
-        auto proxy_new = std::move(*opt_new);
-        auto [x, y, z] = *proxy_new;
-        assert(x == 99);
+        REQUIRE(opt_new.has_value());
+        auto [x, y, z] = *std::move(*opt_new);
+        CHECK(x == 99);
     }
-    std::println("Test6 (grow and slot reuse) passed.");
+    std::println("Test6 (grow) passed.");
 
-    // ======== 7. const 世界无法修改 ========
-    // const world_type cw;
-    // cw.make_soa_value<SimplePod>(0,0.0,' '); // 编译错误（预期内）
-    std::println("Test7 (const restriction) compile-time check passed.");
-
-    // ======== 8. 显式验证默认容量和 used_idx_ 初始化 ========
+    // 7. proxy 可修改数据
     {
-        TEST("gen_soa_store default capacity = 4");
-        gen_soa_store<SimplePod> store;
-        CHECK(store.capacity() == 4);
-        CHECK(store.free_size() == 4);
-        PASS();
-    }
-    {
-        TEST("gen_soa_sparse_store default capacity = 4 and used_idx_ initialized");
-        gen_soa_sparse_store<SimplePod> sparse;
-        CHECK(sparse.capacity() == 4);
-        CHECK(sparse.free_size() == 4);
-        // 若能分配一个 id，则证明 allocate 中的 assert(id < used_idx_.size()) 通过
-        auto id = sparse.allocate();
-        CHECK(id.has_value());
-        sparse.construct_at(*id, SimplePod{0, 0.0, '0'});
-        sparse.release(*id);
-        PASS();
-    }
-
-    // ======== 9. 验证 proxy_value 返回的是引用，可修改原数据 ========
-    {
-        TEST("proxy operator* returns modifiable references");
         auto opt = w.make_soa_value<SimplePod>(42, 3.14, 'X');
         REQUIRE(opt.has_value());
         auto proxy = std::move(*opt);
         auto [x, y, z] = *proxy;
-        x = 100; // 修改引用应反映到存储中
+        x = 100;
         y = 2.71;
         z = 'Y';
         auto [x2, y2, z2] = *proxy;
-        CHECK(x2 == 100);
-        CHECK(y2 == 2.71);
-        CHECK(z2 == 'Y');
-        // 析构 proxy 自动释放
-        PASS();
+        CHECK(x2 == 100 && y2 == 2.71 && z2 == 'Y');
     }
+    std::println("Test7 (modify) passed.");
 
-    // ======== 10. gen_soa_sparse_store 加速删除一致性 ========
+    // 8. 显式 proxy::release
     {
-        TEST("gen_soa_sparse_store O(1) release with correct used_idx_ update");
-        gen_soa_sparse_store<SimplePod> sparse(4);
-        auto a = sparse.allocate();
-        sparse.construct_at(*a, SimplePod{1, 0.0, 'a'});
-        auto b = sparse.allocate();
-        sparse.construct_at(*b, SimplePod{2, 0.0, 'b'});
-        auto c = sparse.allocate();
-        sparse.construct_at(*c, SimplePod{3, 0.0, 'c'});
-        // 释放 b，应触发 swap-with-last，used_ 中 id 顺序可能变为 {1,3}
-        sparse.release(*b);
-        // 验证剩余元素：通过 view 遍历所有存活元素，应包含 {1, 'a'} 和 {3, 'c'}
-        bool found1 = false, found3 = false;
-        for (auto tup : sparse.view<"x", "z">())
-        {
-            auto [x, z] = tup;
-            if (x == 1 && z == 'a')
-                found1 = true;
-            if (x == 3 && z == 'c')
-                found3 = true;
-        }
-        CHECK(found1 && found3);
-        // 再分配应复用之前释放的物理槽位（id 不一定是原来的，但肯定成功）
-        auto d = sparse.allocate();
-        CHECK(d.has_value());
-        sparse.construct_at(*d, SimplePod{4, 0.0, 'd'});
-        CHECK(sparse.size() == 3);
-        // 释放全部后大小归零
-        // 释放全部存活槽位
-        sparse.release(*a);
-        sparse.release(*c);
-        sparse.release(*d);
-        CHECK(sparse.size() == 0);
-        PASS();
-    }
-
-    // ======== 11. 移动后 used_idx_ 状态 ========
-    {
-        TEST("move of gen_soa_sparse_store preserves used_idx_ integrity");
-        gen_soa_sparse_store<NonTrivial> orig(4);
-        auto id1 = orig.allocate();
-        orig.construct_at(*id1, 1, "one");
-        auto id2 = orig.allocate();
-        orig.construct_at(*id2, 2, "two");
-        auto moved = std::move(orig);
-        CHECK(orig.size() == 0);
-        CHECK(orig.capacity() == 0);
-        CHECK(moved.size() == 2);
-        // 通过 release 验证 used_idx_ 仍然有效
-        moved.release(*id1);
-        CHECK(moved.size() == 1);
-        PASS();
-    }
-
-    // ======== 12. 复制后 used_idx_ 独立 ========
-    {
-        TEST("copy of gen_soa_sparse_store has independent used_idx_");
-        gen_soa_sparse_store<NonTrivial> orig(4);
-        auto id = orig.allocate();
-        orig.construct_at(*id, 10, "copy-test");
-        auto copy = orig;
-        // 原对象释放槽位，副本应不受影响
-        orig.release(*id);
-        CHECK(orig.size() == 0);
-        CHECK(copy.size() == 1);
-        // 副本仍能通过 used_idx_ 释放自己的元素
-        copy.release(*id);
-        CHECK(copy.size() == 0);
-        PASS();
-    }
-
-    // ======== 13. grow 后 used_idx_ 扩容正确 ========
-    {
-        TEST("grow of gen_soa_sparse_store extends used_idx_ correctly");
-        gen_soa_sparse_store<SimplePod> sparse(2);
-        auto a = sparse.allocate();
-        sparse.construct_at(*a, SimplePod{1, 0, 'a'});
-        auto b = sparse.allocate();
-        sparse.construct_at(*b, SimplePod{2, 0, 'b'});
-        sparse.grow(5);
-        CHECK(sparse.capacity() == 5);
-        // 新分配的 slot 应在扩展的范围内，且 used_idx_ 大小匹配
-        auto c = sparse.allocate();
-        CHECK(c.has_value());
-        sparse.construct_at(*c, SimplePod{3, 0, 'c'});
-        // 释放一个旧元素，确保 used_idx_ 仍正确
-        sparse.release(*a);
-        CHECK(sparse.size() == 2);
-        PASS();
-    }
-
-    // ======== 14. proxy_value::release 显式调用 ========
-    {
-        TEST("explicit proxy release calls store release and sets null");
-        std::optional<proxy_value<gen_soa_store<SimplePod>>> opt =
-            w.make_soa_value<SimplePod>(99, 9.9, '!');
+        auto opt = w.make_soa_value<SimplePod>(99, 9.9, '!');
         REQUIRE(opt.has_value());
         auto proxy = std::move(*opt);
         auto &store = w.get_soa<SimplePod>();
         size_t before = store.size();
-        proxy.release(); // 手动释放
-        CHECK(store.size() == before - 1);
-        // 再次释放应无副作用
         proxy.release();
         CHECK(store.size() == before - 1);
-        PASS();
+        proxy.release(); // 无害
+        CHECK(store.size() == before - 1);
     }
-    // ===== ECS：用 tuple<proxy_value...> 做实体 =====
+    std::println("Test8 (explicit release) passed.");
+
+    // 9. tuple<proxy_value...> 实体
     {
-        // 创建实体：同时拥有 SimplePod 和 NonTrivial 两个组件
         auto entity =
             std::make_tuple(std::move(*w.make_soa_value<SimplePod>(42, 3.14, 'E')),
                             std::move(*w.make_soa_value<NonTrivial>(1, "EntityOne")));
-
-        // 访问 SimplePod 组件
-        proxy_value<gen_soa_store<SimplePod>> &sp_proxy = std::get<0>(entity);
-        auto [x, y, z] = *sp_proxy; // 结构化绑定，直接拿到字段引用
-        std::println("SimplePod: x={}, y={}, z={}", x, y, z);
-
-        // 访问 NonTrivial 组件
-        auto &nt_proxy = std::get<1>(entity);
-        auto [id, name] = *nt_proxy;
-        std::println("NonTrivial: id={}, name={}", id, name);
-
-        // 修改组件字段（x, y, z 是引用，可直接修改）
+        auto &sp = std::get<0>(entity);
+        auto [x, y, z] = *sp;
+        CHECK(x == 42);
         x = 100;
-        const auto [x2, y2, z2] = *sp_proxy; // 验证修改生效
-        assert(x2 == 100);
-
-        // 实体离开作用域，tuple 析构 → 各 proxy 自动释放组件
+        auto [x2, y2, z2] = *sp;
+        CHECK(x2 == 100);
     }
+    std::println("Test9 (tuple entity) passed.");
+
+    // 10. runtime_type 实体
     {
-        world_type w;
+        world_type w2;
         auto entity = make_runtime_type<"entity0", "a", "b">(
-            std::move(*w.make_soa_value<SimplePod>(42, 3.14, 'E')),
-            std::move(*w.make_soa_value<NonTrivial>(1, "EntityOne")));
-
-        static_assert(decltype(entity)::class_name == "entity0");
-
-        assert(entity->a);
-        assert(entity->a.has_value());
-        assert(entity.get<"a">());
+            std::move(*w2.make_soa_value<SimplePod>(42, 3.14, 'E')),
+            std::move(*w2.make_soa_value<NonTrivial>(1, "EntityOne")));
+        REQUIRE(entity->a.has_value());
         auto ref = *entity;
-        // 直接 . 操作，无需箭头
-        std::println("SimplePod: x={}, y={}, z={}", ref.a.x, ref.a.y, ref.a.z);
-        std::println("NonTrivial: id={}, name={}", ref.b.id, ref.b.name);
-        // 修改字段
+        CHECK(ref.a.x == 42);
         ref.a.x = 100;
         ref.b.id = 2;
+        CHECK((*entity.get<"a">()).x == 100);
+        CHECK((*entity.data_.b).id == 2);
 
-        {
-            const auto &refe = entity;
-            auto ref_const = *refe;
-            // ref_const.a.x = 1; //NOTE: 编译错误
-            assert(ref_const.a.x == 100);
-        }
+        auto &pos_store = w2.get_soa<SimplePod>();
+        size_t eid = pos_store.used_slots()[0];
+        CHECK(pos_store.template get<"x">(eid) == 100);
+        CHECK(pos_store.template get<"y">(eid) == 3.14);
+        CHECK(pos_store.template get<"z">(eid) == 'E');
 
-        assert((*entity.get<"a">()).x == 100);
-        assert((*(entity.data_.a)).x == 100);
-        assert((*(entity.data_.a)).y == 3.14); // y 未被修改
-        assert((*(entity.data_.b)).id == 2);   // id 已被修改
-
-        // 直接从 world 的 SoA 存储中获取实体 ID 并验证字段值
-        auto &pos_store = w.get_soa<SimplePod>();
-        assert(pos_store.size() == 1);
-        size_t eid_pos = pos_store.used_slots()[0]; // 唯一存活的实体 ID
-        assert(pos_store.template get<"x">(eid_pos) == 100);
-        assert(pos_store.template get<"y">(eid_pos) == 3.14);
-        assert(pos_store.template get<"z">(eid_pos) == 'E');
-
-        auto &nt_store = w.get_soa<NonTrivial>();
-        assert(nt_store.size() == 1);
-        size_t eid_nt = nt_store.used_slots()[0];
-        assert(nt_store.template get<"id">(eid_nt) == 2);
-        assert(nt_store.template get<"name">(eid_nt) == "EntityOne");
-        /*
-runtime_type::operator* 不再返回对 proxy 的包装，而是直接返回一个新的聚合体 entity_view。
-
-entity_view 的成员不是 proxy 本身，而是 *proxy 的结果（那个临时聚合体的拷贝）。
-
-那个临时聚合体虽然被拷贝了，但它内部成员是指向 SoA 存储的引用（或值，如果是简单字段），拷贝后这些引用仍然绑定到原始内存，所以修改 ref.a.x 会直接修改底层数据。
-
-因为 ref.a 本身就是一个有成员 x, y, z 的聚合体，自然可以继续用 .x 访问，于是 ref.a.x 完美工作。
-*/
+        auto &nt_store = w2.get_soa<NonTrivial>();
+        size_t nid = nt_store.used_slots()[0];
+        CHECK(nt_store.template get<"id">(nid) == 2);
+        CHECK(nt_store.template get<"name">(nid) == "EntityOne");
     }
+    std::println("Test10 (runtime_type) passed.");
 
-    std::println("\nAll world tests passed!\n");
+    std::println("\nAll tests passed!");
     return 0;
 }

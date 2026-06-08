@@ -1,3 +1,6 @@
+#include <exception>
+#include <stdexcept>
+#include <system_error>
 #include <vector>
 #include <tuple>
 #include <ranges>
@@ -122,20 +125,42 @@ namespace mcs::vulkan::ecs
 
         template <typename T>
             requires(find_info_value(soa_value_members, std::meta::dealias(^^T)) != ~0)
-        constexpr decltype(auto) make_soa_value(this auto &&self, auto &&...args)
+        constexpr decltype(auto)
+        make_soa_value(this auto &&self, auto &&...args) noexcept(
+            noexcept(std::forward_like<decltype(self)>(self.template get_soa<T>())
+                         .construct_at(0, std::forward<decltype(args)>(args)...)))
         {
             auto &store = std::forward_like<decltype(self)>(self.template get_soa<T>());
             using S = std::remove_reference_t<decltype(store)>;
             using proxy_type = proxy_value<S>;
 
             auto slot = store.allocate();
-            if (not slot)
+            if (slot) [[likely]]
             {
-                return std::optional<proxy_type>{std::nullopt};
+                auto id = *slot;
+                store.construct_at(id, std::forward<decltype(args)>(args)...);
+                return std::optional<proxy_type>{proxy_type{store, id}};
             }
-            auto id = *slot;
-            store.construct_at(id, std::forward<decltype(args)>(args)...);
-            return std::optional<proxy_type>{proxy_type{store, id}};
+            else [[unlikely]]
+                return std::optional<proxy_type>{std::nullopt};
+        }
+        template <typename T>
+            requires(find_info_value(soa_value_members, std::meta::dealias(^^T)) != ~0)
+        constexpr decltype(auto) make_soa_value_throw(this auto &&self, auto &&...args)
+        {
+            auto &store = std::forward_like<decltype(self)>(self.template get_soa<T>());
+            using S = std::remove_reference_t<decltype(store)>;
+            using proxy_type = proxy_value<S>;
+
+            auto slot = store.allocate();
+            if (slot) [[likely]]
+            {
+                auto id = *slot;
+                store.construct_at(id, std::forward<decltype(args)>(args)...);
+                return proxy_type{store, id};
+            }
+            else [[unlikely]]
+                throw std::logic_error{"store.allocate() faild!"};
         }
 
         static consteval auto unique_soa_component_type()

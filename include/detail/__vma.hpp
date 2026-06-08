@@ -6,3 +6,4 @@
 #include "./vma/create_resources.hpp"
 #include "./vma/create_image.hpp"
 #include "./vma/create_texture_image.hpp"
+#include "./vma/auto_map_buffer.hpp"

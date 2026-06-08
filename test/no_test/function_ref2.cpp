@@ -447,6 +447,11 @@ void test_ecs()
         execution.push_back(std::constant_wrapper<[](world_type w) noexcept {
             function_set<world_type, B>::update(w, 0);
         }>{});
+
+        // NOTE: auto 自动解析成 world_type。完美
+        execution.push_back(std::constant_wrapper<[](auto w) noexcept {
+            function_set<world_type, B>::update(w, 0);
+        }>{});
     }
     auto Heartbeat = [&]() {
         std::random_device rd;
