@@ -162,7 +162,7 @@ void test_gen_soa_vector()
         auto e1 = vec.allocate();
         REQUIRE(e1);
         vec.construct_at(*e1, 1, 0.0, '1');
-        vec.grow(5);
+        vec.reserve(5);
         auto e2 = vec.allocate();
         REQUIRE(e2);
         vec.construct_at(*e2, 2, 0.0, '2');
@@ -444,6 +444,7 @@ void test_gen_soa_vector()
         {
             world_type2 w;
             auto &store = w.get_soa<"Tracker">();
+            store.reserve(2);
             auto e0 = store.allocate();
             store.construct_at(*e0, DestructionCounter{}, 100); // dc, val
             auto e1 = store.allocate();
@@ -473,6 +474,8 @@ int main()
     {
         auto &store1 = w.get_soa<"SimplePod">();
         auto &store2 = w.get_soa<SimplePod>();
+        store1.reserve(4);
+        store2.reserve(4);
         CHECK(&store1 == &store2);
         static_assert(
             std::is_same_v<std::decay_t<decltype(store1)>::value_type, SimplePod>);
@@ -528,6 +531,7 @@ int main()
 
     // 5. NonTrivial 移动
     {
+        w.get_soa<NonTrivial>().reserve(4);
         auto opt = w.make_soa_value<NonTrivial>(42, "hello");
         REQUIRE(opt.has_value());
         auto proxy = std::move(*opt);
@@ -539,7 +543,7 @@ int main()
     // 6. 扩容后继续分配
     {
         auto &store = w.get_soa<SimplePod>();
-        store.grow(6);
+        store.reserve(6);
         std::vector<proxy_value<gen_soa_vector<SimplePod>>> proxies;
         for (int i = 0; i < 6; ++i)
         {

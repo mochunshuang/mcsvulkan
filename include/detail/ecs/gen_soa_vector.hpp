@@ -44,7 +44,7 @@ namespace mcs::vulkan::ecs
         static constexpr size_type invalid_id = ~0;
 
         // 构造：默认容量 4
-        constexpr gen_soa_vector() : gen_soa_vector(4) {}
+        constexpr gen_soa_vector() : gen_soa_vector(0) {}
         constexpr explicit gen_soa_vector(size_type cap)
             : data_(cap), sparse_(cap, invalid_dense)
         {
@@ -194,12 +194,13 @@ namespace mcs::vulkan::ecs
         }
 
         // ---------- 扩容 ----------
-        constexpr void grow(size_type new_cap)
+        constexpr void reserve(size_type new_cap)
         {
             auto old_cap = capacity();
             if (new_cap <= old_cap)
                 return;
 
+            // 0. 申请内存
             typename soa_type::Pointers new_pointers{};
             template for (constexpr auto I :
                           std::views::indices(soa_type::ptr_members.size()))
@@ -235,25 +236,28 @@ namespace mcs::vulkan::ecs
                 }
             }
 
-            for (size_type i = 0; i < size(); ++i) // 物理槽位 = 下标
+            // 1. 批量移动构造所有元素到新内存（不销毁旧数据）
+            template for (constexpr auto I :
+                          std::views::indices(soa_type::ptr_members.size()))
             {
-                size_type slot = i;
-                template for (constexpr auto I :
-                              std::views::indices(soa_type::ptr_members.size()))
-                {
-                    auto &old = data_.pointers_.[:soa_type::ptr_members[I]:];
-                    auto &nw = new_pointers.[:soa_type::ptr_members[I]:];
+                auto &old = data_.pointers_.[:soa_type::ptr_members[I]:];
+                auto &nw = new_pointers.[:soa_type::ptr_members[I]:];
 
-                    using field_type = typename std::remove_reference_t<
-                        decltype(data_.pointers_
-                                     .[:soa_type::ptr_members[I]:])>::value_type;
-                    static_assert(std::is_nothrow_move_constructible_v<field_type>,
-                                  "Each field type must be nothrow move constructible");
-                    std::construct_at(nw.data() + slot, std::move(old[slot]));
-                    std::destroy_at(old.data() + slot);
-                }
+                using field_type = std::remove_reference_t<decltype(old)>::value_type;
+                static_assert(std::is_nothrow_move_constructible_v<field_type>,
+                              "gen_soa_vector requires nothrow move constructible types");
+                // 将旧内存的 [0, size()) 范围的元素移动到新内存
+                std::uninitialized_move(old.data(), old.data() + size(), nw.data());
+            }
+            // 2. 批量调用旧内存中的元素的析构
+            template for (constexpr auto I :
+                          std::views::indices(soa_type::ptr_members.size()))
+            {
+                auto &old = data_.pointers_.[:soa_type::ptr_members[I]:];
+                std::destroy(old.data(), old.data() + size());
             }
 
+            // 3. 真的释放旧内存
             template for (constexpr auto I :
                           std::views::indices(soa_type::ptr_members.size()))
             {
@@ -272,7 +276,7 @@ namespace mcs::vulkan::ecs
         }
         constexpr void expansion_size(size_type expansion) // NOLINT
         {
-            grow(std::bit_ceil(capacity() + expansion));
+            reserve(std::bit_ceil(capacity() + expansion));
         }
 
         // ---------- 复制 / 移动 ----------data_.p
