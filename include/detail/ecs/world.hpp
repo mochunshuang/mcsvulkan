@@ -10,6 +10,7 @@
 #include "proxy_value.hpp"
 #include "size_type.hpp"
 #include "name_spec.hpp"
+#include "static_string.hpp"
 
 namespace mcs::vulkan::ecs
 {

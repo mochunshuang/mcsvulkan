@@ -27,6 +27,10 @@ namespace mcs::vulkan::ecs
         {
             return data_;
         }
+        constexpr explicit operator bool() const noexcept
+        {
+            return data_ != nullptr;
+        }
 
       private:
         T *data_;

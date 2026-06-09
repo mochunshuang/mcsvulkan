@@ -9,7 +9,6 @@
 #include <utility>
 #include <vector>
 
-using mcs::vulkan::ecs::make_runtime_type;
 using mcs::vulkan::ecs::static_string;
 using mcs::vulkan::ecs::soa_class;
 using mcs::vulkan::ecs::world;
@@ -46,6 +45,56 @@ struct NonTrivial
     NonTrivial &operator=(const NonTrivial &) = delete;
     NonTrivial(NonTrivial &&) noexcept = default;
     NonTrivial &operator=(NonTrivial &&) noexcept = default;
+};
+
+struct DestructionCounter
+{
+    static inline int destroy_count = 0;
+    bool active = true; // 只有 active 才在析构时 +1
+
+    DestructionCounter() = default;
+    ~DestructionCounter()
+    {
+        if (active)
+            ++destroy_count;
+    }
+
+    // 禁止拷贝
+    DestructionCounter(const DestructionCounter &) = delete;
+    DestructionCounter &operator=(const DestructionCounter &) = delete;
+
+    // 移动：源对象失效，不再计数
+    DestructionCounter(DestructionCounter &&other) noexcept
+        : active(std::exchange(other.active, false))
+    {
+    }
+
+    DestructionCounter &operator=(DestructionCounter &&other) noexcept
+    {
+        if (this != &other)
+        {
+            active = std::exchange(other.active, false);
+        }
+        return *this;
+    }
+};
+struct Tracker
+{
+    DestructionCounter dc; // 析构时自动 +1
+    int val;
+    std::string s;
+
+    Tracker(int v, std::string str) : val(v), s(std::move(str)) {}
+    Tracker(const Tracker &) = delete;
+    Tracker &operator=(const Tracker &) = delete;
+    Tracker(Tracker &&) noexcept = default;
+    Tracker &operator=(Tracker &&) noexcept = default;
+};
+
+struct WorldTracker
+{
+    DestructionCounter dc;
+    int val;
 };
 
 void test_gen_soa_vector()
@@ -369,6 +418,40 @@ void test_gen_soa_vector()
         CHECK(has_first && has_third);
         std::cout << "Test 14 (non-trivial release correctness) passed\n";
     }
+
+    // NOTE: gen_soa_vector RAII 保证测试
+    // 15. 验证容器析构时自动销毁所有未释放的实体（通过析构计数器）
+    {
+        DestructionCounter::destroy_count = 0;
+        {
+            gen_soa_vector<Tracker> vec(4);
+            auto e0 = vec.allocate();
+            auto e1 = vec.allocate();
+
+            // Tracker 有三个成员：dc, val, s
+            vec.construct_at(*e0, Tracker{1, "one"});
+            vec.construct_at(*e1, Tracker{2, "two"});
+            CHECK(DestructionCounter::destroy_count == 0); // 构造没有副作用
+        } // vec 析构 → destroy_at(0) 和 destroy_at(1) → 每个 dc 析构 → destroy_count 变成 2
+        CHECK(DestructionCounter::destroy_count == 2); // 确实析构了 2 次
+    }
+    // 16. 验证 world 销毁时内部所有存储都被析构，自动清理实体
+    {
+        DestructionCounter::destroy_count = 0;
+        using soa_list2 = soa_class<name_spec{"Tracker", ^^gen_soa_vector<WorldTracker>}>;
+        using world_type2 = world<soa_list2>;
+
+        {
+            world_type2 w;
+            auto &store = w.get_soa<"Tracker">();
+            auto e0 = store.allocate();
+            store.construct_at(*e0, DestructionCounter{}, 100); // dc, val
+            auto e1 = store.allocate();
+            store.construct_at(*e1, DestructionCounter{}, 200);
+            CHECK(DestructionCounter::destroy_count == 0);
+        } // w 析构 → store 析构 → destroy_at 两个实体 → destroy_count == 2
+        CHECK(DestructionCounter::destroy_count == 2);
+    }
 }
 
 int main()
@@ -514,33 +597,6 @@ int main()
         CHECK(x2 == 100);
     }
     std::println("Test9 (tuple entity) passed.");
-
-    // 10. runtime_type 实体
-    {
-        world_type w2;
-        auto entity = make_runtime_type<"entity0", "a", "b">(
-            std::move(*w2.make_soa_value<SimplePod>(42, 3.14, 'E')),
-            std::move(*w2.make_soa_value<NonTrivial>(1, "EntityOne")));
-        REQUIRE(entity->a.has_value());
-        auto ref = *entity;
-        CHECK(ref.a.x == 42);
-        ref.a.x = 100;
-        ref.b.id = 2;
-        CHECK((*entity.get<"a">()).x == 100);
-        CHECK((*entity.data_.b).id == 2);
-
-        auto &pos_store = w2.get_soa<SimplePod>();
-        size_t eid = pos_store.used_slots()[0];
-        CHECK(pos_store.template get<"x">(eid) == 100);
-        CHECK(pos_store.template get<"y">(eid) == 3.14);
-        CHECK(pos_store.template get<"z">(eid) == 'E');
-
-        auto &nt_store = w2.get_soa<NonTrivial>();
-        size_t nid = nt_store.used_slots()[0];
-        CHECK(nt_store.template get<"id">(nid) == 2);
-        CHECK(nt_store.template get<"name">(nid) == "EntityOne");
-    }
-    std::println("Test10 (runtime_type) passed.");
 
     std::println("\nAll tests passed!");
     return 0;

@@ -92,8 +92,7 @@ namespace mcs::vulkan::ecs
         // 释放实体：O(1) swap-pop，保持密集紧凑
         constexpr void release(size_type entity) noexcept
         {
-            if (!alive(entity))
-                return;
+            assert(alive(entity));
 
             size_type slot = sparse_[entity];
             size_type last = dense_.size() - 1;
@@ -210,9 +209,30 @@ namespace mcs::vulkan::ecs
                 using reb_alloc = typename std::allocator_traits<
                     typename soa_type::allocator_type>::template rebind_alloc<field_type>;
                 reb_alloc ra(data_.alloc_);
-                new_pointers
-                    .[:soa_type::ptr_members[I]:] = soa_member_pointer<field_type>(
-                                                      ra.allocate(new_cap));
+
+                try
+                {
+                    new_pointers
+                        .[:soa_type::ptr_members[I]:] = soa_member_pointer<field_type>(
+                                                          ra.allocate(new_cap));
+                }
+                catch (...)
+                {
+                    template for (constexpr auto J : std::views::indices(I))
+                    {
+                        using field_type = typename std::remove_reference_t<
+                            decltype(data_.pointers_
+                                         .[:soa_type::ptr_members[J]:])>::value_type;
+                        using reb_alloc = typename std::allocator_traits<
+                            typename soa_type::allocator_type>::
+                            template rebind_alloc<field_type>;
+                        reb_alloc ra(data_.alloc_);
+
+                        ra.deallocate(new_pointers.[:soa_type::ptr_members[J]:].data(),
+                                                                               new_cap);
+                    }
+                    throw;
+                }
             }
 
             for (size_type i = 0; i < size(); ++i) // 物理槽位 = 下标
@@ -223,6 +243,12 @@ namespace mcs::vulkan::ecs
                 {
                     auto &old = data_.pointers_.[:soa_type::ptr_members[I]:];
                     auto &nw = new_pointers.[:soa_type::ptr_members[I]:];
+
+                    using field_type = typename std::remove_reference_t<
+                        decltype(data_.pointers_
+                                     .[:soa_type::ptr_members[I]:])>::value_type;
+                    static_assert(std::is_nothrow_move_constructible_v<field_type>,
+                                  "Each field type must be nothrow move constructible");
                     std::construct_at(nw.data() + slot, std::move(old[slot]));
                     std::destroy_at(old.data() + slot);
                 }
@@ -244,8 +270,12 @@ namespace mcs::vulkan::ecs
             data_.pointers_ = std::move(new_pointers);
             // dense/sparse 关系不变，无需调整
         }
+        constexpr void expansion_size(size_type expansion) // NOLINT
+        {
+            grow(std::bit_ceil(capacity() + expansion));
+        }
 
-        // ---------- 复制 / 移动 ----------
+        // ---------- 复制 / 移动 ----------data_.p
         constexpr gen_soa_vector(const gen_soa_vector &o)
             : data_(o.capacity()), dense_(o.dense_), sparse_(o.sparse_),
               free_entities_(o.free_entities_), next_entity_id_(o.next_entity_id_)
@@ -297,8 +327,12 @@ namespace mcs::vulkan::ecs
 
         ~gen_soa_vector() noexcept
         {
-            for (size_type entity : dense_)
-                data_.destroy_at(sparse_[entity]);
+            // for (size_type entity : dense_)
+            //     data_.destroy_at(sparse_[entity]);
+            for (auto idx : std::views::iota(size_type(0), size()))
+            {
+                data_.destroy_at(idx);
+            }
         }
 
         // ---------- 迭代器（遍历物理槽位）----------
