@@ -436,6 +436,11 @@ void test_ecs()
     };
     world_type w{.a = {{1}, {2}}, .ext_a = {{3}}, .b = {{"b_name"}}};
 
+    [](auto t) {
+    }(std::constant_wrapper<[](world_type w) noexcept {
+        function_set<world_type, A>::update(w, 0);
+    }>{});
+
     std::vector<std::function_ref<void(world_type w) noexcept>> execution;
     {
         execution.push_back(std::constant_wrapper<[](world_type w) noexcept {

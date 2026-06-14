@@ -2,12 +2,10 @@
 #include <exception>
 
 #include "head.hpp"
-using mcs::vulkan::ecs::make_runtime_type;
+
 using mcs::vulkan::ecs::static_string;
 using mcs::vulkan::ecs::soa_class;
 using mcs::vulkan::ecs::world;
-using mcs::vulkan::ecs::gen_soa_store;
-using mcs::vulkan::ecs::gen_soa_sparse_store;
 using mcs::vulkan::ecs::proxy_value;
 using mcs::vulkan::ecs::name_spec;
 

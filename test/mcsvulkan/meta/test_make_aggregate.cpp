@@ -109,6 +109,38 @@ void test_make_aggregate_ref()
     }
 }
 
+consteval int parse_int(std::string_view sv)
+{
+    int result = 0;
+    for (char c : sv)
+    {
+        if (c < '0' || c > '9')
+            throw std::meta::exception{"sv is not number", std::meta::current_function()};
+        result = result * 10 + (c - '0');
+    }
+    return result;
+}
+template <static_string prefix, size_t min, size_t max>
+auto call_prefix(auto &fns)
+{
+    using T = std::remove_cvref_t<decltype(fns)>;
+    constexpr auto members = T::members;
+    template for (constexpr auto I : std::views::indices(members.size()))
+    {
+        constexpr auto member_name = T::template get_member_name<I>().view();
+        constexpr auto prefix_name = prefix.view();
+        if constexpr (member_name.starts_with(prefix_name))
+        {
+            constexpr std::string_view num_str = member_name.substr(prefix_name.size());
+            constexpr int num = parse_int(num_str);
+            if constexpr (num >= min && num <= max)
+            {
+                std::cout << fns.[:members[I]:] << '\n';
+            }
+        }
+    }
+};
+
 int main()
 try
 {
@@ -116,6 +148,68 @@ try
     auto b = make_aggregate<"class", "x", "fn">(1, [](auto &&self, auto value) noexcept {
         return std::forward_like<decltype(self)>(self.x) + value;
     });
+    {
+        using T = decltype(b);
+        // constexpr auto nsdms = static_nsdms_of(^^b);
+        //
+        constexpr auto nsdms = static_nsdms_of(^^T);
+        static_assert(nsdms.empty()); //NOTE: 父类才有
+
+        // members
+        static_assert(not T::members.empty());
+        static_assert(T::members.size() == 2);
+    }
+    {
+        std::vector<std::string> words = {"apple",  "banana",  "apricot",
+                                          "cherry", "avocado", "blueberry"};
+        std::string prefix = "ap";
+
+        // C++23 管道符过滤 + ranges::to 收集
+        auto result = words | std::views::filter([&](const std::string_view &s) {
+                          return s.starts_with(prefix); // C++20 starts_with
+                      }) |
+                      std::ranges::to<std::vector>(); // C++23 ranges::to
+
+        // 输出过滤结果
+        for (const auto &s : result)
+            std::cout << s << '\n';
+
+        {
+            prefix = "b";
+            for (const auto &s :
+                 words | std::views::filter([&](const std::string_view &s) {
+                     return s.starts_with(prefix); // C++20 starts_with
+                 }))
+                std::cout << s << '\n';
+        }
+        {
+            std::vector<std::string> items = {"b_1", "a_3", "a_1", "c_2", "a_2", "b_2"};
+            std::string prefix = "a_";
+
+            // 1. 过滤 + 收集（C++23 ranges::to）
+            auto filtered = items | std::views::filter([&](const std::string &s) {
+                                return s.starts_with(prefix);
+                            }) |
+                            std::ranges::to<std::vector>();
+
+            // 2. 排序（C++20 std::ranges::sort）
+            std::ranges::sort(filtered, [&](const std::string &a, const std::string &b) {
+                // 提取数字部分比较（假设格式为 "前缀+数字"）
+                int na = std::stoi(a.substr(prefix.size()));
+                int nb = std::stoi(b.substr(prefix.size()));
+                return na < nb;
+            });
+
+            // 输出结果：a_1 a_2 a_3
+            for (const auto &s : filtered)
+                std::cout << s << '\n';
+        }
+        {
+            auto fns = make_aggregate<"class", "a_0", "a_1", "a_3", "b_0", "b_1">(0, 1, 3,
+                                                                                  10, 20);
+            call_prefix<"a_", 0, 3>(fns);
+        }
+    }
     assert(b.x == 1);
     static_assert(decltype(b)::class_name == "class");
 

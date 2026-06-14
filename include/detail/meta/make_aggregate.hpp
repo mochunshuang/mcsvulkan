@@ -3,6 +3,7 @@
 #include "static_string.hpp"
 #include "static_nsdms_of.hpp"
 #include "static_parameters_of.hpp"
+#include <cstddef>
 #include <ranges>
 
 namespace mcs::vulkan::meta
@@ -89,6 +90,12 @@ namespace mcs::vulkan::meta
         using base_type = gen_type::type;
         static constexpr auto class_name = Name...[0];                // NOLINT
         static constexpr auto members = static_nsdms_of(^^base_type); // NOLINT
+
+        template <size_t I>
+        consteval static auto get_member_name() // NOLINT
+        {
+            return Name...[I + 1];
+        }
 
         template <static_string m_fn>
             requires(gen_type::find_name(m_fn) != -1)

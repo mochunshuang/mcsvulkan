@@ -2172,203 +2172,286 @@ try
         batch.drawCount = objectCount;
     };
     // diff: [test_indirectdraw] end
+    // diff: [test_dod5] start
+    static constexpr auto mainPipeline = make_aggregate<
+        "mainPipeline", "transitionImageLayout", "beginRendering", "setPipelineState",
+        "draw", "endRendering">(
+        std::constant_wrapper<[](world_type &world) {
+            auto &globalCtx = world.globalCtx;
+            auto &mainCtx = world.mainCtx;
+            auto &recordCtx = world.recordCtx;
+            auto &pickCtx = world.pickCtx;
 
+            auto &swapchain = globalCtx.swapchain;
+            auto &commandBuffers = globalCtx.commandBuffers;
+
+            const auto &[currentFrame, imageIndex] = recordCtx.info;
+            const auto &commandBuffer = commandBuffers[currentFrame];
+
+            // images
+            auto &pickingImage = pickCtx.image;
+            auto &resolveImage = pickCtx.resolveImage;
+
+            auto &depthResource = mainCtx.depthResource;
+            auto &msaaResource = mainCtx.msaaResource;
+
+            VkImage image = swapchain.image(imageIndex);
+            VkImage depthImage = depthResource.image();
+
+            VkImage msaaImage = msaaResource.image();
+
+            // Before starting rendering,
+            // transition the swapchain image to COLOR_ATTACHMENT_OPTIMAL
+            my_render::transition_image_layout(
+                commandBuffer,
+                my_render::image_info{
+                    .image = image,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            .access_mask = VK_ACCESS_2_NONE,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}},
+                my_render::image_info{
+                    .image = msaaImage,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            .access_mask = VK_ACCESS_2_NONE,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}},
+                my_render::image_info{
+                    .image = depthImage,
+                    .aspect_mask = VK_IMAGE_ASPECT_DEPTH_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            .access_mask = VK_ACCESS_2_NONE,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                            .stage_mask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                          VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT}},
+                //diff: [test_indirectdraw_no_pick] start  转换拾取 MSAA 图像布局
+                my_render::image_info{
+                    .image = *pickingImage,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {VK_IMAGE_LAYOUT_UNDEFINED, VK_ACCESS_2_NONE,
+                            VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                    .dst = {VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}},
+                my_render::image_info{
+                    .image = *resolveImage,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {VK_IMAGE_LAYOUT_UNDEFINED, VK_ACCESS_2_NONE,
+                            VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                    .dst = {VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}}
+                //diff: [test_indirectdraw_no_pick] end
+            );
+        }>{},
+        std::constant_wrapper<[](world_type &world) {
+            auto &globalCtx = world.globalCtx;
+            auto &mainCtx = world.mainCtx;
+            auto &recordCtx = world.recordCtx;
+            auto &pickCtx = world.pickCtx;
+
+            auto &swapchain = globalCtx.swapchain;
+            auto &commandBuffers = globalCtx.commandBuffers;
+
+            const auto &[currentFrame, imageIndex] = recordCtx.info;
+            const auto &commandBuffer = commandBuffers[currentFrame];
+
+            // imageViews
+            auto &depthResource = mainCtx.depthResource;
+            auto &msaaResource = mainCtx.msaaResource;
+
+            VkImageView msaaImageView = msaaResource.imageView();
+            VkImageView imageView = swapchain.imageView(imageIndex);
+            auto &pickingImageView = pickCtx.imageView;
+            auto &pickingResolveImageView = pickCtx.resolveImageView;
+            VkImageView depthImageView = depthResource.imageView();
+            auto imageExtent = swapchain.imageExtent();
+
+            VkRenderingAttachmentInfo colorAttachment = {
+                .sType = sType<VkRenderingAttachmentInfo>(),
+                .imageView = msaaImageView,
+                .imageLayout = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT,
+                .resolveImageView =
+                    imageView, //NOTE: 将msaaImageView的输出替换到imageView，这就是关键
+                .resolveImageLayout =
+                    VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = {.color = {.float32 = {0.0F, 0.0F, 0.0F, 1.0F}}}};
+            //diff: [test_indirectdraw_no_pick] start
+            // 拾取附件（location=1）
+            VkRenderingAttachmentInfo pickAttachment{
+                .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                .imageView = *pickingImageView,
+                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .resolveMode =
+                    VK_RESOLVE_MODE_SAMPLE_ZERO_BIT, // 整数格式必须用 SAMPLE_ZERO
+                .resolveImageView = *pickingResolveImageView,
+                .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = {
+                    .color = {.uint32 = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0}}}}; // NOLINT
+            std::array attachments = {colorAttachment, pickAttachment};
+            //                        ^ 索引 0          ^ 索引 1
+            //diff: [test_indirectdraw_no_pick] end
+
+            VkRenderingAttachmentInfo depthAttachment = {
+                .sType = sType<VkRenderingAttachmentInfo>(),
+                .imageView = depthImageView,
+                .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = {.depthStencil = {.depth = 1.0F}}};
+
+            commandBuffer.beginRendering(
+                {.sType = sType<VkRenderingInfo>(),
+                 .renderArea = {.offset = {.x = 0, .y = 0}, .extent = imageExtent},
+                 .layerCount = 1,
+                 //diff: [test_indirectdraw_no_pick] start
+                 .colorAttachmentCount = static_cast<uint32_t>(attachments.size()),
+                 .pColorAttachments = attachments.data(),
+                 //diff: [test_indirectdraw_no_pick] end
+                 .pDepthAttachment = &depthAttachment});
+        }>{},
+        std::constant_wrapper<[](world_type &world) {
+            auto &globalCtx = world.globalCtx;
+            auto &mainCtx = world.mainCtx;
+            auto &recordCtx = world.recordCtx;
+            auto &mainShaderCtx = world.mainShaderCtx;
+
+            auto &swapchain = globalCtx.swapchain;
+            auto &commandBuffers = globalCtx.commandBuffers;
+
+            const auto &[currentFrame, imageIndex] = recordCtx.info;
+            const auto &commandBuffer = commandBuffers[currentFrame];
+
+            auto &graphicsPipeline = mainCtx.pipeline;
+            auto imageExtent = swapchain.imageExtent();
+            auto &pipelineLayout = mainCtx.pipelineLayout;
+
+            auto &descriptorSets = mainShaderCtx.descriptorSets;
+            auto descriptorSet = descriptorSets[currentFrame];
+
+            commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                       *graphicsPipeline);
+            commandBuffer.setViewport(
+                0, std::array<VkViewport, 1>{
+                       VkViewport{.x = 0.0F,
+                                  .y = 0.0F,
+                                  .width = static_cast<float>(imageExtent.width),
+                                  .height = static_cast<float>(imageExtent.height),
+                                  .minDepth = 0.0F,
+                                  .maxDepth = 1.0F}});
+
+            commandBuffer.setScissor(
+                0, std::array<VkRect2D, 1>{
+                       VkRect2D{.offset = {.x = 0, .y = 0}, .extent = imageExtent}});
+            commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                             *pipelineLayout, 0, 1, &(descriptorSet), 0,
+                                             nullptr);
+        }>{},
+        std::constant_wrapper<[](world_type &world) {
+            auto &mainShaderCtx = world.mainShaderCtx;
+            auto &recordCtx = world.recordCtx;
+            auto &globalCtx = world.globalCtx;
+
+            auto &commandBuffers = globalCtx.commandBuffers;
+
+            const auto &[currentFrame, imageIndex] = recordCtx.info;
+            const auto &commandBuffer = commandBuffers[currentFrame];
+
+            auto &batches = mainShaderCtx.indirectDrawBatches;
+
+            // diff: [test_indirectdraw] start 使用合并索引缓冲和间接绘制
+            auto &batch = batches[currentFrame];
+            if (batch.drawCount > 0)
+            {
+                commandBuffer.bindIndexBuffer(batch.mergedIndexBuffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.drawIndexedIndirect(batch.indirectDrawBuffer.buffer(), 0,
+                                                  batch.drawCount,
+                                                  sizeof(VkDrawIndexedIndirectCommand));
+            }
+            // diff: [test_indirectdraw] start
+        }>{},
+        std::constant_wrapper<[](world_type &world) {
+            auto &mainShaderCtx = world.mainShaderCtx;
+            auto &recordCtx = world.recordCtx;
+            auto &globalCtx = world.globalCtx;
+            auto &pickCtx = world.pickCtx;
+
+            auto &commandBuffers = globalCtx.commandBuffers;
+
+            const auto &[currentFrame, imageIndex] = recordCtx.info;
+            const auto &commandBuffer = commandBuffers[currentFrame];
+
+            auto &resolveImage = pickCtx.resolveImage;
+            auto &pickingResolveImageView = pickCtx.resolveImageView;
+            auto &pickingFrames = pickCtx.frames;
+            auto &pickMouse = pickCtx.mouse;
+
+            auto &mouseValid = pickMouse.valid;
+            auto &mousePos = pickMouse.pos;
+
+            commandBuffer.endRendering();
+            if (mouseValid)
+            {
+                //diff: [test_indirectdraw_no_pick] start
+                // 转换 resolve 目标到 TRANSFER_SRC
+                my_render::transition_image_layout(
+                    commandBuffer,
+                    my_render::image_info{
+                        .image = *resolveImage,
+                        .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .src = {VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                        .dst = {VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                VK_ACCESS_2_TRANSFER_READ_BIT,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
+                //NOTE: 复制到 pickingFrames，就可以读取了，拿到着色器的输出
+                commandBuffer.copyImageToBuffer(
+                    *resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    *pickingFrames[currentFrame],
+                    std::array<VkBufferImageCopy, 1>{VkBufferImageCopy{
+                        .bufferOffset = 0,
+                        .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                        .imageOffset = {mousePos.x, mousePos.y, 0},
+                        .imageExtent = {1, 1, 1}}});
+
+                //diff: [test_indirectdraw_no_pick] end
+            }
+        }>{});
     // NOLINTNEXTLINE
     static constexpr auto recordCommandBuffer = [](world_type &world) {
         auto &globalCtx = world.globalCtx;
-        auto &mainCtx = world.mainCtx;
-        auto &mainShaderCtx = world.mainShaderCtx;
-        auto &pickCtx = world.pickCtx;
         auto &recordCtx = world.recordCtx;
 
         auto &swapchain = globalCtx.swapchain;
         auto &commandBuffers = globalCtx.commandBuffers;
 
-        auto &graphicsPipeline = mainCtx.pipeline;
-        auto &pipelineLayout = mainCtx.pipelineLayout;
-        auto &depthResource = mainCtx.depthResource;
-        auto &msaaResource = mainCtx.msaaResource;
-
-        auto &descriptorSets = mainShaderCtx.descriptorSets;
-        auto &batches = mainShaderCtx.indirectDrawBatches;
-
-        auto &pickingImage = pickCtx.image;
-        auto &pickingImageView = pickCtx.imageView;
-        auto &resolveImage = pickCtx.resolveImage;
-        auto &pickingResolveImageView = pickCtx.resolveImageView;
-        auto &pickingFrames = pickCtx.frames;
-        auto &pickMouse = pickCtx.mouse;
-
-        auto &mouseValid = pickMouse.valid;
-        auto &mousePos = pickMouse.pos;
         auto [currentFrame, imageIndex] = recordCtx.info;
         const auto &commandBuffer = commandBuffers[currentFrame];
-
-        auto descriptorSet = descriptorSets[currentFrame];
         VkImage image = swapchain.image(imageIndex);
-        VkImageView imageView = swapchain.imageView(imageIndex);
-        auto imageExtent = swapchain.imageExtent();
-        VkImage depthImage = depthResource.image();
-        VkImageView depthImageView = depthResource.imageView();
-
-        VkImage msaaImage = msaaResource.image();
-        VkImageView msaaImageView = msaaResource.imageView();
 
         commandBuffer.begin({.sType = sType<VkCommandBufferBeginInfo>()});
-
-        // Before starting rendering,
-        // transition the swapchain image to COLOR_ATTACHMENT_OPTIMAL
-        my_render::transition_image_layout(
-            commandBuffer,
-            my_render::image_info{
-                .image = image,
-                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
-                        .access_mask = VK_ACCESS_2_NONE,
-                        .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
-                .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                        .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                        .stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}},
-            my_render::image_info{
-                .image = msaaImage,
-                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
-                        .access_mask = VK_ACCESS_2_NONE,
-                        .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
-                .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                        .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                        .stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}},
-            my_render::image_info{
-                .image = depthImage,
-                .aspect_mask = VK_IMAGE_ASPECT_DEPTH_BIT,
-                .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
-                        .access_mask = VK_ACCESS_2_NONE,
-                        .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
-                .dst = {.layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-                        .access_mask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                        .stage_mask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                                      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT}},
-            //diff: [test_indirectdraw_no_pick] start  转换拾取 MSAA 图像布局
-            my_render::image_info{
-                .image = *pickingImage,
-                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .src = {VK_IMAGE_LAYOUT_UNDEFINED, VK_ACCESS_2_NONE,
-                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
-                .dst = {VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}},
-            my_render::image_info{
-                .image = *resolveImage,
-                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .src = {VK_IMAGE_LAYOUT_UNDEFINED, VK_ACCESS_2_NONE,
-                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
-                .dst = {VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}}
-            //diff: [test_indirectdraw_no_pick] end
-        );
-
-        VkRenderingAttachmentInfo colorAttachment = {
-            .sType = sType<VkRenderingAttachmentInfo>(),
-            .imageView = msaaImageView,
-            .imageLayout = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT,
-            .resolveImageView =
-                imageView, //NOTE: 将msaaImageView的输出替换到imageView，这就是关键
-            .resolveImageLayout = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-            .clearValue = {.color = {.float32 = {0.0F, 0.0F, 0.0F, 1.0F}}}};
-        //diff: [test_indirectdraw_no_pick] start
-        // 拾取附件（location=1）
-        VkRenderingAttachmentInfo pickAttachment{
-            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView = *pickingImageView,
-            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT, // 整数格式必须用 SAMPLE_ZERO
-            .resolveImageView = *pickingResolveImageView,
-            .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-            .clearValue = {
-                .color = {.uint32 = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0}}}}; // NOLINT
-        std::array attachments = {colorAttachment, pickAttachment};
-        //                        ^ 索引 0          ^ 索引 1
-        //diff: [test_indirectdraw_no_pick] end
-
-        VkRenderingAttachmentInfo depthAttachment = {
-            .sType = sType<VkRenderingAttachmentInfo>(),
-            .imageView = depthImageView,
-            .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-            .clearValue = {.depthStencil = {.depth = 1.0F}}};
-
-        commandBuffer.beginRendering(
-            {.sType = sType<VkRenderingInfo>(),
-             .renderArea = {.offset = {.x = 0, .y = 0}, .extent = imageExtent},
-             .layerCount = 1,
-             //diff: [test_indirectdraw_no_pick] start
-             .colorAttachmentCount = static_cast<uint32_t>(attachments.size()),
-             .pColorAttachments = attachments.data(),
-             //diff: [test_indirectdraw_no_pick] end
-             .pDepthAttachment = &depthAttachment});
-
-        commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *graphicsPipeline);
-        commandBuffer.setViewport(0, std::array<VkViewport, 1>{VkViewport{
-                                         .x = 0.0F,
-                                         .y = 0.0F,
-                                         .width = static_cast<float>(imageExtent.width),
-                                         .height = static_cast<float>(imageExtent.height),
-                                         .minDepth = 0.0F,
-                                         .maxDepth = 1.0F}});
-
-        commandBuffer.setScissor(
-            0, std::array<VkRect2D, 1>{
-                   VkRect2D{.offset = {.x = 0, .y = 0}, .extent = imageExtent}});
-        commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipelineLayout,
-                                         0, 1, &(descriptorSet), 0, nullptr);
-
-        // diff: [test_indirectdraw] start 使用合并索引缓冲和间接绘制
-        auto &batch = batches[currentFrame];
-        if (batch.drawCount > 0)
-        {
-            commandBuffer.bindIndexBuffer(batch.mergedIndexBuffer.buffer(), 0,
-                                          VK_INDEX_TYPE_UINT32);
-            commandBuffer.drawIndexedIndirect(batch.indirectDrawBuffer.buffer(), 0,
-                                              batch.drawCount,
-                                              sizeof(VkDrawIndexedIndirectCommand));
-        }
-        // diff: [test_indirectdraw] start
-
-        commandBuffer.endRendering();
-        if (mouseValid)
-        {
-            //diff: [test_indirectdraw_no_pick] start
-            // 转换 resolve 目标到 TRANSFER_SRC
-            my_render::transition_image_layout(
-                commandBuffer,
-                my_render::image_info{
-                    .image = *resolveImage,
-                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .src = {VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
-                    .dst = {VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                            VK_ACCESS_2_TRANSFER_READ_BIT,
-                            VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
-            //NOTE: 复制到 pickingFrames，就可以读取了，拿到着色器的输出
-            commandBuffer.copyImageToBuffer(
-                *resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                *pickingFrames[currentFrame],
-                std::array<VkBufferImageCopy, 1>{VkBufferImageCopy{
-                    .bufferOffset = 0,
-                    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                    .imageOffset = {mousePos.x, mousePos.y, 0},
-                    .imageExtent = {1, 1, 1}}});
-
-            //diff: [test_indirectdraw_no_pick] end
-        }
+        mainPipeline.transitionImageLayout(world);
+        mainPipeline.beginRendering(world);
+        mainPipeline.setPipelineState(world);
+        mainPipeline.draw(world);
+        mainPipeline.endRendering(world);
 
         // After rendering, transition the swapchain image to PRESENT_SRC
         my_render::transition_image_layout(
@@ -2384,6 +2467,7 @@ try
                         .stage_mask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT}});
         commandBuffer.end();
     };
+    // diff: [test_dod5] end
 
     // NOLINTNEXTLINE
     static constexpr auto recreateSwapChain = [](world_type &world) constexpr {
@@ -2489,86 +2573,77 @@ try
         }
     };
 
-    enum class VulKanStage
-    {
-        ProcessingWorldInput,
-        AfterWaitForFences,
-        BeforeRecordCommandBuffer
-    };
-    using Scheduler = StageScheduler<VulKanStage, void(world_type &)>;
-    Scheduler dataTransformer;
-    dataTransformer.add(VulKanStage::ProcessingWorldInput,
-                        std::constant_wrapper<[](world_type &world) {
-                            FrameRateController(world);
-                            InputController(world);
-                            views_matrix_update(world);
-                            views_perspective_update(world);
-                            model_update(world);
-                        }>{});
-    dataTransformer.add(
-        VulKanStage::AfterWaitForFences, std::constant_wrapper<[](world_type &world) {
-            auto &globalCtx = world.globalCtx;
-            auto &pickCtx = world.pickCtx;
+    //NOTE: 下面的内联做的更好，编译期的数据更利于优化
+    static constexpr auto vulaknDataTransformer =
+        make_aggregate<"vulaknDataTransformer", "ProcessingWorldInput_0",
+                       "AfterWaitForFences_0", "BeforeRecordCommandBuffer_0">(
+            std::constant_wrapper<[](world_type &world) {
+                FrameRateController(world);
+                InputController(world);
+                views_matrix_update(world);
+                views_perspective_update(world);
+                model_update(world);
+            }>{},
+            std::constant_wrapper<[](world_type &world) {
+                auto &globalCtx = world.globalCtx;
+                auto &pickCtx = world.pickCtx;
 
-            auto &frameContext = globalCtx.frameContext;
+                auto &frameContext = globalCtx.frameContext;
 
-            auto &pickMouse = pickCtx.mouse;
-            auto &pickingFrames = pickCtx.frames;
+                auto &pickMouse = pickCtx.mouse;
+                auto &pickingFrames = pickCtx.frames;
 
-            auto &currentFrame = frameContext.currentFrame;
+                auto &currentFrame = frameContext.currentFrame;
 
-            // 等待栅栏后，正式获取图像前
-            if (currentFrame > 0 && pickMouse.valid)
-            {
-                uint32_t readIdx =
-                    (currentFrame - 1 + MAX_FRAMES_IN_FLIGHT) % MAX_FRAMES_IN_FLIGHT;
-                auto *data = static_cast<uint32_t *>(pickingFrames[readIdx].mapPtr());
-                uint32_t objId = data[0];
-                uint32_t primId = data[1];
-                if (objId != 0xFFFFFFFF)
+                // 等待栅栏后，正式获取图像前
+                if (currentFrame > 0 && pickMouse.valid)
                 {
-                    std::cout << "Hover: Object=" << objId << ", Triangle=" << primId
-                              << "\n";
+                    uint32_t readIdx =
+                        (currentFrame - 1 + MAX_FRAMES_IN_FLIGHT) % MAX_FRAMES_IN_FLIGHT;
+                    auto *data = static_cast<uint32_t *>(pickingFrames[readIdx].mapPtr());
+                    uint32_t objId = data[0];
+                    uint32_t primId = data[1];
+                    if (objId != 0xFFFFFFFF)
+                    {
+                        std::cout << "Hover: Object=" << objId << ", Triangle=" << primId
+                                  << "\n";
+                    }
                 }
-            }
-        }>{});
-    dataTransformer.add(VulKanStage::BeforeRecordCommandBuffer,
-                        std::constant_wrapper<[](world_type &world) {
-                            auto &globalCtx = world.globalCtx;
-                            auto &mainShaderCtx = world.mainShaderCtx;
+            }>{},
+            std::constant_wrapper<[](world_type &world) {
+                auto &globalCtx = world.globalCtx;
+                auto &mainShaderCtx = world.mainShaderCtx;
 
-                            auto &frameContext = globalCtx.frameContext;
-                            auto &camera = globalCtx.camera;
+                auto &frameContext = globalCtx.frameContext;
+                auto &camera = globalCtx.camera;
 
-                            auto &currentFrame = frameContext.currentFrame;
+                auto &currentFrame = frameContext.currentFrame;
 
-                            auto &uniformBuffers = mainShaderCtx.uniformBuffers;
+                auto &uniformBuffers = mainShaderCtx.uniformBuffers;
 
-                            //diff: [test_dod3] start
-                            updateObjectData(world, currentFrame);
-                            updateVertexData(world, currentFrame);
-                            prepareBatch(world, currentFrame);
+                //diff: [test_dod3] start
+                updateObjectData(world, currentFrame);
+                updateVertexData(world, currentFrame);
+                prepareBatch(world, currentFrame);
 
-                            auto uploadUniformBuffers = [&]() {
-                                auto *uniformBuffersPtr =
-                                    uniformBuffers[currentFrame].mapPtr();
+                auto uploadUniformBuffers = [&]() {
+                    auto *uniformBuffersPtr = uniformBuffers[currentFrame].mapPtr();
 
-                                UniformBufferObject ubo{};
-                                ubo.view = camera.viewsMatrix();
+                    UniformBufferObject ubo{};
+                    ubo.view = camera.viewsMatrix();
 
-                                ubo.proj = camera.perspectiveMatrix();
-                                ubo.proj[1][1] *= -1;
+                    ubo.proj = camera.perspectiveMatrix();
+                    ubo.proj[1][1] *= -1;
 
-                                // 复制数据到Uniform Buffer
-                                memcpy(uniformBuffersPtr, &ubo, sizeof(ubo));
-                            };
-                            uploadUniformBuffers();
-                            //diff: [test_dod3] end
-                        }>{});
+                    // 复制数据到Uniform Buffer
+                    memcpy(uniformBuffersPtr, &ubo, sizeof(ubo));
+                };
+                uploadUniformBuffers();
+                //diff: [test_dod3] end
+            }>{});
 
     // NOLINTNEXTLINE
-    static constexpr auto drawFrame = [](world_type &world,
-                                         Scheduler &dataTransformer) constexpr {
+    static constexpr auto drawFrame = [](world_type &world) constexpr {
         auto &globalCtx = world.globalCtx;
         auto &pickCtx = world.pickCtx;
         auto &recordCtx = world.recordCtx;
@@ -2593,7 +2668,9 @@ try
         while (device.waitForFences(1, inFlightFences[currentFrame], VK_TRUE,
                                     UINT64_MAX) == VK_TIMEOUT)
             ;
-        dataTransformer.run(VulKanStage::AfterWaitForFences, world);
+
+        invoke_aggregate_ranges<"AfterWaitForFences_", 0, 0>(vulaknDataTransformer,
+                                                             world);
 
         auto [result, imageIndex] = swapchain.acquireNextImage(
             UINT64_MAX, presentCompleteSemaphore[semaphoreIndex], nullptr);
@@ -2606,10 +2683,13 @@ try
             throw std::runtime_error("failed to acquire swap chain image!");
         device.resetFences(1, inFlightFences[currentFrame]);
 
-        dataTransformer.run(VulKanStage::BeforeRecordCommandBuffer, world);
+        invoke_aggregate_ranges<"BeforeRecordCommandBuffer_", 0, 0>(vulaknDataTransformer,
+                                                                    world);
+
         const auto &commandBuffer = commandBuffers[currentFrame];
         commandBuffer.reset({});
         recordCtx.info = {.current_frame = currentFrame, .image_index = imageIndex};
+
         recordCommandBuffer(world);
 
         // NOLINTNEXTLINE
@@ -2646,124 +2726,111 @@ try
     };
     while (globalCtx.window.shouldClose() == 0)
     {
-        dataTransformer.run(VulKanStage::ProcessingWorldInput, world);
+        invoke_aggregate_ranges<"ProcessingWorldInput_", 0, 0>(vulaknDataTransformer,
+                                                               world);
 
-#if (0)
-        auto now = std::chrono::steady_clock::now();
-        static auto lastUpdate = std::chrono::steady_clock::now();
-        if (now - lastUpdate > std::chrono::seconds(2)) // NOLINT
+        //NOTE: 一般是鼠标选中设置指定的mesh。 暂时不知道如何组织。单个实体.或许需要事件系统？
+        // diff: [test_dod5] start
+        // 定时器：每 2 秒切换纹理和网格
         {
-            lastUpdate = now;
-            static bool mipmap = {};
-            mipmap = !mipmap;
-            //NOTE: 会内存递增 一张图 可能 10M。571M停止
-            //NOTE: 保证更新再 draw 之前 肯定是安全的
-            // 选择下一个未占用的槽位（循环使用，或按需指定）
-            uint32_t newSlot = 0;
-            while (activeTextureSlots.count(newSlot) > 0 && newSlot < MAX_TEXTURES)
+            static auto lastUpdate = std::chrono::steady_clock::now();
+            auto now = std::chrono::steady_clock::now();
+            if (now - lastUpdate > std::chrono::seconds(2))
             {
-                ++newSlot;
-            }
-            if (newSlot >= MAX_TEXTURES)
-            {
-                // 槽位已满，可根据需要处理（例如替换最旧的槽）
-                newSlot = 0; // 简单示例
-            }
-            // 创建新纹理并插入映射
-            textureMap[newSlot] =
-                create_texture.templateForImage2d("textures/viking_room.png", mipmap);
-            activeTextureSlots.insert(newSlot);
+                lastUpdate = now;
 
-            // 更新所有飞行帧的描述符集（单个槽）
-            for (size_t frame = 0; frame < MAX_FRAMES_IN_FLIGHT; ++frame)
-            {
-                auto mageInfo = VkDescriptorImageInfo{
-                    .sampler = nullptr,
-                    .imageView = textureMap[newSlot].imageView(),
-                    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-                VkWriteDescriptorSet write{.sType = sType<VkWriteDescriptorSet>(),
-                                           .dstSet = descriptorSets[frame],
-                                           .dstBinding = 1,
-                                           .dstArrayElement = newSlot,
-                                           .descriptorCount = 1,
-                                           .descriptorType =
-                                               VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-                                           .pImageInfo = &mageInfo};
-                device.updateDescriptorSets(1, &write, 0, nullptr);
-            }
-            // 将物体1的纹理索引指向这个新槽
-            textureIndex1 = newSlot;
+                // 1. 选择一个新的纹理槽位（循环使用或找空闲）
+                static uint32_t dynamicSlot = 0;
+                // 若当前槽已被占用，按序找下一个空闲槽，找不到就复用 0
+                while (activeTextureSlots.count(dynamicSlot) > 0 &&
+                       dynamicSlot < MAX_TEXTURES)
+                    ++dynamicSlot;
+                if (dynamicSlot >= MAX_TEXTURES)
+                    dynamicSlot = 0; // 简单环绕
 
-            static bool isTriangle = true;
-            if (isTriangle)
-            {
-                static int gridSize = 5;       // 初始 1x1 网格（即2个三角形）
-                gridSize = (gridSize % 8) + 1; // 循环 1,2,3,...,8 然后回到1
+                // 2. 创建新纹理（动态 mipmap 切换或固定文件）
+                static bool mipmap = false;
+                mipmap = !mipmap;
+                textureMap[dynamicSlot] =
+                    create_texture.templateForImage2d("textures/viking_room.png", mipmap);
+                activeTextureSlots.insert(dynamicSlot);
 
-                std::vector<Vertex> newVertices;
-                std::vector<uint32_t> newIndices;
-
-                int N = gridSize; // 每边分段数
-                int numVertices = (N + 1) * (N + 1);
-                int numTriangles = N * N * 2;
-                int numIndices = numTriangles * 3;
-
-                newVertices.reserve(numVertices);
-                newIndices.reserve(numIndices);
-
-                // 生成顶点网格（从左下角开始，行优先）
-                float step = 1.0f / N; // 边长1.0
-                for (int j = 0; j <= N; ++j)
+                // 3. 更新所有飞行帧的描述符（绑定 1 的指定槽位）
+                for (size_t frame = 0; frame < MAX_FRAMES_IN_FLIGHT; ++frame)
                 {
-                    float y = -0.5f + j * step; // 从下往上
-                    for (int i = 0; i <= N; ++i)
-                    {
-                        float x = -0.5f + i * step; // 从左往右
-                        newVertices.push_back(
-                            {.pos = {x, y, 0.0f},
-                             .color = {1.0f, 1.0f, 1.0f}, // 白色，你可以随意
-                             .texCoord = {static_cast<float>(i) / N,
-                                          static_cast<float>(j) / N}});
-                    }
+                    VkDescriptorImageInfo imgInfo{
+                        .sampler = nullptr,
+                        .imageView = textureMap[dynamicSlot].imageView(),
+                        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+                    VkWriteDescriptorSet write{.sType = sType<VkWriteDescriptorSet>(),
+                                               .dstSet = descriptorSets[frame],
+                                               .dstBinding = 1,
+                                               .dstArrayElement = dynamicSlot,
+                                               .descriptorCount = 1,
+                                               .descriptorType =
+                                                   VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                                               .pImageInfo = &imgInfo};
+                    device.updateDescriptorSets(1, &write, 0, nullptr);
                 }
 
-                // 生成索引（每个小格子两个三角形）
-                for (int j = 0; j < N; ++j)
+                // 4. 修改“自旋”实体的纹理索引（直接通过 SoA 的 view_entity 引用）
+                //    autoSpinId 是实体的 ID，我们这里只需拿到第 0 号实体的纹理索引引用
+                //    （假设只有一个自旋实体，id == 0）
+                auto entityId = 0; // 或你已有的 autoSpinId
+                auto [texRef] = autoSpinStore.view_entity<"textureData">(0, entityId);
+                texRef = dynamicSlot; // 立即更新实体记录的纹理槽位
+
+                // 5. 动态重建网格（三角形 / 四边形切换）
+                static bool useQuad = true;
+                if (useQuad)
                 {
-                    for (int i = 0; i < N; ++i)
-                    {
-                        // 当前格子的四个顶点索引
-                        uint32_t topLeft = j * (N + 1) + i;
-                        uint32_t topRight = j * (N + 1) + i + 1;
-                        uint32_t bottomLeft = (j + 1) * (N + 1) + i;
-                        uint32_t bottomRight = (j + 1) * (N + 1) + i + 1;
+                    // 生成 NxN 网格（N 在 2~8 之间循环）
+                    static int N = 2;
+                    N = (N % 7) + 2; // 2,3,4,...,8
 
-                        // 第一个三角形（左上-右下）
-                        newIndices.push_back(topLeft);
-                        newIndices.push_back(bottomLeft);
-                        newIndices.push_back(bottomRight);
+                    std::vector<Vertex> newVertices;
+                    std::vector<uint32_t> newIndices;
+                    float step = 1.0f / (N - 1);
+                    for (int j = 0; j < N; ++j)
+                        for (int i = 0; i < N; ++i)
+                            newVertices.push_back(
+                                {.pos = {-0.5f + i * step, -0.5f + j * step, 0.0f},
+                                 .color = {1.0f, 1.0f, 1.0f},
+                                 .texCoord = {static_cast<float>(i) / (N - 1),
+                                              static_cast<float>(j) / (N - 1)}});
+                    for (int j = 0; j < N - 1; ++j)
+                        for (int i = 0; i < N - 1; ++i)
+                        {
+                            uint32_t tl = j * N + i;
+                            uint32_t tr = tl + 1;
+                            uint32_t bl = (j + 1) * N + i;
+                            uint32_t br = bl + 1;
+                            newIndices.insert(newIndices.end(), {tl, bl, br, tl, br, tr});
+                        }
 
-                        // 第二个三角形（左上-右上-右下）
-                        newIndices.push_back(topLeft);
-                        newIndices.push_back(bottomRight);
-                        newIndices.push_back(topRight);
-                    }
+                    // 排队更新：通过 SoA 的 vertexUpdateQueue 操作
+                    auto [vertexUpdateQueue] =
+                        autoSpinStore.view_entity<"vertexUpdateQueue">(0, entityId);
+                    vertexUpdateQueue = mesh::vertex_raw_data{std::move(newVertices),
+                                                              std::move(newIndices),
+                                                              MAX_FRAMES_IN_FLIGHT};
+                    std::cout << "网格切换为 " << N << "x" << N
+                              << "，三角形数: " << newIndices.size() / 3 << '\n';
                 }
-
-                input_mesh.queueUpdate(newVertices, newIndices);
-
-                std::cout << "当前网格: " << N << "x" << N
-                          << "，三角形数量: " << numTriangles
-                          << "，primitiveId 范围: 0 ~ " << numTriangles - 1 << "\n";
+                else
+                {
+                    // 回退到原始四边形
+                    auto [vertexUpdateQueue] =
+                        autoSpinStore.view_entity<"vertexUpdateQueue">(0, entityId);
+                    vertexUpdateQueue =
+                        mesh::vertex_raw_data{vertices, indices, MAX_FRAMES_IN_FLIGHT};
+                    std::cout << "网格切换为原始四边形\n";
+                }
+                useQuad = !useQuad;
             }
-            else
-            {
-                input_mesh.queueUpdate(vertices, indices);
-            }
-            isTriangle = !isTriangle;
         }
-#endif
-        drawFrame(world, dataTransformer);
+        // diff: [test_dod5] end
+        drawFrame(world);
     }
     device.waitIdle();
 
