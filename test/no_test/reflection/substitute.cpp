@@ -79,11 +79,14 @@ static_assert(!meta::can_substitute(^^auto_fn, {
 // 2.1 变量模板：is_void_v<int> → false
 constexpr meta::info r_void_int = meta::substitute(^^is_void_v, {
                                                                     ^^int});
+static_assert(not meta::is_type(r_void_int));
 static_assert([:r_void_int:] == false);
 
 // 2.2 变量模板：is_void_v<void> → true
 constexpr meta::info r_void_void = meta::substitute(^^is_void_v, {
                                                                      ^^void});
+static_assert(not meta::is_type(r_void_int));
+static_assert(meta::is_type(meta::type_of(r_void_int)));
 static_assert([:r_void_void:] == true);
 
 // 2.3 别名模板：ptr<int> → int*

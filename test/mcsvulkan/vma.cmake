@@ -134,6 +134,7 @@ add_std_glsl_target(test_dod test_indirectdraw.vert test_texture.frag)
 add_std_glsl_target(test_indirectdraw_no_pick test_indirectdraw_no_pick.vert test_indirectdraw_no_pick.frag)
 add_std_glsl_target(test_dod2 test_indirectdraw_no_pick.vert test_indirectdraw_no_pick.frag)
 add_std_glsl_target(test_dod3 test_indirectdraw_no_pick.vert test_indirectdraw_no_pick.frag)
+add_std_glsl_target(test_dod4 test_indirectdraw_no_pick.vert test_indirectdraw_no_pick.frag)
 
 # end
 std_glsl_env_destroy()

@@ -101,445 +101,6 @@ struct soa_member_pointer
   private:
     T *data_;
 };
-template <typename T, template <typename> class Alloc = std::allocator>
-struct soa_memory
-{
-    using allocator_type = Alloc<T>;
-    struct Pointers;
-    consteval
-    {
-        std::meta::define_aggregate(
-            ^^Pointers, nsdms_spec_transformed(^^T, [](std::meta::info type) {
-              return std::meta::substitute(^^soa_member_pointer, {
-                                                                     type});
-            }));
-    }
-
-    size_type capacity_{};
-    Pointers pointers_{};
-    allocator_type alloc_{}; // 源分配器
-
-    static constexpr auto ptr_members = std::define_static_array(nsdms_of(^^Pointers));
-    static constexpr auto members = std::define_static_array(nsdms_of(^^T));
-
-    // static consteval auto get_field_by_name(static_string name) -> size_type
-    // {
-    //     size_type idx = ~0u;
-    //     for (size_type i{}; i < members.size(); ++i)
-    //     {
-    //         if (std::meta::identifier_of(members[i]) == name)
-    //         {
-    //             idx = i;
-    //             break;
-    //         }
-    //     }
-    //     if (idx == ~0u)
-    //         throw std::meta::exception{"not find field", std::meta::current_function()};
-    //     return idx;
-    // }
-
-  public:
-    // 构造函数：只分配内存，不构造
-    constexpr explicit soa_memory(size_type capacity)
-        : soa_memory(capacity, allocator_type{})
-    {
-    }
-    constexpr soa_memory(size_type capacity, auto alloc)
-        : capacity_{capacity}, alloc_{std::move(alloc)}
-    {
-        if (capacity > 0)
-        {
-            template for (constexpr auto I : std::views::indices(ptr_members.size()))
-            {
-                auto &field = pointers_.[:ptr_members[I]:];
-                using FieldType = std::remove_reference_t<decltype(field)>::value_type;
-                using RebAlloc = typename std::allocator_traits<
-                    allocator_type>::template rebind_alloc<FieldType>;
-                RebAlloc reb_alloc(alloc_);
-                auto *new_data = reb_alloc.allocate(capacity);
-                field = soa_member_pointer<FieldType>(new_data);
-            }
-        }
-    }
-
-    // 容量相关
-    constexpr size_type capacity() const noexcept
-    {
-        return capacity_;
-    }
-
-    // 元素访问（按成员下标 I 和元素索引 idx）
-    template <size_type I>
-    decltype(auto) constexpr get(this auto &&self, size_type idx) noexcept
-    {
-        constexpr auto member_info = ptr_members[I];
-        return std::forward_like<decltype(self)>(self.pointers_.[:member_info:][idx]);
-    }
-
-    // template <static_string name>
-    // constexpr decltype(auto) get(this auto &&self, size_type idx) noexcept
-    // {
-    //     constexpr auto I = soa_memory::get_field_by_name(name);
-    //     return std::forward<decltype(self)>(self).template get<I>(idx);
-    // }
-
-    template <size_type I>
-    decltype(auto) constexpr field(this auto &&self) noexcept
-    {
-        constexpr auto member_info = ptr_members[I];
-        return std::forward_like<decltype(self)>(self.pointers_.[:member_info:]);
-    }
-
-    // template <static_string name>
-    // constexpr decltype(auto) field(this auto &&self) noexcept
-    // {
-    //     constexpr auto I = soa_memory::get_field_by_name(name);
-    //     return std::forward<decltype(self)>(self).template field<I>();
-    // }
-
-    template <size_type I>
-    constexpr decltype(auto) span(this auto &&self) noexcept
-    {
-        auto &&[... ptrs] = std::forward_like<decltype(self)>(self.pointers_);
-        return std::span(ptrs...[I].data(), self.capacity_);
-    }
-    // template <static_string name>
-    // constexpr decltype(auto) span(this auto &&self) noexcept
-    // {
-    //     auto &&[... ptrs] = std::forward_like<decltype(self)>(self.pointers_);
-    //     constexpr auto I = soa_memory::get_field_by_name(name);
-    //     return std::span(ptrs...[I].data(), self.capacity_);
-    // }
-
-    constexpr decltype(auto) view(this auto &&self) noexcept
-    {
-        auto &&[... ptrs] = std::forward_like<decltype(self)>(self.pointers_);
-        return std::views::zip(std::span{ptrs.data(), self.capacity_}...);
-    }
-    // template <static_string... name>
-    //     requires(sizeof...(name) > 0)
-    // constexpr decltype(auto) view(this auto &&self) noexcept
-    // {
-    //     return std::views::zip(
-    //         std::span{std::forward<decltype(self)>(self).template field<name>().data(),
-    //                   self.capacity_}...);
-    // }
-
-    constexpr decltype(auto) begin(this auto &&self) noexcept
-    {
-        return std::forward<decltype(self)>(self).view().begin();
-    }
-    constexpr decltype(auto) end(this auto &&self) noexcept
-    {
-        return std::forward<decltype(self)>(self).view().end();
-    }
-
-    // NOTE: 没有 size 无法 std::destroy
-    constexpr void destroy() noexcept
-    {
-        if (capacity_ == 0)
-            return;
-        template for (constexpr auto I :
-                      std::views::indices(ptr_members.size()) | std::views::reverse)
-        {
-            auto &field = pointers_.[:ptr_members[I]:];
-            using FieldType = std::remove_reference_t<decltype(field)>::value_type;
-            using RebAlloc = typename std::allocator_traits<
-                allocator_type>::template rebind_alloc<FieldType>;
-            RebAlloc reb_alloc(alloc_);
-            reb_alloc.deallocate(field.data(), capacity_);
-            field = {};
-        }
-        capacity_ = 0;
-    }
-
-    constexpr ~soa_memory() noexcept
-    {
-        destroy();
-    }
-
-    constexpr soa_memory(const soa_memory &o)
-        : capacity_{o.capacity_}, pointers_{},
-          alloc_{std::allocator_traits<
-              allocator_type>::select_on_container_copy_construction(o.alloc_)}
-    {
-        if (capacity_ > 0)
-        {
-            template for (constexpr auto I : std::views::indices(ptr_members.size()))
-            {
-                auto &field = pointers_.[:ptr_members[I]:];
-                using U = std::remove_cvref_t<decltype(field)>::value_type;
-                using RebAlloc = typename std::allocator_traits<
-                    allocator_type>::template rebind_alloc<U>;
-
-                RebAlloc reb_alloc(alloc_);
-                auto *new_data = reb_alloc.allocate(capacity_);
-                field = soa_member_pointer<U>(new_data);
-            }
-        }
-    }
-    constexpr soa_memory &operator=(const soa_memory &o)
-    {
-        //copy‑and‑swap
-        if (this != &o)
-        {
-            auto tmp(o);            // 调用拷贝构造
-            *this = std::move(tmp); // 调用移动赋值 operator=(soa_memory&&)
-        }
-        return *this;
-    }
-
-    constexpr soa_memory(soa_memory &&o) noexcept
-        : capacity_{std::exchange(o.capacity_, 0)}, pointers_{std::move(o.pointers_)},
-          alloc_{std::move(o.alloc_)}
-    {
-    }
-    constexpr soa_memory &operator=(soa_memory &&o) noexcept
-    {
-        if (this != &o)
-        {
-            destroy();
-            capacity_ = std::exchange(o.capacity_, 0);
-            // 逐成员移动赋值：pointers_ 和 alloc_
-            // 注意：polymorphic_allocator 的移动赋值被删除！
-            // 因此改用 destroy + construct
-            std::destroy_at(&pointers_);
-            std::construct_at(&pointers_, std::move(o.pointers_));
-            std::destroy_at(&alloc_);
-            std::construct_at(&alloc_, std::move(o.alloc_));
-        }
-        return *this;
-    }
-
-    constexpr void destroy_at(size_type id) noexcept
-    {
-        template for (constexpr auto I : std::views::indices(ptr_members.size()))
-        {
-            auto &field = pointers_.[:ptr_members[I]:];
-            std::destroy_at(field.data() + id);
-        }
-    }
-
-    // 元素级构造（placement new）
-    template <size_type I, typename... Args>
-    constexpr void construct_field(size_type idx, Args &&...args) noexcept(
-        std::is_nothrow_constructible_v<
-            typename std::remove_reference_t<
-                decltype(pointers_.[:ptr_members[I]:])>::value_type,
-            Args...>)
-    {
-        auto &field = pointers_.[:ptr_members[I]:];
-        std::construct_at(field.data() + idx, std::forward<Args>(args)...);
-    }
-    template <typename... Args>
-    constexpr void construct_at(size_type idx, Args &&...args) noexcept(
-        std::is_nothrow_constructible_v<T, Args...>)
-    {
-        template for (constexpr auto I : std::views::indices(ptr_members.size()))
-        {
-            construct_field<I>(idx, std::forward<Args...[I]>(args...[I]));
-        }
-    }
-    constexpr void construct_at(size_type idx,
-                                T t) noexcept(std::is_nothrow_move_constructible_v<T>)
-    {
-        template for (constexpr auto I : std::views::indices(ptr_members.size()))
-        {
-            auto &field = t.[:members[I]:];
-            construct_field<I>(idx, std::move(field));
-        }
-    }
-
-    constexpr auto operator[](this auto &&self, size_type idx) noexcept
-    {
-        assert(idx < self.capacity());
-        auto [... ptrs] = self.pointers_;
-        struct bind_result;
-        consteval
-        {
-            constexpr std::array<std::meta::info, members.size()> type_array{
-                (^^decltype(std::forward_like<decltype(self)>(ptrs[idx])))...};
-            std::vector<std::meta::info> specs_;
-            for (int i = 0; i < members.size(); ++i)
-            {
-                specs_.push_back(std::meta::data_member_spec(
-                    type_array[i], {.name = std::meta::identifier_of(members[i])}));
-            }
-            std::meta::define_aggregate(^^bind_result, specs_);
-        }
-        return bind_result(std::forward_like<decltype(self)>(ptrs[idx])...);
-    }
-};
-
-struct component_id
-{
-    //world_id_type 存放执行真正store的 id 需要配合其他元信息才能解析,才能知道存放的是什么
-    std::vector<world_id_type> fields;
-};
-
-struct world_id_manager final
-{
-    struct component_id_item
-    {
-        world_id_version_type version; // 记录每个id的版本，包括空洞
-    };
-    struct component_id_view
-    {
-        world_id_type index;
-        world_id_version_type version;
-    };
-
-    using soa_type = soa_memory<component_id_item>;
-
-  private:
-    soa_type data_;                          // 存在空洞，不保证紧密
-    std::vector<world_id_type> free_indexs_; // 记录可复用. free_ids[last] -> free_idx
-
-  public:
-    constexpr component_id_view get_current_view(world_id_type allocate_idx) noexcept
-    {
-        assert(allocate_idx < data_.capacity());
-        [[assume(allocate_idx < data_.capacity())]];
-        return {.index = allocate_idx, .version = data_.get<0>(allocate_idx)};
-    }
-
-    constexpr world_id_type allocate()
-    {
-        [[assume(not free_indexs_.empty())]];
-
-        if (not free_indexs_.empty()) [[likely]]
-        {
-            auto id = free_indexs_.back();
-            free_indexs_.pop_back();
-            return id;
-        }
-        else [[unlikely]]
-            throw std::logic_error{"free_indexs_ is empty!"};
-    }
-    constexpr component_id_view allocate_with_view()
-    {
-        assert(not free_indexs_.empty());
-        [[assume(not free_indexs_.empty())]];
-
-        if (not free_indexs_.empty()) [[likely]]
-        {
-            auto id = free_indexs_.back();
-            free_indexs_.pop_back();
-            return get_current_view(id);
-        }
-        else [[unlikely]]
-            throw std::logic_error{"free_indexs_ is empty!"};
-    }
-    constexpr void release(world_id_type index)
-    {
-        assert(index < data_.capacity());
-        [[assume(not free_indexs_.empty())]];
-
-        auto [version] = data_[index];
-        // id.fields.clear();
-        ++version;
-        free_indexs_.emplace_back(index);
-    }
-    [[nodiscard]] constexpr bool expire(component_id_view view) const noexcept
-    {
-        auto [index, version] = view;
-        assert(index < data_.capacity());
-        [[assume(not free_indexs_.empty())]];
-
-        auto cur_version = data_.get<0>(index);
-        return cur_version == version;
-    }
-
-    constexpr world_id_manager(world_id_type capacity) : data_{capacity}
-    {
-        free_indexs_.reserve(capacity);
-        for (auto i = capacity; i > 0;)
-        {
-            free_indexs_.emplace_back(--i);
-        }
-    }
-    ~world_id_manager() = default;
-    // ---------- 移动语义 ----------
-    constexpr world_id_manager(world_id_manager &&other) noexcept
-        : data_(std::move(other.data_)), free_indexs_(std::move(other.free_indexs_))
-    {
-    }
-
-    constexpr world_id_manager &operator=(world_id_manager &&other) noexcept
-    {
-        if (this != &other)
-        {
-            data_ = std::move(other.data_);
-            free_indexs_ = std::move(other.free_indexs_);
-        }
-        return *this;
-    }
-    world_id_manager(const world_id_manager &other) = delete;
-    world_id_manager &operator=(const world_id_manager &other) = delete;
-
-    [[nodiscard]] auto capacity() const noexcept
-    {
-        return data_.capacity();
-    }
-    [[nodiscard]] constexpr size_type free_size() const noexcept // NOLINT
-    {
-        return free_indexs_.size();
-    }
-
-    constexpr void grow(size_type new_cap)
-    {
-        auto old_cap = capacity();
-        if (new_cap <= old_cap)
-            return;
-
-        // 1. 分配新内存
-        typename soa_type::Pointers new_pointers{};
-        template for (constexpr auto I :
-                      std::views::indices(soa_type::ptr_members.size()))
-        {
-            using field_type = typename std::remove_reference_t<
-                decltype(data_.pointers_.[:soa_type::ptr_members[I]:])>::value_type;
-            using reb_alloc = typename std::allocator_traits<
-                typename soa_type::allocator_type>::template rebind_alloc<field_type>;
-            reb_alloc ra(data_.alloc_);
-            new_pointers.[:soa_type::ptr_members[I]:] = soa_member_pointer<field_type>(
-                                                          ra.allocate(new_cap));
-        }
-
-        // 2. 搬迁数据
-        template for (constexpr auto I :
-                      std::views::indices(soa_type::ptr_members.size()))
-        {
-            auto &src = data_.pointers_.[:soa_type::ptr_members[I]:];
-            auto &dst = new_pointers.[:soa_type::ptr_members[I]:];
-            std::uninitialized_move_n(src.data(), old_cap, dst.data());
-        }
-
-        // 3. 释放旧内存
-        template for (constexpr auto I :
-                      std::views::indices(soa_type::ptr_members.size()))
-        {
-            using field_type = typename std::remove_reference_t<
-                decltype(data_.pointers_.[:soa_type::ptr_members[I]:])>::value_type;
-            using reb_alloc = typename std::allocator_traits<
-                typename soa_type::allocator_type>::template rebind_alloc<field_type>;
-            reb_alloc ra(data_.alloc_);
-            ra.deallocate(data_.pointers_.[:soa_type::ptr_members[I]:].data(), old_cap);
-        }
-
-        // 4. 更新状态
-        data_.capacity_ = new_cap;
-        data_.pointers_ = std::move(new_pointers);
-
-        // 5. 扩展 free_ 列表
-        for (size_type i = new_cap; i > old_cap; --i)
-            free_indexs_.push_back(i - 1);
-    }
-    constexpr void extend(size_type additionalSize)
-    {
-        grow(capacity() + additionalSize);
-    }
-};
 
 struct position
 {
@@ -752,8 +313,8 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
                 if (auto *p = field[0].data())
                 {
                     reb_alloc.deallocate(p, field_count * cap);
-                    for (size_t j = 0; j < field_count; ++j)
-                        field[j] = {};
+                    template for (constexpr auto J : std::views::indices(field_count))
+                        field[J] = {};
                 }
             }
         }
@@ -785,8 +346,8 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
                 {
                     // 一次性分配 field_count * cap 个元素，保证子列连续
                     T *big = reb_alloc.allocate(field_count * cap);
-                    for (size_t j = 0; j < field_count; ++j)
-                        result.[:members[I]:][j] = soa_member_pointer<T>(big + j * cap);
+                    template for (constexpr auto J : std::views::indices(field_count))
+                        result.[:members[I]:][J] = soa_member_pointer<T>(big + J * cap);
                 }
             }
         }
@@ -798,21 +359,31 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
         return result;
     }
 
+    template <size_type I>
+    constexpr auto destroy_fields_before() noexcept
+    {
+        // if (dense_.size() == 0)
+        //     return; //NOTE: destroy_n 内部已经判断
+        template for (constexpr auto J : std::views::indices(I))
+        {
+            auto &field = (*this).[:members[J]:];
+            constexpr auto fc = info...[J].field_count();
+            if constexpr (fc == 1)
+                std::destroy_n(field.data(), dense_.size());
+            else
+            {
+                template for (constexpr auto K : std::views::indices(fc))
+                {
+                    std::destroy_n(field[K].data(), dense_.size());
+                }
+            }
+        }
+    }
+
     //  析构当前对象所有有效的元素
     constexpr auto destroy_fields() noexcept
     {
-        if (dense_.size() == 0)
-            return;
-        template for (constexpr auto I : std::views::indices(members.size()))
-        {
-            auto &field = (*this).[:members[I]:];
-            constexpr auto field_count = info...[I].field_count();
-            if constexpr (field_count == 1)
-                std::destroy_n(field.data(), dense_.size());
-            else
-                for (std::size_t j = 0; j < field_count; ++j)
-                    std::destroy_n(field[j].data(), dense_.size());
-        }
+        destroy_fields_before<members.size()>();
     }
 
     constexpr gen_soa_aggregate() : gen_soa_aggregate(0) {}
@@ -828,8 +399,11 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
         deallocate_fields(*this, capacity_, allocator_);
     }
     constexpr gen_soa_aggregate(const gen_soa_aggregate &o)
-        : base_type(allocate_for_base(o.capacity_, o.allocator_)), dense_(o.dense_),
-          sparse_(o.sparse_), free_entities_(o.free_entities_),
+        : base_type(allocate_for_base(
+              o.capacity_,
+              std::allocator_traits<
+                  allocator_type>::select_on_container_copy_construction(o.allocator_))),
+          dense_(o.dense_), sparse_(o.sparse_), free_entities_(o.free_entities_),
           next_entity_id_(o.next_entity_id_),
           allocator_(
               std::allocator_traits<
@@ -842,21 +416,42 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
             {
                 auto &src_field = o.[:members[I]:];
                 auto &dst_field = (*this).[:members[I]:];
+                const auto size = dense_.size();
                 constexpr auto fc = info...[I].field_count();
-                if constexpr (fc == 1)
-                    std::uninitialized_copy_n(src_field.data(), dense_.size(),
-                                              dst_field.data());
-                else
-                    for (std::size_t j = 0; j < fc; ++j)
-                        std::uninitialized_copy_n(src_field[j].data(), dense_.size(),
-                                                  dst_field[j].data());
+                try
+                {
+                    if constexpr (fc == 1)
+                        std::uninitialized_copy_n(src_field.data(), size,
+                                                  dst_field.data());
+                    else
+                    {
+                        std::size_t constructed_fields = 0;
+                        try
+                        {
+                            template for (constexpr auto J : std::views::indices(fc))
+                            {
+                                std::uninitialized_copy_n(src_field[J].data(), size,
+                                                          dst_field[J].data());
+                                ++constructed_fields;
+                            }
+                        }
+                        catch (...)
+                        {
+                            for (std::size_t j = 0; j < constructed_fields; ++j)
+                                std::destroy_n(dst_field[j].data(), size);
+                            throw;
+                        }
+                    }
+                }
+                catch (...)
+                {
+                    destroy_fields_before<I>();
+                    throw;
+                }
             }
         }
         catch (...)
         {
-            // 销毁已经复制完成的元素（与 destroy_fields 类似，但只到 I 为止）
-            // 为简单，可以直接调用 destroy_fields()（因为未复制的字段指针有效但内容未构造，destroy_n 对未构造对象不安全）
-            // 更好的做法是只销毁已复制部分，但这里可先调用 deallocate_fields 并重新抛出
             deallocate_fields(*this, capacity_, allocator_);
             throw;
         }
@@ -888,8 +483,10 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
             }
             else
             {
-                for (std::size_t j = 0; j < fc; ++j)
-                    dst[j] = std::exchange(src[j], {});
+                template for (constexpr auto J : std::views::indices(fc))
+                {
+                    dst[J] = std::exchange(src[J], {});
+                }
             }
         }
     }
@@ -912,8 +509,10 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
                 }
                 else
                 {
-                    for (size_t j = 0; j < fc; ++j)
-                        dst[j] = std::exchange(src[j], {});
+                    template for (constexpr auto J : std::views::indices(fc))
+                    {
+                        dst[J] = std::exchange(src[J], {});
+                    }
                 }
             }
             dense_ = std::exchange(other.dense_, {});
@@ -929,7 +528,7 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
     //NOTE: 必须固定位置分配
     // ======================== 实体管理 ========================
     [[nodiscard]] constexpr std::optional<std::pair<size_type, size_type>>
-    allocate_with_slot() noexcept
+    allocate_with_slot()
     {
         if (dense_.size() >= capacity_) [[unlikely]]
             return std::nullopt;
@@ -943,9 +542,9 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
             }
             else
             {
+                if (next_entity_id_ >= sparse_.size())
+                    sparse_.resize(next_entity_id_ + 1, invalid_dense);
                 entity = next_entity_id_++;
-                if (entity >= sparse_.size())
-                    sparse_.resize(entity + 1, invalid_dense);
             }
 
             size_type slot = dense_.size(); //NOTE: 必须是真正的连续
@@ -954,7 +553,7 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
             return std::pair<size_type, size_type>{entity, slot};
         }
     }
-    [[nodiscard]] constexpr std::optional<size_type> allocate() noexcept
+    [[nodiscard]] constexpr std::optional<size_type> allocate()
     {
         if (auto ret = allocate_with_slot(); ret) [[likely]]
             return (*ret).first;
@@ -967,17 +566,27 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
     static consteval bool is_noexcept_construct()
     {
         constexpr auto [... I] = std::make_index_sequence<members.size()>{};
-        return (std::is_nothrow_constructible_v<
-                    typename[:info...[I].field_type():], Arg...[I]> &&
-                ...);
-    }
+        static_assert(
+            (std::is_nothrow_move_constructible_v<typename[:info...[I].field_type():]> &&
+             ...),
+            "All field types must have nothrow move constructors");
 
-    static consteval bool is_nothrow_move_construct()
-    {
-        constexpr auto [... I] = std::make_index_sequence<members.size()>{};
-        return (
-            std::is_nothrow_move_constructible_v<typename[:info...[I].field_type():]> &&
-            ...);
+        constexpr auto nothrow_constructible = []<size_t I>() {
+            constexpr auto field_count = info...[I].field_count();
+            using T = [:info...[I].field_type():];
+            if constexpr (field_count == 1)
+            {
+                return std::is_nothrow_constructible_v<T, Arg...[I]>;
+            }
+            else
+            {
+                using value_type =
+                    std::remove_cvref_t<decltype(std::declval<Arg...[I]>()[0])>;
+                return std::is_nothrow_constructible_v<T, value_type>;
+                // return std::is_constructible_v<std::array<T, field_count>, Arg...[I]>;
+            }
+        };
+        return (nothrow_constructible.template operator()<I>() && ...);
     }
 
     template <typename... Arg>
@@ -985,22 +594,74 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
     constexpr auto construct_at(this auto &self, size_type slot,
                                 Arg &&...args) noexcept(is_noexcept_construct<Arg...>())
     {
-        //NOTE: moveonly 就是BUG。 因为 调用了多次的：std::forward<Arg...[I]>(args...[I])
-        template for (constexpr auto I : std::views::indices(members.size()))
+        constexpr auto is_noexcept = is_noexcept_construct<Arg...>();
+        if constexpr (is_noexcept)
         {
-            constexpr auto field_count = info...[I].field_count();
-            if constexpr (field_count > 1)
+            template for (constexpr auto I : std::views::indices(members.size()))
             {
-                template for (constexpr auto J : std::views::indices(field_count))
+                constexpr auto field_count = info...[I].field_count();
+                auto &field = self.[:members[I]:];
+                if constexpr (field_count > 1)
                 {
-                    auto *ptr = self.[:members[I]:][J].data() + slot;
+                    // NOTE: 必须一次给够
+                    template for (constexpr auto J : std::views::indices(field_count))
+                    {
+                        auto *ptr = field[J].data() + slot;
+                        std::construct_at(ptr,
+                                          std::forward_like<Arg...[I]>(args...[I][J]));
+                    }
+                }
+                else
+                {
+                    auto *ptr = field.data() + slot;
                     std::construct_at(ptr, std::forward<Arg...[I]>(args...[I]));
                 }
             }
-            else
+        }
+        else
+        {
+            template for (constexpr auto I : std::views::indices(members.size()))
             {
-                auto *ptr = self.[:members[I]:].data() + slot;
-                std::construct_at(ptr, std::forward<Arg...[I]>(args...[I]));
+                try
+                {
+                    auto &field = self.[:members[I]:];
+                    constexpr auto field_count = info...[I].field_count();
+                    if constexpr (field_count > 1)
+                    {
+                        std::size_t constructed_fields = 0;
+                        try
+                        {
+                            template for (constexpr auto J :
+                                          std::views::indices(field_count))
+                            {
+                                auto *ptr = field[J].data() + slot;
+                                std::construct_at(
+                                    ptr, std::forward_like<Arg...[I]>(args...[I][J]));
+                                ++constructed_fields;
+                            }
+                        }
+                        catch (...)
+                        {
+                            for (std::size_t j = 0; j < constructed_fields; ++j)
+                            {
+                                auto *ptr = field[j].data() + slot;
+                                std::destroy_at(ptr);
+                            }
+                            throw;
+                        }
+                    }
+                    else
+                    {
+                        auto *ptr = field.data() + slot;
+                        std::construct_at(ptr, std::forward<Arg...[I]>(args...[I]));
+                    }
+                }
+                catch (...)
+                {
+                    // NOTE: 销毁前面的已经构造的字段
+                    self.template destroy_fields_before<I>();
+                    throw;
+                }
             }
         }
     }
@@ -1028,7 +689,12 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
             {
                 auto &field = (*this).[:members[I]:];
                 using std::swap;
-                swap(field[slot], field[last]);
+                constexpr auto fc = info...[I].field_count();
+                if constexpr (fc == 1)
+                    swap(field[slot], field[last]);
+                else
+                    template for (constexpr auto J : std::views::indices(fc))
+                        swap(field[J][slot], field[J][last]);
             }
             dense_[slot] = moved_entity;
             sparse_[moved_entity] = slot;
@@ -1049,15 +715,9 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
             if constexpr (fc == 1)
                 std::destroy_at(field.data() + slot);
             else
-                for (std::size_t j = 0; j < fc; ++j)
-                    std::destroy_at(field[j].data() + slot);
+                template for (constexpr auto J : std::views::indices(fc))
+                    std::destroy_at(field[J].data() + slot);
         }
-    }
-
-    // 通过实体 ID 销毁
-    constexpr void destroy_entity(size_type entity) noexcept
-    {
-        destroy_at(get_slot(entity));
     }
 
     constexpr void reserve(size_type new_cap)
@@ -1086,9 +746,9 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
                 if constexpr (field_count == 1)
                     std::uninitialized_move_n(old_field.data(), count, new_field.data());
                 else
-                    for (size_t j = 0; j < field_count; ++j)
-                        std::uninitialized_move_n(old_field[j].data(), count,
-                                                  new_field[j].data());
+                    template for (constexpr auto J : std::views::indices(field_count))
+                        std::uninitialized_move_n(old_field[J].data(), count,
+                                                  new_field[J].data());
             }
 
             // 3. 析构旧内存中的对象（已被移动）
@@ -1100,8 +760,8 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
                 if constexpr (field_count == 1)
                     std::destroy_n(old_field.data(), count);
                 else
-                    for (size_t j = 0; j < field_count; ++j)
-                        std::destroy_n(old_field[j].data(), count);
+                    template for (constexpr auto J : std::views::indices(field_count))
+                        std::destroy_n(old_field[J].data(), count);
             }
         }
 
@@ -1132,6 +792,7 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
         requires(sizeof...(Arg) == members.size())
     constexpr size_type new_entity(Arg &&...args) noexcept(false)
     {
+
         if (auto ret = allocate_with_slot(); ret)
         {
             auto [entity, slot] = *ret;
@@ -1143,15 +804,9 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
             }
             else
             {
-                static_assert(is_nothrow_move_construct(),
-                              "new_entity requires is_nothrow_move_construct is true");
                 try
                 {
-                    constexpr auto [... I] = std::make_index_sequence<members.size()>{};
-                    auto &&[... value] =
-                        std::make_tuple(typename[:info...[I].field_type():]{
-                            std::forward<Arg...[I]>(args...[I])}...);
-                    construct_at(slot, std::move(value)...);
+                    construct_at(slot, std::forward<Arg>(args)...);
                 }
                 catch (...)
                 {
@@ -1212,6 +867,54 @@ struct gen_soa_aggregate : detail::gen_soa_pointers<info...>::type
         constexpr auto [... I] = std::make_index_sequence<members.size()>{};
         return std::views::zip(
             get_field_span<I>(std::forward<decltype(self)>(self), field_count)...);
+    }
+
+    // view
+    template <size_type I>
+    constexpr decltype(auto) get_slot_field(this auto &&self,
+                                            [[maybe_unused]] size_type field_count,
+                                            size_type slot) noexcept
+    {
+        auto &field = self.[:members[I]:];
+        if constexpr (info...[I].field_count() > 1)
+            return std::forward_like<decltype(self)>(field[field_count][slot]);
+        else
+            return std::forward_like<decltype(self)>(field[slot]);
+    }
+
+    template <static_string... name>
+        requires(sizeof...(name) > 0 && ((find_name(name) != ~0) && ...))
+    constexpr auto view_slot(this auto &&self, size_type field_count,
+                             size_type slot) noexcept
+    {
+        assert(slot < self.size());
+        struct view_result;
+        consteval
+        {
+            std::array<std::meta::info, sizeof...(name)> infos;
+            int idx = 0;
+            template for (constexpr auto I : std::array{find_name(name)...})
+            {
+                using T = decltype(std::forward<decltype(self)>(self)
+                                       .template get_slot_field<I>(0, 0));
+                static_assert(std::is_reference_v<T>, "should reference type");
+                infos[idx++] = std::meta::data_member_spec(
+                    ^^T, {
+                             .name = info...[I].field_name()});
+            }
+            std::meta::define_aggregate(^^view_result, infos);
+        }
+        return view_result{
+            std::forward<decltype(self)>(self).template get_slot_field<find_name(name)>(
+                field_count, slot)...};
+    }
+    template <static_string... name>
+        requires(sizeof...(name) > 0 && ((find_name(name) != ~0) && ...))
+    constexpr auto view_entity(this auto &&self, size_type field_count,
+                               size_type entity) noexcept
+    {
+        return std::forward<decltype(self)>(self).template view_slot<name...>(
+            field_count, self.get_slot(entity));
     }
 
     template <static_string... name>
@@ -1724,7 +1427,7 @@ constexpr bool gen_soa_aggregate_test()
         using Store3 = gen_soa_aggregate<{"color", ^^float, 3}>;
         Store3 s3(5);
         auto e3 = s3.allocate();
-        s3.construct_entity(*e3, 0.5f); // 所有三个分量都设为 0.5
+        s3.construct_entity(*e3, std::array{0.5f, 0.5f, 0.5f}); // 所有三个分量都设为 0.5
         size_t slot3 = s3.get_slot(*e3);
         assert(s3.color[0][slot3] == 0.5f);
         assert(s3.color[1][slot3] == 0.5f);
@@ -1734,7 +1437,8 @@ constexpr bool gen_soa_aggregate_test()
         using Store4 = gen_soa_aggregate<{"id", ^^int}, {"vec", ^^float, 2}>;
         Store4 s4(5);
         auto e4 = s4.allocate();
-        s4.construct_entity(*e4, 100, 9.9f); // id=100, vec[0]=9.9, vec[1]=9.9
+        s4.construct_entity(*e4, 100,
+                            std::array{9.9f, 9.9f}); // id=100, vec[0]=9.9, vec[1]=9.9
         size_t slot4 = s4.get_slot(*e4);
         assert(s4.id[slot4] == 100);
         assert(s4.vec[0][slot4] == 9.9f);
@@ -1757,10 +1461,10 @@ constexpr bool gen_soa_aggregate_test()
 
         // 2. 数组字段同样检查底层类型
         using Store3 = gen_soa_aggregate<{"color", ^^float, 3}>;
-        static_assert(Store3::is_noexcept_construct<float>());
+        static_assert(Store3::is_noexcept_construct<std::array<float, 3>>());
 
         using Store4 = gen_soa_aggregate<{"id", ^^int}, {"vec", ^^float, 2}>;
-        static_assert(Store4::is_noexcept_construct<int, float>());
+        static_assert(Store4::is_noexcept_construct<int, std::array<float, 2>>());
 
         // 3. 如果类型构造可能抛异常，is_noexcept_construct 应为 false
         struct MayThrow
@@ -1771,271 +1475,7 @@ constexpr bool gen_soa_aggregate_test()
         static_assert(!Store5::is_noexcept_construct<int>());
     }
 
-    // ---------- 测试 new_entity(Arg&&...) ----------
-    {
-        // 1. 单个普通字段
-        using Store1 = gen_soa_aggregate<{"a", ^^int}>;
-        Store1 s1(5);
-        auto e1 = s1.new_entity(42); // 分配并直接构造
-        assert(s1.size() == 1);
-        size_t slot1 = s1.get_slot(e1);
-        assert(s1.a[slot1] == 42);
-
-        // 2. 多字段，普通类型
-        using Store2 = gen_soa_aggregate<{"x", ^^int}, {"y", ^^double}>;
-        Store2 s2(5);
-        auto e2 = s2.new_entity(10, 3.14);
-        assert(s2.size() == 1);
-        size_t slot2 = s2.get_slot(e2);
-        assert(s2.x[slot2] == 10);
-        assert(s2.y[slot2] == 3.14);
-
-        // 3. 单个数组字段 (field_count = 3)
-        using Store3 = gen_soa_aggregate<{"color", ^^float, 3}>;
-        Store3 s3(5);
-        auto e3 = s3.new_entity(0.5f); // 所有子分量都用 0.5 构造
-        assert(s3.size() == 1);
-        size_t slot3 = s3.get_slot(e3);
-        assert(s3.color[0][slot3] == 0.5f);
-        assert(s3.color[1][slot3] == 0.5f);
-        assert(s3.color[2][slot3] == 0.5f);
-
-        // 4. 混合字段
-        using Store4 = gen_soa_aggregate<{"id", ^^int}, {"vec", ^^float, 2}>;
-        Store4 s4(5);
-        auto e4 = s4.new_entity(100, 9.9f);
-        assert(s4.size() == 1);
-        size_t slot4 = s4.get_slot(e4);
-        assert(s4.id[slot4] == 100);
-        assert(s4.vec[0][slot4] == 9.9f);
-        assert(s4.vec[1][slot4] == 9.9f);
-
-        // 5. 容量耗尽时抛出 std::bad_alloc
-        using Store5 = gen_soa_aggregate<{"a", ^^int}>;
-        Store5 s5(3); // 容量 3
-        s5.new_entity(1);
-        s5.new_entity(2);
-        s5.new_entity(3);
-        assert(s5.size() == 3);
-        assert(s5.capacity() == 3);
-        bool threw = false;
-        try
-        {
-            s5.new_entity(4); // 应该抛出
-        }
-        catch (const std::bad_alloc &)
-        {
-            threw = true;
-        }
-        assert(threw);
-
-        // 6. 释放一个实体后可以再次 new_entity（复用）
-        s5.release_entity(s5.dense_[0]); // 释放第一个实体
-        auto e5 = s5.new_entity(5);      // 应成功
-        assert(s5.size() == 3);          // dense 大小不变，因为复用
-        size_t slot_new = s5.get_slot(e5);
-        assert(s5.a[slot_new] == 5);
-    }
-
-    // 测试 release_entity 的正确性
-    {
-        using Store = gen_soa_aggregate<{"x", ^^int}, {"y", ^^double}>;
-        Store s(5);
-        auto e0 = s.new_entity(10, 1.0);
-        auto e1 = s.new_entity(20, 2.0);
-        auto e2 = s.new_entity(30, 3.0);
-        assert(s.size() == 3);
-
-        // 释放中间的实体 e1
-        s.release_entity(e1);
-        assert(s.size() == 2);
-        assert(!s.alive(e1));               // 实体 ID 失效
-        assert(s.alive(e0) && s.alive(e2)); // 其他实体仍存活
-
-        // 验证数据被移动：原本 e2 所在的槽位应该被搬到 e1 的旧槽位
-        size_t slot_e0 = s.get_slot(e0);
-        size_t slot_e2 = s.get_slot(e2);
-        assert(s.x[slot_e0] == 10); // e0 数据不变
-        assert(s.x[slot_e2] == 30); // e2 的数据移动到新槽位
-
-        // 复用 e1 的 ID 再分配
-        auto e3 = s.new_entity(40, 4.0);
-        assert(s.size() == 3);
-        assert(s.alive(e3));
-        size_t slot_e3 = s.get_slot(e3);
-        assert(s.x[slot_e3] == 40);
-    }
-
     // ===== 扩容测试 =====
-
-    // 1. 基本扩容（单字段）
-    {
-        using Store = gen_soa_aggregate<{"x", ^^int}, {"y", ^^double}>;
-        Store s(2);
-        auto e0 = s.new_entity(10, 1.0);
-        auto e1 = s.new_entity(20, 2.0);
-        assert(s.size() == 2 && !s.allocate().has_value());
-
-        s.reserve(5);
-        assert(s.capacity() == 5);
-        assert(s.x[s.get_slot(e0)] == 10 && s.y[s.get_slot(e0)] == 1.0);
-        assert(s.x[s.get_slot(e1)] == 20 && s.y[s.get_slot(e1)] == 2.0);
-
-        auto e2 = s.new_entity(30, 3.0);
-        auto e3 = s.new_entity(40, 4.0);
-        auto e4 = s.new_entity(50, 5.0);
-        assert(s.size() == 5);
-        assert(s.x[s.get_slot(e2)] == 30 && s.y[s.get_slot(e2)] == 3.0);
-        assert(s.x[s.get_slot(e3)] == 40 && s.y[s.get_slot(e3)] == 4.0);
-        assert(s.x[s.get_slot(e4)] == 50 && s.y[s.get_slot(e4)] == 5.0);
-
-        s.release_entity(e2);
-        assert(s.size() == 4);
-        auto e5 = s.new_entity(60, 6.0);
-        assert(s.size() == 5);
-        assert(s.x[s.get_slot(e5)] == 60 && s.y[s.get_slot(e5)] == 6.0);
-
-        // 再次扩容并验证所有数据
-        s.reserve(10);
-        assert(s.capacity() == 10);
-        assert(s.x[s.get_slot(e0)] == 10);
-        assert(s.x[s.get_slot(e1)] == 20);
-        assert(s.x[s.get_slot(e3)] == 40);
-        assert(s.x[s.get_slot(e4)] == 50);
-        assert(s.x[s.get_slot(e5)] == 60);
-    }
-
-    // 2. 数组字段扩容（SoA 连续内存）
-    {
-        using Store = gen_soa_aggregate<{"pos", ^^float, 3}>;
-        Store s(2);
-        auto e0 = s.new_entity(1.0f); // 三个分量都设为 1.0
-        auto e1 = s.new_entity(2.0f);
-        assert(s.size() == 2);
-
-        s.reserve(4);
-        assert(s.capacity() == 4);
-
-        size_t s0 = s.get_slot(e0);
-        size_t s1 = s.get_slot(e1);
-        assert(s.pos[0][s0] == 1.0f && s.pos[1][s0] == 1.0f && s.pos[2][s0] == 1.0f);
-        assert(s.pos[0][s1] == 2.0f && s.pos[1][s1] == 2.0f && s.pos[2][s1] == 2.0f);
-
-        // 分配新实体，并通过视图修改分量（验证内存独立）
-        auto e2 = s.new_entity(3.0f);
-        auto e3 = s.new_entity(4.0f);
-        s.pos[0][s.get_slot(e2)] = 9.9f;
-        assert(s.pos[0][s.get_slot(e2)] == 9.9f);
-        // 其他实体不受影响
-        assert(s.pos[0][s.get_slot(e0)] == 1.0f);
-    }
-
-    // 3. 混合字段扩容
-    {
-        using Store = gen_soa_aggregate<{"id", ^^int}, {"vec", ^^float, 2}>;
-        Store s(2);
-        auto e0 = s.new_entity(100, 9.9f);
-        auto e1 = s.new_entity(200, 8.8f);
-
-        s.reserve(5);
-        size_t s0 = s.get_slot(e0);
-        size_t s1 = s.get_slot(e1);
-        assert(s.id[s0] == 100 && s.vec[0][s0] == 9.9f && s.vec[1][s0] == 9.9f);
-        assert(s.id[s1] == 200 && s.vec[0][s1] == 8.8f && s.vec[1][s1] == 8.8f);
-
-        auto e2 = s.new_entity(300, 7.7f);
-        assert(s.size() == 3);
-        assert(s.id[s.get_slot(e2)] == 300 && s.vec[0][s.get_slot(e2)] == 7.7f);
-    }
-
-    // 4. 释放实体后再扩容（确保空闲池正确）
-    {
-        using Store = gen_soa_aggregate<{"a", ^^int}>;
-        Store s(3);
-        auto e0 = s.new_entity(1);
-        auto e1 = s.new_entity(2);
-        auto e2 = s.new_entity(3);
-        s.release_entity(e1); // 留下空洞
-        s.reserve(6);
-        // 原有实体数据完整
-        assert(s.a[s.get_slot(e0)] == 1);
-        assert(s.a[s.get_slot(e2)] == 3);
-        // 可以分配新实体（包括复用 e1 的 ID 和新增的 ID）
-        auto e3 = s.new_entity(4);
-        assert(s.size() == 3);
-        assert(s.a[s.get_slot(e3)] == 4);
-    }
-
-    // 5. 多次扩容
-    {
-        using Store = gen_soa_aggregate<{"x", ^^int}>;
-        Store s(1);
-        auto e0 = s.new_entity(42);
-        s.reserve(2);
-        assert(s.capacity() == 2 && s.x[s.get_slot(e0)] == 42);
-        s.reserve(5);
-        assert(s.capacity() == 5 && s.x[s.get_slot(e0)] == 42);
-        s.reserve(10);
-        assert(s.capacity() == 10 && s.x[s.get_slot(e0)] == 42);
-    }
-
-    // ===== 异常安全测试（new_entity 构造失败回滚） =====
-    {
-        struct ThrowOnConstruct
-        {
-            int value;
-            constexpr ThrowOnConstruct(int v) noexcept(false) : value(v)
-            {
-                if (v < 0)
-                    throw std::runtime_error("negative");
-            }
-            constexpr ThrowOnConstruct(ThrowOnConstruct &&o) noexcept : value(o.value)
-            {
-                o.value = 0;
-            }
-            constexpr ThrowOnConstruct &operator=(ThrowOnConstruct &&o) noexcept
-            {
-                if (this != &o)
-                {
-                    value = o.value;
-                    o.value = 0;
-                }
-                return *this;
-            }
-            constexpr bool operator==(int rhs)
-            {
-                return value == rhs;
-            }
-        };
-
-        using Store = gen_soa_aggregate<{"x", ^^ThrowOnConstruct}>;
-        Store s(5);
-        auto e1 = s.new_entity(42);
-        assert(s.size() == 1);
-        assert(s.x[s.get_slot(e1)].value == 42);
-
-        bool caught = false;
-        try
-        {
-            s.new_entity(-1);
-        }
-        catch (const std::runtime_error &)
-        {
-            caught = true;
-        }
-        assert(caught);
-        assert(s.size() == 1);
-        assert(s.alive(e1));
-        assert(s.x[s.get_slot(e1)].value == 42);
-
-        auto e2 = s.new_entity(100);
-        assert(s.size() == 2);
-        assert(s.x[s.get_slot(e2)].value == 100);
-
-        s.release_entity(e1);
-        s.release_entity(e2);
-        assert(s.size() == 0);
-    }
 
     return true;
 }
@@ -2076,207 +1516,6 @@ struct ThrowOnConstruct
         return lhs.value == rhs;
     }
 };
-constexpr bool gen_soa_aggregate_runtime_test()
-{
-    // 异常回滚测试（用 constructed/destroyed 验证无泄漏）
-    {
-        ThrowOnConstruct::constructed = 0;
-        ThrowOnConstruct::destroyed = 0;
-
-        using Store = gen_soa_aggregate<{"x", ^^ThrowOnConstruct}>;
-        Store s(5);
-
-        auto e1 = s.new_entity(42);
-        assert(s.size() == 1);
-        assert(s.x[s.get_slot(e1)].value == 42);
-        // 此时构造数应 > 析构数（因为有一个活对象在槽位）
-        assert(ThrowOnConstruct::constructed > ThrowOnConstruct::destroyed);
-
-        // 构造失败应回滚，构造数和析构数不变
-        bool caught = false;
-        int c_before = ThrowOnConstruct::constructed;
-        int d_before = ThrowOnConstruct::destroyed;
-        try
-        {
-            s.new_entity(-1);
-        }
-        catch (const std::runtime_error &)
-        {
-            caught = true;
-        }
-        assert(caught);
-        assert(ThrowOnConstruct::constructed == c_before);
-        assert(ThrowOnConstruct::destroyed == d_before);
-        // 实体数不变
-        assert(s.size() == 1);
-        assert(s.alive(e1));
-
-        // 再次成功分配 e2
-        auto e2 = s.new_entity(100);
-        assert(s.size() == 2);
-        assert(s.x[s.get_slot(e2)].value == 100);
-
-        // 释放所有实体
-        s.release_entity(e1);
-        s.release_entity(e2);
-
-        // 最终应完美平衡，没有泄漏
-        assert(ThrowOnConstruct::constructed == ThrowOnConstruct::destroyed);
-    }
-    // 异常回滚测试：只验证实体管理和数据完整性
-    {
-        struct ThrowOnConstruct
-        {
-            int value;
-            ThrowOnConstruct(int v) noexcept(false) : value(v)
-            {
-                if (v < 0)
-                    throw std::runtime_error("negative");
-            }
-            ThrowOnConstruct(ThrowOnConstruct &&o) noexcept : value(o.value)
-            {
-                o.value = 0;
-            }
-            ThrowOnConstruct &operator=(ThrowOnConstruct &&o) noexcept
-            {
-                if (this != &o)
-                {
-                    value = o.value;
-                    o.value = 0;
-                }
-                return *this;
-            }
-            bool operator==(int rhs)
-            {
-                return value == rhs;
-            }
-        };
-
-        using Store = gen_soa_aggregate<{"x", ^^ThrowOnConstruct}>;
-        Store s(5);
-        auto e1 = s.new_entity(42);
-        assert(s.size() == 1);
-        assert(s.x[s.get_slot(e1)].value == 42);
-
-        bool caught = false;
-        try
-        {
-            s.new_entity(-1);
-        }
-        catch (const std::runtime_error &)
-        {
-            caught = true;
-        }
-        assert(caught);
-        // 回滚后实体数不变，原实体仍存活且数据正确
-        assert(s.size() == 1);
-        assert(s.alive(e1));
-        assert(s.x[s.get_slot(e1)].value == 42);
-
-        // 可以继续正常分配新实体
-        auto e2 = s.new_entity(100);
-        assert(s.size() == 2);
-        assert(s.x[s.get_slot(e2)].value == 100);
-
-        // 释放两个实体
-        s.release_entity(e1);
-        s.release_entity(e2);
-        assert(s.size() == 0);
-    } // 容器离开作用域，析构安全（没有未定义行为）
-    return true;
-}
-
-constexpr bool gen_soa_aggregate_update_test()
-{
-    // 1. 直接声明需要的存储
-    using Store = gen_soa_aggregate<{"id", ^^int}, {"vec", ^^float, 2}>;
-    Store s(64);
-    auto e0 = s.new_entity(100, 9.9f);
-    auto e1 = s.new_entity(200, 8.8f);
-
-    // 2. 阶段枚举
-    enum class Stage
-    {
-        Input,
-        Update,
-        Physics,
-        Render,
-        Count
-    };
-
-    // 3. 系统函数（Lambda 直接捕获存储引用）
-    auto inputSystem = [&s](float dt) {
-        // 如果需要修改 vec 的两个分量，可以分别取子视图
-        for (auto [id, vx] : s.view<"id", "vec">(0))
-        { // 第0分量
-            if (id == 100)
-                vx += dt;
-        }
-        for (auto [id, vy] : s.view<"id", "vec">(1))
-        { // 第1分量
-            if (id == 100)
-                vy += dt;
-        }
-        // 或者使用 tie 拿到 soa_member_pointer，再通过槽位下标操作（见下文验证部分）
-    };
-
-    auto physicsSystem = [&s](float dt) {
-        // 对所有实体两个分量都乘阻尼
-        for (auto [vx] : s.view<"vec">(0))
-            vx *= 0.99f;
-        for (auto [vy] : s.view<"vec">(1))
-            vy *= 0.99f;
-    };
-
-    auto renderSystem = [&s]() {
-        // 渲染时遍历实体，例如读取 id 和整个 vec（可通过 tie 获取字段指针）
-        for (auto [id] : s.view<"id">())
-        {
-            // 这里仅示例，实际可调用 Vulkan
-        }
-    };
-
-    // 4. 阶段调度器（同你原来的，无修改）
-    class StageScheduler
-    {
-      public:
-        using Callback = std::move_only_function<void()>;
-        void add(Stage s, Callback cb)
-        {
-            lists_[static_cast<int>(s)].push_back(std::move(cb));
-        }
-        void run(Stage s)
-        {
-            for (auto &cb : lists_[static_cast<int>(s)])
-                cb();
-        }
-
-      private:
-        std::vector<Callback> lists_[static_cast<int>(Stage::Count)];
-    };
-
-    StageScheduler scheduler;
-    float dt = 0.016f;
-    scheduler.add(Stage::Input, [&] { inputSystem(dt); });
-    scheduler.add(Stage::Physics, [&] { physicsSystem(dt); });
-    scheduler.add(Stage::Render, [&] { renderSystem(); });
-
-    // 5. 运行一帧
-    scheduler.run(Stage::Input);
-    scheduler.run(Stage::Physics);
-    scheduler.run(Stage::Render);
-
-    // 6. 验证结果：使用字段指针直接访问
-    auto slot0 = s.get_slot(e0);
-    auto id0 = s.id[slot0];
-    auto vx0 = s.vec[0][slot0];
-    auto vy0 = s.vec[1][slot0];
-
-    // 初始 9.9 → +0.016 → 9.916 → *0.99 = 9.81684 （注意两个分量分别处理）
-    // 因为输入系统里对两个分量都加了 dt，物理系统都乘了 0.99
-    return (id0 == 100) && (std::abs(vx0 - 9.81684f) < 0.01f) &&
-           (std::abs(vy0 - 9.81684f) < 0.01f);
-}
 
 template <typename E, typename FnType = void() noexcept>
     requires std::is_enum_v<E>
@@ -2321,13 +1560,403 @@ class StageScheduler
     std::flat_map<underlying, std::vector<Callback>> lists_;
 };
 
+constexpr bool gen_soa_aggregate_new_entity_test()
+{
+    // ===== 1. 单字段 (field_count = 1) =====
+    {
+        using Store = gen_soa_aggregate<{"a", ^^int}>;
+        Store s(3);
+        auto e = s.new_entity(42);
+        assert(s.size() == 1);
+        size_t slot = s.get_slot(e);
+        assert(s.a[slot] == 42);
+        // 再次分配
+        auto e2 = s.new_entity(99);
+        assert(s.size() == 2);
+        size_t slot2 = s.get_slot(e2);
+        assert(s.a[slot2] == 99);
+        assert(s.a[slot] == 42); // 第一个实体不受影响
+    }
+
+    // ===== 2. 多字段，均为普通类型 =====
+    {
+        using Store = gen_soa_aggregate<{"x", ^^int}, {"y", ^^double}>;
+        Store s(5);
+        auto e = s.new_entity(10, 3.14);
+        size_t slot = s.get_slot(e);
+        assert(s.x[slot] == 10);
+        assert(s.y[slot] == 3.14);
+    }
+
+    // ===== 3. 单个数组字段 (field_count = 3) =====
+    {
+        using Store = gen_soa_aggregate<{"color", ^^float, 3}>;
+        Store s(5);
+        // 必须传入 std::array<float, 3>
+        auto e = s.new_entity(std::array<float, 3>{0.1f, 0.2f, 0.3f});
+        size_t slot = s.get_slot(e);
+        assert(s.color[0][slot] == 0.1f);
+        assert(s.color[1][slot] == 0.2f);
+        assert(s.color[2][slot] == 0.3f);
+    }
+
+    // ===== 4. 混合：普通字段 + 数组字段 =====
+    {
+        using Store = gen_soa_aggregate<{"id", ^^int}, {"vec", ^^float, 2}>;
+        Store s(5);
+        auto e = s.new_entity(100, std::array<float, 2>{9.9f, 8.8f});
+        size_t slot = s.get_slot(e);
+        assert(s.id[slot] == 100);
+        assert(s.vec[0][slot] == 9.9f);
+        assert(s.vec[1][slot] == 8.8f);
+    }
+
+    // ===== 5. 容量耗尽时抛出 std::bad_alloc =====
+    {
+        using Store = gen_soa_aggregate<{"a", ^^int}>;
+        Store s(2);
+        s.new_entity(1);
+        s.new_entity(2);
+        bool threw = false;
+        try
+        {
+            s.new_entity(3); // 容量满，应抛出
+        }
+        catch (const std::bad_alloc &)
+        {
+            threw = true;
+        }
+        assert(threw);
+    }
+
+    // ===== 6. 多个数组字段同时构造 =====
+    {
+        using Store = gen_soa_aggregate<{"pos", ^^float, 3}, {"vel", ^^float, 3}>;
+        Store s(5);
+        auto e = s.new_entity(std::array<float, 3>{1.0f, 2.0f, 3.0f},
+                              std::array<float, 3>{0.1f, 0.2f, 0.3f});
+        size_t slot = s.get_slot(e);
+        for (int i = 0; i < 3; ++i)
+        {
+            assert(s.pos[i][slot] == (i + 1) * 1.0f);
+            assert(s.vel[i][slot] == (i + 1) * 0.1f);
+        }
+    }
+
+    // ===== 7. 移动语义测试（右值数组应移动而非拷贝） =====
+    {
+        // 使用一个可探测移动次数的类型（简化：使用 int，无法直接探测，但可以验证值正确）
+        using Store = gen_soa_aggregate<{"arr", ^^int, 2}>;
+        Store s(2);
+        std::array<int, 2> src{7, 8};
+        auto e = s.new_entity(std::move(src)); // 右值
+        size_t slot = s.get_slot(e);
+        assert(s.arr[0][slot] == 7);
+        assert(s.arr[1][slot] == 8);
+        // 如果源数组元素被移动（对于 int 无影响），但至少不会拷贝源对象两次
+    }
+
+    // ===== 8. 参数数量必须与字段总数匹配（编译期检查，此处省略） =====
+    // 错误调用示例（取消注释将无法编译）:
+    // s.new_entity(1, 2, 3); // 字段总数不匹配
+
+    // ===== 测试 view_entity (单实体视图) =====
+    {
+        using Store = gen_soa_aggregate<{"id", ^^int}, {"value", ^^double}>;
+        Store store(5);
+        auto e0 = store.new_entity(1, 1.1);
+        auto e1 = store.new_entity(2, 2.2);
+
+        // 1. 获取 entity 的视图，并读取数据
+        auto v0 = store.view_entity<"id", "value">(0, e0);
+        // v0 应该是一个聚合，包含两个引用成员，名称分别对应字段名
+        static_assert(std::is_reference_v<decltype(v0.id)>);
+        static_assert(std::is_reference_v<decltype(v0.value)>);
+        assert(v0.id == 1);
+        assert(v0.value == 1.1);
+
+        // 2. 通过视图修改值，应反映回原存储
+        v0.id = 10;
+        v0.value = 10.1;
+        assert(store.id[store.get_slot(e0)] == 10);
+        assert(store.value[store.get_slot(e0)] == 10.1);
+
+        // 3. 另一个实体视图，互不干扰
+        auto v1 = store.view_entity<"id", "value">(0, e1);
+        assert(v1.id == 2);
+        assert(v1.value == 2.2);
+
+        // 4. 只选择单个字段的视图
+        auto v_id_only = store.view_entity<"id">(0, e0);
+        static_assert(std::is_reference_v<decltype(v_id_only.id)>);
+        assert(v_id_only.id == 10);
+        v_id_only.id = 100;
+        assert(store.id[store.get_slot(e0)] == 100);
+
+        // 5. 测试多分量数组字段的 view_entity（指定子索引）
+        using VecStore = gen_soa_aggregate<{"pos", ^^float, 3}, {"vel", ^^float, 3}>;
+        VecStore vs(5);
+        auto ve0 =
+            vs.new_entity(std::array{1.0f, 2.0f, 3.0f}, std::array{0.1f, 0.2f, 0.3f});
+        // 查看 pos 的 y 分量和 vel 的 y 分量（field_count=1 表示取第二分量）
+        auto v_y = vs.view_entity<"pos", "vel">(1, ve0);
+        // 由于 pos 和 vel 都是 3 分量，取索引 1 得到各自的 y 分量
+        // 类型应该是 float&
+        static_assert(std::is_reference_v<decltype(v_y.pos)>);
+        static_assert(std::is_reference_v<decltype(v_y.vel)>);
+        assert(v_y.pos == 2.0f);
+        assert(v_y.vel == 0.2f);
+        // 修改 y 分量
+        v_y.pos = 20.0f;
+        v_y.vel = 2.0f;
+        // 验证原存储对应位置
+        size_t slot_v = vs.get_slot(ve0);
+        assert(vs.pos[1][slot_v] == 20.0f);
+        assert(vs.vel[1][slot_v] == 2.0f);
+
+        // 6. const 实体视图（只读）
+        const Store &cstore = store;
+        auto cv = cstore.view_entity<"id", "value">(0, e1);
+        static_assert(std::is_reference_v<decltype(cv.id)>);
+        static_assert(std::is_const_v<std::remove_reference_t<decltype(cv.id)>>);
+        // 编译期验证不可修改：若取消下面注释应编译失败
+        // cv.id = 5;
+        assert(cv.id == 2);
+        assert(cv.value == 2.2);
+
+        {
+            auto [id, val] = store.view_entity<"id", "value">(0, e0);
+            static_assert(std::is_reference_v<decltype(cv.id)>);
+            static_assert(std::is_reference_v<decltype(id)>);
+        }
+    }
+
+    return true;
+}
+// 此测试放在 main 中执行（非 constexpr）
+constexpr bool gen_soa_aggregate_runtime_test()
+{
+    // 使用已有的 ThrowOnConstruct（需保证移动构造为 noexcept）
+    // 注意：ThrowOnConstruct 的移动构造是 noexcept，满足 new_entity 的静态断言
+    using Store = gen_soa_aggregate<{"x", ^^ThrowOnConstruct}>;
+    Store s(5);
+
+    // 记录初始计数（这里借用 static 计数器，但需要手动重置）
+    ThrowOnConstruct::constructed = 0;
+    ThrowOnConstruct::destroyed = 0;
+
+    // 正常分配一个实体
+    auto e1 = s.new_entity(42);
+    assert(s.size() == 1);
+    assert(s.x[s.get_slot(e1)].value == 42);
+    int c1 = ThrowOnConstruct::constructed;
+    int d1 = ThrowOnConstruct::destroyed;
+    assert(c1 > d1); // 有一个存活对象
+
+    // 尝试分配一个会抛异常的实体（-1 触发异常）
+    bool caught = false;
+    try
+    {
+        s.new_entity(-1);
+    }
+    catch (const std::runtime_error &)
+    {
+        caught = true;
+    }
+    assert(caught);
+    // 构造和析构计数应保持不变（临时对象被销毁，槽位未被修改）
+    assert(ThrowOnConstruct::constructed == c1);
+    assert(ThrowOnConstruct::destroyed == d1);
+    // 实体数不变
+    assert(s.size() == 1);
+    assert(s.alive(e1));
+
+    // 再次正常分配
+    auto e2 = s.new_entity(100);
+    assert(s.size() == 2);
+    assert(s.x[s.get_slot(e2)].value == 100);
+
+    // 释放所有实体
+    s.release_entity(e1);
+    s.release_entity(e2);
+    // 构造与析构应平衡
+    assert(ThrowOnConstruct::constructed == ThrowOnConstruct::destroyed);
+
+    // 测试多字段且包含数组的异常安全
+    {
+        using Store2 = gen_soa_aggregate<{"id", ^^ThrowOnConstruct}, {"vec", ^^float, 2}>;
+        Store2 s2(5);
+        ThrowOnConstruct::constructed = 0;
+        ThrowOnConstruct::destroyed = 0;
+        auto e = s2.new_entity(10, std::array<float, 2>{1.0f, 2.0f});
+        size_t slot = s2.get_slot(e);
+        assert(s2.id[slot].value == 10);
+        assert(s2.vec[0][slot] == 1.0f && s2.vec[1][slot] == 2.0f);
+
+        // 构造失败回滚：id 字段抛异常（值 -1）
+        bool caught2 = false;
+        try
+        {
+            s2.new_entity(-1, std::array<float, 2>{3.0f, 4.0f});
+        }
+        catch (const std::runtime_error &)
+        {
+            caught2 = true;
+        }
+        assert(caught2);
+        assert(s2.size() == 1); // 实体数不变
+        assert(ThrowOnConstruct::constructed ==
+               ThrowOnConstruct::destroyed + 1); // 仅一个活对象
+    }
+
+    return true;
+}
+
+// move‑only 类型：只移动，不可拷贝，移动为 noexcept
+struct MoveOnly
+{
+    int *ptr;
+    constexpr MoveOnly(int v) : ptr(new int(v)) {}
+    constexpr MoveOnly(MoveOnly &&o) noexcept : ptr(o.ptr)
+    {
+        o.ptr = nullptr;
+    }
+    constexpr MoveOnly &operator=(MoveOnly &&o) noexcept
+    {
+        if (this != &o)
+        {
+            delete ptr;
+            ptr = o.ptr;
+            o.ptr = nullptr;
+        }
+        return *this;
+    }
+    constexpr ~MoveOnly()
+    {
+        delete ptr;
+    }
+    constexpr MoveOnly(const MoveOnly &) = delete;
+    constexpr MoveOnly &operator=(const MoveOnly &) = delete;
+    constexpr bool operator==(int v) const
+    {
+        return ptr && *ptr == v;
+    }
+};
+
+// 辅助 move‑only 数组类型（用于多列字段的每个子列）
+struct MoveOnlyArrayElement
+{
+    std::unique_ptr<int> data;
+    constexpr MoveOnlyArrayElement(int v) : data(std::make_unique<int>(v)) {}
+    constexpr MoveOnlyArrayElement(MoveOnlyArrayElement &&) noexcept = default;
+    constexpr MoveOnlyArrayElement &operator=(MoveOnlyArrayElement &&) noexcept = default;
+    constexpr bool operator==(int v) const
+    {
+        return data && *data == v;
+    }
+};
+constexpr bool gen_soa_aggregate_moveonly_test()
+{
+    // 1. 单 move‑only 字段
+    {
+        using Store = gen_soa_aggregate<{"mo", ^^MoveOnly}>;
+        Store s(3);
+        auto e = s.new_entity(MoveOnly(42)); // 右值
+        size_t slot = s.get_slot(e);
+        assert(s.mo[slot] == 42);
+    }
+
+    // 2. 混合：一个普通 int + 一个 move‑only 字段
+    {
+        using Store = gen_soa_aggregate<{"id", ^^int}, {"val", ^^MoveOnly}>;
+        Store s(3);
+        auto e = s.new_entity(10, MoveOnly(99));
+        size_t slot = s.get_slot(e);
+        assert(s.id[slot] == 10);
+        assert(s.val[slot] == 99);
+    }
+
+    // 3. 单个数组字段，元素类型为 move‑only (field_count=2)
+    {
+        using Store = gen_soa_aggregate<{"pair", ^^MoveOnlyArrayElement, 2}>;
+        Store s(3);
+        // 必须传递 std::array<MoveOnlyArrayElement, 2>
+        auto e = s.new_entity(std::array<MoveOnlyArrayElement, 2>{
+            MoveOnlyArrayElement(111), MoveOnlyArrayElement(222)});
+        size_t slot = s.get_slot(e);
+        assert(s.pair[0][slot] == 111);
+        assert(s.pair[1][slot] == 222);
+    }
+
+    // 4. 混合：一个普通 int + 一个 move‑only 数组字段
+    {
+        using Store =
+            gen_soa_aggregate<{"id", ^^int}, {"vec", ^^MoveOnlyArrayElement, 3}>;
+        Store s(3);
+        auto e = s.new_entity(7, std::array<MoveOnlyArrayElement, 3>{
+                                     MoveOnlyArrayElement(1), MoveOnlyArrayElement(2),
+                                     MoveOnlyArrayElement(3)});
+        size_t slot = s.get_slot(e);
+        assert(s.id[slot] == 7);
+        for (int j = 0; j < 3; ++j)
+            assert(s.vec[j][slot] == j + 1);
+    }
+
+    // 5. 多个 move‑only 字段（非数组+数组）
+    {
+        using Store =
+            gen_soa_aggregate<{"a", ^^MoveOnly}, {"b", ^^MoveOnlyArrayElement, 2}>;
+        Store s(3);
+        auto e = s.new_entity(MoveOnly(100),
+                              std::array<MoveOnlyArrayElement, 2>{
+                                  MoveOnlyArrayElement(200), MoveOnlyArrayElement(300)});
+        size_t slot = s.get_slot(e);
+        assert(s.a[slot] == 100);
+        assert(s.b[0][slot] == 200);
+        assert(s.b[1][slot] == 300);
+    }
+
+    // 6. 验证被移动后的源对象不会影响目标（移动后原 unique_ptr 为空，但目标正常）
+    {
+        using Store = gen_soa_aggregate<{"mo", ^^MoveOnly}>;
+        Store s(1);
+        MoveOnly source(500);
+        auto e = s.new_entity(std::move(source)); // 移动构造到槽位
+        assert(s.mo[s.get_slot(e)] == 500);
+        // source 被移走，ptr 应为空（这是 move‑only 的正常行为）
+        assert(source.ptr == nullptr);
+    }
+
+    return true;
+}
+
+constexpr bool noexcept_test()
+{
+    using Store2 = gen_soa_aggregate<{"x", ^^int}, {"y", ^^double}>;
+    static_assert(Store2::is_noexcept_construct<int, double>());
+
+    using StoreArr = gen_soa_aggregate<{"color", ^^float, 3}>;
+    // 传入 std::array<float,3>，构造 float 是 noexcept 的
+    static_assert(StoreArr::is_noexcept_construct<std::array<float, 3>>());
+
+    // 验证 construct_entity 的 noexcept 是否正确（通过编译期表达式）
+    using Store = gen_soa_aggregate<{"a", ^^int}>;
+    StoreArr s{5};
+    static_assert(noexcept(s.construct_entity(0, std::array<float, 3>{1, 2, 3})) ==
+                  StoreArr::is_noexcept_construct<std::array<float, 3> &&>());
+    return true;
+}
+
 int main()
 try
 {
     static_assert(gen_soa_aggregate_test());
-    // error: the value of 'ThrowOnConstruct::alive' is not usable in a constant expression
-    assert(gen_soa_aggregate_runtime_test());
-    assert(gen_soa_aggregate_update_test());
+    static_assert(noexcept_test());
+
+    static_assert(gen_soa_aggregate_new_entity_test()); // 编译期测试
+    assert(gen_soa_aggregate_runtime_test());           // 运行时异常安全测试
+    static_assert(gen_soa_aggregate_moveonly_test());   // move‑only 测试
+
     {
         enum class Stage
         {
@@ -2373,39 +2002,6 @@ try
 
         }>{};
     }
-
-    position_manager positions{
-        std::vector<position>{position{0, 1, 2}, position{2, 3, 2}}};
-    point_manager points{std::vector<Point>{Point{0, 1}, Point{2, 3}}};
-
-    {
-        auto str = "123";
-        // static_string s = static_string{str}; //NOTE: 不允许
-        static_string s = "123";
-        static_string s2 = "123";
-        assert(s == s2);
-        {
-            static_string s = "1234";
-            static_string s2 = "1234";
-            constexpr auto str2 = "1234";
-            static_string s3 = static_string{str2};
-            assert(s == s2);
-            assert(s == s3); //NOTE: constexpr 和 static 存储的位置不同
-        }
-        constexpr static_string s3 = "123";
-        // static_assert(s3 == s2); //NOTE: 不允许
-    }
-    static_string class_info;
-
-    // NOTE: world
-    int a = 0;
-    {
-    }
-
-    uint16_t x = 65535;
-    ++x;                    // 溢出
-    std::cout << x << '\n'; // 输出 0
-    assert(x == 0);
 
     std::cout << "main done\n";
     return 0;

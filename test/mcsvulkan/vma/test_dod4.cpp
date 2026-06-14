@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <flat_map>
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/fwd.hpp>
 #include <iostream>
@@ -311,15 +312,6 @@ namespace mesh
         return glm::vec3(minPos.x, maxPos.y, maxPos.z);
     }
 
-    static constexpr auto int_vertex_data =
-        [](std::array<std::vector<vertex_data>, MAX_FRAMES_IN_FLIGHT> &vertexData,
-           size_t init_size) {
-            for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
-            {
-                auto &data = vertexData[i];
-                data.reserve(init_size);
-            }
-        };
     static constexpr auto make_vertex_data(auto &world,
                                            const std::vector<Vertex> &vertices,
                                            const std::vector<index_type> &indices)
@@ -331,25 +323,6 @@ namespace mesh
         return cur;
     }
 
-    static constexpr auto append_vertex_data =
-        [](auto &world,
-           std::array<std::vector<vertex_data>, MAX_FRAMES_IN_FLIGHT> &vertexData,
-           const std::vector<Vertex> &vertices, const std::vector<index_type> &indices) {
-            for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
-            {
-                auto &data = vertexData[i];
-                data.emplace_back(make_vertex_data(world, vertices, indices));
-            }
-        };
-    static constexpr auto int_object_data =
-        [](std::array<std::vector<object_data_map>, MAX_FRAMES_IN_FLIGHT> &objectDataMap,
-           size_t init_size) {
-            for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
-            {
-                auto &data = objectDataMap[i];
-                data.reserve(init_size);
-            }
-        };
     static constexpr auto make_object_data_map(auto &world, size_t buffer_size)
     {
         object_data_map cur;
@@ -357,16 +330,6 @@ namespace mesh
         getObjectDataDeviceAddresses(world, cur);
         return cur;
     }
-    static constexpr auto append_object_data_map =
-        [](auto &world,
-           std::array<std::vector<object_data_map>, MAX_FRAMES_IN_FLIGHT> &objectDataMap,
-           size_t buffer_size) {
-            for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
-            {
-                auto &data = objectDataMap[i];
-                data.emplace_back(make_object_data_map(world, buffer_size));
-            }
-        };
 
     static constexpr auto queueUpdate = [](std::vector<vertex_raw_data> &vertex_raw_data,
                                            uint32_t slot, std::vector<Vertex> vertices,
@@ -376,6 +339,14 @@ namespace mesh
         queue_data.indices = std::move(indices);
         queue_data.count = MAX_FRAMES_IN_FLIGHT;
     };
+
+    template <class T, size_t N>
+    static constexpr auto gen_array_value(const auto &gen_value) noexcept(
+        noexcept(gen_value()))
+    {
+        constexpr auto [... I] = std::make_index_sequence<N>{};
+        return std::array<T, N>{((void)I, gen_value())...};
+    }
 
 }; // namespace mesh
 
@@ -642,6 +613,51 @@ using Sampler = mcs::vulkan::Sampler;
 using create_sampler = mcs::vulkan::tool::create_sampler;
 // NOLINTEND
 //diff: [test_indirectdraw2] end
+
+//diff: [test_dod4] start
+template <typename E, typename FnType = void() noexcept>
+    requires std::is_enum_v<E>
+class StageScheduler
+{
+    using underlying = std::underlying_type_t<E>;
+    static constexpr auto infos =
+        std::define_static_array(std::meta::enumerators_of(^^E));
+
+  public:
+    using Callback = std::move_only_function<FnType>;
+
+    constexpr void add(E s, Callback cb)
+    {
+        lists_[static_cast<underlying>(s)].push_back(std::move(cb));
+    }
+    constexpr void run(E stage)
+    {
+        auto it = lists_.find(static_cast<underlying>(stage));
+        if (it != lists_.end())
+        {
+            for (auto &cb : it->second)
+                cb();
+        }
+    }
+
+    constexpr void run_all()
+    {
+        template for (constexpr auto I : std::ranges::views::indices(infos.size()))
+        {
+            constexpr E val = std::meta::extract<E>(infos[I]);
+            auto it = lists_.find(std::to_underlying(val));
+            if (it != lists_.end())
+            {
+                for (auto &cb : it->second)
+                    cb();
+            }
+        }
+    }
+
+  private:
+    std::flat_map<underlying, std::vector<Callback>> lists_;
+};
+//diff: [test_dod4] end
 
 int main()
 try
@@ -1287,12 +1303,6 @@ try
 
     // diff: [test_dod2] start 定义全部数据
 
-    std::vector<uint32_t> autoSpinTexture = {0};
-    std::vector<uint32_t> interactiveTexture = {3};
-
-    std::vector<uint32_t> autoSpinSampler = {0};
-    std::vector<uint32_t> interactiveSampler = {1};
-
     struct model_state
     {
         mcs::vulkan::event::position2d_event last_pos{};
@@ -1306,49 +1316,6 @@ try
     {
         glm::mat4 matrix;
     };
-
-    //NOTE: 定义数据集合到 上下文中
-    std::vector<mesh::vertex_raw_data> autoSpinVertexUpdateQueue;
-    std::array<std::vector<mesh::vertex_data>, MAX_FRAMES_IN_FLIGHT> autoSpinVertexData;
-    std::array<std::vector<mesh::object_data_map>, MAX_FRAMES_IN_FLIGHT>
-        autoSpinObjectDataMap;
-
-    std::vector<mesh::vertex_raw_data> interactiveVertexUpdateQueue;
-    std::array<std::vector<mesh::vertex_data>, MAX_FRAMES_IN_FLIGHT>
-        interactiveVertexData;
-    std::array<std::vector<mesh::object_data_map>, MAX_FRAMES_IN_FLIGHT>
-        interactiveObjectDataMap;
-    std::vector<glm::vec3> interactiveTopLeftLocal; //NOTE: 一份即可
-    std::vector<model_state> interactiveModelState;
-    // init size
-    autoSpinVertexUpdateQueue.reserve(1);
-    mesh::int_vertex_data(autoSpinVertexData, 1);
-    mesh::int_object_data(autoSpinObjectDataMap, 1);
-
-    interactiveVertexUpdateQueue.reserve(1);
-    mesh::int_vertex_data(interactiveVertexData, 1);
-    mesh::int_object_data(interactiveObjectDataMap, 1);
-    interactiveTopLeftLocal.reserve(1);
-    interactiveModelState.reserve(1);
-
-    float autoSpinElapsed = 0.0F; //NOTE: 时间也是数据
-    auto autoSpinMeshCtx =
-        make_aggregate_ref<"autoSpinMeshCtx", "vertexData", "objectDataMap",
-                           "vertexUpdateQueue", "textureData", "samplerData",
-                           "spinElapsed">(autoSpinVertexData, autoSpinObjectDataMap,
-                                          autoSpinVertexUpdateQueue, autoSpinTexture,
-                                          autoSpinSampler, autoSpinElapsed);
-
-    auto interactiveMeshCtx =
-        make_aggregate_ref<"interactiveMeshCtx", "vertexData", "objectDataMap",
-                           "vertexUpdateQueue", "topLeftLocal", "modelState",
-                           "textureData", "samplerData">(
-            interactiveVertexData, interactiveObjectDataMap, interactiveVertexUpdateQueue,
-            interactiveTopLeftLocal, interactiveModelState, interactiveTexture,
-            interactiveSampler);
-
-    auto meshCtx = make_aggregate_ref<"meshCtx", "autoSpinMeshCtx", "interactiveMeshCtx">(
-        autoSpinMeshCtx, interactiveMeshCtx);
 
     // diff: [test_dod2] end
 
@@ -1385,11 +1352,8 @@ try
     auto soaCtx = make_aggregate_ref<"soaCtx", "autoSpinStore", "interactiveStore",
                                      "autoSpinStoreShareData">(
         autoSpinStore, interactiveStore, autoSpinStoreShareData);
-#define TEST_DOD3
-    //diff: [test_dod3.cpp] end
 
-    // 随机生成两个纹理索引和采样器索引
-    uint32_t &textureIndex1 = autoSpinTexture[0];
+    //diff: [test_dod3.cpp] end
 
     struct record_info
     {
@@ -1516,64 +1480,33 @@ try
         make_aggregate_ref<"inputCtx", "input", "deltaTime">(input, deltaTime);
 
     auto world = make_aggregate_ref<"world", "globalCtx", "mainCtx", "mainShaderCtx",
-                                    "pickCtx", "inputCtx", "meshCtx", "soaCtx">(
-        globalCtx, mainCtx, mainShaderCtx, pickCtx, inputCtx, meshCtx, soaCtx);
+                                    "pickCtx", "inputCtx", "soaCtx">(
+        globalCtx, mainCtx, mainShaderCtx, pickCtx, inputCtx, soaCtx);
     using world_type = decltype(world);
 
     // diff: [test_dod2] start:  world之后 才能调用 数据API
 
     // init data
-    mesh::append_vertex_data(world, autoSpinMeshCtx.vertexData, vertices, indices);
-    mesh::append_object_data_map(world, autoSpinMeshCtx.objectDataMap,
-                                 sizeof(object_data));
-
-    mesh::append_vertex_data(world, interactiveMeshCtx.vertexData,
-                             vertices | std::views::transform([](const Vertex &vertex) {
-                                 auto newvertex = vertex;
-                                 newvertex.pos[2] = 0.5;
-                                 return newvertex;
-                             }) | std::ranges::to<std::vector<Vertex>>(),
-                             indices);
-    mesh::append_object_data_map(world, interactiveMeshCtx.objectDataMap,
-                                 sizeof(object_data));
-    interactiveTopLeftLocal.emplace_back(mesh::get_topLeftLocal(
-        {.vertices = vertices | std::views::transform([](const Vertex &vertex) {
-                         auto newvertex = vertex;
-                         newvertex.pos[2] = 0.5;
-                         return newvertex;
-                     }) |
-                     std::ranges::to<std::vector<Vertex>>(),
-         .indices = indices}));
-    interactiveModelState.emplace_back();
 
     //diff: [test_dod3] start
     auto autoSpinId = autoSpinStore.new_entity(
-        std::array<mesh::vertex_data, MAX_FRAMES_IN_FLIGHT>{
-            mesh::make_vertex_data(world, vertices, indices),
-            mesh::make_vertex_data(world, vertices, indices)},
-        std::array<mesh::object_data_map, MAX_FRAMES_IN_FLIGHT>{
-            make_object_data_map(world, sizeof(object_data)),
-            make_object_data_map(world, sizeof(object_data))},
+        mesh::gen_array_value<mesh::vertex_data, MAX_FRAMES_IN_FLIGHT>(
+            [&] { return mesh::make_vertex_data(world, vertices, indices); }),
+        mesh::gen_array_value<mesh::object_data_map, MAX_FRAMES_IN_FLIGHT>(
+            [&] { return mesh::make_object_data_map(world, sizeof(object_data)); }),
         mesh::vertex_raw_data{}, 0, 0);
     auto interactiveId = interactiveStore.new_entity(
-        std::array<mesh::vertex_data, MAX_FRAMES_IN_FLIGHT>{
-            mesh::make_vertex_data(
+        mesh::gen_array_value<mesh::vertex_data, MAX_FRAMES_IN_FLIGHT>([&] {
+            return mesh::make_vertex_data(
                 world, vertices | std::views::transform([](const Vertex &vertex) {
                            auto newvertex = vertex;
                            newvertex.pos[2] = 0.5;
                            return newvertex;
                        }) | std::ranges::to<std::vector<Vertex>>(),
-                indices),
-            mesh::make_vertex_data(
-                world, vertices | std::views::transform([](const Vertex &vertex) {
-                           auto newvertex = vertex;
-                           newvertex.pos[2] = 0.5;
-                           return newvertex;
-                       }) | std::ranges::to<std::vector<Vertex>>(),
-                indices)},
-        std::array<mesh::object_data_map, MAX_FRAMES_IN_FLIGHT>{
-            make_object_data_map(world, sizeof(object_data)),
-            make_object_data_map(world, sizeof(object_data))},
+                indices);
+        }),
+        mesh::gen_array_value<mesh::object_data_map, MAX_FRAMES_IN_FLIGHT>(
+            [&] { return mesh::make_object_data_map(world, sizeof(object_data)); }),
         mesh::vertex_raw_data{}, 3, 1,
         mesh::get_topLeftLocal(
             {.vertices = vertices | std::views::transform([](const Vertex &vertex) {
@@ -1584,6 +1517,11 @@ try
                          std::ranges::to<std::vector<Vertex>>(),
              .indices = indices}),
         model_state{});
+
+    // 随机生成两个纹理索引和采样器索引
+    auto [textureIndex1] = autoSpinStore.view_entity<"textureData">(0, autoSpinId);
+    static_assert(std::is_reference_v<decltype(textureIndex1)>);
+
     //diff: [test_dod3] end
 
     // diff: [test_dod2] end
@@ -1756,49 +1694,6 @@ try
     // diff: [test_model_matrix3] 小小调整
     static constexpr auto updateObjectData = [](world_type &world,
                                                 uint32_t currentFrame) noexcept {
-        auto &meshCtx = world.meshCtx;
-
-        auto &autoSpinMeshCtx = meshCtx.autoSpinMeshCtx;
-        auto &interactiveMeshCtx = meshCtx.interactiveMeshCtx;
-
-        // 获取 deltaTime（从 inputCtx 读取）
-        const float dt = world.inputCtx.deltaTime;
-        // 更新自旋动画的累积时间
-        autoSpinMeshCtx.spinElapsed += dt;
-
-        // Buffer is already mapped. You can access its memory.
-        for (auto &objectDataMap : autoSpinMeshCtx.objectDataMap[currentFrame])
-        {
-            // static auto startTime = std::chrono::high_resolution_clock::now();
-            // auto currentTime = std::chrono::high_resolution_clock::now();
-            // float time = std::chrono::duration<float, std::chrono::seconds::period>(
-            //                  currentTime - startTime)
-            //                  .count();
-            // auto mesh1_model = time * glm::radians(90.0F);
-            // auto data =
-            //     glm::rotate(glm::mat4(1.0F), mesh1_model, glm::vec3(0.0F, 0.0F, 1.0F));
-
-            // 用累积时间计算旋转矩阵（替代原来的 static startTime）
-
-            auto angle = autoSpinMeshCtx.spinElapsed * glm::radians(90.0f);
-            auto data = glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0.0f, 0.0f, 1.0f));
-            ::memcpy(objectDataMap.objectDataBuffer.mapPtr(), &data, sizeof(data));
-        }
-        for (const auto &[objectDataMap, modelState] :
-             std::views::zip(interactiveMeshCtx.objectDataMap[currentFrame],
-                             interactiveMeshCtx.modelState))
-        {
-            // 错误 ❌ —— modelState.model_matrix 是结构体，不是 mat4
-            // ::memcpy(objectDataMap.objectDataBuffer.mapPtr(), &modelState.model_matrix,
-            //          sizeof(modelState.model_matrix));
-
-            //NOTE: memcpy 要特别小心啊
-            auto mat = modelState.model_matrix(); // 得到 glm::mat4
-            ::memcpy(objectDataMap.objectDataBuffer.mapPtr(), &mat, sizeof(mat));
-        }
-    };
-    static constexpr auto updateObjectData2 = [](world_type &world,
-                                                 uint32_t currentFrame) noexcept {
         auto &soaCtx = world.soaCtx;
 
         auto &autoSpinStore = soaCtx.autoSpinStore;
@@ -1826,61 +1721,9 @@ try
         }
     };
     // diff: [test_model_matrix2] end
+
     static constexpr auto updateVertexData = [](world_type &world,
                                                 uint32_t currentFrame) noexcept {
-        auto &meshCtx = world.meshCtx;
-
-        auto &autoSpinMeshCtx = meshCtx.autoSpinMeshCtx;
-        auto &interactiveMeshCtx = meshCtx.interactiveMeshCtx;
-
-        for (auto [data, raw_data] :
-             std::views::zip(autoSpinMeshCtx.vertexData[currentFrame],
-                             autoSpinMeshCtx.vertexUpdateQueue))
-        {
-            auto &count = raw_data.count;
-            if (count == 0)
-                continue;
-            --count;
-
-            auto &vertices = raw_data.vertices;
-            auto &indices = raw_data.indices;
-
-            // 更新GPU缓冲区（这个帧当前没有被GPU使用）;
-            mesh::createVertexBufferForFrame(world, data, vertices);
-            mesh::createIndexBufferForFrame(world, data, indices);
-            mesh::getVertexDataDeviceAddresses(world, data);
-
-            if (count == 0)
-                raw_data.clear();
-        }
-
-        for (auto [data, raw_data, model, topLeftLocal] : std::views::zip(
-                 interactiveMeshCtx.vertexData[currentFrame],
-                 interactiveMeshCtx.vertexUpdateQueue, interactiveMeshCtx.modelState,
-                 interactiveMeshCtx.topLeftLocal))
-        {
-            auto &count = raw_data.count;
-            if (count == 0)
-                continue;
-            --count;
-
-            auto &vertices = raw_data.vertices;
-            auto &indices = raw_data.indices;
-
-            // 更新GPU缓冲区（这个帧当前没有被GPU使用）;
-            mesh::createVertexBufferForFrame(world, data, vertices);
-            mesh::createIndexBufferForFrame(world, data, indices);
-            mesh::getVertexDataDeviceAddresses(world, data);
-
-            topLeftLocal = mesh::get_topLeftLocal(raw_data);
-
-            if (count == 0)
-                raw_data.clear();
-        }
-    };
-
-    static constexpr auto updateVertexData2 = [](world_type &world,
-                                                 uint32_t currentFrame) noexcept {
         auto &soaCtx = world.soaCtx;
 
         auto &autoSpinStore = soaCtx.autoSpinStore;
@@ -1919,246 +1762,6 @@ try
     };
 
     static constexpr auto model_update = [](world_type &world) {
-        auto &globalCtx = world.globalCtx;
-        auto &inputCtx = world.inputCtx;
-        auto &meshCtx = world.meshCtx;
-
-        auto &modelState = meshCtx.interactiveMeshCtx.modelState[0];
-        auto &topLeftLocal = meshCtx.interactiveMeshCtx.topLeftLocal[0];
-
-        const auto &input = inputCtx.input;
-        auto &camera = globalCtx.camera;
-        auto &swapchain = globalCtx.swapchain;
-        auto &frameContext = globalCtx.frameContext;
-
-        auto &[lastPos, isMiddleButtonPressed, isLeftButtonPressed,
-               rightButtonPressedLast, lastLeftPos, modelMatrix] = modelState;
-        using mcs::vulkan::event::MouseButtons;
-        using mcs::vulkan::event::Key;
-        using mcs::vulkan::event::scroll_event;
-        const auto cur = input.cursorPos();
-        const auto windowSize = swapchain.refImageExtent();
-
-        const bool curMiddlePressed =
-            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_MIDDLE);
-        const bool curLeftPressed =
-            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_LEFT);
-        const bool curRightPressed =
-            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_RIGHT);
-
-        if (scroll_event{} != input.scroll())
-        {
-            std::println("input.scroll(): {}", input.scroll());
-            // 获取修饰键状态
-            bool ctrlPressed = input.isKeyPressedOrRepeat(Key::eLEFT_CONTROL) ||
-                               input.isKeyPressedOrRepeat(Key::eRIGHT_CONTROL);
-            bool altPressed = input.isKeyPressedOrRepeat(Key::eLEFT_ALT) ||
-                              input.isKeyPressedOrRepeat(Key::eRIGHT_ALT);
-            bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
-                                input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
-            auto scroll = input.scroll();
-            float delta = scroll.yoffset; // +1 向上滚（放大），-1 向下滚（缩小）
-
-            if (delta != 0.0f)
-            {
-                // 缩放因子：每格 ±10%
-                const float factor = (delta > 0) ? 1.1f : (1.0f / 1.1f);
-
-                // 统计按下修饰键的数量
-                int modCount =
-                    (ctrlPressed ? 1 : 0) + (altPressed ? 1 : 0) + (shiftPressed ? 1 : 0);
-
-                if (modCount == 1)
-                {
-                    // 仅一个修饰键按下：缩放对应的轴
-                    if (ctrlPressed)
-                        modelMatrix.scale.x *= factor;
-                    else if (altPressed)
-                        modelMatrix.scale.y *= factor;
-                    else if (shiftPressed)
-                        modelMatrix.scale.z *= factor;
-                }
-                else
-                {
-                    // 无修饰键或多个修饰键：均匀缩放所有轴
-                    modelMatrix.scale *= factor;
-                }
-
-                // 可选：限制缩放范围，避免过小或过大
-                // modelMatrix_.scale = glm::clamp(modelMatrix_.scale, 0.01f, 100.0f);
-            }
-        }
-
-        // ========== 右键单击复位物体 ==========
-        if (curRightPressed && !rightButtonPressedLast)
-        {
-            // 按下瞬间：平移归零，旋转归单位四元数
-            modelMatrix.translation = glm::vec3(0.0f);
-            modelMatrix.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
-            // scale 保持 (1,1,1) 不变
-            modelMatrix.scale = {1, 1, 1};
-        }
-        rightButtonPressedLast = curRightPressed; // 更新状态供下一帧使用
-
-        // ========== 左键旋转处理（支持修饰键分离轴） ==========
-        if (curLeftPressed)
-        {
-            if (!isLeftButtonPressed)
-            {
-                lastLeftPos = cur;
-                isLeftButtonPressed = true;
-            }
-            else
-            {
-                float dx = static_cast<float>(cur.xpos - lastLeftPos.xpos);
-                float dy = static_cast<float>(cur.ypos - lastLeftPos.ypos);
-
-                if (dx != 0.0f || dy != 0.0f)
-                {
-                    glm::mat4 view = camera.viewsMatrix();
-                    glm::mat4 viewInv = glm::inverse(view);
-                    glm::vec3 worldRight = viewInv[0]; // 屏幕右方向（水平轴）
-                    glm::vec3 worldUp = viewInv[1];    // 屏幕上方向（垂直轴）
-                    glm::vec3 worldForward = -glm::vec3(viewInv[2]); // 视线方向
-
-                    const float rotSensitivity = 0.01f;
-
-                    bool ctrlPressed = input.isKeyPressedOrRepeat(Key::eLEFT_CONTROL) ||
-                                       input.isKeyPressedOrRepeat(Key::eRIGHT_CONTROL);
-                    bool altPressed = input.isKeyPressedOrRepeat(Key::eLEFT_ALT) ||
-                                      input.isKeyPressedOrRepeat(Key::eRIGHT_ALT);
-                    bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
-                                        input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
-
-                    glm::quat deltaRot(1.0f, 0.0f, 0.0f, 0.0f);
-
-                    if (ctrlPressed)
-                    {
-                        // Ctrl + 水平移动：绕屏幕垂直轴（左右旋转）
-                        deltaRot = glm::angleAxis(dx * rotSensitivity, worldUp);
-                    }
-                    else if (altPressed)
-                    {
-                        // Alt + 垂直移动：绕屏幕水平轴（上下翻转）
-                        deltaRot = glm::angleAxis(dy * rotSensitivity, worldRight);
-                    }
-                    else if (shiftPressed)
-                    {
-                        // Shift + 水平移动：绕视线方向（滚动）
-                        deltaRot = glm::angleAxis(dx * rotSensitivity, worldForward);
-                    }
-                    else
-                    {
-                        // 无修饰键：水平绕 worldUp，垂直绕 worldRight
-                        glm::quat rotY = glm::angleAxis(dx * rotSensitivity, worldUp);
-                        glm::quat rotX = glm::angleAxis(dy * rotSensitivity, worldRight);
-                        deltaRot = rotY * rotX;
-                    }
-
-                    if (deltaRot != glm::quat(1.0f, 0.0f, 0.0f, 0.0f))
-                    {
-                        modelMatrix.rotation = deltaRot * modelMatrix.rotation;
-                    }
-                }
-                lastLeftPos = cur;
-            }
-        }
-        else
-        {
-            isLeftButtonPressed = false;
-        }
-        if (curMiddlePressed)
-        {
-            // 检测 Shift 键（独立于左键修饰键）
-            bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
-                                input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
-
-            glm::mat4 view = camera.viewsMatrix();
-            glm::mat4 proj = camera.perspectiveMatrix();
-            glm::mat4 viewInv = glm::inverse(view);
-            glm::vec4 viewport(0.0f, 0.0f, static_cast<float>(windowSize.width),
-                               static_cast<float>(windowSize.height));
-
-            glm::vec3 currentScale = modelMatrix.scale;
-            glm::quat currentRot = modelMatrix.rotation;
-            glm::vec3 localTopLeft = topLeftLocal;
-            glm::vec3 scaledTopLeft = currentScale * localTopLeft;
-            glm::vec3 rotatedOffset =
-                currentRot * scaledTopLeft; // 从平移位置指向左上角的偏移量
-            glm::vec3 currentTopLeftWorld = modelMatrix.translation + rotatedOffset;
-
-            glm::vec3 winNear(static_cast<float>(cur.xpos),
-                              static_cast<float>(windowSize.height - cur.ypos), 0.0f);
-            glm::vec3 winFar(static_cast<float>(cur.xpos),
-                             static_cast<float>(windowSize.height - cur.ypos), 1.0f);
-            glm::vec3 nearWorld = glm::unProject(winNear, view, proj, viewport);
-            glm::vec3 farWorld = glm::unProject(winFar, view, proj, viewport);
-            glm::vec3 dirWorld = glm::normalize(farWorld - nearWorld);
-
-            const float eps = 1e-6f;
-            const float maxT = 1000.0f;   // 最大射线距离，根据场景调整
-            const float maxDelta = 10.0f; // 单次最大平移变化量（可选）
-
-            glm::vec3 newTranslation = modelMatrix.translation; // 默认不变
-
-            if (shiftPressed)
-            {
-                // ========== 旧模式：世界 XY 平面平移（固定世界 Z） ==========
-                float targetZ = currentTopLeftWorld.z; // 保持当前左上角的世界 Z
-                if (std::fabs(dirWorld.z) > eps)
-                {
-                    float t = (targetZ - nearWorld.z) / dirWorld.z;
-                    if (t >= 0.0f && t < maxT)
-                    {
-                        glm::vec3 worldPoint = nearWorld + t * dirWorld;
-                        newTranslation = worldPoint - rotatedOffset;
-                    }
-                }
-            }
-            else
-            {
-                // ========== 新模式：屏幕空间平移（固定相机空间 Z） ==========
-                // 将当前左上角转换到相机空间，获取其深度
-                glm::vec4 currentTopLeftView =
-                    view * glm::vec4(currentTopLeftWorld, 1.0f);
-                float depthView = currentTopLeftView.z; // 相机空间 Z
-
-                // 将射线端点转换到相机空间
-                glm::vec4 nearView = view * glm::vec4(nearWorld, 1.0f);
-                glm::vec4 farView = view * glm::vec4(farWorld, 1.0f);
-                glm::vec3 dirView = glm::vec3(farView - nearView); // 相机空间射线方向
-
-                if (std::fabs(dirView.z) > eps)
-                {
-                    float t = (depthView - nearView.z) / dirView.z;
-                    if (t >= 0.0f && t <= 1.0f) // 交点在射线范围内
-                    {
-                        glm::vec3 pointView = glm::vec3(nearView) + t * dirView;
-                        glm::vec4 pointWorld = viewInv * glm::vec4(pointView, 1.0f);
-                        glm::vec3 worldPoint = glm::vec3(pointWorld) / pointWorld.w;
-                        newTranslation = worldPoint - rotatedOffset;
-                    }
-                }
-            }
-
-            // 可选：限制平移变化量，防止跳变
-            glm::vec3 delta = newTranslation - modelMatrix.translation;
-            if (glm::length(delta) < maxDelta)
-            {
-                modelMatrix.translation = newTranslation;
-            }
-            // 若超过限制，可以忽略本次更新，或按比例缩放
-
-            if (!isMiddleButtonPressed)
-                isMiddleButtonPressed = true;
-            lastPos = cur;
-        }
-        else
-        {
-            isMiddleButtonPressed = false;
-        }
-    };
-    static constexpr auto model_update2 = [](world_type &world) {
         auto &globalCtx = world.globalCtx;
         auto &inputCtx = world.inputCtx;
 
@@ -2402,164 +2005,6 @@ try
 
     // diff: [test_indirectdraw] start prepareBatch：动态分配合批资源并填充数据 // NOLINTNEXTLINE
     static constexpr auto prepareBatch = [](world_type &world, uint32_t currentFrame) {
-        auto &globalCtx = world.globalCtx;
-        auto &mainShaderCtx = world.mainShaderCtx;
-
-        auto &meshCtx = world.meshCtx;
-
-        auto &allocator = globalCtx.allocator;
-        auto &device = globalCtx.device;
-
-        auto &descriptorSets = mainShaderCtx.descriptorSets;
-        auto &batches = mainShaderCtx.indirectDrawBatches;
-
-        auto &descriptorSet = descriptorSets[currentFrame];
-        auto &batch = batches[currentFrame];
-
-        auto &autoSpinMeshCtx = meshCtx.autoSpinMeshCtx;
-        auto &interactiveMeshCtx = meshCtx.interactiveMeshCtx;
-
-        auto autoSpinObjs =
-            std::views::zip(autoSpinMeshCtx.vertexData[currentFrame],
-                            autoSpinMeshCtx.objectDataMap[currentFrame],
-                            autoSpinMeshCtx.textureData, autoSpinMeshCtx.samplerData) |
-            std::views::transform([](auto &&tuple) {
-                auto &[mesh, data, tex, samp] = tuple;
-                return ShaderData{&mesh, &data, tex, samp};
-            }) |
-            std::ranges::to<std::vector<ShaderData>>();
-        auto interactiveObjs =
-            std::views::zip(interactiveMeshCtx.vertexData[currentFrame],
-                            interactiveMeshCtx.objectDataMap[currentFrame],
-                            interactiveMeshCtx.textureData,
-                            interactiveMeshCtx.samplerData) |
-            std::views::transform([](auto &&tuple) {
-                auto &[mesh, data, tex, samp] = tuple;
-                return ShaderData{&mesh, &data, tex, samp};
-            }) |
-            std::ranges::to<std::vector<ShaderData>>();
-
-        std::vector<ShaderData> objects;
-        objects.reserve(autoSpinObjs.size() + interactiveObjs.size());
-        objects.append_range(std::move(autoSpinObjs));
-        objects.append_range(std::move(interactiveObjs));
-        auto objectCount = static_cast<uint32_t>(objects.size());
-
-        uint32_t totalIndexCount = 0;
-        for (auto &o : objects)
-            totalIndexCount += o.vertex_data->index_sequence.size();
-
-        // 1. 保证合并索引缓冲足够大
-        VkDeviceSize needIdx = totalIndexCount * sizeof(uint32_t);
-        if (batch.mergedIndexCapacity < needIdx)
-        {
-            batch.mergedIndexBuffer = auto_map_buffer{
-                create_buffer(allocator,
-                              {.sType = sType<VkBufferCreateInfo>(),
-                               .size = needIdx,
-                               .usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                               .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                              {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                                        VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                               .usage = VMA_MEMORY_USAGE_AUTO})};
-            batch.mergedIndexCapacity = needIdx;
-        }
-
-        // 2. 保证 ObjectInfo SSBO 足够大
-        VkDeviceSize needObj = objectCount * sizeof(ObjectInfo);
-        if (batch.objectInfoCapacity < needObj)
-        {
-
-            batch.objectInfoBuffer = auto_map_buffer{
-                create_buffer(allocator,
-                              {.sType = sType<VkBufferCreateInfo>(),
-                               .size = needObj,
-                               .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                               .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                              {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                                        VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                               .usage = VMA_MEMORY_USAGE_AUTO})};
-            batch.objectInfoCapacity = needObj;
-
-            // 更新描述符集中的 binding 3 指向新缓冲
-            VkDescriptorBufferInfo bufInfo{
-                .buffer = batch.objectInfoBuffer.buffer(),
-                .offset = 0,
-                .range = VK_WHOLE_SIZE,
-            };
-            VkWriteDescriptorSet write{
-                .sType = sType<VkWriteDescriptorSet>(),
-                .dstSet = descriptorSet,
-                .dstBinding = 3,
-                .dstArrayElement = 0,
-                .descriptorCount = 1,
-                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .pBufferInfo = &bufInfo,
-            };
-            device.updateDescriptorSets(1, &write, 0, nullptr);
-        }
-
-        // 3. 保证间接命令缓冲足够大
-        VkDeviceSize needCmd = objectCount * sizeof(VkDrawIndexedIndirectCommand);
-        if (batch.indirectCmdCapacity < needCmd)
-        {
-            batch.indirectDrawBuffer = auto_map_buffer{
-                create_buffer(allocator,
-                              {.sType = sType<VkBufferCreateInfo>(),
-                               .size = needCmd,
-                               .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                               .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                              {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                                        VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                               .usage = VMA_MEMORY_USAGE_AUTO})};
-            batch.indirectCmdCapacity = needCmd;
-        }
-
-        // 4. 填充数据
-        uint32_t idxOff = 0;
-        std::vector<ObjectInfo> infos(objectCount);
-        std::vector<VkDrawIndexedIndirectCommand> cmds(objectCount);
-        for (uint32_t i = 0; i < objectCount; ++i)
-        {
-            auto &shaderData = objects[i];
-            auto &vertex_data = *shaderData.vertex_data;
-            auto &object_data = *shaderData.object_data_map;
-
-            auto &index_sequence = vertex_data.index_sequence;
-            using index_value_type = decltype(auto(index_sequence[0]));
-            uint32_t indexCount = index_sequence.size();
-            //diff: [test_dod2] 要特别小心void*
-            // 拷贝索引数据到合并缓冲
-            // 错误 ❌: mapPtr() 返回 void*
-            // memcpy(batch.mergedIndexBuffer.mapPtr() + idxOff, index_sequence.data(),
-            //        indexCount * sizeof(index_value_type));
-            memcpy(static_cast<uint32_t *>(batch.mergedIndexBuffer.mapPtr()) + idxOff,
-                   index_sequence.data(), indexCount * sizeof(uint32_t));
-
-            cmds[i] = {
-                .indexCount = indexCount,
-                .instanceCount = 1,
-                .firstIndex = idxOff,
-                .vertexOffset = 0,
-                .firstInstance = i, // 关键：每个物体不同的 firstInstance
-            };
-            infos[i] = {
-                .vertexBufferAddress = vertex_data.vertexBufferAddress,
-                .objectDataAddress = object_data.objectDataAddress,
-                .textureIndex = shaderData.texture_index,
-                .samplerIndex = shaderData.sampler_index,
-                .objectId =
-                    i, //diff: [test_indirectdraw_no_pick]. 直接用数组索引. 可以从object中拿到自定义
-            };
-            idxOff += indexCount;
-        }
-        memcpy(batch.objectInfoBuffer.mapPtr(), infos.data(), needObj);
-        memcpy(batch.indirectDrawBuffer.mapPtr(), cmds.data(), needCmd);
-        batch.drawCount = objectCount;
-    };
-    static constexpr auto prepareBatch2 = [](world_type &world, uint32_t currentFrame) {
         auto &globalCtx = world.globalCtx;
         auto &mainShaderCtx = world.mainShaderCtx;
 
@@ -3031,17 +2476,11 @@ try
             }
         }
 
-#ifdef TEST_DOD3
-        updateObjectData2(world, currentFrame);
-        updateVertexData2(world, currentFrame);
-        prepareBatch2(world, currentFrame);
-#else
-        //diff: [test_dod2] start
+        //diff: [test_dod3] start
         updateObjectData(world, currentFrame);
         updateVertexData(world, currentFrame);
         prepareBatch(world, currentFrame);
-        //diff: [test_dod2] end
-#endif //TEST_DOD3
+        //diff: [test_dod3] end
 
         auto [result, imageIndex] = swapchain.acquireNextImage(
             UINT64_MAX, presentCompleteSemaphore[semaphoreIndex], nullptr);
@@ -3091,13 +2530,12 @@ try
         semaphoreIndex = (semaphoreIndex + 1) % presentCompleteSemaphore.size();
         currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     };
+    constexpr auto FrameRateController = [](auto &world) {
+        auto &inputCtx = world.inputCtx;
+        constexpr float TARGET_FPS = 60.0F;                    // 目标帧率（可改144/30等）
+        constexpr float TARGET_FRAME_TIME = 1.0F / TARGET_FPS; // 目标帧间隔（秒）
+        static auto lastFrameTime = std::chrono::high_resolution_clock::now();
 
-    constexpr float TARGET_FPS = 60.0F;                    // 目标帧率（可改144/30等）
-    constexpr float TARGET_FRAME_TIME = 1.0F / TARGET_FPS; // 目标帧间隔（秒）
-    auto lastFrameTime = std::chrono::high_resolution_clock::now();
-
-    while (globalCtx.window.shouldClose() == 0)
-    {
         // 1. 计算当前帧开始时间
         auto currentFrameStart = std::chrono::high_resolution_clock::now();
 
@@ -3117,9 +2555,18 @@ try
         auto currentFrameTime = std::chrono::high_resolution_clock::now();
         float rawDelta =
             std::chrono::duration<float>(currentFrameTime - lastFrameTime).count();
-        inputCtx.deltaTime =
-            glm::clamp(rawDelta, 0.001f, 0.1f); // diff: [test_dod3.cpp] 更新到引用变量
+        inputCtx.deltaTime = glm::clamp(rawDelta, 0.001f,
+                                        0.1f); // diff: [test_dod3.cpp] 更新到引用变量
         lastFrameTime = currentFrameTime;
+    };
+    constexpr auto InputController = [](auto &world) {
+        auto &inputCtx = world.inputCtx;
+        auto &pickCtx = world.pickCtx;
+        auto &globalCtx = world.globalCtx;
+
+        auto &input = inputCtx.input;
+        auto &pickMouse = pickCtx.mouse;
+        auto &swapchain = globalCtx.swapchain;
 
         input.scroll() = {};
 
@@ -3137,14 +2584,16 @@ try
         {
             pickMouse.valid = false;
         }
+    };
+    while (globalCtx.window.shouldClose() == 0)
+    {
+
+        FrameRateController(world);
+        InputController(world);
 
         views_matrix_update(world);
         views_perspective_update(world);
-#ifdef TEST_DOD3
-        model_update2(world);
-#else
         model_update(world);
-#endif //TEST_DOD3
 
 #if (0)
         auto now = std::chrono::steady_clock::now();

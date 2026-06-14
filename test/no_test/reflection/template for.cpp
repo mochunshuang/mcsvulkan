@@ -116,6 +116,11 @@ int main()
 try
 {
     print2<3>();
+
+    template for (constexpr auto e : std::array{1, 3, 5})
+    {
+        std::println("{}", e);
+    }
     std::cout << "main done\n";
     return 0;
 }
