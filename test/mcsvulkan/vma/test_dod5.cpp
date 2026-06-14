@@ -2516,36 +2516,50 @@ try
 
         frameContext.rebuild(swapchain.imagesSize());
     };
+    // diff: [test_dod5] start
+    static auto s_lastFrameTime = std::chrono::high_resolution_clock::now();
+    static constexpr auto limit_frame_rate = [](auto & /*world*/,
+                                                float targetFPS = 60.0f) {
+        const float targetFrameTime = 1.0f / targetFPS;
+        auto now = std::chrono::high_resolution_clock::now();
+        float elapsed = std::chrono::duration<float>(now - s_lastFrameTime).count();
 
-    static constexpr auto FrameRateController = [](auto &world) {
-        auto &inputCtx = world.inputCtx;
-        constexpr float TARGET_FPS = 60.0F;                    // 目标帧率（可改144/30等）
-        constexpr float TARGET_FRAME_TIME = 1.0F / TARGET_FPS; // 目标帧间隔（秒）
-        static auto lastFrameTime = std::chrono::high_resolution_clock::now();
-
-        // 1. 计算当前帧开始时间
-        auto currentFrameStart = std::chrono::high_resolution_clock::now();
-
-        // 2. 计算上一帧的耗时 + 帧率限制等待
-        std::chrono::duration<float> frameDuration = currentFrameStart - lastFrameTime;
-        float frameTime = frameDuration.count();
-
-        // 如果当前帧耗时小于目标帧间隔，等待补足时间
-        if (frameTime < TARGET_FRAME_TIME)
+        if (elapsed < targetFrameTime)
         {
-            auto sleepTime = std::chrono::duration<float>(TARGET_FRAME_TIME - frameTime);
+            auto sleepTime = std::chrono::duration<float>(targetFrameTime - elapsed);
             std::this_thread::sleep_for(
                 std::chrono::duration_cast<std::chrono::microseconds>(sleepTime));
+            s_lastFrameTime = std::chrono::high_resolution_clock::now();
         }
-
-        // 3. 重新计算真实的deltaTime（用于移动逻辑）
-        auto currentFrameTime = std::chrono::high_resolution_clock::now();
-        float rawDelta =
-            std::chrono::duration<float>(currentFrameTime - lastFrameTime).count();
-        inputCtx.deltaTime = glm::clamp(rawDelta, 0.001f,
-                                        0.1f); // diff: [test_dod3.cpp] 更新到引用变量
-        lastFrameTime = currentFrameTime;
+        else
+        {
+            s_lastFrameTime = now;
+        }
     };
+    static constexpr auto update_delta_time = [](auto &world) {
+        auto now = std::chrono::high_resolution_clock::now();
+        float rawDelta = std::chrono::duration<float>(now - s_lastFrameTime).count();
+        world.inputCtx.deltaTime = glm::clamp(rawDelta, 0.001f, 0.1f);
+        s_lastFrameTime = now;
+    };
+    static constexpr auto FrameRateMonitor = [](auto & /*world*/) {
+        static auto lastPrintTime = std::chrono::high_resolution_clock::now();
+        static int frameCounter = 0;
+
+        ++frameCounter;
+        auto now = std::chrono::high_resolution_clock::now();
+        float elapsed = std::chrono::duration<float>(now - lastPrintTime).count();
+
+        if (elapsed >= 1.0f)
+        {
+            float fps = frameCounter / elapsed;
+            float avgFrameTimeMs = elapsed * 1000.0f / frameCounter;
+            std::println("[FPS] {:5.1f} (avg frame: {:.3f} ms)", fps, avgFrameTimeMs);
+            frameCounter = 0;
+            lastPrintTime = now;
+        }
+    };
+    // diff: [test_dod5] end
     static constexpr auto InputController = [](auto &world) {
         auto &inputCtx = world.inputCtx;
         auto &pickCtx = world.pickCtx;
@@ -2554,8 +2568,6 @@ try
         auto &input = inputCtx.input;
         auto &pickMouse = pickCtx.mouse;
         auto &swapchain = globalCtx.swapchain;
-
-        input.scroll() = {};
 
         surface::pollEvents();
 
@@ -2578,11 +2590,14 @@ try
         make_aggregate<"vulaknDataTransformer", "ProcessingWorldInput_0",
                        "AfterWaitForFences_0", "BeforeRecordCommandBuffer_0">(
             std::constant_wrapper<[](world_type &world) {
-                FrameRateController(world);
+                // limit_frame_rate(world);  // ① 帧率限制（可选）
+                update_delta_time(world); // ② 必须在帧率限制之后，保证 delta 正确
                 InputController(world);
                 views_matrix_update(world);
                 views_perspective_update(world);
                 model_update(world);
+                FrameRateMonitor(world);            // ③ 纯监控
+                world.inputCtx.input.scroll() = {}; // 滚轮清零放在最后
             }>{},
             std::constant_wrapper<[](world_type &world) {
                 auto &globalCtx = world.globalCtx;
@@ -2731,7 +2746,7 @@ try
 
         //NOTE: 一般是鼠标选中设置指定的mesh。 暂时不知道如何组织。单个实体.或许需要事件系统？
         // diff: [test_dod5] start
-        // 定时器：每 2 秒切换纹理和网格
+        // 定时器：每 2 秒切换纹理和网格 //NOTE: 400 - 470 左右。更新影响50左右的帧率
         {
             static auto lastUpdate = std::chrono::steady_clock::now();
             auto now = std::chrono::steady_clock::now();
@@ -2790,6 +2805,8 @@ try
 
                     std::vector<Vertex> newVertices;
                     std::vector<uint32_t> newIndices;
+                    newVertices.reserve(N * N);                // 顶点总数
+                    newIndices.reserve((N - 1) * (N - 1) * 6); // 三角形索引总数
                     float step = 1.0f / (N - 1);
                     for (int j = 0; j < N; ++j)
                         for (int i = 0; i < N; ++i)
@@ -2809,13 +2826,13 @@ try
                         }
 
                     // 排队更新：通过 SoA 的 vertexUpdateQueue 操作
+                    std::cout << "网格切换为 " << N << "x" << N
+                              << "，三角形数: " << newIndices.size() / 3 << '\n';
                     auto [vertexUpdateQueue] =
                         autoSpinStore.view_entity<"vertexUpdateQueue">(0, entityId);
                     vertexUpdateQueue = mesh::vertex_raw_data{std::move(newVertices),
                                                               std::move(newIndices),
                                                               MAX_FRAMES_IN_FLIGHT};
-                    std::cout << "网格切换为 " << N << "x" << N
-                              << "，三角形数: " << newIndices.size() / 3 << '\n';
                 }
                 else
                 {
