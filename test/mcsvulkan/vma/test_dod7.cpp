@@ -212,7 +212,7 @@ namespace mesh
              .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | USAGE | REQUIRE_BUFFER_USAGE,
              .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
             {
-                .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+                // .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT, //diff: [test_dod6.cpp] 关键。突破到10000个小对象.注释掉代码中全部的 VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT
                 .usage = VMA_MEMORY_USAGE_AUTO,
             });
 
@@ -246,7 +246,7 @@ namespace mesh
              .size = BUFFER_SIZE,
              .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | USAGE | REQUIRE_BUFFER_USAGE,
              .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-            {.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+            {// .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
              .usage = VMA_MEMORY_USAGE_AUTO});
 
         // 创建暂存缓冲区并复制数据
@@ -575,9 +575,9 @@ Texture generateGradientTexture(VmaAllocator allocator, const LogicalDevice &dev
                  .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
                  .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
                  // VMA 配置
-                 .allocationCreateInfo = {.flags =
-                                              VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
-                                          .usage = VMA_MEMORY_USAGE_AUTO}})
+                 .allocationCreateInfo =
+                     {//  .flags =VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+                      .usage = VMA_MEMORY_USAGE_AUTO}})
             .setViewCreateInfo(
                 {.viewType = VK_IMAGE_VIEW_TYPE_2D,
                  .subresourceRange = {
@@ -951,24 +951,24 @@ try
     create_texture create_texture{
         commandPool, GRAPHICS_AND_PRESENT,
         create_image{device, allocator}
-            .setCreateInfo(
-                {.imageType = VK_IMAGE_TYPE_2D,
-                 .format = VK_FORMAT_R8G8B8A8_SRGB,
-                 //  .extent = {.width = static_cast<uint32_t>(width),
-                 //             .height = static_cast<uint32_t>(height),
-                 //             .depth = 1},
-                 .mipLevels = 1,
-                 .arrayLayers = 1,
-                 .samples = VK_SAMPLE_COUNT_1_BIT,
-                 .tiling = VK_IMAGE_TILING_OPTIMAL,
-                 .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                          VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                 .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                 // VMA 配置
-                 .allocationCreateInfo = {.flags =
-                                              VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
-                                          .usage = VMA_MEMORY_USAGE_AUTO}})
+            .setCreateInfo({.imageType = VK_IMAGE_TYPE_2D,
+                            .format = VK_FORMAT_R8G8B8A8_SRGB,
+                            //  .extent = {.width = static_cast<uint32_t>(width),
+                            //             .height = static_cast<uint32_t>(height),
+                            //             .depth = 1},
+                            .mipLevels = 1,
+                            .arrayLayers = 1,
+                            .samples = VK_SAMPLE_COUNT_1_BIT,
+                            .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                     VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                     VK_IMAGE_USAGE_SAMPLED_BIT,
+                            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            // VMA 配置
+                            .allocationCreateInfo =
+                                {//  .flags =VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+                                 .usage = VMA_MEMORY_USAGE_AUTO}})
             .setViewCreateInfo(
                 {.viewType = VK_IMAGE_VIEW_TYPE_2D,
                  .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -1141,9 +1141,9 @@ try
                  .sharingMode = VkSharingMode::VK_SHARING_MODE_EXCLUSIVE,
                  .initialLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED,
                  // VMA 配置
-                 .allocationCreateInfo = {.flags =
-                                              VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
-                                          .usage = VMA_MEMORY_USAGE_AUTO}})
+                 .allocationCreateInfo =
+                     {//  .flags =VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+                      .usage = VMA_MEMORY_USAGE_AUTO}})
             .setViewCreateInfo(
                 {.viewType = VK_IMAGE_VIEW_TYPE_2D,
                  .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
@@ -1158,23 +1158,22 @@ try
 
     auto msaaResourcesBuild =
         create_resources{device, allocator}
-            .setCreateInfo(
-                {.imageType = VK_IMAGE_TYPE_2D,
-                 .format = swapchainBuild.refImageFormat(),
-                 .extent = {.width = swapchain.refImageExtent().width,
-                            .height = swapchain.refImageExtent().height,
-                            .depth = 1},
-                 .mipLevels = 1,
-                 .arrayLayers = 1,
-                 .samples = physical_device.getMaxUsableSampleCount(),
-                 .tiling = VK_IMAGE_TILING_OPTIMAL,
-                 .usage = VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
-                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                 .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                 .allocationCreateInfo = {.flags =
-                                              VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
-                                          .usage = VMA_MEMORY_USAGE_AUTO}})
+            .setCreateInfo({.imageType = VK_IMAGE_TYPE_2D,
+                            .format = swapchainBuild.refImageFormat(),
+                            .extent = {.width = swapchain.refImageExtent().width,
+                                       .height = swapchain.refImageExtent().height,
+                                       .depth = 1},
+                            .mipLevels = 1,
+                            .arrayLayers = 1,
+                            .samples = physical_device.getMaxUsableSampleCount(),
+                            .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
+                                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            .allocationCreateInfo =
+                                {//  .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+                                 .usage = VMA_MEMORY_USAGE_AUTO}})
             .setViewCreateInfo(
                 {.viewType = VK_IMAGE_VIEW_TYPE_2D,
                  .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -1373,9 +1372,9 @@ try
                  ,
                  .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
                  .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                 .allocationCreateInfo = {.flags =
-                                              VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
-                                          .usage = VMA_MEMORY_USAGE_AUTO}})
+                 .allocationCreateInfo =
+                     {//  .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+                      .usage = VMA_MEMORY_USAGE_AUTO}})
             .setViewCreateInfo(
                 {.viewType = VK_IMAGE_VIEW_TYPE_2D,
                  .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -2005,6 +2004,8 @@ try
         auto &autoSpinStore = soaCtx.autoSpinStore;
         auto &interactiveStore = soaCtx.interactiveStore;
 
+        auto start = std::chrono::high_resolution_clock::now();
+
         auto autoSpinObjs =
             autoSpinStore
                 .view<"vertexData", "objectDataMap", "textureData", "samplerData">(
@@ -2143,7 +2144,19 @@ try
         memcpy(batch.objectInfoBuffer.mapPtr(), infos.data(), needObj);
         memcpy(batch.indirectDrawBuffer.mapPtr(), cmds.data(), needCmd);
         batch.drawCount = objectCount;
+
+        // 3. 记录结束时间点
+        auto end = std::chrono::high_resolution_clock::now();
+
+        // 4. 计算时间差，并转换为毫秒
+        auto duration =
+            std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+        // NOTE: 函数执行耗时: 2 毫秒. [FPS]  77.1 (avg frame: 12.963 ms) 占用了1/6
+        // 5. 打印耗时
+        std::cout << "函数执行耗时: " << duration.count() << " 毫秒" << std::endl;
     };
+
     // diff: [test_indirectdraw] end
     // diff: [test_dod5] start
     static constexpr auto mainPipeline = make_aggregate<
@@ -2561,7 +2574,7 @@ try
         // diff: [test_dod5] start
         // 每 2 秒添加 10 个小实体，使用网格锚点保证不重叠，并按波次从内向外扩散
         static auto lastUpdate = std::chrono::steady_clock::now();
-        constexpr auto add_count_per_times = 100; //NOTE: 一万就崩溃了
+        constexpr auto add_count_per_times = 1000;
         constexpr int total_batches = 10;
         constexpr int total_entities = add_count_per_times * total_batches;
         static int batch_index = 0; // 当前批次索引 (0~4)

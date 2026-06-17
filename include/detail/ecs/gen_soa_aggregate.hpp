@@ -141,6 +141,10 @@ namespace mcs::vulkan::ecs
         {
             return capacity_;
         }
+        [[nodiscard]] constexpr auto free_size() const noexcept
+        {
+            return capacity() - size();
+        }
 
         // 静态工具：释放 base_type 中所有字段的内存并置空
         template <typename Alloc>
