@@ -16,6 +16,7 @@ std_glsl_target(test_bindless_vertext6 test_bindless_vertext5.vert test_triangle
 
 std_glsl_target(test_drawIndexedIndirect test_drawIndexedIndirect.vert test_drawIndexedIndirect.frag)
 std_glsl_target(test_drawIndexedIndirect2 indirect.vert indirect.frag)
+std_glsl_target(test_indirect_inst indirect_inst.vert indirect.frag)
 
 # end
 std_glsl_env_destroy()
