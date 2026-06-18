@@ -8,6 +8,8 @@
 
 #include "../head.hpp"
 
+#include <random>
+
 using Instance = mcs::vulkan::Instance;
 using create_instance = mcs::vulkan::tool::create_instance;
 using create_debugger = mcs::vulkan::tool::create_debugger;
@@ -343,13 +345,14 @@ try
     frame_context<MAX_FRAMES_IN_FLIGHT> frameContext{device, swapchain.imagesSize()};
 
     //diff: [test_vertext] start
+    // diff: [test_vertext3] start
     // 定义顶点数据（一个四边形，两个三角形）
     const std::vector<Vertex> vertices = {
-        {{-0.5f, -0.5f}}, // 左下，红
-        {{0.5f, -0.5f}},  // 右下，绿
-        {{0.5f, 0.5f}},   // 右上，蓝
-        {{-0.5f, 0.5f}}   // 左上，黄
-    };
+        {{-0.01f, -0.01f}}, // 左下，红
+        {{0.01f, -0.01f}},  // 右下，绿
+        {{0.01f, 0.01f}},   // 右上，蓝
+        {{-0.01f, 0.01f}}   // 左上，黄
+    }; // diff: [test_vertext3] send
     const std::vector<uint32_t> indices = {
         0, 1, 2, // 第一个三角形
         0, 2, 3  // 第二个三角形
@@ -401,13 +404,60 @@ try
                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     //diff: [test_vertext2] start
+    // diff: [test_vertext3] start
     // NOTE: 红先被绘制，后面绘制的会覆盖前面的，因此红最小，黄最大。管线关闭了混合（blendEnable = VK_FALSE），逻辑操作为直接复制，所以后写入的像素会完全覆盖先写入的像素
-    // 实例数据（4 个实例）
-    std::vector<InstanceData> instancesDta = {
-        InstanceData{.offset = {-0.3f, 0.3f}, .color = {1, 0, 0}},
-        InstanceData{.offset = {0.3f, 0.3f}, .color = {0, 1, .0}},
-        InstanceData{.offset = {-0.3f, -0.3f}, .color = {0, 0, 1}},
-        InstanceData{.offset = {0.3f, -0.3f}, .color = {1, 1, 0}}};
+    // NOTE: 一千万： FPS: 38.6 (avg: 39.2) | FrameTime: 25.94ms | Total: 79
+    // NOTE: 十万： FPS: 1932.2 (avg: 1941.6) | FrameTime: 0.52ms | Total: 34958  才加3M的内存
+    const uint32_t INSTANCE_COUNT = 1000; // 修改此值即可改变实例数量
+    /*
+struct InstanceData {
+    glm::vec2 offset; // 2 × 4 = 8 字节
+    glm::vec3 color;  // 3 × 4 = 12 字节
+};
+32 字节 × 100,000 = 3,200,000 字节 ≈ 3.05 MiB（约 3.2 MB）。 洒洒水了
+*/
+    std::vector<InstanceData> instancesDta;
+    instancesDta.reserve(INSTANCE_COUNT);
+
+    // 动态计算网格尺寸（保证覆盖[-1,1]区域）
+    int gridSize = static_cast<int>(std::ceil(std::sqrt(INSTANCE_COUNT)));
+    // 如果实例数正好是平方数，gridSize^2 >= INSTANCE_COUNT，取前 INSTANCE_COUNT 个即可
+    // 调整每个格子的宽度/高度，使所有格子填满整个屏幕区域
+    const float cellWidth = 2.0f / gridSize;
+    const float cellHeight = 2.0f / gridSize;
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    // 随机偏移范围控制在格子大小的 40% 以内（避免重叠越界）
+    std::uniform_real_distribution<float> dis(-0.4f, 0.4f);
+
+    auto generateData = [&]() {
+        uint32_t generated = 0;
+        for (int i = 0; i < gridSize && generated < INSTANCE_COUNT; ++i)
+        {
+            for (int j = 0; j < gridSize && generated < INSTANCE_COUNT; ++j)
+            {
+                // 格子中心坐标
+                float xCenter = -1.0f + (i + 0.5f) * cellWidth;
+                float yCenter = -1.0f + (j + 0.5f) * cellHeight;
+                // 随机偏移（乘以格子尺寸的一半，使得偏移在格子内部）
+                float offsetX = dis(gen) * cellWidth * 0.5f;
+                float offsetY = dis(gen) * cellHeight * 0.5f;
+                // 颜色根据网格位置渐变（有规律）
+                float r = static_cast<float>(i) / gridSize;
+                float g = static_cast<float>(j) / gridSize;
+                float b = 0.5f + 0.5f * (r + g) * 0.5f;
+                instancesDta.push_back(
+                    {.offset = glm::vec2{xCenter + offsetX, yCenter + offsetY},
+                     .color = glm::vec3{r, g, b}});
+                ++generated;
+            }
+        }
+    };
+    generateData();
+
+    // diff: [test_vertext3] end
+
     auto instanceBuffer = make_buffer(std::span{instancesDta},
                                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                           VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
@@ -425,81 +475,31 @@ try
                                       VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
                                           VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    {
-        /*
-        关键点：类型 2/6/10/14 都属于 Heap 2，具有 DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT 三元组。这意味着：
 
-        可以直接 vkMapMemory 得到 CPU 指针，memcpy 后 GPU 立即可见（因为 HOST_COHERENT 自动处理缓存一致性问题，无需 vkFlushMappedMemoryRanges）。
+    //NOTE: 网格数据应该唯一。
+    //diff: [test_vertext3] start: 使用同一种数据源，但是网格不一样，画三角形. 确定了。顶点数据可以共享
+    instancesDta.clear();
+    generateData();
+    auto instanceBuffer2 = make_buffer(std::span{instancesDta},
+                                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                           VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                           VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkDeviceAddress instanceAddress2 =
+        device.getBufferDeviceAddress({.sType = sType<VkBufferDeviceAddressInfo>(),
+                                       .buffer = instanceBuffer2.buffer()});
+    std::vector<VkDrawIndexedIndirectCommand> indirectCmds2 = {
+        {.indexCount = 3, //NOTE: 只用前三个
+         .instanceCount = static_cast<uint32_t>(instancesDta.size()),
+         .firstIndex = 0,
+         .vertexOffset = 0,
+         .firstInstance = 0}};
+    auto indirectBuffer2 = make_buffer(std::span{indirectCmds2},
+                                       VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                                           VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    //diff: [test_vertext3] end
 
-        数据位于显存，GPU 访问速度快。
-
-        更新时只需确保不在 GPU 还在使用同一缓冲区时覆盖它（通过多缓冲解决）。
-        */
-        VkPhysicalDeviceMemoryProperties memProps = physical_device.getMemoryProperties();
-
-        std::println("=== Physical Device Memory Properties ===");
-        std::println("Memory Type Count: {}", memProps.memoryTypeCount);
-        for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i)
-        {
-            const auto &type = memProps.memoryTypes[i];
-            std::print("  Type[{}]: heapIndex={}, flags=", i, type.heapIndex);
-            // 解析 flags 为可读字符串
-            if (type.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-                std::print("DEVICE_LOCAL ");
-            if (type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
-                std::print("HOST_VISIBLE ");
-            if (type.propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-                std::print("HOST_COHERENT ");
-            if (type.propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)
-                std::print("HOST_CACHED ");
-            if (type.propertyFlags & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT)
-                std::print("LAZILY_ALLOCATED ");
-            if (type.propertyFlags & VK_MEMORY_PROPERTY_PROTECTED_BIT)
-                std::print("PROTECTED ");
-            std::println("");
-        }
-
-        std::println("\nMemory Heap Count: {}", memProps.memoryHeapCount);
-        for (uint32_t i = 0; i < memProps.memoryHeapCount; ++i)
-        {
-            const auto &heap = memProps.memoryHeaps[i];
-            std::print("  Heap[{}]: size={:.2f} MB, flags=", i,
-                       heap.size / (1024.0 * 1024.0));
-            if (heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-                std::print("DEVICE_LOCAL ");
-            if (heap.flags & VK_MEMORY_HEAP_MULTI_INSTANCE_BIT)
-                std::print("MULTI_INSTANCE ");
-            std::println("");
-        }
-        std::println("==========================================\n");
-        //NOTE: 看出来了，可以指导哪个堆中，取内存
-        /*
-=== Physical Device Memory Properties ===                                                                                                                                                           
-Memory Type Count: 16                                                                                                                                                                               
-  Type[0]: heapIndex=0, flags=DEVICE_LOCAL                                                                                                                                                          
-  Type[1]: heapIndex=1, flags=HOST_VISIBLE HOST_COHERENT                                                                                                                                            
-  Type[2]: heapIndex=2, flags=DEVICE_LOCAL HOST_VISIBLE HOST_COHERENT                                                                                                                               
-  Type[3]: heapIndex=1, flags=HOST_VISIBLE HOST_COHERENT HOST_CACHED                                                                                                                                
-  Type[4]: heapIndex=0, flags=DEVICE_LOCAL                                                                                                                                                          
-  Type[5]: heapIndex=1, flags=HOST_VISIBLE HOST_COHERENT                                                                                                                                            
-  Type[6]: heapIndex=2, flags=DEVICE_LOCAL HOST_VISIBLE HOST_COHERENT                                                                                                                               
-  Type[7]: heapIndex=1, flags=HOST_VISIBLE HOST_COHERENT HOST_CACHED                                                                                                                                
-  Type[8]: heapIndex=0, flags=DEVICE_LOCAL                                                                                                                                                          
-  Type[9]: heapIndex=1, flags=HOST_VISIBLE HOST_COHERENT 
-  Type[10]: heapIndex=2, flags=DEVICE_LOCAL HOST_VISIBLE HOST_COHERENT 
-  Type[11]: heapIndex=1, flags=HOST_VISIBLE HOST_COHERENT HOST_CACHED 
-  Type[12]: heapIndex=0, flags=DEVICE_LOCAL 
-  Type[13]: heapIndex=1, flags=HOST_VISIBLE HOST_COHERENT 
-  Type[14]: heapIndex=2, flags=DEVICE_LOCAL HOST_VISIBLE HOST_COHERENT 
-  Type[15]: heapIndex=1, flags=HOST_VISIBLE HOST_COHERENT HOST_CACHED 
-
-Memory Heap Count: 3
-  Heap[0]: size=256.00 MB, flags=DEVICE_LOCAL MULTI_INSTANCE 
-  Heap[1]: size=15776.00 MB, flags=
-  Heap[2]: size=256.00 MB, flags=DEVICE_LOCAL MULTI_INSTANCE 
-==========================================
-*/
-    }
     //diff: [test_vertext2] end
 
     //diff: [test_vertext] end
@@ -563,6 +563,19 @@ Memory Heap Count: 3
         // 3. 间接绘制
         commandBuffer.drawIndexedIndirect(indirectBuffer.buffer(), 0, indirectCmds.size(),
                                           sizeof(VkDrawIndexedIndirectCommand));
+        {
+            //diff: [test_vertext3] start
+            // 2. 推送实例数据地址
+            PushData pushConstants = {instanceAddress2};
+            commandBuffer.pushConstants(*pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                                        sizeof(PushData), &pushConstants);
+
+            // 3. 间接绘制
+            commandBuffer.drawIndexedIndirect(indirectBuffer2.buffer(), 0,
+                                              indirectCmds2.size(),
+                                              sizeof(VkDrawIndexedIndirectCommand));
+            //diff: [test_vertext3] end
+        }
         //diff: [test_vertext2] end
 
         commandBuffer.endRendering();

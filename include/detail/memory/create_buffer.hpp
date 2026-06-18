@@ -11,7 +11,6 @@ namespace mcs::vulkan::memory
 {
     struct create_buffer
     {
-
         /*
         typedef struct VkBufferCreateInfo {
             VkStructureType        sType;
@@ -48,7 +47,7 @@ namespace mcs::vulkan::memory
             std::vector<uint32_t> queueFamilyIndices;
         };
         static_assert(std::is_default_constructible_v<create_info>);
-        auto &&setCreateInfo(this auto &&self, create_info createInfo)
+        auto &&setCreateInfo(this auto &&self, create_info createInfo) noexcept
         {
             self.createInfo_ = std::move(createInfo);
             return std::forward<decltype(self)>(self);
@@ -80,8 +79,8 @@ namespace mcs::vulkan::memory
         using GenMemoryAllocateInfo = std::move_only_function<memory_allocate_info(
             VkMemoryRequirements memRequirements,
             VkPhysicalDeviceMemoryProperties memoryProperties)>;
-        auto &&setGenMemoryAllocateInfo(this auto &&self,
-                                        GenMemoryAllocateInfo genMemoryAllocateInfo)
+        auto &&setGenMemoryAllocateInfo(
+            this auto &&self, GenMemoryAllocateInfo genMemoryAllocateInfo) noexcept
         {
             self.genMemoryAllocateInfo_ = std::move(genMemoryAllocateInfo);
             return std::forward<decltype(self)>(self);
@@ -127,6 +126,7 @@ namespace mcs::vulkan::memory
                 throw;
             }
         }
+        constexpr create_buffer() noexcept : createInfo_{} {}
 
       private:
         create_info createInfo_;
