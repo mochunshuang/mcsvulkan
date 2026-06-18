@@ -13,11 +13,12 @@ namespace mcs::vulkan::tool
         std::unique_ptr<uint8_t[]> storage_; // NOLINT
 
       public:
-        pNext() = default;
+        constexpr pNext() = default;
         pNext(const pNext &) = delete;
+        constexpr pNext(std::nullptr_t) noexcept : storage_(nullptr) {} // NOLINT
         constexpr pNext(pNext &&o) noexcept : storage_{std::exchange(o.storage_, {})} {}
-        pNext &operator=(const pNext &) = delete;
-        pNext &operator=(pNext &&o) noexcept
+        constexpr pNext &operator=(const pNext &) = delete;
+        constexpr pNext &operator=(pNext &&o) noexcept
         {
             if (&o != this)
             {

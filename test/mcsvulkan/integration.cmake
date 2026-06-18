@@ -18,5 +18,8 @@ std_glsl_target(test_drawIndexedIndirect test_drawIndexedIndirect.vert test_draw
 std_glsl_target(test_drawIndexedIndirect2 indirect.vert indirect.frag)
 std_glsl_target(test_indirect_inst indirect_inst.vert indirect.frag)
 
+std_glsl_target(test_vertext test_vertext.vert test_triangle.frag)
+std_glsl_target(test_vertext2 test_vertext2.vert test_triangle.frag)
+
 # end
 std_glsl_env_destroy()

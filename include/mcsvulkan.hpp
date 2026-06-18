@@ -13,6 +13,7 @@
 #include "detail/__yoga.hpp"
 #include "detail/__meta.hpp"
 #include "detail/__ecs.hpp"
+#include "detail/__memory.hpp"
 
 #include "detail/raii_vulkan.hpp"
 #include "detail/Instance.hpp"
