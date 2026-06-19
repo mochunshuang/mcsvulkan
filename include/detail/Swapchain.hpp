@@ -58,8 +58,8 @@ namespace mcs::vulkan
         {
             return swapChainImageViews_[idx];
         }
-        auto acquireNextImage(uint64_t timeout, VkSemaphore semaphore,
-                              VkFence fence) const noexcept
+        constexpr auto acquireNextImage(uint64_t timeout, VkSemaphore semaphore,
+                                        VkFence fence) const noexcept
         {
             return device_->acquireNextImageKHR(swapchain_, timeout, semaphore, fence);
         }

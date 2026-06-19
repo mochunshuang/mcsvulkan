@@ -725,5 +725,13 @@ namespace mcs::vulkan
             table_.vkCmdDrawIndexedIndirect(commandBuffer, buffer, offset, drawCount,
                                             stride);
         }
+
+        constexpr void flushMappedMemoryRanges(
+            uint32_t memoryRangeCount,
+            const VkMappedMemoryRange *pMemoryRanges) const noexcept
+        {
+            MCS_ASSERT(table_.vkFlushMappedMemoryRanges != nullptr);
+            table_.vkFlushMappedMemoryRanges(value_, memoryRangeCount, pMemoryRanges);
+        }
     };
 }; // namespace mcs::vulkan

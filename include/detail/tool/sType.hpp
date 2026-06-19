@@ -148,9 +148,14 @@ namespace mcs::vulkan::tool
         else if constexpr (std::is_same_v<T,
                                           VkPhysicalDeviceShaderDrawParametersFeatures>)
             return VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES;
+        else if constexpr (std::is_same_v<T, VkBufferMemoryBarrier2>)
+            return VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+        else if constexpr (std::is_same_v<T, VkMemoryBarrier2>)
+            return VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
         else
-            // static_assert(false, "Unknown Vulkan structure type");
-            std::terminate();
+            []() {
+                static_assert(false, "Unknown Vulkan structure type");
+            }();
     }
 
 }; // namespace mcs::vulkan::tool
