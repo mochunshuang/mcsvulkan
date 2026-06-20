@@ -458,10 +458,6 @@ struct InstanceData {
          .firstIndex = 0,
          .vertexOffset = 0,
          .firstInstance = 0}};
-    auto indirectBuffer = make_buffer(std::span{indirectCmds},
-                                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-                                          VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     //diff: [test_vertext2] end
 
@@ -486,9 +482,7 @@ struct InstanceData {
         std::max(quadIndices.size(), triIndices.size()) * sizeof(uint32_t);
 
     // 状态控制
-    bool isQuad = true;              // 当前形状
-    bool needGeometryUpdate = false; // 请求切换标志
-    int geometryUpdateCount = 0;
+    bool isQuad = true; // 当前形状
 
     // diff: [test_vertext4] end
 
@@ -555,7 +549,8 @@ struct InstanceData {
     std::array<auto_map_buffer, MAX_FRAMES_IN_FLIGHT> indexBuffers;
     std::array<auto_map_buffer, MAX_FRAMES_IN_FLIGHT> indirectBuffers;
     std::array<auto_map_buffer, MAX_FRAMES_IN_FLIGHT> instanceBuffers;
-    std::array<bool, MAX_FRAMES_IN_FLIGHT> frameCopyRequired{};
+    std::array<VkDeviceAddress, MAX_FRAMES_IN_FLIGHT> instanceBufferAddress{};
+    std::array<bool, MAX_FRAMES_IN_FLIGHT> frameNeedsGeometryUpdate{};
 
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
     {
@@ -570,6 +565,9 @@ struct InstanceData {
                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                   VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                               true); // 需要设备地址
+        instanceBufferAddress[i] =
+            device.getBufferDeviceAddress({.sType = sType<VkBufferDeviceAddressInfo>(),
+                                           .buffer = instanceBuffers[i].buffer()});
     }
     // diff: [test_vertext6] end
 
@@ -593,8 +591,31 @@ struct InstanceData {
         auto &indexBuffer = indexBuffers[frameIndex];
         auto &indirectBuffer = indirectBuffers[frameIndex];
         auto &instanceBuffer = instanceBuffers[frameIndex];
-        if (frameCopyRequired[frameIndex])
+        auto &instanceBufferAddr = instanceBufferAddress[frameIndex];
+        if (frameNeedsGeometryUpdate[frameIndex])
         {
+            // 直接向每个飞行帧的 ReBAR 缓冲区写入
+            {
+                const auto &newVerts = isQuad ? quadVertices : triVertices;
+                const auto &newIdxs = isQuad ? quadIndices : triIndices;
+
+                memcpy(vertexBuffers[frameIndex].mapPtr(), newVerts.data(),
+                       newVerts.size() * sizeof(Vertex));
+                memcpy(indexBuffers[frameIndex].mapPtr(), newIdxs.data(),
+                       newIdxs.size() * sizeof(uint32_t));
+                memcpy(indirectBuffers[frameIndex].mapPtr(), indirectCmds.data(),
+                       sizeof(VkDrawIndexedIndirectCommand));
+                memcpy(instanceBuffers[frameIndex].mapPtr(), instancesDta.data(),
+                       instancesDta.size() * sizeof(InstanceData));
+
+                // 刷新（非连贯内存需要；此处统一刷新保证安全）
+                flush_buffer(device, vertexBuffers[frameIndex].bufferMemory());
+                flush_buffer(device, indexBuffers[frameIndex].bufferMemory());
+                flush_buffer(device, indirectBuffers[frameIndex].bufferMemory());
+                flush_buffer(device, instanceBuffers[frameIndex].bufferMemory());
+
+                frameNeedsGeometryUpdate[frameIndex] = false;
+            }
             // 仅插入主机写入 → 图形/索引/间接/着色器读取的屏障
             std::array<VkBufferMemoryBarrier2, 4> barriers{{
                 {
@@ -644,8 +665,6 @@ struct InstanceData {
                                          static_cast<uint32_t>(barriers.size()),
                                      .pBufferMemoryBarriers = barriers.data()};
             commandBuffer.pipelineBarrier2(depInfo);
-
-            frameCopyRequired[frameIndex] = false;
         }
         //diff: [test_vertext6] end
 
@@ -685,10 +704,7 @@ struct InstanceData {
 
         // 2. 推送实例数据地址
         //diff: [test_vertext5] start
-        VkDeviceAddress currentInstanceAddress = device.getBufferDeviceAddress(
-            {.sType = sType<VkBufferDeviceAddressInfo>(),
-             .buffer = instanceBuffers[frameIndex].buffer()});
-        PushData pushConstants = {currentInstanceAddress};
+        PushData pushConstants = {instanceBufferAddr};
         commandBuffer.pushConstants(*pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0,
                                     sizeof(PushData), &pushConstants);
         //diff: [test_vertext5] end
@@ -729,48 +745,6 @@ struct InstanceData {
         while (logicalDevice->waitForFences(1, inFlightFences[currentFrame], VK_TRUE,
                                             UINT64_MAX) == VK_TIMEOUT)
             ;
-        //diff: [test_vertext6] start
-        // 几何更新 ----------
-        if (needGeometryUpdate && geometryUpdateCount == 0)
-        {
-            isQuad = !isQuad;
-            const auto &newVerts = isQuad ? quadVertices : triVertices;
-            const auto &newIdxs = isQuad ? quadIndices : triIndices;
-
-            instancesDta.clear();
-            generateData();
-            indirectCmds[0].indexCount = static_cast<uint32_t>(newIdxs.size());
-            indirectCmds[0].instanceCount = static_cast<uint32_t>(instancesDta.size());
-
-            // 直接向每个飞行帧的 ReBAR 缓冲区写入
-            for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
-            {
-                memcpy(vertexBuffers[i].mapPtr(), newVerts.data(),
-                       newVerts.size() * sizeof(Vertex));
-                memcpy(indexBuffers[i].mapPtr(), newIdxs.data(),
-                       newIdxs.size() * sizeof(uint32_t));
-                memcpy(indirectBuffers[i].mapPtr(), indirectCmds.data(),
-                       sizeof(VkDrawIndexedIndirectCommand));
-                memcpy(instanceBuffers[i].mapPtr(), instancesDta.data(),
-                       instancesDta.size() * sizeof(InstanceData));
-
-                // 刷新（非连贯内存需要；此处统一刷新保证安全）
-                flush_buffer(device, vertexBuffers[i].bufferMemory());
-                flush_buffer(device, indexBuffers[i].bufferMemory());
-                flush_buffer(device, indirectBuffers[i].bufferMemory());
-                flush_buffer(device, instanceBuffers[i].bufferMemory());
-            }
-
-            geometryUpdateCount = MAX_FRAMES_IN_FLIGHT;
-            needGeometryUpdate = false;
-        }
-
-        if (geometryUpdateCount > 0)
-        {
-            frameCopyRequired[currentFrame] = true;
-            --geometryUpdateCount;
-        }
-        //diff: [test_vertext6] end
 
         auto [result, imageIndex] = swapchain.acquireNextImage(
             UINT64_MAX, presentCompleteSemaphore[semaphoreIndex], nullptr);
@@ -860,9 +834,24 @@ struct InstanceData {
                 frameCount = 0;
                 lastTime = now;
 
-                //diff: [test_vertext4] start
-                needGeometryUpdate = true;
-                //diff: [test_vertext4] end
+                //diff: [test_vertext6] start: [简化和凝结了更新]
+                // NOTE: 标记更新和重新建立 indirectCmds
+                {
+                    // 切换形状并准备新数据（只做一次）
+                    isQuad = !isQuad;
+                    const auto &newIdxs = isQuad ? quadIndices : triIndices;
+
+                    instancesDta.clear();
+                    generateData();
+                    indirectCmds[0].indexCount = static_cast<uint32_t>(newIdxs.size());
+                    indirectCmds[0].instanceCount =
+                        static_cast<uint32_t>(instancesDta.size());
+
+                    // 标记所有飞行帧“脏”（后续各自空闲时自行更新）
+                    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+                        frameNeedsGeometryUpdate[i] = true;
+                }
+                //diff: [test_vertext6] end
 
             } // NOLINTEND
         }

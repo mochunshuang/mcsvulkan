@@ -451,20 +451,12 @@ struct InstanceData {
 
     // diff: [test_vertext3] end
 
-    std::array<buffer_base, MAX_FRAMES_IN_FLIGHT> instanceBuffers;
-    auto instanceStaging =
-        create_staging_buffer(device, INSTANCE_COUNT * sizeof(InstanceData));
-
     std::vector<VkDrawIndexedIndirectCommand> indirectCmds = {
         {.indexCount = static_cast<uint32_t>(indices.size()),
          .instanceCount = static_cast<uint32_t>(instancesDta.size()),
          .firstIndex = 0,
          .vertexOffset = 0,
          .firstInstance = 0}};
-    auto indirectBuffer = make_buffer(std::span{indirectCmds},
-                                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-                                          VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     //diff: [test_vertext2] end
 
@@ -489,9 +481,7 @@ struct InstanceData {
         std::max(quadIndices.size(), triIndices.size()) * sizeof(uint32_t);
 
     // 状态控制
-    bool isQuad = true;              // 当前形状
-    bool needGeometryUpdate = false; // 请求切换标志
-    int geometryUpdateCount = 0;
+    bool isQuad = true; // 当前形状
 
     // diff: [test_vertext4] end
 
@@ -499,7 +489,9 @@ struct InstanceData {
     std::array<buffer_base, MAX_FRAMES_IN_FLIGHT> vertexBuffers;
     std::array<buffer_base, MAX_FRAMES_IN_FLIGHT> indexBuffers;
     std::array<buffer_base, MAX_FRAMES_IN_FLIGHT> indirectBuffers;
-    std::array<bool, MAX_FRAMES_IN_FLIGHT> frameCopyRequired{};
+    std::array<buffer_base, MAX_FRAMES_IN_FLIGHT> instanceBuffers;
+    std::array<VkDeviceAddress, MAX_FRAMES_IN_FLIGHT> instanceBufferAddress{};
+    std::array<bool, MAX_FRAMES_IN_FLIGHT> frameNeedsGeometryUpdate{};
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
     {
         vertexBuffers[i] = make_buffer(std::span{vertices},
@@ -521,6 +513,9 @@ struct InstanceData {
                                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                                              VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        instanceBufferAddress[i] =
+            device.getBufferDeviceAddress({.sType = sType<VkBufferDeviceAddressInfo>(),
+                                           .buffer = instanceBuffers[i].buffer()});
     }
     // 为每帧创建独立的 staging buffer 组
     struct PerFrameStaging
@@ -563,30 +558,35 @@ struct InstanceData {
         auto &indexBuffer = indexBuffers[frameIndex];
         auto &indirectBuffer = indirectBuffers[frameIndex];
         auto &instanceBuffer = instanceBuffers[frameIndex];
-        if (frameCopyRequired[frameIndex])
+        auto &instanceBufferAddr = instanceBufferAddress[frameIndex];
+        if (frameNeedsGeometryUpdate[frameIndex])
         {
-
             //diff: [test_vertext5] start
             auto &stg = stagings[frameIndex];
             //diff: [test_vertext5] end
+            // 上传数据到GPU
+            {
+                const VkDeviceSize vsize =
+                    (isQuad ? quadVertices.size() : triVertices.size()) * sizeof(Vertex);
+                const VkDeviceSize isize =
+                    (isQuad ? quadIndices.size() : triIndices.size()) * sizeof(uint32_t);
 
-            const VkDeviceSize vsize =
-                (isQuad ? quadVertices.size() : triVertices.size()) * sizeof(Vertex);
-            const VkDeviceSize isize =
-                (isQuad ? quadIndices.size() : triIndices.size()) * sizeof(uint32_t);
-
-            commandBuffer.copyBuffer(
-                stg.vertex.buffer(), vertexBuffer.buffer(),
-                std::array<VkBufferCopy, 1>{VkBufferCopy{0, 0, vsize}});
-            commandBuffer.copyBuffer(
-                stg.index.buffer(), indexBuffer.buffer(),
-                std::array<VkBufferCopy, 1>{VkBufferCopy{0, 0, isize}});
-            commandBuffer.copyBuffer(stg.indirect.buffer(), indirectBuffer.buffer(),
-                                     std::array<VkBufferCopy, 1>{VkBufferCopy{
-                                         0, 0, sizeof(VkDrawIndexedIndirectCommand)}});
-            commandBuffer.copyBuffer(stg.instance.buffer(), instanceBuffer.buffer(),
-                                     std::array<VkBufferCopy, 1>{VkBufferCopy{
-                                         0, 0, INSTANCE_COUNT * sizeof(InstanceData)}});
+                commandBuffer.copyBuffer(
+                    stg.vertex.buffer(), vertexBuffer.buffer(),
+                    std::array<VkBufferCopy, 1>{VkBufferCopy{0, 0, vsize}});
+                commandBuffer.copyBuffer(
+                    stg.index.buffer(), indexBuffer.buffer(),
+                    std::array<VkBufferCopy, 1>{VkBufferCopy{0, 0, isize}});
+                commandBuffer.copyBuffer(
+                    stg.indirect.buffer(), indirectBuffer.buffer(),
+                    std::array<VkBufferCopy, 1>{
+                        VkBufferCopy{0, 0, sizeof(VkDrawIndexedIndirectCommand)}});
+                commandBuffer.copyBuffer(
+                    stg.instance.buffer(), instanceBuffer.buffer(),
+                    std::array<VkBufferCopy, 1>{
+                        VkBufferCopy{0, 0, INSTANCE_COUNT * sizeof(InstanceData)}});
+                frameNeedsGeometryUpdate[frameIndex] = false;
+            }
 
             const std::array<VkBufferMemoryBarrier2, 4> barriers{
                 {{.sType = sType<VkBufferMemoryBarrier2>(),
@@ -630,7 +630,7 @@ struct InstanceData {
                   .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT,
                   .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                   .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                  .buffer = instanceBuffers[frameIndex].buffer(),
+                  .buffer = instanceBuffer.buffer(),
                   .offset = 0,
                   .size = VK_WHOLE_SIZE}}};
 
@@ -640,9 +640,6 @@ struct InstanceData {
                  .dependencyFlags = 0,
                  .bufferMemoryBarrierCount = static_cast<uint32_t>(barriers.size()),
                  .pBufferMemoryBarriers = barriers.data()});
-
-            // 清除标记
-            frameCopyRequired[frameIndex] = false;
         }
         //diff: [test_vertext4] end
 
@@ -682,10 +679,7 @@ struct InstanceData {
 
         // 2. 推送实例数据地址
         //diff: [test_vertext5] start
-        VkDeviceAddress currentInstanceAddress = device.getBufferDeviceAddress(
-            {.sType = sType<VkBufferDeviceAddressInfo>(),
-             .buffer = instanceBuffers[frameIndex].buffer()});
-        PushData pushConstants = {currentInstanceAddress};
+        PushData pushConstants = {instanceBufferAddr};
         commandBuffer.pushConstants(*pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0,
                                     sizeof(PushData), &pushConstants);
         //diff: [test_vertext5] end
@@ -726,43 +720,6 @@ struct InstanceData {
         while (logicalDevice->waitForFences(1, inFlightFences[currentFrame], VK_TRUE,
                                             UINT64_MAX) == VK_TIMEOUT)
             ;
-        //diff: [test_vertext5] start
-        // ---------- 几何更新 ----------
-        if (needGeometryUpdate && geometryUpdateCount == 0)
-        {
-            isQuad = !isQuad;
-            const auto &newVerts = isQuad ? quadVertices : triVertices;
-            const auto &newIdxs = isQuad ? quadIndices : triIndices;
-
-            // 重新生成实例数据
-            instancesDta.clear();
-            generateData();
-            indirectCmds[0].indexCount = static_cast<uint32_t>(newIdxs.size());
-            indirectCmds[0].instanceCount = static_cast<uint32_t>(instancesDta.size());
-
-            // 向所有 staging 缓冲区写入相同的新数据（后续每帧各拷贝自己的那份）
-            for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
-            {
-                memcpy(stagings[i].vertex.mapPtr(), newVerts.data(),
-                       newVerts.size() * sizeof(Vertex));
-                memcpy(stagings[i].index.mapPtr(), newIdxs.data(),
-                       newIdxs.size() * sizeof(uint32_t));
-                memcpy(stagings[i].indirect.mapPtr(), indirectCmds.data(),
-                       sizeof(VkDrawIndexedIndirectCommand));
-                memcpy(stagings[i].instance.mapPtr(), instancesDta.data(),
-                       instancesDta.size() * sizeof(InstanceData));
-            }
-
-            geometryUpdateCount = MAX_FRAMES_IN_FLIGHT;
-            needGeometryUpdate = false;
-        }
-
-        if (geometryUpdateCount > 0)
-        {
-            frameCopyRequired[currentFrame] = true;
-            --geometryUpdateCount; // 每帧递减，直至所有飞行帧都完成拷贝
-        }
-        //diff: [test_vertext5] end
 
         auto [result, imageIndex] = swapchain.acquireNextImage(
             UINT64_MAX, presentCompleteSemaphore[semaphoreIndex], nullptr);
@@ -852,9 +809,36 @@ struct InstanceData {
                 frameCount = 0;
                 lastTime = now;
 
-                //diff: [test_vertext4] start
-                needGeometryUpdate = true;
-                //diff: [test_vertext4] end
+                //diff: [test_vertext5] start: [简化和凝结了更新]
+                // NOTE: 标记更新和重新建立 indirectCmds
+                {
+                    // 切换形状并准备新数据（只做一次）
+                    isQuad = !isQuad;
+
+                    const auto &newVerts = isQuad ? quadVertices : triVertices;
+                    const auto &newIdxs = isQuad ? quadIndices : triIndices;
+
+                    instancesDta.clear();
+                    generateData();
+                    indirectCmds[0].indexCount = static_cast<uint32_t>(newIdxs.size());
+                    indirectCmds[0].instanceCount =
+                        static_cast<uint32_t>(instancesDta.size());
+
+                    // 标记所有飞行帧“脏”（后续各自空闲时自行更新）
+                    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+                    {
+                        memcpy(stagings[i].vertex.mapPtr(), newVerts.data(),
+                               newVerts.size() * sizeof(Vertex));
+                        memcpy(stagings[i].index.mapPtr(), newIdxs.data(),
+                               newIdxs.size() * sizeof(uint32_t));
+                        memcpy(stagings[i].indirect.mapPtr(), indirectCmds.data(),
+                               sizeof(VkDrawIndexedIndirectCommand));
+                        memcpy(stagings[i].instance.mapPtr(), instancesDta.data(),
+                               instancesDta.size() * sizeof(InstanceData));
+                        frameNeedsGeometryUpdate[i] = true;
+                    }
+                }
+                //diff: [test_vertext5] end
 
             } // NOLINTEND
         }
