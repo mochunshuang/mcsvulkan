@@ -67,6 +67,9 @@ if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     add_compile_options(
         "$<$<COMPILE_LANGUAGE:CXX>:-freflection>"
     )
+
+    # https://github.com/msys2/MINGW-packages/issues/29279
+    # add_compile_definitions(__cpp_lib_constexpr_exceptions=0) # multiple definition of `std::runtime_error::runtime_error(std::runtime_error const&)'
 endif()
 
 # test add

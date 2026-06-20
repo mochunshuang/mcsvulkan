@@ -4,6 +4,7 @@
 #include "../tool/sType.hpp"
 #include "../tool/pNext.hpp"
 #include "../tool/Flags.hpp"
+#include "memory_allocate_info.hpp"
 #include <functional>
 #include <vector>
 
@@ -23,7 +24,7 @@ namespace mcs::vulkan::memory
             const uint32_t*        pQueueFamilyIndices;
         } VkBufferCreateInfo;
         */
-        struct create_info
+        struct create_info // NOLINTBEGIN
         {
             constexpr VkBufferCreateInfo operator()() const noexcept
             {
@@ -40,65 +41,28 @@ namespace mcs::vulkan::memory
                     .pQueueFamilyIndices = queueFamilyIndices.data()};
             }
             tool::pNext pNext;
-            VkBufferCreateFlags flags;
+            tool::Flags<VkBufferCreateFlagBits> flags;
             VkDeviceSize size;
             VkBufferUsageFlags usage;
             VkSharingMode sharingMode;
             std::vector<uint32_t> queueFamilyIndices;
-        };
+        }; // NOLINTEND
         static_assert(std::is_default_constructible_v<create_info>);
-        auto &&setCreateInfo(this auto &&self, create_info createInfo) noexcept
+        constexpr auto &&setCreateInfo(this auto &&self, create_info createInfo) noexcept
         {
             self.createInfo_ = std::move(createInfo);
             return std::forward<decltype(self)>(self);
         }
-
-        /*
-        typedef struct VkMemoryAllocateInfo {
-            VkStructureType    sType;
-            const void*        pNext;
-            VkDeviceSize       allocationSize;
-            uint32_t           memoryTypeIndex;
-        } VkMemoryAllocateInfo;
-        */
-        struct memory_allocate_info
-        {
-            constexpr VkMemoryAllocateInfo operator()() const noexcept
-            {
-                using tool::sType;
-                return {.sType = sType<VkMemoryAllocateInfo>(),
-                        .pNext = pNext.value(),
-                        .allocationSize = allocationSize,
-                        .memoryTypeIndex = memoryTypeIndex};
-            }
-            tool::pNext pNext;
-            VkDeviceSize allocationSize;
-            uint32_t memoryTypeIndex;
-        };
+        using memory_allocate_info = memory_allocate_info;
         static_assert(std::is_default_constructible_v<memory_allocate_info>);
         using GenMemoryAllocateInfo = std::move_only_function<memory_allocate_info(
             VkMemoryRequirements memRequirements,
             VkPhysicalDeviceMemoryProperties memoryProperties)>;
-        auto &&setGenMemoryAllocateInfo(
+        constexpr auto &&setGenMemoryAllocateInfo(
             this auto &&self, GenMemoryAllocateInfo genMemoryAllocateInfo) noexcept
         {
             self.genMemoryAllocateInfo_ = std::move(genMemoryAllocateInfo);
             return std::forward<decltype(self)>(self);
-        }
-
-        [[nodiscard]] static constexpr auto findMemoryTypeIndex(
-            uint32_t typeFilter, // NOLINTNEXTLINE
-            VkPhysicalDeviceMemoryProperties memProperties,
-            VkMemoryPropertyFlags properties)
-        {
-            for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++)
-            {
-                if (((typeFilter & (1 << i)) != 0U) && // NOLINTNEXTLINE
-                    ((memProperties.memoryTypes[i].propertyFlags) & properties) ==
-                        properties)
-                    return i;
-            }
-            throw std::runtime_error("failed to find suitable memory type!");
         }
 
         constexpr auto build(LogicalDevice &device, VkDeviceSize memoryOffset = 0)
@@ -127,6 +91,12 @@ namespace mcs::vulkan::memory
             }
         }
         constexpr create_buffer() noexcept : createInfo_{} {}
+        constexpr create_buffer(create_info createInfo,
+                                GenMemoryAllocateInfo genMemoryAllocateInfo) noexcept
+            : createInfo_{std::move(createInfo)},
+              genMemoryAllocateInfo_{std::move(genMemoryAllocateInfo)}
+        {
+        }
 
       private:
         create_info createInfo_;

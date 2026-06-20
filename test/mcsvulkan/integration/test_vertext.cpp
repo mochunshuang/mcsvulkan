@@ -49,6 +49,7 @@ using mcs::vulkan::MCS_ASSERT;
 using mcs::vulkan::memory::create_buffer;
 using mcs::vulkan::memory::create_staging_buffer;
 using mcs::vulkan::memory::auto_map_buffer;
+using mcs::vulkan::memory::find_memory_type_index;
 using mcs::vulkan::tool::simple_copy_buffer;
 struct Vertex // NOLINT
 {
@@ -337,22 +338,21 @@ try
                                           VkMemoryPropertyFlags properties) {
         VkDeviceSize buffer_size = sizeof(Data) * data.size();
         using memory_allocate_info = create_buffer::memory_allocate_info;
-        auto buffer =
-            create_buffer{}
-                .setCreateInfo({.size = buffer_size,
-                                .usage = usage,
-                                .sharingMode = VK_SHARING_MODE_EXCLUSIVE})
-                .setGenMemoryAllocateInfo(
-                    [&](VkMemoryRequirements memRequirements,
-                        VkPhysicalDeviceMemoryProperties memoryProperties)
-                        -> memory_allocate_info {
-                        return {.pNext = {},
-                                .allocationSize = memRequirements.size,
-                                .memoryTypeIndex = create_buffer::findMemoryTypeIndex(
-                                    memRequirements.memoryTypeBits, memoryProperties,
-                                    properties)};
-                    })
-                .build(device);
+        auto buffer = create_buffer{}
+                          .setCreateInfo({.size = buffer_size,
+                                          .usage = usage,
+                                          .sharingMode = VK_SHARING_MODE_EXCLUSIVE})
+                          .setGenMemoryAllocateInfo(
+                              [&](VkMemoryRequirements memRequirements,
+                                  VkPhysicalDeviceMemoryProperties memoryProperties)
+                                  -> memory_allocate_info {
+                                  return {.pNext = {},
+                                          .allocationSize = memRequirements.size,
+                                          .memoryTypeIndex = find_memory_type_index(
+                                              memRequirements.memoryTypeBits,
+                                              memoryProperties, properties)};
+                              })
+                          .build(device);
         auto staging_buffer = create_staging_buffer(device, buffer_size);
         ::memcpy(staging_buffer.mapPtr(), data.data(), buffer_size);
 

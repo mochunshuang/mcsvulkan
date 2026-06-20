@@ -153,9 +153,7 @@ namespace mcs::vulkan::tool
         else if constexpr (std::is_same_v<T, VkMemoryBarrier2>)
             return VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
         else
-            []() {
-                static_assert(false, "Unknown Vulkan structure type");
-            }();
+            throw std::logic_error("Unknown Vulkan structure type");
     }
 
 }; // namespace mcs::vulkan::tool

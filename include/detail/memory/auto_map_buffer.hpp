@@ -8,8 +8,8 @@ namespace mcs::vulkan::memory
     struct auto_map_buffer : buffer_base
     {
         auto_map_buffer() = default; // NOLINTNEXTLINE
-        constexpr explicit auto_map_buffer(buffer_base base, size_t bufferSize,
-                                           VkMemoryMapFlags flags = 0)
+        constexpr auto_map_buffer(buffer_base base, size_t bufferSize,
+                                  VkMemoryMapFlags flags = 0)
             : buffer_base{std::move(base)}, mapPtr_{buffer_base::map(bufferSize, flags)}
         {
         }
@@ -31,8 +31,6 @@ namespace mcs::vulkan::memory
             {
                 if (mapPtr_ != nullptr)
                     buffer_base::unmap();
-
-                // 全限定函数名字
                 buffer_base::operator=(std::move(other));
                 mapPtr_ = std::exchange(other.mapPtr_, nullptr);
             }
@@ -46,6 +44,15 @@ namespace mcs::vulkan::memory
         [[nodiscard]] void *mapPtr() const noexcept
         {
             return mapPtr_;
+        }
+        constexpr void destroy() noexcept
+        {
+            if (mapPtr_ != nullptr)
+            {
+                if (mapPtr_ != nullptr)
+                    buffer_base::unmap();
+                buffer_base::destroy();
+            }
         }
 
       private:

@@ -52,6 +52,7 @@ using mcs::vulkan::MCS_ASSERT;
 using mcs::vulkan::memory::create_buffer;
 using mcs::vulkan::memory::create_staging_buffer;
 using mcs::vulkan::memory::auto_map_buffer;
+using mcs::vulkan::memory::find_memory_type_index;
 using mcs::vulkan::memory::buffer_base;
 using mcs::vulkan::tool::simple_copy_buffer;
 using mcs::vulkan::tool::pNext;
@@ -383,9 +384,9 @@ try
                                               VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT}})
                                 : nullptr,
                         .allocationSize = memRequirements.size,
-                        .memoryTypeIndex = create_buffer::findMemoryTypeIndex(
-                            memRequirements.memoryTypeBits, memoryProperties,
-                            properties)};
+                        .memoryTypeIndex =
+                            find_memory_type_index(memRequirements.memoryTypeBits,
+                                                   memoryProperties, properties)};
                 })
                 .build(device);
         auto staging_buffer = create_staging_buffer(device, buffer_size);
@@ -497,27 +498,27 @@ struct InstanceData {
                 .setCreateInfo({.size = bufferSize,
                                 .usage = usage,
                                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE})
-                .setGenMemoryAllocateInfo(
-                    [requiresDeviceAddress](VkMemoryRequirements memReqs,
-                                            VkPhysicalDeviceMemoryProperties memProps) {
-                        uint32_t idx = create_buffer::findMemoryTypeIndex(
-                            memReqs.memoryTypeBits, memProps,
-                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
-                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+                .setGenMemoryAllocateInfo([requiresDeviceAddress](
+                                              VkMemoryRequirements memReqs,
+                                              VkPhysicalDeviceMemoryProperties memProps) {
+                    uint32_t idx =
+                        find_memory_type_index(memReqs.memoryTypeBits, memProps,
+                                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
 
-                        pNext pnext;
-                        if (requiresDeviceAddress)
-                        {
-                            pnext = make_pNext(structure_chain<VkMemoryAllocateFlagsInfo>{
-                                VkMemoryAllocateFlagsInfo{
-                                    .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT}});
-                        }
+                    pNext pnext;
+                    if (requiresDeviceAddress)
+                    {
+                        pnext = make_pNext(structure_chain<VkMemoryAllocateFlagsInfo>{
+                            VkMemoryAllocateFlagsInfo{
+                                .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT}});
+                    }
 
-                        return create_buffer::memory_allocate_info{
-                            .pNext = std::move(pnext),
-                            .allocationSize = memReqs.size,
-                            .memoryTypeIndex = idx};
-                    })
+                    return create_buffer::memory_allocate_info{.pNext = std::move(pnext),
+                                                               .allocationSize =
+                                                                   memReqs.size,
+                                                               .memoryTypeIndex = idx};
+                })
                 .build(device);
 
         // 映射整个缓冲区

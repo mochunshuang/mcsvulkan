@@ -935,18 +935,21 @@ try
         {.descriptorSets = std::vector<VkDescriptorSetLayout>{MAX_FRAMES_IN_FLIGHT,
                                                               *descriptorSetLayout}});
     constexpr VkDeviceSize BUFFER_SIZE = sizeof(UniformBufferObject);
-    std::array<auto_map_buffer, MAX_FRAMES_IN_FLIGHT> uniformBuffers;
+    // diff: [test_dod7] start: 不再是 vma 的内存
+    std::array<mcs::vulkan::memory::auto_map_buffer, MAX_FRAMES_IN_FLIGHT> uniformBuffers;
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
     {
-        uniformBuffers[i] = auto_map_buffer(create_buffer(
-            allocator,
-            {.sType = sType<VkBufferCreateInfo>(),
-             .size = BUFFER_SIZE,
-             .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-             .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-            {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
-             .usage = VMA_MEMORY_USAGE_AUTO}));
+        uniformBuffers[i] = mcs::vulkan::memory::auto_map_buffer(
+            mcs::vulkan::memory::create_simple_buffer(
+                device,
+                {.size = BUFFER_SIZE,
+                 .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+            BUFFER_SIZE);
     }
+    // diff: [test_dod7] end
 
     create_texture create_texture{
         commandPool, GRAPHICS_AND_PRESENT,
@@ -1117,71 +1120,70 @@ try
         device.updateDescriptorSets(1, &write, 0, nullptr);
     } // diff: [test_indirectdraw] end
 
-    auto depthResourcesBuild =
-        create_resources{device, allocator}
-            .setCreateInfo(
-                {.imageType = VK_IMAGE_TYPE_2D,
-                 .format = create_resources::findSupportedFormat(
-                     physical_device,
-                     std::array<VkFormat, 3>{VkFormat::VK_FORMAT_D32_SFLOAT,
-                                             VkFormat::VK_FORMAT_D32_SFLOAT_S8_UINT,
-                                             VkFormat::VK_FORMAT_D24_UNORM_S8_UINT},
-                     VkImageTiling::VK_IMAGE_TILING_OPTIMAL,
-                     VkFormatFeatureFlagBits::
-                         VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT),
-                 .extent = {.width = swapchain.refImageExtent().width,
-                            .height = swapchain.refImageExtent().height,
-                            .depth = 1},
-                 .mipLevels = 1,
-                 .arrayLayers = 1,
-                 .samples = physical_device.getMaxUsableSampleCount(),
-                 .tiling = VK_IMAGE_TILING_OPTIMAL,
-                 .usage =
-                     VkImageUsageFlagBits::VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-                 .sharingMode = VkSharingMode::VK_SHARING_MODE_EXCLUSIVE,
-                 .initialLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED,
-                 // VMA 配置
-                 .allocationCreateInfo =
-                     {//  .flags =VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
-                      .usage = VMA_MEMORY_USAGE_AUTO}})
-            .setViewCreateInfo(
-                {.viewType = VK_IMAGE_VIEW_TYPE_2D,
-                 .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
-                                      .baseMipLevel = 0,
-                                      .levelCount = 1,
-                                      .baseArrayLayer = 0,
-                                      .layerCount = 1}});
-    auto depthResource = depthResourcesBuild.build();
-    const auto &depthFormat_ref = depthResourcesBuild.refImageFormat();
+    auto depthResourcesBuild = mcs::vulkan::memory::build_simple_resource(
+        {.imageType = VK_IMAGE_TYPE_2D,
+         .format = create_resources::findSupportedFormat(
+             physical_device,
+             std::array<VkFormat, 3>{VkFormat::VK_FORMAT_D32_SFLOAT,
+                                     VkFormat::VK_FORMAT_D32_SFLOAT_S8_UINT,
+                                     VkFormat::VK_FORMAT_D24_UNORM_S8_UINT},
+             VkImageTiling::VK_IMAGE_TILING_OPTIMAL,
+             VkFormatFeatureFlagBits::VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT),
+         .extent = {.width = swapchain.refImageExtent().width,
+                    .height = swapchain.refImageExtent().height,
+                    .depth = 1},
+         .mipLevels = 1,
+         .arrayLayers = 1,
+         .samples = physical_device.getMaxUsableSampleCount(),
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VkImageUsageFlagBits::VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+         .sharingMode = VkSharingMode::VK_SHARING_MODE_EXCLUSIVE,
+         .initialLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED},
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        [](VkImageCreateInfo imageCreateInfo, VkImage image) noexcept
+            -> mcs::vulkan::memory::create_image::view_create_info {
+            return {.image = image,
+                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                    .format = imageCreateInfo.format,
+                    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+                                         .baseMipLevel = 0,
+                                         .levelCount = 1,
+                                         .baseArrayLayer = 0,
+                                         .layerCount = 1}};
+        });
+
+    auto depthResource = depthResourcesBuild.build(device);
+    const auto &depthFormat_ref = depthResourcesBuild.refCreateInfoFormat();
     std::cout << "depthResource hasStencilComponent: "
               << depthResourcesBuild.hasStencilComponent() << '\n';
 
-    auto msaaResourcesBuild =
-        create_resources{device, allocator}
-            .setCreateInfo({.imageType = VK_IMAGE_TYPE_2D,
-                            .format = swapchainBuild.refImageFormat(),
-                            .extent = {.width = swapchain.refImageExtent().width,
-                                       .height = swapchain.refImageExtent().height,
-                                       .depth = 1},
-                            .mipLevels = 1,
-                            .arrayLayers = 1,
-                            .samples = physical_device.getMaxUsableSampleCount(),
-                            .tiling = VK_IMAGE_TILING_OPTIMAL,
-                            .usage = VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
-                                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-                            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                            .allocationCreateInfo =
-                                {//  .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
-                                 .usage = VMA_MEMORY_USAGE_AUTO}})
-            .setViewCreateInfo(
-                {.viewType = VK_IMAGE_VIEW_TYPE_2D,
-                 .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                                      .baseMipLevel = 0,
-                                      .levelCount = 1,
-                                      .baseArrayLayer = 0,
-                                      .layerCount = 1}});
-    auto msaaResource = msaaResourcesBuild.build();
+    auto msaaResourcesBuild = mcs::vulkan::memory::build_simple_resource(
+        {.imageType = VK_IMAGE_TYPE_2D,
+         .format = swapchainBuild.refImageFormat(),
+         .extent = {.width = swapchain.refImageExtent().width,
+                    .height = swapchain.refImageExtent().height,
+                    .depth = 1},
+         .mipLevels = 1,
+         .arrayLayers = 1,
+         .samples = physical_device.getMaxUsableSampleCount(),
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
+                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED},
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        [](VkImageCreateInfo imageCreateInfo, VkImage image) noexcept
+            -> mcs::vulkan::memory::create_image::view_create_info {
+            return {.image = image,
+                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                    .format = imageCreateInfo.format,
+                    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                         .baseMipLevel = 0,
+                                         .levelCount = 1,
+                                         .baseArrayLayer = 0,
+                                         .layerCount = 1}};
+        });
+    auto msaaResource = msaaResourcesBuild.build(device);
 
     auto pipelineLayout =
         create_pipeline_layout{}
@@ -1355,56 +1357,64 @@ try
 
     // ========== 拾取资源 ==========
     // 创建拾取图像（R32G32_UINT）
-    auto build_pick =
-        create_image{device, allocator}
-            .setCreateInfo(
-                {.imageType = VK_IMAGE_TYPE_2D,
-                 .format = VK_FORMAT_R32G32_UINT,
-                 .extent = {.width = WIDTH, .height = HEIGHT, .depth = 1},
-                 .mipLevels = 1,
-                 .arrayLayers = 1,
-                 .samples =
-                     physical_device.getMaxUsableSampleCount(), //NOTE: 和主管线一样
-                 .tiling = VK_IMAGE_TILING_OPTIMAL,
-                 .usage =
-                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT //diff: [test_indirectdraw_no_pick] 没有任何代码从 pickingImage 进行拷贝或读取，因此 TRANSFER_SRC_BIT 完全没有必要
-                 // | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                 ,
-                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                 .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                 .allocationCreateInfo =
-                     {//  .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
-                      .usage = VMA_MEMORY_USAGE_AUTO}})
-            .setViewCreateInfo(
-                {.viewType = VK_IMAGE_VIEW_TYPE_2D,
-                 .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                                      .baseMipLevel = 0,
-                                      .levelCount = 1,
-                                      .baseArrayLayer = 0,
-                                      .layerCount = 1}});
+
+    auto pickResourcesBuild = mcs::vulkan::memory::build_simple_resource(
+        {.imageType = VK_IMAGE_TYPE_2D,
+         .format = VK_FORMAT_R32G32_UINT,
+         .extent = {.width = WIDTH, .height = HEIGHT, .depth = 1},
+         .mipLevels = 1,
+         .arrayLayers = 1,
+         .samples = physical_device.getMaxUsableSampleCount(), //NOTE: 和主管线一样
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage =
+             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT //diff: [test_indirectdraw_no_pick] 没有任何代码从 pickingImage 进行拷贝或读取，因此 TRANSFER_SRC_BIT 完全没有必要
+         // | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+         ,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED},
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        [](VkImageCreateInfo imageCreateInfo, VkImage image) noexcept
+            -> mcs::vulkan::memory::create_image::view_create_info {
+            return {.image = image,
+                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                    .format = imageCreateInfo.format,
+                    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                         .baseMipLevel = 0,
+                                         .levelCount = 1,
+                                         .baseArrayLayer = 0,
+                                         .layerCount = 1}};
+        });
+    auto pickResource = pickResourcesBuild.build(device);
 
     //  创建解析图像（单样本）
-    auto build_resolve =
-        create_image{device, allocator}
-            .setCreateInfo(
-                {.imageType = build_pick.createInfo().imageType,
-                 .format = build_pick.createInfo().format,
-                 .extent = build_pick.createInfo().extent,
-                 .mipLevels = build_pick.createInfo().mipLevels,
-                 .arrayLayers = build_pick.createInfo().arrayLayers,
-                 .samples = VK_SAMPLE_COUNT_1_BIT,
-                 .tiling = build_pick.createInfo().tiling,
-                 .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |   // 作为 resolve 目标
-                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT |   // 用于复制像素到缓冲区
-                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT // ← 必须！
-                 ,
-                 .sharingMode = build_pick.createInfo().sharingMode,
-                 .initialLayout = build_pick.createInfo().initialLayout,
-                 // VMA 配置
-                 .allocationCreateInfo = build_pick.createInfo().allocationCreateInfo})
-            .setViewCreateInfo(
-                {.viewType = build_pick.viewCreateInfo().viewType,
-                 .subresourceRange = build_pick.viewCreateInfo().subresourceRange});
+
+    auto resolveResourcesBuild = mcs::vulkan::memory::build_simple_resource(
+        {.imageType = pickResourcesBuild.refCreateInfo().imageType,
+         .format = pickResourcesBuild.refCreateInfo().format,
+         .extent = pickResourcesBuild.refCreateInfo().extent,
+         .mipLevels = pickResourcesBuild.refCreateInfo().mipLevels,
+         .arrayLayers = pickResourcesBuild.refCreateInfo().arrayLayers,
+         .samples = VK_SAMPLE_COUNT_1_BIT,
+         .tiling = pickResourcesBuild.refCreateInfo().tiling,
+         .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |   // 作为 resolve 目标
+                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT |   // 用于复制像素到缓冲区
+                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT // ← 必须！
+         ,
+         .sharingMode = pickResourcesBuild.refCreateInfo().sharingMode,
+         .initialLayout = pickResourcesBuild.refCreateInfo().initialLayout},
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        [](VkImageCreateInfo imageCreateInfo, VkImage image) noexcept
+            -> mcs::vulkan::memory::create_image::view_create_info {
+            return {.image = image,
+                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                    .format = imageCreateInfo.format,
+                    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                         .baseMipLevel = 0,
+                                         .levelCount = 1,
+                                         .baseArrayLayer = 0,
+                                         .layerCount = 1}};
+        });
+    auto resolveResource = resolveResourcesBuild.build(device);
 
     // 每个飞行帧的暂存缓冲区（8 字节 = R32G32_UINT 像素）
     std::array<auto_map_buffer, MAX_FRAMES_IN_FLIGHT> pickingFrames;
@@ -1426,16 +1436,12 @@ try
                                     VMA_ALLOCATION_CREATE_MAPPED_BIT,
                            .usage = VMA_MEMORY_USAGE_AUTO})};
     }
-    auto pickingImage = build_pick.makeImage();
-    auto pickingImageView = build_pick.makeImageView(*pickingImage);
-    auto resolveImage = build_resolve.makeImage();
-    auto pickingResolveImageView = build_resolve.makeImageView(*resolveImage);
 
-    auto pickCtx = make_aggregate_ref<"pickCtx", "imageBuild", "image", "imageView",
-                                      "resolveImageBuild", "resolveImage",
-                                      "resolveImageView", "frames", "mouse">(
-        build_pick, pickingImage, pickingImageView, build_resolve, resolveImage,
-        pickingResolveImageView, pickingFrames, pickMouse);
+    auto pickCtx =
+        make_aggregate_ref<"pickCtx", "pickResourcesBuild", "pickResource",
+                           "resolveResourcesBuild", "resolveResource", "frames", "mouse">(
+            pickResourcesBuild, pickResource, resolveResourcesBuild, resolveResource,
+            pickingFrames, pickMouse);
     auto globalCtx =
         make_aggregate_ref<"globalCtx", "allocator", "device", "window", "surface",
                            "swapchainBuild", "swapchain", "camera", "frameContext",
@@ -2175,9 +2181,8 @@ try
             const auto &commandBuffer = commandBuffers[currentFrame];
 
             // images
-            auto &pickingImage = pickCtx.image;
-            auto &resolveImage = pickCtx.resolveImage;
-
+            auto pickingImage = pickCtx.pickResource.image();
+            auto resolveImage = pickCtx.resolveResource.image();
             auto &depthResource = mainCtx.depthResource;
             auto &msaaResource = mainCtx.msaaResource;
 
@@ -2222,7 +2227,7 @@ try
                                           VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT}},
                 //diff: [test_indirectdraw_no_pick] start  转换拾取 MSAA 图像布局
                 my_render::image_info{
-                    .image = *pickingImage,
+                    .image = pickingImage,
                     .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
                     .src = {VK_IMAGE_LAYOUT_UNDEFINED, VK_ACCESS_2_NONE,
                             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
@@ -2230,7 +2235,7 @@ try
                             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}},
                 my_render::image_info{
-                    .image = *resolveImage,
+                    .image = resolveImage,
                     .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
                     .src = {VK_IMAGE_LAYOUT_UNDEFINED, VK_ACCESS_2_NONE,
                             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
@@ -2258,8 +2263,8 @@ try
 
             VkImageView msaaImageView = msaaResource.imageView();
             VkImageView imageView = swapchain.imageView(imageIndex);
-            auto &pickingImageView = pickCtx.imageView;
-            auto &pickingResolveImageView = pickCtx.resolveImageView;
+            auto pickingImageView = pickCtx.pickResource.imageView();
+            auto pickingResolveImageView = pickCtx.resolveResource.imageView();
             VkImageView depthImageView = depthResource.imageView();
             auto imageExtent = swapchain.imageExtent();
 
@@ -2279,11 +2284,11 @@ try
             // 拾取附件（location=1）
             VkRenderingAttachmentInfo pickAttachment{
                 .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                .imageView = *pickingImageView,
+                .imageView = pickingImageView,
                 .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 .resolveMode =
                     VK_RESOLVE_MODE_SAMPLE_ZERO_BIT, // 整数格式必须用 SAMPLE_ZERO
-                .resolveImageView = *pickingResolveImageView,
+                .resolveImageView = pickingResolveImageView,
                 .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
                 .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
@@ -2383,8 +2388,8 @@ try
             const auto &[currentFrame, imageIndex] = recordCtx.info;
             const auto &commandBuffer = commandBuffers[currentFrame];
 
-            auto &resolveImage = pickCtx.resolveImage;
-            auto &pickingResolveImageView = pickCtx.resolveImageView;
+            auto resolveImage = pickCtx.resolveResource.image();
+
             auto &pickingFrames = pickCtx.frames;
             auto &pickMouse = pickCtx.mouse;
 
@@ -2399,7 +2404,7 @@ try
                 my_render::transition_image_layout(
                     commandBuffer,
                     my_render::image_info{
-                        .image = *resolveImage,
+                        .image = resolveImage,
                         .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
                         .src = {VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
@@ -2409,7 +2414,7 @@ try
                                 VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
                 //NOTE: 复制到 pickingFrames，就可以读取了，拿到着色器的输出
                 commandBuffer.copyImageToBuffer(
-                    *resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     *pickingFrames[currentFrame],
                     std::array<VkBufferImageCopy, 1>{VkBufferImageCopy{
                         .bufferOffset = 0,
@@ -2473,12 +2478,10 @@ try
         auto &depthResourcesBuild = mainCtx.depthResourcesBuild;
         auto &msaaResource = mainCtx.msaaResource;
 
-        auto &build_pick = pickCtx.imageBuild;
-        auto &pickingImage = pickCtx.image;
-        auto &pickingImageView = pickCtx.imageView;
-        auto &build_resolve = pickCtx.resolveImageBuild;
-        auto &resolveImage = pickCtx.resolveImage;
-        auto &pickingResolveImageView = pickCtx.resolveImageView;
+        auto &pickResourcesBuild = pickCtx.pickResourcesBuild;
+        auto &pickResource = pickCtx.pickResource;
+        auto &resolveResourcesBuild = pickCtx.resolveResourcesBuild;
+        auto &resolveResource = pickCtx.resolveResource;
         auto &pickMouse = pickCtx.mouse;
 
         surface.waitGoodFramebufferSize();
@@ -2489,15 +2492,16 @@ try
         VkExtent3D imageExtent = {
             .width = newExtent.width, .height = newExtent.height, .depth = 1};
 
-        msaaResource = msaaResourcesBuild.updateImageExtent(imageExtent).rebuild();
-        depthResource = depthResourcesBuild.updateImageExtent(imageExtent).rebuild();
+        msaaResource = msaaResourcesBuild.setCreateInfoExtent(imageExtent).build(device);
+        depthResource =
+            depthResourcesBuild.setCreateInfoExtent(imageExtent).build(device);
         camera.refPerspectiveMatrix().aspect =
             newExtent.width / static_cast<float>(newExtent.height);
 
-        pickingImage = build_pick.updateImageExtent(imageExtent).rebuild();
-        pickingImageView = build_pick.makeImageView(*pickingImage);
-        resolveImage = build_resolve.updateImageExtent(imageExtent).rebuild();
-        pickingResolveImageView = build_resolve.makeImageView(*resolveImage);
+        pickResource = pickResourcesBuild.setCreateInfoExtent(imageExtent).build(device);
+        resolveResource =
+            resolveResourcesBuild.setCreateInfoExtent(imageExtent).build(device);
+
         pickMouse.valid = false;
 
         frameContext.rebuild(swapchain.imagesSize());

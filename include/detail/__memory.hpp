@@ -3,3 +3,7 @@
 #include "memory/auto_map_buffer.hpp"
 #include "memory/create_buffer.hpp"
 #include "memory/create_staging_buffer.hpp"
+#include "memory/create_simple_buffer.hpp"
+#include "memory/create_image.hpp"
+#include "memory/create_resources.hpp"
+#include "memory/build_simple_resource.hpp"
