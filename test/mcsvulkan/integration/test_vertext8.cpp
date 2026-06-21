@@ -1,0 +1,944 @@
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <exception>
+#include <iostream>
+#include <print>
+#include <vector>
+#include <random>
+#include <list>
+#include <cstring>
+
+#include "../head.hpp"
+
+// ======================== 原有 using 声明（全部保留） ========================
+using Instance = mcs::vulkan::Instance;
+using create_instance = mcs::vulkan::tool::create_instance;
+using create_debugger = mcs::vulkan::tool::create_debugger;
+using physical_device_selector = mcs::vulkan::tool::physical_device_selector;
+using mcs::vulkan::vkMakeVersion;
+using mcs::vulkan::vkApiVersion;
+
+using mcs::vulkan::tool::enable_intance_build;
+using mcs::vulkan::tool::structure_chain;
+using mcs::vulkan::tool::queue_family_index_selector;
+using mcs::vulkan::tool::create_logical_device;
+using mcs::vulkan::tool::create_swap_chain;
+using mcs::vulkan::tool::create_pipeline_layout;
+using mcs::vulkan::tool::create_graphics_pipeline;
+using mcs::vulkan::tool::create_command_pool;
+using mcs::vulkan::tool::frame_context;
+using mcs::vulkan::tool::sType;
+
+using mcs::vulkan::raii_vulkan;
+using mcs::vulkan::PhysicalDevice;
+using mcs::vulkan::surface_impl;
+using surface = mcs::vulkan::wsi::glfw::Window;
+using mcs::vulkan::Queue;
+
+using mcs::vulkan::LogicalDevice;
+
+using mcs::vulkan::tool::make_pNext;
+
+using mcs::vulkan::CommandPool;
+using mcs::vulkan::CommandBuffers;
+using mcs::vulkan::CommandBuffer;
+using mcs::vulkan::CommandBufferView;
+
+constexpr uint32_t WIDTH = 800;
+constexpr uint32_t HEIGHT = 600;
+constexpr auto TITLE = "test_my_triangle";
+using mcs::vulkan::MCS_ASSERT;
+
+// 原有内存管理工具（本程序已用子分配器替代，保留 using 以保持兼容）
+using mcs::vulkan::memory::create_buffer;
+using mcs::vulkan::memory::create_staging_buffer;
+using mcs::vulkan::memory::auto_map_buffer;
+using mcs::vulkan::memory::find_memory_type_index;
+using mcs::vulkan::memory::buffer_base;
+using mcs::vulkan::tool::simple_copy_buffer;
+using mcs::vulkan::tool::pNext;
+
+// ======================== 子分配器 ========================
+/*
+ * SubAllocator 采用空闲链表算法，管理大块 VkDeviceMemory，并按需切分出小块供 VkBuffer 使用。
+ * 优点：
+ *  - 大幅减少 vkAllocateMemory 调用次数（例如，本程序从 8 次降至 1 次），降低驱动开销。
+ *  - 同一内存块内的多个缓冲区共享一次 vkMapMemory 得到的持久指针，简化动态更新。
+ *  - 内存布局更紧凑，适合需要频繁更新、大量小缓冲区的场景。
+ *
+ * 工作原理：
+ *  - 构造函数创建一个或多个 Block，每个 Block 对应一次 vkAllocateMemory。
+ *  - allocate 方法在 Block 的空闲链表中寻找合适区间，切分并返回子区域信息。
+ *  - 返回的 Allocation 包含大块内存句柄、偏移、大小以及映射后的可用指针。
+ *  - 释放时通过空闲链表合并，减少碎片。
+ */
+class SubAllocator
+{
+  public:
+    // 分配结果：包含大块内存对象、大块内偏移、实际分配大小和映射指针（已加偏移）
+    struct Allocation
+    {
+        VkDeviceMemory memory;
+        VkDeviceSize offset;
+        VkDeviceSize size;
+        void *mappedPtr;
+    };
+
+    /*
+     * 构造函数
+     * device: 逻辑设备引用，用于调用 vkAllocateMemory / vkMapMemory 等
+     * memoryTypeIndex: 所选内存类型索引（必须同时满足 DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT）
+     * blockSize: 每个大内存块的默认大小
+     * pNext: 传递给 vkAllocateMemory 的 pNext 链（例如 VkMemoryAllocateFlagsInfo 用于设备地址）
+     * mapAll: 是否映射所有新创建的大块内存（通常为 true，方便 CPU 端直写）
+     */
+    SubAllocator(LogicalDevice &device, uint32_t memoryTypeIndex, VkDeviceSize blockSize,
+                 const void *pNext = nullptr, bool mapAll = true)
+        : device_(device), typeIndex_(memoryTypeIndex), blockSize_(blockSize),
+          pNext_(pNext), mapAll_(mapAll)
+    {
+    }
+
+    // 析构时释放所有大块内存，并解除映射
+    ~SubAllocator()
+    {
+        for (auto *b : blocks_)
+        {
+            if (b->mapped)
+                device_.unmapMemory(b->memory);
+            device_.freeMemory(b->memory, device_.allocator());
+            delete b;
+        }
+    }
+
+    /*
+     * 分配 size 字节的内存区域，实际分配会按 alignment 对齐
+     * 算法：遍历所有块，用首次适应策略在空闲链表中寻找合适区间。
+     *       若找不到，则创建新的大块并从中分配。
+     */
+    Allocation allocate(VkDeviceSize size, VkDeviceSize alignment)
+    {
+        for (auto *b : blocks_)
+        {
+            VkDeviceSize off;
+            if (b->tryAlloc(size, alignment, off))
+                return {b->memory, off, size,
+                        b->mapped ? static_cast<char *>(b->mapBase) + off : nullptr};
+        }
+        // 现有块均无法满足，申请新块（至少 blockSize，或大于请求的 size）
+        VkDeviceSize allocSize = std::max(blockSize_, size);
+        auto *newBlock = new Block(device_, typeIndex_, allocSize, pNext_, mapAll_);
+        blocks_.push_back(newBlock);
+        VkDeviceSize off;
+        if (!newBlock->tryAlloc(size, alignment, off))
+            throw std::runtime_error("SubAllocator internal error");
+        return {newBlock->memory, off, size,
+                newBlock->mapped ? static_cast<char *>(newBlock->mapBase) + off
+                                 : nullptr};
+    }
+
+    /*
+     * 释放之前分配的内存区域，会与相邻空闲区域合并
+     * 本示例中所有缓冲区均为永久存在，不会调用此函数，但保留完整实现。
+     */
+    void free(const Allocation &alloc)
+    {
+        for (auto *b : blocks_)
+            if (b->memory == alloc.memory)
+            {
+                b->dealloc(alloc.offset, alloc.size);
+                return;
+            }
+    }
+
+  private:
+    // 单个大内存块，内部维护一个按偏移排序的空闲链表
+    struct Block
+    {
+        LogicalDevice &device;
+        VkDeviceMemory memory;
+        VkDeviceSize size;
+        void *mapBase; // 若 mapped == true，指向映射基址
+        bool mapped;
+        std::list<std::pair<VkDeviceSize, VkDeviceSize>> freeList; // (offset, size)
+
+        Block(LogicalDevice &dev, uint32_t typeIndex, VkDeviceSize size,
+              const void *pNext, bool map)
+            : device(dev), size(size), mapped(map)
+        {
+            VkMemoryAllocateInfo allocInfo{.sType =
+                                               VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                           .pNext = pNext,
+                                           .allocationSize = size,
+                                           .memoryTypeIndex = typeIndex};
+            memory = device.allocateMemory(allocInfo, device.allocator());
+            if (map)
+                device.mapMemory(memory, 0, VK_WHOLE_SIZE, 0, &mapBase);
+            // 初始整个块空闲
+            freeList.push_back({0, size});
+        }
+
+        /*
+         * 首次适应分配：在空闲链表中寻找第一个满足对齐要求且大小足够的区间。
+         * 分配后从链表中移除对应区间，如有剩余则插入前后碎片。
+         * 返回 true 表示分配成功，并输出偏移 outOff。
+         */
+        bool tryAlloc(VkDeviceSize reqSize, VkDeviceSize alignment, VkDeviceSize &outOff)
+        {
+            for (auto it = freeList.begin(); it != freeList.end(); ++it)
+            {
+                VkDeviceSize off = it->first, rangeSize = it->second;
+                VkDeviceSize aligned =
+                    (off + alignment - 1) & ~(alignment - 1); // 对齐计算
+                if (aligned + reqSize <= off + rangeSize)
+                {
+                    it = freeList.erase(it);
+                    // 前部碎片：对齐后的起始位置与原区间起点有空隙
+                    if (aligned > off)
+                        freeList.insert(it, {off, aligned - off});
+                    // 后部碎片：分配后剩余的空间
+                    if (aligned + reqSize < off + rangeSize)
+                        freeList.insert(
+                            it, {aligned + reqSize, off + rangeSize - aligned - reqSize});
+                    outOff = aligned;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /*
+         * 回收释放的内存：将 [off, off+sz) 区间插入空闲链表，并与前后相邻区间合并。
+         */
+        void dealloc(VkDeviceSize off, VkDeviceSize sz)
+        {
+            auto it = freeList.begin();
+            while (it != freeList.end() && it->first < off)
+                ++it;
+            // 与前一个区间合并
+            if (it != freeList.begin())
+            {
+                auto prev = std::prev(it);
+                if (prev->first + prev->second == off)
+                {
+                    off = prev->first;
+                    sz += prev->second;
+                    freeList.erase(prev);
+                }
+            }
+            // 与后一个区间合并
+            if (it != freeList.end() && off + sz == it->first)
+            {
+                sz += it->second;
+                it = freeList.erase(it);
+            }
+            freeList.insert(it, {off, sz});
+        }
+    };
+
+    LogicalDevice &device_;
+    uint32_t typeIndex_;
+    VkDeviceSize blockSize_;
+    const void *pNext_;
+    bool mapAll_;
+    std::vector<Block *> blocks_;
+};
+
+// ======================== 子分配缓冲区包装 ========================
+/*
+ * SubAllocatedBuffer 持有 VkBuffer 及其在子分配器中的分配信息。
+ *  - buffer : Vulkan 缓冲区句柄
+ *  - memory : 大块内存句柄（实际可忽略，仅供调试）
+ *  - offset : 在大块内存中的起始偏移
+ *  - size   : 缓冲区有效大小
+ *  - mappedPtr : 映射后的起始地址（已加偏移），用于 CPU 直接读写
+ *  - device : LogicalDevice 指针，用于析构时销毁 VkBuffer
+ *
+ * 注意：SubAllocatedBuffer 不负责释放大块内存，那是 SubAllocator 的责任。
+ *       析构顺序：必须先销毁所有 VkBuffer，再销毁大块内存。本程序中，SubAllocatedBuffer 数组
+ *       定义在 subAlloc 之前，利用 C++ 栈逆序析构确保正确顺序。
+ */
+struct SubAllocatedBuffer
+{
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE; // 实际存储的是大块内存，用于调试
+    VkDeviceSize offset = 0;                // 在大块内存中的偏移（仅供内部使用）
+    VkDeviceSize size = 0;                  // 缓冲区有效大小
+    void *mappedPtr = nullptr;              // 映射后的起始地址
+    LogicalDevice *device = nullptr;        // 用于销毁缓冲区
+
+    SubAllocatedBuffer() = default;
+    SubAllocatedBuffer(VkBuffer buf, VkDeviceMemory mem, VkDeviceSize off,
+                       VkDeviceSize sz, void *ptr, LogicalDevice *dev)
+        : buffer(buf), memory(mem), offset(off), size(sz), mappedPtr(ptr), device(dev)
+    {
+    }
+
+    ~SubAllocatedBuffer()
+    {
+        // 只销毁 VkBuffer，不负责释放大块内存
+        if (buffer && device)
+            device->destroyBuffer(buffer, device->allocator());
+    }
+
+    // 禁止拷贝，允许移动
+    SubAllocatedBuffer(const SubAllocatedBuffer &) = delete;
+    SubAllocatedBuffer &operator=(const SubAllocatedBuffer &) = delete;
+    SubAllocatedBuffer(SubAllocatedBuffer &&other) noexcept
+        : buffer(other.buffer), memory(other.memory), offset(other.offset),
+          size(other.size), mappedPtr(other.mappedPtr), device(other.device)
+    {
+        other.buffer = VK_NULL_HANDLE;
+        other.device = nullptr;
+    }
+    SubAllocatedBuffer &operator=(SubAllocatedBuffer &&other) noexcept
+    {
+        if (this != &other)
+        {
+            this->~SubAllocatedBuffer();
+            buffer = other.buffer;
+            memory = other.memory;
+            offset = other.offset;
+            size = other.size;
+            mappedPtr = other.mappedPtr;
+            device = other.device;
+            other.buffer = VK_NULL_HANDLE;
+            other.device = nullptr;
+        }
+        return *this;
+    }
+
+    VkBuffer getBuffer() const
+    {
+        return buffer;
+    }
+    void *getMapPtr() const
+    {
+        return mappedPtr;
+    }
+};
+
+struct Vertex
+{
+    glm::vec2 pos;
+    static constexpr auto vertex_input_state() noexcept
+    {
+        return create_graphics_pipeline::vertex_input_state{
+            .vertexBindingDescriptions = {{.binding = 0,
+                                           .stride = sizeof(Vertex),
+                                           .inputRate = VK_VERTEX_INPUT_RATE_VERTEX}},
+            .vertexAttributeDescriptions = {{.location = 0,
+                                             .binding = 0,
+                                             .format = VK_FORMAT_R32G32_SFLOAT,
+                                             .offset = offsetof(Vertex, pos)}}};
+    }
+};
+
+struct InstanceData
+{
+    glm::vec2 offset;
+    glm::vec3 color;
+};
+struct PushData
+{
+    uint64_t instance_address;
+};
+
+struct my_render
+{
+    constexpr static void transition_image_layout(
+        const CommandBufferView &commandBuffer, VkImage image,
+        VkImageAspectFlags aspectMask, VkImageLayout oldLayout, VkImageLayout newLayout,
+        VkAccessFlags2 srcAccessMask, VkAccessFlags2 dstAccessMask,
+        VkPipelineStageFlags2 srcStageMask, VkPipelineStageFlags2 dstStageMask) noexcept
+    {
+        VkImageMemoryBarrier2 barrier = {.sType = sType<VkImageMemoryBarrier2>(),
+                                         .srcStageMask = srcStageMask,
+                                         .srcAccessMask = srcAccessMask,
+                                         .dstStageMask = dstStageMask,
+                                         .dstAccessMask = dstAccessMask,
+                                         .oldLayout = oldLayout,
+                                         .newLayout = newLayout,
+                                         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                         .image = image,
+                                         .subresourceRange = {.aspectMask = aspectMask,
+                                                              .baseMipLevel = 0,
+                                                              .levelCount = 1,
+                                                              .baseArrayLayer = 0,
+                                                              .layerCount = 1}};
+        VkDependencyInfo depInfo = {.sType = sType<VkDependencyInfo>(),
+                                    .imageMemoryBarrierCount = 1,
+                                    .pImageMemoryBarriers = &barrier};
+        commandBuffer.pipelineBarrier2(depInfo);
+    }
+};
+
+int main()
+try
+{
+#ifdef VERT_SHADER_PATH
+    std::cout << "VERT_SHADER_PATH: " << VERT_SHADER_PATH << '\n';
+#endif
+#ifdef FRAG_SHADER_PATH
+    std::cout << "FRAG_SHADER_PATH: " << FRAG_SHADER_PATH << '\n';
+#endif
+    raii_vulkan ctx{};
+    surface window{};
+    window.setup({.width = WIDTH, .height = HEIGHT}, TITLE);
+
+    constexpr auto APIVERSION = VK_API_VERSION_1_4;
+    static_assert(vkApiVersion(1, 4, 0) == VK_API_VERSION_1_4);
+    static_assert(vkApiVersion(0, 1, 4, 0) == VK_API_VERSION_1_4);
+
+    auto enables = enable_intance_build{}
+                       .enableDebugExtension()
+                       .enableValidationLayer()
+                       .enableSurfaceExtension<surface>();
+    enables.check();
+    enables.print();
+
+    Instance instance =
+        create_instance{}
+            .setCreateInfo(
+                {.applicationInfo = {.pApplicationName = "Hello Triangle",
+                                     .applicationVersion = vkMakeVersion(1, 0, 0),
+                                     .pEngineName = "No Engine",
+                                     .engineVersion = vkMakeVersion(1, 0, 0),
+                                     .apiVersion = APIVERSION},
+                 .enabledLayers = enables.enabledLayers(),
+                 .enabledExtensions = enables.enabledExtensions()})
+            .build();
+    auto debuger = create_debugger{}
+                       .setCreateInfo(create_debugger::defaultCreateInfo())
+                       .build(instance);
+
+    std::vector<const char *> requiredDeviceExtension = {
+        VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_SPIRV_1_4_EXTENSION_NAME,
+        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
+        VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME};
+    requiredDeviceExtension.emplace_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+
+    structure_chain<VkPhysicalDeviceFeatures2, VkPhysicalDeviceVulkan12Features,
+                    VkPhysicalDeviceVulkan13Features,
+                    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT>
+        enablefeatureChain = {
+            {.features = {.multiDrawIndirect = VK_TRUE, .shaderInt64 = VK_TRUE}},
+            {.scalarBlockLayout = VK_TRUE, .bufferDeviceAddress = VK_TRUE},
+            {.synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE},
+            {.extendedDynamicState = VK_TRUE}};
+
+    auto [id [[maybe_unused]], physical_device [[maybe_unused]]] =
+        physical_device_selector{instance}
+            .requiredDeviceExtension(requiredDeviceExtension)
+            .requiredProperties(
+                [](const VkPhysicalDeviceProperties &props) constexpr noexcept {
+                    return props.apiVersion >= VK_API_VERSION_1_3;
+                })
+            .requiredQueueFamily(
+                [](const VkQueueFamilyProperties &qfp) constexpr noexcept {
+                    return !!(qfp.queueFlags & VK_QUEUE_GRAPHICS_BIT);
+                })
+            .requiredFeatures([](const PhysicalDevice &pd) constexpr noexcept -> bool {
+                auto query =
+                    structure_chain<VkPhysicalDeviceFeatures2,
+                                    VkPhysicalDeviceVulkan13Features,
+                                    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT>{
+                        {}, {}, {}};
+                pd.getFeatures2(&query.head());
+                auto &v13 = query.template get<VkPhysicalDeviceVulkan13Features>();
+                auto &ext =
+                    query.template get<VkPhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+                return v13.dynamicRendering && v13.synchronization2 &&
+                       ext.extendedDynamicState;
+            })
+            .select()[0];
+
+    mcs::vulkan::surface auto surface = surface_impl(physical_device, window);
+
+    const uint32_t GRAPHICS_QUEUE_FAMILY_IDX =
+        queue_family_index_selector{physical_device}
+            .requiredQueueFamily([&](const VkQueueFamilyProperties &qfp, uint32_t idx) {
+                return (qfp.queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+                       physical_device.getSurfaceSupportKHR(idx, *surface);
+            })
+            .select()[0];
+
+    LogicalDevice device =
+        create_logical_device{}
+            .setCreateInfo({
+                .pNext = make_pNext(enablefeatureChain),
+                .queueCreateInfos = create_logical_device::makeQueueCreateInfos(
+                    create_logical_device::queue_create_info{
+                        .queueFamilyIndex = GRAPHICS_QUEUE_FAMILY_IDX,
+                        .queueCount = 1,
+                        .queuePrioritie = 1.0}),
+                .enabledExtensions = requiredDeviceExtension,
+            })
+            .build(physical_device);
+    requiredDeviceExtension.clear();
+
+    const auto GRAPHICS_AND_PRESENT = Queue(
+        device, {.queue_family_index = GRAPHICS_QUEUE_FAMILY_IDX, .queue_index = 0});
+
+    auto swapchainBuild =
+        create_swap_chain{surface, device}
+            .setCreateInfo(
+                {.changeMinImageCount = [](uint32_t m) noexcept { return m + 1; },
+                 .candidateSurfaceFormats = {{.format = VK_FORMAT_B8G8R8A8_SRGB,
+                                              .colorSpace =
+                                                  VK_COLOR_SPACE_SRGB_NONLINEAR_KHR}},
+                 .imageArrayLayers = 1,
+                 .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                 .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                 .queueFamilyIndices = {},
+                 .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+                 .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+                 .candidatePresentModes = {VK_PRESENT_MODE_MAILBOX_KHR,
+                                           VK_PRESENT_MODE_IMMEDIATE_KHR},
+                 .clipped = VK_TRUE})
+            .setViewCreateInfo(
+                {.viewType = VK_IMAGE_VIEW_TYPE_2D,
+                 .components = {.r = VK_COMPONENT_SWIZZLE_IDENTITY,
+                                .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+                                .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+                                .a = VK_COMPONENT_SWIZZLE_IDENTITY},
+                 .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                      .baseMipLevel = 0,
+                                      .levelCount = 1,
+                                      .baseArrayLayer = 0,
+                                      .layerCount = 1}});
+    auto swapchain = swapchainBuild.build();
+
+    auto pipelineLayout =
+        create_pipeline_layout{}
+            .setCreateInfo(
+                {.setLayouts = {},
+                 .pushConstantRanges = {{.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+                                         .offset = 0,
+                                         .size = sizeof(PushData)}}})
+            .build(device);
+
+    using stage_info = create_graphics_pipeline::stage_info;
+    auto graphicsPipeline =
+        create_graphics_pipeline{}
+            .setCreateInfo(
+                {.pNext = make_pNext(structure_chain<VkPipelineRenderingCreateInfo>{
+                     {.colorAttachmentCount = 1,
+                      .pColorAttachmentFormats = &swapchainBuild.refImageFormat()}}),
+                 .stages = create_graphics_pipeline::makeStages(
+                     stage_info{.stage = VK_SHADER_STAGE_VERTEX_BIT,
+                                .filePath = VERT_SHADER_PATH,
+                                .pName = "main"},
+                     stage_info{.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                                .filePath = FRAG_SHADER_PATH,
+                                .pName = "main"}),
+                 .vertexInputState = Vertex::vertex_input_state(),
+                 .inputAssemblyState = {.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                                        .primitiveRestartEnable = VK_FALSE},
+                 .tessellationState = {},
+                 .viewportState = {.viewports = {VkViewport{}}, .scissors = {VkRect2D{}}},
+                 .rasterizationState = {.depthClampEnable = VK_FALSE,
+                                        .rasterizerDiscardEnable = VK_FALSE,
+                                        .polygonMode = VK_POLYGON_MODE_FILL,
+                                        .cullMode = VK_CULL_MODE_BACK_BIT,
+                                        .frontFace = VK_FRONT_FACE_CLOCKWISE,
+                                        .depthBiasEnable = VK_FALSE,
+                                        .lineWidth = 1.0F},
+                 .multisampleState = {.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+                                      .sampleShadingEnable = VK_FALSE},
+                 .depthStencilState = {},
+                 .colorBlendState = {.logicOpEnable = VK_FALSE,
+                                     .logicOp = VkLogicOp::VK_LOGIC_OP_COPY,
+                                     .attachments = {{.blendEnable = VK_FALSE,
+                                                      .colorWriteMask =
+                                                          VK_COLOR_COMPONENT_R_BIT |
+                                                          VK_COLOR_COMPONENT_G_BIT |
+                                                          VK_COLOR_COMPONENT_B_BIT |
+                                                          VK_COLOR_COMPONENT_A_BIT}}},
+                 .dynamicState = {.dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT,
+                                                    VK_DYNAMIC_STATE_SCISSOR}},
+                 .layout = *pipelineLayout})
+            .build(device);
+
+    CommandPool commandPool =
+        create_command_pool{}
+            .setCreateInfo({.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+                            .queueFamilyIndex = GRAPHICS_QUEUE_FAMILY_IDX})
+            .build(device);
+
+    constexpr auto MAX_FRAMES_IN_FLIGHT = 2;
+    CommandBuffers commandBuffers =
+        commandPool.allocateCommandBuffers({.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                            .commandBufferCount = MAX_FRAMES_IN_FLIGHT});
+    frame_context<MAX_FRAMES_IN_FLIGHT> frameContext{device, swapchain.imagesSize()};
+
+    // ================= 顶点/实例数据（不变） =================
+    const std::vector<Vertex> vertices = {
+        {{-0.01f, -0.01f}}, {{0.01f, -0.01f}}, {{0.01f, 0.01f}}, {{-0.01f, 0.01f}}};
+    const std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+
+    const uint32_t INSTANCE_COUNT = 1000;
+    std::vector<InstanceData> instancesDta;
+    instancesDta.reserve(INSTANCE_COUNT);
+    int gridSize = static_cast<int>(std::ceil(std::sqrt(INSTANCE_COUNT)));
+    const float cellWidth = 2.0f / gridSize;
+    const float cellHeight = 2.0f / gridSize;
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> dis(-0.4f, 0.4f);
+    auto generateData = [&]() {
+        instancesDta.clear();
+        uint32_t generated = 0;
+        for (int i = 0; i < gridSize && generated < INSTANCE_COUNT; ++i)
+            for (int j = 0; j < gridSize && generated < INSTANCE_COUNT; ++j)
+            {
+                float xCenter = -1.0f + (i + 0.5f) * cellWidth;
+                float yCenter = -1.0f + (j + 0.5f) * cellHeight;
+                float offsetX = dis(gen) * cellWidth * 0.5f;
+                float offsetY = dis(gen) * cellHeight * 0.5f;
+                float r = static_cast<float>(i) / gridSize;
+                float g = static_cast<float>(j) / gridSize;
+                float b = 0.5f + 0.5f * (r + g) * 0.5f;
+                instancesDta.push_back(
+                    {.offset = glm::vec2{xCenter + offsetX, yCenter + offsetY},
+                     .color = glm::vec3{r, g, b}});
+                ++generated;
+            }
+    };
+    generateData();
+
+    std::vector<VkDrawIndexedIndirectCommand> indirectCmds = {
+        {.indexCount = static_cast<uint32_t>(indices.size()),
+         .instanceCount = static_cast<uint32_t>(instancesDta.size()),
+         .firstIndex = 0,
+         .vertexOffset = 0,
+         .firstInstance = 0}};
+
+    const std::vector<Vertex> quadVertices = {
+        {{-0.01f, -0.01f}}, {{0.01f, -0.01f}}, {{0.01f, 0.01f}}, {{-0.01f, 0.01f}}};
+    const std::vector<uint32_t> quadIndices = {0, 1, 2, 0, 2, 3};
+    const std::vector<Vertex> triVertices = {
+        {{-0.02f, -0.02f}}, {{0.02f, -0.02f}}, {{0.00f, 0.02f}}};
+    const std::vector<uint32_t> triIndices = {0, 1, 2};
+    bool isQuad = true;
+
+    // ================= 子分配器初始化 =================
+    // 1. 获取内存类型索引（DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT）
+    uint32_t memoryTypeIndex = 0;
+    {
+        VkBufferCreateInfo tmpInfo{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                   .size = 256,
+                                   .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                   .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+        VkBuffer tmpBuf = device.createBuffer(tmpInfo, device.allocator());
+        VkMemoryRequirements memReqs = device.getBufferMemoryRequirements(tmpBuf);
+        device.destroyBuffer(tmpBuf, device.allocator());
+
+        VkPhysicalDeviceMemoryProperties memProps = physical_device.getMemoryProperties();
+        memoryTypeIndex = find_memory_type_index(
+            memReqs.memoryTypeBits, memProps,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    }
+
+    // 2. 子分配器（块大小 64MB，启用设备地址标志）
+    VkMemoryAllocateFlagsInfo addrFlags{.sType =
+                                            VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+                                        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    SubAllocator subAlloc(device, memoryTypeIndex, 64 * 1024 * 1024, &addrFlags, true);
+
+    // 辅助函数：创建 VkBuffer 并从子分配器获取内存
+    auto createSubBuffer = [&](VkDeviceSize size,
+                               VkBufferUsageFlags usage) -> SubAllocatedBuffer {
+        VkBufferCreateInfo bufferInfo{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                      .size = size,
+                                      .usage = usage,
+                                      .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+        VkBuffer buf = device.createBuffer(bufferInfo, device.allocator());
+        VkMemoryRequirements memReqs = device.getBufferMemoryRequirements(buf);
+        auto alloc = subAlloc.allocate(memReqs.size, memReqs.alignment);
+        device.bindBufferMemory(buf, alloc.memory, alloc.offset);
+        return {buf, alloc.memory, alloc.offset, size, alloc.mappedPtr, &device};
+    };
+
+    // 替换原有的 auto_map_buffer 数组
+    std::array<SubAllocatedBuffer, MAX_FRAMES_IN_FLIGHT> vertexBuffers;
+    std::array<SubAllocatedBuffer, MAX_FRAMES_IN_FLIGHT> indexBuffers;
+    std::array<SubAllocatedBuffer, MAX_FRAMES_IN_FLIGHT> indirectBuffers;
+    std::array<SubAllocatedBuffer, MAX_FRAMES_IN_FLIGHT> instanceBuffers;
+    std::array<VkDeviceAddress, MAX_FRAMES_IN_FLIGHT> instanceBufferAddress{};
+    std::array<bool, MAX_FRAMES_IN_FLIGHT> frameNeedsGeometryUpdate{};
+
+    for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+    {
+        vertexBuffers[i] = createSubBuffer(vertices.size() * sizeof(Vertex),
+                                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        memcpy(vertexBuffers[i].mappedPtr, vertices.data(),
+               vertices.size() * sizeof(Vertex));
+
+        indexBuffers[i] = createSubBuffer(indices.size() * sizeof(uint32_t),
+                                          VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+        memcpy(indexBuffers[i].mappedPtr, indices.data(),
+               indices.size() * sizeof(uint32_t));
+
+        indirectBuffers[i] = createSubBuffer(sizeof(VkDrawIndexedIndirectCommand),
+                                             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+        memcpy(indirectBuffers[i].mappedPtr, indirectCmds.data(),
+               sizeof(VkDrawIndexedIndirectCommand));
+
+        /*
+         * 实例缓冲区需要同时具备 STORAGE_BUFFER 和 SHADER_DEVICE_ADDRESS 使用标志：
+         *   - VK_BUFFER_USAGE_STORAGE_BUFFER_BIT：作为 SSBO 在着色器中访问
+         *   - VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT：允许通过 vkGetBufferDeviceAddress
+         *     获取设备地址，并通过推送常量传递给着色器。
+         */
+        instanceBuffers[i] =
+            createSubBuffer(instancesDta.size() * sizeof(InstanceData),
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        memcpy(instanceBuffers[i].mappedPtr, instancesDta.data(),
+               instancesDta.size() * sizeof(InstanceData));
+
+        instanceBufferAddress[i] =
+            device.getBufferDeviceAddress({.sType = sType<VkBufferDeviceAddressInfo>(),
+                                           .buffer = instanceBuffers[i].buffer});
+    }
+
+    // ================= 记录命令缓冲区 =================
+    const auto recordCommandBuffer = [&](const CommandBufferView &commandBuffer,
+                                         uint32_t imageIndex, uint32_t frameIndex) {
+        VkImage image = swapchain.image(imageIndex);
+        VkImageView imageView = swapchain.imageView(imageIndex);
+        auto imageExtent = swapchain.imageExtent();
+
+        commandBuffer.begin({.sType = sType<VkCommandBufferBeginInfo>()});
+        my_render::transition_image_layout(
+            commandBuffer, image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, {},
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+        auto &vb = vertexBuffers[frameIndex];
+        auto &ib = indexBuffers[frameIndex];
+        auto &idb = indirectBuffers[frameIndex];
+        auto &instb = instanceBuffers[frameIndex];
+        auto instanceBufferAddres = instanceBufferAddress[frameIndex];
+
+        if (frameNeedsGeometryUpdate[frameIndex])
+        {
+            const auto &newVerts = isQuad ? quadVertices : triVertices;
+            const auto &newIdxs = isQuad ? quadIndices : triIndices;
+
+            // 直接 memcpy 到映射指针更新数据，因为内存是 HOST_COHERENT，GPU 自动可见
+            memcpy(vb.mappedPtr, newVerts.data(), newVerts.size() * sizeof(Vertex));
+            memcpy(ib.mappedPtr, newIdxs.data(), newIdxs.size() * sizeof(uint32_t));
+            memcpy(idb.mappedPtr, indirectCmds.data(),
+                   sizeof(VkDrawIndexedIndirectCommand));
+            memcpy(instb.mappedPtr, instancesDta.data(),
+                   instancesDta.size() * sizeof(InstanceData));
+
+            frameNeedsGeometryUpdate[frameIndex] = false;
+
+            /*
+             * 缓冲区屏障：offset 设为 0，size 设为缓冲区实际大小。
+             * 因为缓冲区已被绑定到大块内存的子区域，其“本地偏移”从 0 开始，
+             * 屏障只需要覆盖整个缓冲区范围即可。
+             */
+            std::array<VkBufferMemoryBarrier2, 4> barriers{{
+                {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
+                 VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT,
+                 VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT, VK_QUEUE_FAMILY_IGNORED,
+                 VK_QUEUE_FAMILY_IGNORED, vb.buffer, 0, vb.size},
+                {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
+                 VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT, VK_ACCESS_2_INDEX_READ_BIT,
+                 VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, ib.buffer, 0, ib.size},
+                {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
+                 VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                 VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT, VK_QUEUE_FAMILY_IGNORED,
+                 VK_QUEUE_FAMILY_IGNORED, idb.buffer, 0, idb.size},
+                {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
+                 VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_WRITE_BIT,
+                 VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT,
+                 VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, instb.buffer, 0,
+                 instb.size},
+            }};
+            commandBuffer.pipelineBarrier2(
+                {.sType = sType<VkDependencyInfo>(),
+                 .bufferMemoryBarrierCount = static_cast<uint32_t>(barriers.size()),
+                 .pBufferMemoryBarriers = barriers.data()});
+        }
+
+        VkRenderingAttachmentInfo colorAttachment = {
+            .sType = sType<VkRenderingAttachmentInfo>(),
+            .imageView = imageView,
+            .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = {.color = {.float32 = {0.0F, 0.0F, 0.0F, 1.0F}}}};
+
+        commandBuffer.beginRendering(
+            {.sType = sType<VkRenderingInfo>(),
+             .renderArea = {.offset = {.x = 0, .y = 0}, .extent = imageExtent},
+             .layerCount = 1,
+             .colorAttachmentCount = 1,
+             .pColorAttachments = &colorAttachment});
+        commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *graphicsPipeline);
+        commandBuffer.setViewport(0, std::array<VkViewport, 1>{VkViewport{
+                                         .x = 0.0F,
+                                         .y = 0.0F,
+                                         .width = static_cast<float>(imageExtent.width),
+                                         .height = static_cast<float>(imageExtent.height),
+                                         .minDepth = 0.0F,
+                                         .maxDepth = 1.0F}});
+        commandBuffer.setScissor(
+            0, std::array<VkRect2D, 1>{
+                   VkRect2D{.offset = {.x = 0, .y = 0}, .extent = imageExtent}});
+
+        /*
+         * 绑定缓冲区：偏移参数设为 0，因为缓冲区已在 vkBindBufferMemory 时
+         * 绑定到大块内存的正确子区域，它的本地偏移从 0 开始。
+         */
+        commandBuffer.bindVertexBuffers(0, 1, vb.buffer, 0);
+        commandBuffer.bindIndexBuffer(ib.buffer, 0, VK_INDEX_TYPE_UINT32);
+
+        PushData pushConstants = {instanceBufferAddres};
+        commandBuffer.pushConstants(*pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                                    sizeof(PushData), &pushConstants);
+
+        /*
+         * 间接绘制：同样从缓冲区偏移 0 开始读取绘制命令。
+         */
+        commandBuffer.drawIndexedIndirect(idb.buffer, 0, 1,
+                                          sizeof(VkDrawIndexedIndirectCommand));
+
+        commandBuffer.endRendering();
+
+        my_render::transition_image_layout(
+            commandBuffer, image, VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, 0,
+            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
+        commandBuffer.end();
+    };
+    // NOLINTNEXTLINE
+    const auto recreateSwapChain = [&]() {
+        surface.waitGoodFramebufferSize();
+        device.waitIdle();
+        swapchain.destroy();
+        swapchain = swapchainBuild.rebuild();
+    };
+    // NOLINTNEXTLINE
+    const auto drawFrame = [&]() {
+        auto &inFlightFences = frameContext.inFlightFences;
+        auto &currentFrame = frameContext.currentFrame;
+        auto &presentCompleteSemaphore = frameContext.presentCompleteSemaphore;
+        auto &semaphoreIndex = frameContext.semaphoreIndex;
+        auto &renderFinishedSemaphore = frameContext.renderFinishedSemaphore;
+
+        const LogicalDevice *logicalDevice = frameContext.device_;
+
+        while (logicalDevice->waitForFences(1, inFlightFences[currentFrame], VK_TRUE,
+                                            UINT64_MAX) == VK_TIMEOUT)
+            ;
+
+        auto [result, imageIndex] = swapchain.acquireNextImage(
+            UINT64_MAX, presentCompleteSemaphore[semaphoreIndex], nullptr);
+        if (result == VK_ERROR_OUT_OF_DATE_KHR)
+        {
+            recreateSwapChain();
+            return;
+        }
+        if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
+            throw std::runtime_error("failed to acquire swap chain image!");
+
+        logicalDevice->resetFences(1, inFlightFences[currentFrame]);
+
+        const auto &commandBuffer = commandBuffers[currentFrame];
+        commandBuffer.reset({});
+        recordCommandBuffer(commandBuffer, imageIndex, currentFrame);
+
+        // NOLINTNEXTLINE
+        VkPipelineStageFlags waitDestinationStageMask[] = {
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+        GRAPHICS_AND_PRESENT.submit(
+            1,
+            {.sType = sType<VkSubmitInfo>(),
+             .waitSemaphoreCount = 1,
+             .pWaitSemaphores = &presentCompleteSemaphore[semaphoreIndex],
+             .pWaitDstStageMask = waitDestinationStageMask,
+             .commandBufferCount = 1,
+             .pCommandBuffers = &*commandBuffer,
+             .signalSemaphoreCount = 1,
+             .pSignalSemaphores = &renderFinishedSemaphore[imageIndex]},
+            inFlightFences[currentFrame]);
+
+        result = GRAPHICS_AND_PRESENT.presentKHR(
+            {.sType = sType<VkPresentInfoKHR>(),
+             .waitSemaphoreCount = 1,
+             .pWaitSemaphores = &renderFinishedSemaphore[imageIndex],
+             .swapchainCount = 1,
+             .pSwapchains = &(*swapchain),
+             .pImageIndices = &imageIndex});
+        if (auto &framebufferResized = window.refFramebufferResized();
+            result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR ||
+            framebufferResized)
+        {
+            framebufferResized = false;
+            recreateSwapChain();
+        }
+        semaphoreIndex = (semaphoreIndex + 1) % presentCompleteSemaphore.size();
+        currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+    };
+
+    while (window.shouldClose() == 0)
+    {
+        surface::pollEvents();
+        drawFrame();
+        {
+            static auto lastTime = std::chrono::high_resolution_clock::now();
+            static int frameCount = 0, totalFrames = 0;
+            static float accumulatedFPS = 0.0f;
+            static int avgSamples = 0;
+            frameCount++;
+            totalFrames++;
+            auto now = std::chrono::high_resolution_clock::now();
+            float elapsed = std::chrono::duration<float>(now - lastTime).count();
+            if (elapsed >= 1.0f)
+            {
+                float fps = frameCount / elapsed;
+                accumulatedFPS += fps;
+                avgSamples++;
+                float avgFPS = accumulatedFPS / avgSamples;
+                float frameTimeMs = (elapsed / frameCount) * 1000.0f;
+                std::println(
+                    "FPS: {:.1f} (avg: {:.1f}) | FrameTime: {:.2f}ms | Total: {}", fps,
+                    avgFPS, frameTimeMs, totalFrames);
+                frameCount = 0;
+                lastTime = now;
+
+                isQuad = !isQuad;
+                const auto &newIdxs = isQuad ? quadIndices : triIndices;
+                instancesDta.clear();
+                generateData();
+                indirectCmds[0].indexCount = static_cast<uint32_t>(newIdxs.size());
+                indirectCmds[0].instanceCount =
+                    static_cast<uint32_t>(instancesDta.size());
+                for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+                    frameNeedsGeometryUpdate[i] = true;
+            }
+        }
+    }
+    device.waitIdle();
+    std::cout << "main done\n";
+    return 0;
+}
+catch (std::exception &e)
+{
+    std::println("main catch exception: {}", e.what());
+}
