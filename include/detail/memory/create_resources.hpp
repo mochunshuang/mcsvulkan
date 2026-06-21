@@ -8,23 +8,13 @@ namespace mcs::vulkan::memory
 {
     struct create_resources : create_image
     {
-        constexpr resource build(LogicalDevice &device, VkDeviceSize memoryOffset = 0)
+        using create_image::create_image;
+        [[nodiscard]] constexpr resource build(const LogicalDevice &device,
+                                               VkDeviceSize memoryOffset = 0) const
         {
             image_base base = create_image::build(device, memoryOffset);
             VkImageView imageView = create_image::buildRawView(device, base.image());
             return {std::move(base), imageView};
-        }
-
-        constexpr create_resources() noexcept = default;
-        constexpr explicit create_resources(create_image createImage) noexcept
-            : create_image{std::move(createImage)}
-        {
-        }
-        constexpr auto &&setCreateImage(this auto &&self,
-                                        create_image createImage) noexcept
-        {
-            self = std::move(createImage);
-            return std::forward<decltype(self)>(self);
         }
     };
 }; // namespace mcs::vulkan::memory

@@ -236,6 +236,14 @@ int main()
         std::move_only_function<int(int)> f(std::in_place_type<S>, 100);
         assert(f(5) == 105);
     }
+    { // const 包装器
+        int a = 0;
+        std::move_only_function<void() const> f2 = [&]() {
+            a = 1;
+        };
+        f2();
+        assert(a == 1);
+    }
 
     std::cout << "All move_only_function tests passed!\n";
     return 0;

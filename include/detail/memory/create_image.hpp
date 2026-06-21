@@ -76,7 +76,7 @@ namespace mcs::vulkan::memory
         using memory_allocate_info = memory_allocate_info;
         using GenMemoryAllocateInfo = std::move_only_function<memory_allocate_info(
             VkMemoryRequirements memRequirements,
-            VkPhysicalDeviceMemoryProperties memoryProperties)>;
+            VkPhysicalDeviceMemoryProperties memoryProperties) const>;
         constexpr auto &&setGenMemoryAllocateInfo(
             this auto &&self, GenMemoryAllocateInfo genMemoryAllocateInfo) noexcept
         {
@@ -121,7 +121,7 @@ namespace mcs::vulkan::memory
         }; // NOLINTEND
         static_assert(std::is_default_constructible_v<view_create_info>);
         using GenViewCreateInfo = std::move_only_function<view_create_info(
-            VkImageCreateInfo imageCreateInfo, VkImage image) noexcept>;
+            VkImageCreateInfo imageCreateInfo, VkImage image) const>;
         constexpr auto &&setGenViewCreateInfo(
             this auto &&self, GenViewCreateInfo genViewCreateInfo) noexcept
         {
@@ -129,7 +129,8 @@ namespace mcs::vulkan::memory
             return std::forward<decltype(self)>(self);
         }
 
-        constexpr image_base build(LogicalDevice &device, VkDeviceSize memoryOffset = 0)
+        [[nodiscard]] constexpr image_base build(const LogicalDevice &device,
+                                                 VkDeviceSize memoryOffset = 0) const
         {
             VkImage image = nullptr;
             VkDeviceMemory imageMemory = nullptr;
@@ -154,12 +155,14 @@ namespace mcs::vulkan::memory
                 throw;
             }
         }
-        constexpr VkImageView buildRawView(LogicalDevice &device, VkImage image)
+        constexpr VkImageView buildRawView(const LogicalDevice &device,
+                                           VkImage image) const
         {
             view_create_info createInfo = genViewCreateInfo_(createInfo_(), image);
             return device.createImageView(createInfo(), device.allocator());
         }
-        constexpr ImageView buildImageView(LogicalDevice &device, VkImage image)
+        constexpr ImageView buildImageView(const LogicalDevice &device,
+                                           VkImage image) const
         {
             return {device, buildRawView(device, image)};
         }

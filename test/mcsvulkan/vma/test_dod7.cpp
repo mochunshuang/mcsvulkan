@@ -62,14 +62,6 @@ using mcs::vulkan::Fence;
 
 using raii_vma = mcs::vulkan::raii_vma;
 
-using buffer_base = mcs::vulkan::vma::buffer_base;
-using auto_map_buffer = mcs::vulkan::vma::auto_map_buffer;
-using mcs::vulkan::vma::create_buffer;
-using mcs::vulkan::vma::staging_buffer;
-
-using mcs::vulkan::vma::create_resources;
-using mcs::vulkan::vma::create_image;
-
 using mcs::vulkan::tool::simple_copy_buffer;
 
 using mcs::vulkan::meta::make_aggregate_ref;
@@ -156,6 +148,11 @@ static_assert(sizeof(Vertex) == 32, "check sizeof error");
 
 namespace mesh
 {
+    using buffer_base = mcs::vulkan::memory::buffer_base;
+    using auto_map_buffer = mcs::vulkan::memory::auto_map_buffer;
+    using mcs::vulkan::memory::create_simple_buffer;
+    using mcs::vulkan::memory::create_staging_buffer;
+
     using index_type = uint32_t;
     struct vertex_raw_data
     {
@@ -190,96 +187,91 @@ namespace mesh
     // buffer 内存要求
     static constexpr auto REQUIRE_BUFFER_USAGE =
         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    static constexpr void createVertexBufferForFrame(
-        auto &world, vertex_data &fb, const std::span<const Vertex> &vertices)
+    static constexpr void createVertexBufferForFrame(auto &world, vertex_data &fb,
+                                                     const std::span<const Vertex> &data)
     {
         auto &globalCtx = world.globalCtx;
 
-        auto &allocator = globalCtx.allocator;
         auto &commandPool = globalCtx.commandPool;
         auto &queue = globalCtx.queue;
+        auto &device = globalCtx.device;
 
-        const VkDeviceSize BUFFER_SIZE = sizeof(vertices[0]) * vertices.size();
+        const VkDeviceSize BUFFER_SIZE = sizeof(data[0]) * data.size();
         auto &destBuffer = fb.vertexBuffer;
 
         constexpr auto USAGE = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
 
         // 直接使用重构后的 create_buffer 函数
-        destBuffer = create_buffer(
-            allocator,
-            {.sType = sType<VkBufferCreateInfo>(),
-             .size = BUFFER_SIZE,
+        destBuffer = mcs::vulkan::memory::create_simple_buffer(
+            device,
+            {.size = BUFFER_SIZE,
              .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | USAGE | REQUIRE_BUFFER_USAGE,
              .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-            {
-                // .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT, //diff: [test_dod6.cpp] 关键。突破到10000个小对象.注释掉代码中全部的 VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT
-                .usage = VMA_MEMORY_USAGE_AUTO,
-            });
+            VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT);
 
         // 创建暂存缓冲区并复制数据
-        const auto STAGING_BUFFER = staging_buffer(allocator, BUFFER_SIZE);
-        STAGING_BUFFER.copyDataToBuffer(vertices.data(), BUFFER_SIZE);
+        auto staging_buffer = create_staging_buffer(device, BUFFER_SIZE);
+        ::memcpy(staging_buffer.mapPtr(), data.data(), BUFFER_SIZE);
 
-        simple_copy_buffer(commandPool, queue, STAGING_BUFFER.buffer(),
-                           destBuffer.buffer(), VkBufferCopy{.size = BUFFER_SIZE});
+        simple_copy_buffer(
+            commandPool, queue, staging_buffer.buffer(), destBuffer.buffer(),
+            VkBufferCopy{.srcOffset = {}, .dstOffset = {}, .size = BUFFER_SIZE});
     }
 
     static void createIndexBufferForFrame(auto &world, vertex_data &fb,
-                                          const std::span<const index_type> &indices)
+                                          const std::span<const index_type> &data)
     {
         auto &globalCtx = world.globalCtx;
 
-        auto &allocator = globalCtx.allocator;
         auto &commandPool = globalCtx.commandPool;
         auto &queue = globalCtx.queue;
+        auto &device = globalCtx.device;
 
-        fb.index_sequence = indices | std::ranges::to<std::vector>();
+        fb.index_sequence = data | std::ranges::to<std::vector>();
 
-        const VkDeviceSize BUFFER_SIZE = sizeof(indices[0]) * indices.size();
+        const VkDeviceSize BUFFER_SIZE = sizeof(data[0]) * data.size();
         auto &destBuffer = fb.indexBuffer;
 
         constexpr auto USAGE = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
         // 直接使用重构后的 create_buffer 函数
-        destBuffer = create_buffer(
-            allocator,
-            {.sType = sType<VkBufferCreateInfo>(),
-             .size = BUFFER_SIZE,
+        destBuffer = mcs::vulkan::memory::create_simple_buffer(
+            device,
+            {.size = BUFFER_SIZE,
              .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | USAGE | REQUIRE_BUFFER_USAGE,
              .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-            {// .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
-             .usage = VMA_MEMORY_USAGE_AUTO});
+            VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT);
 
         // 创建暂存缓冲区并复制数据
-        const auto STAGING_BUFFER = staging_buffer(allocator, BUFFER_SIZE);
-        STAGING_BUFFER.copyDataToBuffer(indices.data(), BUFFER_SIZE);
 
-        simple_copy_buffer(commandPool, queue, STAGING_BUFFER.buffer(),
-                           destBuffer.buffer(), {VkBufferCopy{.size = BUFFER_SIZE}});
+        auto staging_buffer = create_staging_buffer(device, BUFFER_SIZE);
+        ::memcpy(staging_buffer.mapPtr(), data.data(), BUFFER_SIZE);
+
+        simple_copy_buffer(
+            commandPool, queue, staging_buffer.buffer(), destBuffer.buffer(),
+            VkBufferCopy{.srcOffset = {}, .dstOffset = {}, .size = BUFFER_SIZE});
     }
 
     static constexpr void createObjectBuffer(auto &world, object_data_map &fb,
-                                             size_t buffer_size)
+                                             size_t BUFFER_SIZE)
     {
         auto &globalCtx = world.globalCtx;
+        auto &device = globalCtx.device;
 
-        auto &allocator = globalCtx.allocator;
-
-        fb.objectDataBuffer = auto_map_buffer{create_buffer(
-            allocator,
-            {.sType = sType<VkBufferCreateInfo>(),
-             .size = buffer_size,
-             .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | REQUIRE_BUFFER_USAGE,
-             .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-            {
-                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                         VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                .usage = VMA_MEMORY_USAGE_AUTO,
-            })};
+        fb.objectDataBuffer = mcs::vulkan::memory::auto_map_buffer(
+            mcs::vulkan::memory::create_simple_buffer(
+                device,
+                {.size = BUFFER_SIZE,
+                 .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | REQUIRE_BUFFER_USAGE,
+                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+            BUFFER_SIZE);
     }
 
     static void getVertexDataDeviceAddresses(auto &world, vertex_data &fb)
     {
-        auto &device = world.globalCtx.device;
+        auto &globalCtx = world.globalCtx;
+        auto &device = globalCtx.device;
         if (fb.vertexBuffer.buffer() != VK_NULL_HANDLE)
         {
             fb.vertexBufferAddress = device.getBufferDeviceAddress(
@@ -289,7 +281,8 @@ namespace mesh
     }
     static void getObjectDataDeviceAddresses(auto &world, object_data_map &fb)
     {
-        auto &device = world.globalCtx.device;
+        auto &globalCtx = world.globalCtx;
+        auto &device = globalCtx.device;
         if (fb.objectDataBuffer.buffer() != VK_NULL_HANDLE)
         {
             fb.objectDataAddress = device.getBufferDeviceAddress(
@@ -532,13 +525,13 @@ struct ObjectInfo
 
 struct PerFrameBatch
 {
-    auto_map_buffer mergedIndexBuffer{};
+    mcs::vulkan::memory::auto_map_buffer mergedIndexBuffer{};
     VkDeviceSize mergedIndexCapacity = 0;
 
-    auto_map_buffer objectInfoBuffer{};
+    mcs::vulkan::memory::auto_map_buffer objectInfoBuffer{};
     VkDeviceSize objectInfoCapacity = 0;
 
-    auto_map_buffer indirectDrawBuffer{};
+    mcs::vulkan::memory::auto_map_buffer indirectDrawBuffer{};
     VkDeviceSize indirectCmdCapacity = 0;
 
     uint32_t drawCount = 0;
@@ -547,48 +540,48 @@ struct PerFrameBatch
 
 //diff: [test_indirectdraw2] start
 // NOLINTBEGIN
-using Texture = mcs::vulkan::vma::resource;
-using create_texture = mcs::vulkan::vma::create_texture_image;
+
 using mcs::vulkan::load::raw_stbi_image;
 
-Texture generateGradientTexture(VmaAllocator allocator, const LogicalDevice &device,
-                                const CommandPool &pool, const Queue &queue,
-                                int textureType = 0, bool mipmap = true)
+using Sampler = mcs::vulkan::Sampler;
+using create_sampler = mcs::vulkan::tool::create_sampler;
+
+auto generateGradientTexture(const LogicalDevice &device, const CommandPool &pool,
+                             const Queue &queue, int textureType = 0, bool mipmap = true)
 {
     auto texWidth_ = 256;
     auto texHeight_ = 256;
-    create_image build =
-        create_image{device, allocator}
-            .setCreateInfo(
-                {.imageType = VK_IMAGE_TYPE_2D,
-                 .format = VK_FORMAT_R8G8B8A8_SRGB,
-                 .extent = {.width = static_cast<uint32_t>(texWidth_),
-                            .height = static_cast<uint32_t>(texHeight_),
-                            .depth = 1},
-                 .mipLevels =
-                     mipmap ? create_texture::getMipLevels(texWidth_, texHeight_) : 1,
-                 .arrayLayers = 1,
-                 .samples = VK_SAMPLE_COUNT_1_BIT,
-                 .tiling = VK_IMAGE_TILING_OPTIMAL,
-                 .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                          VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                 .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                 // VMA 配置
-                 .allocationCreateInfo =
-                     {//  .flags =VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
-                      .usage = VMA_MEMORY_USAGE_AUTO}})
-            .setViewCreateInfo(
-                {.viewType = VK_IMAGE_VIEW_TYPE_2D,
-                 .subresourceRange = {
-                     .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                     .baseMipLevel = 0,
-                     .levelCount =
-                         mipmap ? create_texture::getMipLevels(texWidth_, texHeight_) : 1,
-                     .baseArrayLayer = 0,
-                     .layerCount = 1}});
-    // 生成程序纹理
-    create_texture create_texture{pool, queue, std::move(build)};
+
+    mcs::vulkan::memory::create_texture create_texture{
+        [](mcs::vulkan::memory::create_texture::image_info imageInfo)
+            -> mcs::vulkan::memory::create_texture::create_info {
+            return {.imageType = VK_IMAGE_TYPE_2D,
+                    .format = VK_FORMAT_R8G8B8A8_SRGB,
+                    .extent = {.width = imageInfo.extent.width,
+                               .height = imageInfo.extent.height,
+                               .depth = 1},
+                    .mipLevels = imageInfo.mipLevels,
+                    .arrayLayers = 1,
+                    .samples = VK_SAMPLE_COUNT_1_BIT,
+                    .tiling = VK_IMAGE_TILING_OPTIMAL,
+                    .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+        },
+        mcs::vulkan::memory::gen_memory_allocate_info(
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+        [](VkImageCreateInfo imageCreateInfo,
+           VkImage image) -> mcs::vulkan::memory::create_texture::view_create_info {
+            return {.image = image,
+                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                    .format = imageCreateInfo.format,
+                    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                         .baseMipLevel = 0,
+                                         .levelCount = imageCreateInfo.mipLevels,
+                                         .baseArrayLayer = 0,
+                                         .layerCount = 1}};
+        }};
 
     auto imageSize = texWidth_ * texHeight_ * STBI_rgb_alpha;
     auto pixels = std::make_unique_for_overwrite<uint8_t[]>(imageSize);
@@ -607,10 +600,17 @@ Texture generateGradientTexture(VmaAllocator allocator, const LogicalDevice &dev
         generateGradientTexture(pixels.get(), texWidth_, texHeight_, topColor,
                                 bottomColor);
     }
-    return create_texture.build({pixels.get(), static_cast<uint64_t>(imageSize)});
+    return create_texture.build(
+        device, pool, queue,
+        mcs::vulkan::memory::create_texture::image_info{
+            .extent = {.width = static_cast<uint32_t>(texWidth_),
+                       .height = static_cast<uint32_t>(texHeight_)},
+            .pixels =
+                std::span<const uint8_t>{pixels.get(), static_cast<uint64_t>(imageSize)},
+            .mipLevels = mipmap ? mcs::vulkan::memory::create_texture::getMipLevels(
+                                      texWidth_, texHeight_)
+                                : 1});
 }
-using Sampler = mcs::vulkan::Sampler;
-using create_sampler = mcs::vulkan::tool::create_sampler;
 // NOLINTEND
 //diff: [test_indirectdraw2] end
 
@@ -780,7 +780,7 @@ try
             .select()[0];
 
     // NOTE: 根据GPU 配置 vma
-    updateVmaFlag(vma_flags, physical_device, requiredDeviceExtension);
+    // updateVmaFlag(vma_flags, physical_device, requiredDeviceExtension);
 
     mcs::vulkan::surface auto surface = surface_impl(physical_device, window);
     const uint32_t GRAPHICS_QUEUE_FAMILY_IDX =
@@ -807,12 +807,12 @@ try
     requiredDeviceExtension.clear();
 
     // NOTE: 逻辑设备确定后，就能初始化 vma了
-    raii_vma vma{{.flags = vma_flags,
-                  .physicalDevice = *physical_device,
-                  .device = *device,
-                  .instance = *instance,
-                  .vulkanApiVersion = APIVERSION}};
-    [[maybe_unused]] VmaAllocator allocator = vma.allocator();
+    // raii_vma vma{{.flags = vma_flags,
+    //               .physicalDevice = *physical_device,
+    //               .device = *device,
+    //               .instance = *instance,
+    //               .vulkanApiVersion = APIVERSION}};
+    // [[maybe_unused]] VmaAllocator allocator = vma.allocator();
 
     const auto GRAPHICS_AND_PRESENT = Queue(
         device, {.queue_family_index = GRAPHICS_QUEUE_FAMILY_IDX, .queue_index = 0});
@@ -950,58 +950,58 @@ try
             BUFFER_SIZE);
     }
     // diff: [test_dod7] end
+    uint32_t create_texture_mipLevels = 1;
+    mcs::vulkan::memory::create_texture create_texture{
+        [&](mcs::vulkan::memory::create_texture::image_info imageInfo)
+            -> mcs::vulkan::memory::create_texture::create_info {
+            create_texture_mipLevels = imageInfo.mipLevels;
+            return {.imageType = VK_IMAGE_TYPE_2D,
+                    .format = VK_FORMAT_R8G8B8A8_SRGB,
+                    .extent = {.width = imageInfo.extent.width,
+                               .height = imageInfo.extent.height,
+                               .depth = 1},
+                    .mipLevels = imageInfo.mipLevels,
+                    .arrayLayers = 1,
+                    .samples = VK_SAMPLE_COUNT_1_BIT,
+                    .tiling = VK_IMAGE_TILING_OPTIMAL,
+                    .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+        },
+        mcs::vulkan::memory::gen_memory_allocate_info(
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+        [](VkImageCreateInfo imageCreateInfo,
+           VkImage image) -> mcs::vulkan::memory::create_texture::view_create_info {
+            return {.image = image,
+                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                    .format = imageCreateInfo.format,
+                    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                         .baseMipLevel = 0,
+                                         .levelCount = imageCreateInfo.mipLevels,
+                                         .baseArrayLayer = 0,
+                                         .layerCount = 1}};
+        }};
 
-    create_texture create_texture{
-        commandPool, GRAPHICS_AND_PRESENT,
-        create_image{device, allocator}
-            .setCreateInfo({.imageType = VK_IMAGE_TYPE_2D,
-                            .format = VK_FORMAT_R8G8B8A8_SRGB,
-                            //  .extent = {.width = static_cast<uint32_t>(width),
-                            //             .height = static_cast<uint32_t>(height),
-                            //             .depth = 1},
-                            .mipLevels = 1,
-                            .arrayLayers = 1,
-                            .samples = VK_SAMPLE_COUNT_1_BIT,
-                            .tiling = VK_IMAGE_TILING_OPTIMAL,
-                            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                     VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                     VK_IMAGE_USAGE_SAMPLED_BIT,
-                            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                            // VMA 配置
-                            .allocationCreateInfo =
-                                {//  .flags =VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
-                                 .usage = VMA_MEMORY_USAGE_AUTO}})
-            .setViewCreateInfo(
-                {.viewType = VK_IMAGE_VIEW_TYPE_2D,
-                 .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                                      .baseMipLevel = 0,
-                                      .levelCount = 1,
-                                      .baseArrayLayer = 0,
-                                      .layerCount = 1}})};
-    std::map<uint32_t, Texture> textureMap; // 槽位 → 纹理
+    std::map<uint32_t, mcs::vulkan::memory::resource> textureMap; // 槽位 → 纹理
     {
-        raw_stbi_image img{"textures/texture.jpg", STBI_rgb_alpha};
-        create_texture.updateFormat(VK_FORMAT_R8G8B8A8_SRGB)
-            .updateImageExtent({.width = static_cast<uint32_t>(img.width()),
-                                .height = static_cast<uint32_t>(img.height()),
-                                .depth = 1});
-        create_texture.refCreator().createInfo().mipLevels =
-            create_texture::getMipLevels(img.width(), img.height());
-        create_texture.refCreator().viewCreateInfo().subresourceRange.levelCount =
-            create_texture.refCreator().createInfo().mipLevels;
-        textureMap.emplace(0, create_texture.build({img.data(), img.size()}));
+        raw_stbi_image{"textures/texture.jpg", STBI_rgb_alpha};
+
+        textureMap.emplace(0, create_texture.templateForImage2d(
+                                  device, commandPool, GRAPHICS_AND_PRESENT,
+                                  raw_stbi_image{"textures/texture.jpg", STBI_rgb_alpha},
+                                  true));
     }
     activeTextureSlots.insert(0);
 
-    textureMap.emplace(3, generateGradientTexture(allocator, device, commandPool,
-                                                  GRAPHICS_AND_PRESENT,
-                                                  1)); // 棋盘
+    textureMap.emplace(3,
+                       generateGradientTexture(device, commandPool, GRAPHICS_AND_PRESENT,
+                                               1)); // 棋盘
     activeTextureSlots.insert(3);
 
-    textureMap.emplace(9, generateGradientTexture(allocator, device, commandPool,
-                                                  GRAPHICS_AND_PRESENT,
-                                                  2)); // 渐变
+    textureMap.emplace(9,
+                       generateGradientTexture(device, commandPool, GRAPHICS_AND_PRESENT,
+                                               2)); // 渐变
     activeTextureSlots.insert(9);
 
     std::vector<Sampler> samplers;
@@ -1011,7 +1011,7 @@ try
             .setCreateInfo(create_sampler::templateLinear())
             .enableAnisotropy(
                 device.physicalDevice()->getProperties().limits.maxSamplerAnisotropy)
-            .updateMaxLodByMipmap(create_texture.mipLevels())
+            .updateMaxLodByMipmap(create_texture_mipLevels)
             .build(device)); // 线性采样器
     samplers.emplace_back(create_sampler{}
                               .setCreateInfo(create_sampler::templateNearest())
@@ -1091,15 +1091,16 @@ try
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
     {
         // 创建 16 字节的极小 SSBO，仅用于满足描述符绑定要求
-        batches[i].objectInfoBuffer = auto_map_buffer(
-            create_buffer(allocator,
-                          {.sType = sType<VkBufferCreateInfo>(),
-                           .size = 16, // NOLINT
-                           .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                           .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                          {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                                    VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                           .usage = VMA_MEMORY_USAGE_AUTO}));
+        constexpr auto BUFFER_SIZE = 16;
+        batches[i].objectInfoBuffer = mcs::vulkan::memory::auto_map_buffer(
+            mcs::vulkan::memory::create_simple_buffer(
+                device,
+                {.size = BUFFER_SIZE,
+                 .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+            BUFFER_SIZE);
     }
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
     {
@@ -1122,7 +1123,7 @@ try
 
     auto depthResourcesBuild = mcs::vulkan::memory::build_simple_resource(
         {.imageType = VK_IMAGE_TYPE_2D,
-         .format = create_resources::findSupportedFormat(
+         .format = mcs::vulkan::memory::create_resources::findSupportedFormat(
              physical_device,
              std::array<VkFormat, 3>{VkFormat::VK_FORMAT_D32_SFLOAT,
                                      VkFormat::VK_FORMAT_D32_SFLOAT_S8_UINT,
@@ -1417,7 +1418,7 @@ try
     auto resolveResource = resolveResourcesBuild.build(device);
 
     // 每个飞行帧的暂存缓冲区（8 字节 = R32G32_UINT 像素）
-    std::array<auto_map_buffer, MAX_FRAMES_IN_FLIGHT> pickingFrames;
+    std::array<mcs::vulkan::memory::auto_map_buffer, MAX_FRAMES_IN_FLIGHT> pickingFrames;
     // 当前鼠标位置（已翻转 Y 轴，与 Vulkan 视口一致）
     struct pick_mouse
     {
@@ -1427,14 +1428,16 @@ try
     pick_mouse pickMouse;
     for (auto &pf : pickingFrames)
     {
-        pf = auto_map_buffer{
-            create_buffer(allocator,
-                          {.sType = sType<VkBufferCreateInfo>(),
-                           .size = 8,
-                           .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT},
-                          {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                                    VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                           .usage = VMA_MEMORY_USAGE_AUTO})};
+        constexpr auto BUFFER_SIZE = 8;
+        pf = mcs::vulkan::memory::auto_map_buffer(
+            mcs::vulkan::memory::create_simple_buffer(
+                device,
+                {.size = BUFFER_SIZE,
+                 .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+            BUFFER_SIZE);
     }
 
     auto pickCtx =
@@ -1443,11 +1446,11 @@ try
             pickResourcesBuild, pickResource, resolveResourcesBuild, resolveResource,
             pickingFrames, pickMouse);
     auto globalCtx =
-        make_aggregate_ref<"globalCtx", "allocator", "device", "window", "surface",
-                           "swapchainBuild", "swapchain", "camera", "frameContext",
-                           "commandPool", "commandBuffers", "queue">(
-            allocator, device, window, surface, swapchainBuild, swapchain, camera,
-            frameContext, commandPool, commandBuffers, GRAPHICS_AND_PRESENT);
+        make_aggregate_ref<"globalCtx", "device", "window", "surface", "swapchainBuild",
+                           "swapchain", "camera", "frameContext", "commandPool",
+                           "commandBuffers", "queue">(
+            device, window, surface, swapchainBuild, swapchain, camera, frameContext,
+            commandPool, commandBuffers, GRAPHICS_AND_PRESENT);
 
     auto mainCtx =
         make_aggregate_ref<"mainCtx", "pipeline", "pipelineLayout", "depthResourcesBuild",
@@ -1997,7 +2000,6 @@ try
         auto &globalCtx = world.globalCtx;
         auto &mainShaderCtx = world.mainShaderCtx;
 
-        auto &allocator = globalCtx.allocator;
         auto &device = globalCtx.device;
 
         auto &descriptorSets = mainShaderCtx.descriptorSets;
@@ -2045,16 +2047,16 @@ try
         VkDeviceSize needIdx = totalIndexCount * sizeof(uint32_t);
         if (batch.mergedIndexCapacity < needIdx)
         {
-            batch.mergedIndexBuffer = auto_map_buffer{
-                create_buffer(allocator,
-                              {.sType = sType<VkBufferCreateInfo>(),
-                               .size = needIdx,
-                               .usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                               .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                              {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                                        VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                               .usage = VMA_MEMORY_USAGE_AUTO})};
+            batch.mergedIndexBuffer = mcs::vulkan::memory::auto_map_buffer(
+                mcs::vulkan::memory::create_simple_buffer(
+                    device,
+                    {.size = needIdx,
+                     .usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                              VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+                needIdx);
             batch.mergedIndexCapacity = needIdx;
         }
 
@@ -2063,15 +2065,15 @@ try
         if (batch.objectInfoCapacity < needObj)
         {
 
-            batch.objectInfoBuffer = auto_map_buffer{
-                create_buffer(allocator,
-                              {.sType = sType<VkBufferCreateInfo>(),
-                               .size = needObj,
-                               .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                               .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                              {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                                        VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                               .usage = VMA_MEMORY_USAGE_AUTO})};
+            batch.objectInfoBuffer = mcs::vulkan::memory::auto_map_buffer(
+                mcs::vulkan::memory::create_simple_buffer(
+                    device,
+                    {.size = needObj,
+                     .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+                needObj);
             batch.objectInfoCapacity = needObj;
 
             // 更新描述符集中的 binding 3 指向新缓冲
@@ -2096,16 +2098,16 @@ try
         VkDeviceSize needCmd = objectCount * sizeof(VkDrawIndexedIndirectCommand);
         if (batch.indirectCmdCapacity < needCmd)
         {
-            batch.indirectDrawBuffer = auto_map_buffer{
-                create_buffer(allocator,
-                              {.sType = sType<VkBufferCreateInfo>(),
-                               .size = needCmd,
-                               .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
-                                        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                               .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                              {.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
-                                        VMA_ALLOCATION_CREATE_MAPPED_BIT,
-                               .usage = VMA_MEMORY_USAGE_AUTO})};
+            batch.indirectDrawBuffer = mcs::vulkan::memory::auto_map_buffer(
+                mcs::vulkan::memory::create_simple_buffer(
+                    device,
+                    {.size = needCmd,
+                     .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                              VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+                needCmd);
             batch.indirectCmdCapacity = needCmd;
         }
 
@@ -2415,7 +2417,7 @@ try
                 //NOTE: 复制到 pickingFrames，就可以读取了，拿到着色器的输出
                 commandBuffer.copyImageToBuffer(
                     resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    *pickingFrames[currentFrame],
+                    pickingFrames[currentFrame].buffer(),
                     std::array<VkBufferImageCopy, 1>{VkBufferImageCopy{
                         .bufferOffset = 0,
                         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
@@ -2578,7 +2580,13 @@ try
         // diff: [test_dod5] start
         // 每 2 秒添加 10 个小实体，使用网格锚点保证不重叠，并按波次从内向外扩散
         static auto lastUpdate = std::chrono::steady_clock::now();
-        constexpr auto add_count_per_times = 1000;
+        // NOTE: 最终实体数量会达到 10000。每个实体 6 个内存分配 → 60000 次 vkAllocateMemory，远超过 4096 的限制。
+        /*
+[ ERROR ] [create_debugger.hpp:24:static VkBool32 mcs::vulkan::tool::create_debugger::defaultDebugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT, const VkDebugUtilsMessengerCallbackDataEXT*, void*)]: 1318213324 Validation Layer: Error: VUID-vkAllocateMemory-maxMemoryAllocationCount-04101: vkAllocateMemory(): The number of currently valid memory objects (4096) is not less than maxMemoryAllocationCount (4096).
+The Vulkan spec states: There must be less than VkPhysicalDeviceLimits::maxMemoryAllocationCount device memory allocations currently allocated on the device (https://docs.vulkan.org/spec/latest/chapters/memory.html#VUID-vkAllocateMemory-maxMemoryAllocationCount-04101)
+*/
+        //diff: [test_dod7] vma是很重要的，至少目前是这样。 子分配还是很有必要的
+        constexpr auto add_count_per_times = 100;
         constexpr int total_batches = 10;
         constexpr int total_entities = add_count_per_times * total_batches;
         static int batch_index = 0; // 当前批次索引 (0~4)
@@ -2755,7 +2763,7 @@ try
         auto &recordCtx = world.recordCtx;
 
         auto &device = globalCtx.device;
-        auto &allocator = globalCtx.allocator;
+
         auto &swapchain = globalCtx.swapchain;
         auto &frameContext = globalCtx.frameContext;
         auto &window = globalCtx.window;
@@ -2857,8 +2865,9 @@ try
                 // 2. 创建新纹理（动态 mipmap 切换或固定文件）
                 static bool mipmap = false;
                 mipmap = !mipmap;
-                textureMap[dynamicSlot] =
-                    create_texture.templateForImage2d("textures/viking_room.png", mipmap);
+                textureMap[dynamicSlot] = create_texture.templateForImage2d(
+                    device, commandPool, GRAPHICS_AND_PRESENT,
+                    raw_stbi_image{"textures/viking_room.png", STBI_rgb_alpha}, mipmap);
                 activeTextureSlots.insert(dynamicSlot);
 
                 // 3. 更新所有飞行帧的描述符（绑定 1 的指定槽位）

@@ -57,7 +57,7 @@ namespace mcs::vulkan::memory
         static_assert(std::is_default_constructible_v<memory_allocate_info>);
         using GenMemoryAllocateInfo = std::move_only_function<memory_allocate_info(
             VkMemoryRequirements memRequirements,
-            VkPhysicalDeviceMemoryProperties memoryProperties)>;
+            VkPhysicalDeviceMemoryProperties memoryProperties) const>;
         constexpr auto &&setGenMemoryAllocateInfo(
             this auto &&self, GenMemoryAllocateInfo genMemoryAllocateInfo) noexcept
         {
@@ -65,7 +65,8 @@ namespace mcs::vulkan::memory
             return std::forward<decltype(self)>(self);
         }
 
-        constexpr auto build(LogicalDevice &device, VkDeviceSize memoryOffset = 0)
+        [[nodiscard]] constexpr auto build(const LogicalDevice &device,
+                                           VkDeviceSize memoryOffset = 0) const
         {
             VkBuffer buffer = nullptr;
             VkDeviceMemory bufferMemory = nullptr;

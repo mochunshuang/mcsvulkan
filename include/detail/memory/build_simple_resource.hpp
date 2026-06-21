@@ -9,8 +9,7 @@ namespace mcs::vulkan::memory
         create_resources::create_info info, VkMemoryPropertyFlags properties,
         create_resources::GenViewCreateInfo genViewCreateInfo)
     {
-        return create_resources{create_image{std::move(info),
-                                             gen_memory_allocate_info(properties),
-                                             std::move(genViewCreateInfo)}};
+        return create_resources{std::move(info), gen_memory_allocate_info(properties),
+                                std::move(genViewCreateInfo)};
     }
 }; // namespace mcs::vulkan::memory

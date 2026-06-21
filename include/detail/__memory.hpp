@@ -7,3 +7,4 @@
 #include "memory/create_image.hpp"
 #include "memory/create_resources.hpp"
 #include "memory/build_simple_resource.hpp"
+#include "memory/create_texture.hpp"

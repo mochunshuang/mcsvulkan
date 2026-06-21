@@ -7,7 +7,7 @@
 namespace mcs::vulkan::memory
 {
     static constexpr auto_map_buffer create_staging_buffer(
-        LogicalDevice &device,
+        const LogicalDevice &device,
         VkDeviceSize buffer_size,   // NOLINT
         VkMemoryMapFlags flags = 0) // NOLINT
     {
