@@ -4,6 +4,7 @@
 #include <exception>
 #include <iostream>
 #include <print>
+#include <utility>
 #include <vector>
 #include <random>
 #include <list>
@@ -59,164 +60,159 @@ using mcs::vulkan::memory::buffer_base;
 using mcs::vulkan::tool::simple_copy_buffer;
 using mcs::vulkan::tool::pNext;
 
-// ======================== 子分配器 ========================
-/*
- * SubAllocator 采用空闲链表算法，管理大块 VkDeviceMemory，并按需切分出小块供 VkBuffer 使用。
- * 优点：
- *  - 大幅减少 vkAllocateMemory 调用次数（例如，本程序从 8 次降至 1 次），降低驱动开销。
- *  - 同一内存块内的多个缓冲区共享一次 vkMapMemory 得到的持久指针，简化动态更新。
- *  - 内存布局更紧凑，适合需要频繁更新、大量小缓冲区的场景。
- *
- * 工作原理：
- *  - 构造函数创建一个或多个 Block，每个 Block 对应一次 vkAllocateMemory。
- *  - allocate 方法在 Block 的空闲链表中寻找合适区间，切分并返回子区域信息。
- *  - 返回的 Allocation 包含大块内存句柄、偏移、大小以及映射后的可用指针。
- *  - 释放时通过空闲链表合并，减少碎片。
- */
+// ---------- 子分配信息（纯数据） ----------
+struct SubAllocation
+{
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    VkDeviceSize size = 0;
+    void *mappedPtr = nullptr;
+};
+
+// ---------- 子分配器 ----------
 class SubAllocator
 {
   public:
-    // 分配结果：包含大块内存对象、大块内偏移、实际分配大小和映射指针（已加偏移）
-    struct Allocation
-    {
-        VkDeviceMemory memory;
-        VkDeviceSize offset;
-        VkDeviceSize size;
-        void *mappedPtr;
-    };
-
-    /*
-     * 构造函数
-     * device: 逻辑设备引用，用于调用 vkAllocateMemory / vkMapMemory 等
-     * memoryTypeIndex: 所选内存类型索引（必须同时满足 DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT）
-     * blockSize: 每个大内存块的默认大小
-     * pNext: 传递给 vkAllocateMemory 的 pNext 链（例如 VkMemoryAllocateFlagsInfo 用于设备地址）
-     * mapAll: 是否映射所有新创建的大块内存（通常为 true，方便 CPU 端直写）
-     */
     SubAllocator(LogicalDevice &device, uint32_t memoryTypeIndex, VkDeviceSize blockSize,
-                 const void *pNext = nullptr, bool mapAll = true)
+                 pNext pnext, bool mapAll = true)
         : device_(device), typeIndex_(memoryTypeIndex), blockSize_(blockSize),
-          pNext_(pNext), mapAll_(mapAll)
+          pNext_(std::move(pnext)), mapAll_(mapAll)
     {
     }
 
-    // 析构时释放所有大块内存，并解除映射
-    ~SubAllocator()
+    SubAllocator(const SubAllocator &) = delete;
+    SubAllocator &operator=(const SubAllocator &) = delete;
+
+    SubAllocation allocate(const VkMemoryRequirements &memReqs)
     {
-        for (auto *b : blocks_)
+        const VkDeviceSize reqSize = memReqs.size;
+        const VkDeviceSize alignment = memReqs.alignment;
+
+        for (auto &block : blocks_)
         {
-            if (b->mapped)
-                device_.unmapMemory(b->memory);
-            device_.freeMemory(b->memory, device_.allocator());
-            delete b;
-        }
-    }
-
-    /*
-     * 分配 size 字节的内存区域，实际分配会按 alignment 对齐
-     * 算法：遍历所有块，用首次适应策略在空闲链表中寻找合适区间。
-     *       若找不到，则创建新的大块并从中分配。
-     */
-    Allocation allocate(VkDeviceSize size, VkDeviceSize alignment)
-    {
-        for (auto *b : blocks_)
-        {
-            VkDeviceSize off;
-            if (b->tryAlloc(size, alignment, off))
-                return {b->memory, off, size,
-                        b->mapped ? static_cast<char *>(b->mapBase) + off : nullptr};
-        }
-        // 现有块均无法满足，申请新块（至少 blockSize，或大于请求的 size）
-        VkDeviceSize allocSize = std::max(blockSize_, size);
-        auto *newBlock = new Block(device_, typeIndex_, allocSize, pNext_, mapAll_);
-        blocks_.push_back(newBlock);
-        VkDeviceSize off;
-        if (!newBlock->tryAlloc(size, alignment, off))
-            throw std::runtime_error("SubAllocator internal error");
-        return {newBlock->memory, off, size,
-                newBlock->mapped ? static_cast<char *>(newBlock->mapBase) + off
-                                 : nullptr};
-    }
-
-    /*
-     * 释放之前分配的内存区域，会与相邻空闲区域合并
-     * 本示例中所有缓冲区均为永久存在，不会调用此函数，但保留完整实现。
-     */
-    void free(const Allocation &alloc)
-    {
-        for (auto *b : blocks_)
-            if (b->memory == alloc.memory)
+            VkDeviceSize offset = 0;
+            if (block->tryAlloc(reqSize, alignment, offset))
             {
-                b->dealloc(alloc.offset, alloc.size);
+                return {.memory = block->memory,
+                        .offset = offset,
+                        .size = reqSize,
+                        .mappedPtr = block->mapped
+                                         ? static_cast<char *>(block->mapBase) + offset
+                                         : nullptr};
+            }
+        }
+
+        VkDeviceSize allocSize = std::max(blockSize_, reqSize);
+        auto newBlock = std::make_unique<Block>(device_, typeIndex_, allocSize,
+                                                pNext_.value(), mapAll_);
+        VkDeviceSize offset = 0;
+        if (!newBlock->tryAlloc(reqSize, alignment, offset))
+            throw std::runtime_error("SubAllocator: internal allocation failure");
+
+        SubAllocation result{.memory = newBlock->memory,
+                             .offset = offset,
+                             .size = reqSize,
+                             .mappedPtr =
+                                 newBlock->mapped
+                                     ? static_cast<char *>(newBlock->mapBase) + offset
+                                     : nullptr};
+        blocks_.push_back(std::move(newBlock));
+        return result;
+    }
+
+    void free(const SubAllocation &alloc)
+    {
+        if (alloc.size == 0)
+            return;
+        for (auto &block : blocks_)
+        {
+            if (block->memory == alloc.memory)
+            {
+                block->dealloc(alloc.offset, alloc.size);
                 return;
             }
+        }
     }
 
   private:
-    // 单个大内存块，内部维护一个按偏移排序的空闲链表
     struct Block
     {
         LogicalDevice &device;
-        VkDeviceMemory memory;
-        VkDeviceSize size;
-        void *mapBase; // 若 mapped == true，指向映射基址
-        bool mapped;
-        std::list<std::pair<VkDeviceSize, VkDeviceSize>> freeList; // (offset, size)
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkDeviceSize size = 0;
+        void *mapBase = nullptr;
+        bool mapped = false;
+        std::vector<std::pair<VkDeviceSize, VkDeviceSize>> freeList;
 
-        Block(LogicalDevice &dev, uint32_t typeIndex, VkDeviceSize size,
-              const void *pNext, bool map)
-            : device(dev), size(size), mapped(map)
+        Block(LogicalDevice &dev, uint32_t typeIndex, VkDeviceSize sz, const void *pNext,
+              bool doMap)
+            : device(dev), size(sz), mapped(doMap)
         {
-            VkMemoryAllocateInfo allocInfo{.sType =
-                                               VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-                                           .pNext = pNext,
-                                           .allocationSize = size,
-                                           .memoryTypeIndex = typeIndex};
+            VkMemoryAllocateInfo allocInfo{};
+            allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            allocInfo.pNext = pNext;
+            allocInfo.allocationSize = sz;
+            allocInfo.memoryTypeIndex = typeIndex;
+
             memory = device.allocateMemory(allocInfo, device.allocator());
-            if (map)
+            if (mapped)
                 device.mapMemory(memory, 0, VK_WHOLE_SIZE, 0, &mapBase);
-            // 初始整个块空闲
-            freeList.push_back({0, size});
+            freeList.emplace_back(0, sz);
         }
 
-        /*
-         * 首次适应分配：在空闲链表中寻找第一个满足对齐要求且大小足够的区间。
-         * 分配后从链表中移除对应区间，如有剩余则插入前后碎片。
-         * 返回 true 表示分配成功，并输出偏移 outOff。
-         */
-        bool tryAlloc(VkDeviceSize reqSize, VkDeviceSize alignment, VkDeviceSize &outOff)
+        ~Block()
+        {
+            if (mapped)
+                device.unmapMemory(memory);
+            if (memory)
+                device.freeMemory(memory, device.allocator());
+        }
+
+        // 禁止拷贝和移动（由 unique_ptr 管理）
+        Block(const Block &) = delete;
+        Block &operator=(const Block &) = delete;
+        Block(Block &&) = delete;
+        Block &operator=(Block &&) = delete;
+
+        bool tryAlloc(VkDeviceSize reqSize, VkDeviceSize alignment,
+                      VkDeviceSize &outOffset)
         {
             for (auto it = freeList.begin(); it != freeList.end(); ++it)
             {
-                VkDeviceSize off = it->first, rangeSize = it->second;
-                VkDeviceSize aligned =
-                    (off + alignment - 1) & ~(alignment - 1); // 对齐计算
-                if (aligned + reqSize <= off + rangeSize)
+                VkDeviceSize first = it->first;
+                VkDeviceSize rangeEnd = first + it->second;
+                VkDeviceSize aligned = (first + alignment - 1) & ~(alignment - 1);
+                if (aligned + reqSize > rangeEnd)
+                    continue;
+
+                VkDeviceSize before = aligned - first;
+                VkDeviceSize after = rangeEnd - (aligned + reqSize);
+
+                if (after > 0)
+                {
+                    it->first = aligned + reqSize;
+                    it->second = after;
+                }
+                else
                 {
                     it = freeList.erase(it);
-                    // 前部碎片：对齐后的起始位置与原区间起点有空隙
-                    if (aligned > off)
-                        freeList.insert(it, {off, aligned - off});
-                    // 后部碎片：分配后剩余的空间
-                    if (aligned + reqSize < off + rangeSize)
-                        freeList.insert(
-                            it, {aligned + reqSize, off + rangeSize - aligned - reqSize});
-                    outOff = aligned;
-                    return true;
                 }
+                if (before > 0)
+                {
+                    freeList.insert(it, {first, before});
+                }
+                outOffset = aligned;
+                return true;
             }
             return false;
         }
 
-        /*
-         * 回收释放的内存：将 [off, off+sz) 区间插入空闲链表，并与前后相邻区间合并。
-         */
         void dealloc(VkDeviceSize off, VkDeviceSize sz)
         {
-            auto it = freeList.begin();
-            while (it != freeList.end() && it->first < off)
-                ++it;
-            // 与前一个区间合并
+            auto it = std::lower_bound(
+                freeList.begin(), freeList.end(), off,
+                [](const auto &a, VkDeviceSize b) { return a.first < b; });
+
             if (it != freeList.begin())
             {
                 auto prev = std::prev(it);
@@ -225,13 +221,18 @@ class SubAllocator
                     off = prev->first;
                     sz += prev->second;
                     freeList.erase(prev);
+                    it = std::lower_bound(
+                        freeList.begin(), freeList.end(), off,
+                        [](const auto &a, VkDeviceSize b) { return a.first < b; });
                 }
             }
-            // 与后一个区间合并
             if (it != freeList.end() && off + sz == it->first)
             {
                 sz += it->second;
-                it = freeList.erase(it);
+                freeList.erase(it);
+                it = std::lower_bound(
+                    freeList.begin(), freeList.end(), off,
+                    [](const auto &a, VkDeviceSize b) { return a.first < b; });
             }
             freeList.insert(it, {off, sz});
         }
@@ -240,82 +241,70 @@ class SubAllocator
     LogicalDevice &device_;
     uint32_t typeIndex_;
     VkDeviceSize blockSize_;
-    const void *pNext_;
+    pNext pNext_; // 内部拥有扩展链副本
     bool mapAll_;
-    std::vector<Block *> blocks_;
+    std::vector<std::unique_ptr<Block>> blocks_;
 };
 
-// ======================== 子分配缓冲区包装 ========================
-/*
- * SubAllocatedBuffer 持有 VkBuffer 及其在子分配器中的分配信息。
- *  - buffer : Vulkan 缓冲区句柄
- *  - memory : 大块内存句柄（实际可忽略，仅供调试）
- *  - offset : 在大块内存中的起始偏移
- *  - size   : 缓冲区有效大小
- *  - mappedPtr : 映射后的起始地址（已加偏移），用于 CPU 直接读写
- *  - device : LogicalDevice 指针，用于析构时销毁 VkBuffer
- *
- * 注意：SubAllocatedBuffer 不负责释放大块内存，那是 SubAllocator 的责任。
- *       析构顺序：必须先销毁所有 VkBuffer，再销毁大块内存。本程序中，SubAllocatedBuffer 数组
- *       定义在 subAlloc 之前，利用 C++ 栈逆序析构确保正确顺序。
- */
+// ---------- 自管理缓冲区（所有权完全转移） ----------
 struct SubAllocatedBuffer
 {
     VkBuffer buffer = VK_NULL_HANDLE;
-    VkDeviceMemory memory = VK_NULL_HANDLE; // 实际存储的是大块内存，用于调试
-    VkDeviceSize offset = 0;                // 在大块内存中的偏移（仅供内部使用）
-    VkDeviceSize size = 0;                  // 缓冲区有效大小
-    void *mappedPtr = nullptr;              // 映射后的起始地址
-    LogicalDevice *device = nullptr;        // 用于销毁缓冲区
+    SubAllocation alloc;
+    LogicalDevice *device = nullptr;
+    SubAllocator *subAlloc = nullptr;
 
     SubAllocatedBuffer() = default;
-    SubAllocatedBuffer(VkBuffer buf, VkDeviceMemory mem, VkDeviceSize off,
-                       VkDeviceSize sz, void *ptr, LogicalDevice *dev)
-        : buffer(buf), memory(mem), offset(off), size(sz), mappedPtr(ptr), device(dev)
+    SubAllocatedBuffer(VkBuffer buf, const SubAllocation &al, LogicalDevice *dev,
+                       SubAllocator *allocator)
+        : buffer(buf), alloc(al), device(dev), subAlloc(allocator)
     {
     }
 
     ~SubAllocatedBuffer()
     {
-        // 只销毁 VkBuffer，不负责释放大块内存
         if (buffer && device)
             device->destroyBuffer(buffer, device->allocator());
+        if (subAlloc && alloc.size > 0)
+            subAlloc->free(alloc);
     }
 
-    // 禁止拷贝，允许移动
-    SubAllocatedBuffer(const SubAllocatedBuffer &) = delete;
-    SubAllocatedBuffer &operator=(const SubAllocatedBuffer &) = delete;
     SubAllocatedBuffer(SubAllocatedBuffer &&other) noexcept
-        : buffer(other.buffer), memory(other.memory), offset(other.offset),
-          size(other.size), mappedPtr(other.mappedPtr), device(other.device)
+        : buffer(std::exchange(other.buffer, VK_NULL_HANDLE)),
+          alloc(std::exchange(other.alloc, {})),
+          device(std::exchange(other.device, nullptr)),
+          subAlloc(std::exchange(other.subAlloc, nullptr))
     {
-        other.buffer = VK_NULL_HANDLE;
-        other.device = nullptr;
     }
+
     SubAllocatedBuffer &operator=(SubAllocatedBuffer &&other) noexcept
     {
         if (this != &other)
         {
-            this->~SubAllocatedBuffer();
-            buffer = other.buffer;
-            memory = other.memory;
-            offset = other.offset;
-            size = other.size;
-            mappedPtr = other.mappedPtr;
-            device = other.device;
-            other.buffer = VK_NULL_HANDLE;
-            other.device = nullptr;
+            if (buffer && device)
+                device->destroyBuffer(buffer, device->allocator());
+            if (subAlloc && alloc.size > 0)
+                subAlloc->free(alloc);
+
+            buffer = std::exchange(other.buffer, VK_NULL_HANDLE);
+            alloc = std::exchange(other.alloc, {});
+            device = std::exchange(other.device, nullptr);
+            subAlloc = std::exchange(other.subAlloc, nullptr);
         }
         return *this;
     }
 
-    VkBuffer getBuffer() const
+    SubAllocatedBuffer(const SubAllocatedBuffer &) = delete;
+    SubAllocatedBuffer &operator=(const SubAllocatedBuffer &) = delete;
+
+    VkDeviceAddress getDeviceAddress() const
     {
-        return buffer;
-    }
-    void *getMapPtr() const
-    {
-        return mappedPtr;
+        if (!device || !buffer)
+            return 0;
+        VkBufferDeviceAddressInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+        info.buffer = buffer;
+        return device->getBufferDeviceAddress(info);
     }
 };
 
@@ -644,10 +633,10 @@ try
     }
 
     // 2. 子分配器（块大小 64MB，启用设备地址标志）
-    VkMemoryAllocateFlagsInfo addrFlags{.sType =
-                                            VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
-                                        .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
-    SubAllocator subAlloc(device, memoryTypeIndex, 64 * 1024 * 1024, &addrFlags, true);
+    SubAllocator subAlloc(device, memoryTypeIndex, 64 * 1024 * 1024,
+                          make_pNext(structure_chain<VkMemoryAllocateFlagsInfo>{
+                              {.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT}}),
+                          true);
 
     // 辅助函数：创建 VkBuffer 并从子分配器获取内存
     auto createSubBuffer = [&](VkDeviceSize size,
@@ -658,36 +647,27 @@ try
                                       .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
         VkBuffer buf = device.createBuffer(bufferInfo, device.allocator());
         VkMemoryRequirements memReqs = device.getBufferMemoryRequirements(buf);
-        auto alloc = subAlloc.allocate(memReqs.size, memReqs.alignment);
+        SubAllocation alloc = subAlloc.allocate(memReqs); // 传入整个结构体
         device.bindBufferMemory(buf, alloc.memory, alloc.offset);
-        return {buf, alloc.memory, alloc.offset, size, alloc.mappedPtr, &device};
+        return SubAllocatedBuffer(buf, alloc, &device, &subAlloc);
     };
-
     // 替换原有的 auto_map_buffer 数组
     std::array<SubAllocatedBuffer, MAX_FRAMES_IN_FLIGHT> vertexBuffers;
     std::array<SubAllocatedBuffer, MAX_FRAMES_IN_FLIGHT> indexBuffers;
     std::array<SubAllocatedBuffer, MAX_FRAMES_IN_FLIGHT> indirectBuffers;
     std::array<SubAllocatedBuffer, MAX_FRAMES_IN_FLIGHT> instanceBuffers;
     std::array<VkDeviceAddress, MAX_FRAMES_IN_FLIGHT> instanceBufferAddress{};
-    std::array<bool, MAX_FRAMES_IN_FLIGHT> frameNeedsGeometryUpdate{};
+    // NOTE: 初始化的时候，将数据上传的GPU
+    std::array<bool, MAX_FRAMES_IN_FLIGHT> frameNeedsGeometryUpdate{true, true};
 
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
     {
         vertexBuffers[i] = createSubBuffer(vertices.size() * sizeof(Vertex),
                                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-        memcpy(vertexBuffers[i].mappedPtr, vertices.data(),
-               vertices.size() * sizeof(Vertex));
-
         indexBuffers[i] = createSubBuffer(indices.size() * sizeof(uint32_t),
                                           VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-        memcpy(indexBuffers[i].mappedPtr, indices.data(),
-               indices.size() * sizeof(uint32_t));
-
         indirectBuffers[i] = createSubBuffer(sizeof(VkDrawIndexedIndirectCommand),
                                              VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
-        memcpy(indirectBuffers[i].mappedPtr, indirectCmds.data(),
-               sizeof(VkDrawIndexedIndirectCommand));
-
         /*
          * 实例缓冲区需要同时具备 STORAGE_BUFFER 和 SHADER_DEVICE_ADDRESS 使用标志：
          *   - VK_BUFFER_USAGE_STORAGE_BUFFER_BIT：作为 SSBO 在着色器中访问
@@ -698,9 +678,6 @@ try
             createSubBuffer(instancesDta.size() * sizeof(InstanceData),
                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
-        memcpy(instanceBuffers[i].mappedPtr, instancesDta.data(),
-               instancesDta.size() * sizeof(InstanceData));
-
         instanceBufferAddress[i] =
             device.getBufferDeviceAddress({.sType = sType<VkBufferDeviceAddressInfo>(),
                                            .buffer = instanceBuffers[i].buffer});
@@ -732,11 +709,11 @@ try
             const auto &newIdxs = isQuad ? quadIndices : triIndices;
 
             // 直接 memcpy 到映射指针更新数据，因为内存是 HOST_COHERENT，GPU 自动可见
-            memcpy(vb.mappedPtr, newVerts.data(), newVerts.size() * sizeof(Vertex));
-            memcpy(ib.mappedPtr, newIdxs.data(), newIdxs.size() * sizeof(uint32_t));
-            memcpy(idb.mappedPtr, indirectCmds.data(),
+            memcpy(vb.alloc.mappedPtr, newVerts.data(), newVerts.size() * sizeof(Vertex));
+            memcpy(ib.alloc.mappedPtr, newIdxs.data(), newIdxs.size() * sizeof(uint32_t));
+            memcpy(idb.alloc.mappedPtr, indirectCmds.data(),
                    sizeof(VkDrawIndexedIndirectCommand));
-            memcpy(instb.mappedPtr, instancesDta.data(),
+            memcpy(instb.alloc.mappedPtr, instancesDta.data(),
                    instancesDta.size() * sizeof(InstanceData));
 
             frameNeedsGeometryUpdate[frameIndex] = false;
@@ -751,21 +728,22 @@ try
                  VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_WRITE_BIT,
                  VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT,
                  VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT, VK_QUEUE_FAMILY_IGNORED,
-                 VK_QUEUE_FAMILY_IGNORED, vb.buffer, 0, vb.size},
+                 VK_QUEUE_FAMILY_IGNORED, vb.buffer, 0, vb.alloc.size},
                 {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
                  VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_WRITE_BIT,
                  VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT, VK_ACCESS_2_INDEX_READ_BIT,
-                 VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, ib.buffer, 0, ib.size},
+                 VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, ib.buffer, 0,
+                 ib.alloc.size},
                 {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
                  VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_WRITE_BIT,
                  VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
                  VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT, VK_QUEUE_FAMILY_IGNORED,
-                 VK_QUEUE_FAMILY_IGNORED, idb.buffer, 0, idb.size},
+                 VK_QUEUE_FAMILY_IGNORED, idb.buffer, 0, idb.alloc.size},
                 {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
                  VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_WRITE_BIT,
                  VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT,
                  VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, instb.buffer, 0,
-                 instb.size},
+                 instb.alloc.size},
             }};
             commandBuffer.pipelineBarrier2(
                 {.sType = sType<VkDependencyInfo>(),
