@@ -101,8 +101,9 @@ class SubAllocator
                                          : nullptr};
             }
         }
-
         VkDeviceSize allocSize = std::max(blockSize_, reqSize);
+        std::println("[SubAlloc] Need new block! Request={} bytes, Allocating={} bytes",
+                     reqSize, allocSize);
         auto newBlock = std::make_unique<Block>(device_, typeIndex_, allocSize,
                                                 pNext_.value(), mapAll_);
         VkDeviceSize offset = 0;
@@ -158,6 +159,8 @@ class SubAllocator
             if (mapped)
                 device.mapMemory(memory, 0, VK_WHOLE_SIZE, 0, &mapBase);
             freeList.emplace_back(0, sz);
+            std::println("[SubAlloc] Created new Block: size={} ({} MB), memory={}", sz,
+                         sz / (1024 * 1024), (void *)memory);
         }
 
         ~Block()
@@ -165,10 +168,13 @@ class SubAllocator
             if (mapped)
                 device.unmapMemory(memory);
             if (memory)
+            {
+                std::println("[SubAlloc] Destroying Block: size={} ({} MB), memory={}",
+                             size, size / (1024 * 1024), (void *)memory);
                 device.freeMemory(memory, device.allocator());
+            }
         }
 
-        // 禁止拷贝和移动（由 unique_ptr 管理）
         Block(const Block &) = delete;
         Block &operator=(const Block &) = delete;
         Block(Block &&) = delete;
@@ -209,6 +215,10 @@ class SubAllocator
 
         void dealloc(VkDeviceSize off, VkDeviceSize sz)
         {
+            VkDeviceSize origOff = off; // 保存原始值
+            VkDeviceSize origSz = sz;
+
+            bool merged = false;
             auto it = std::lower_bound(
                 freeList.begin(), freeList.end(), off,
                 [](const auto &a, VkDeviceSize b) { return a.first < b; });
@@ -224,6 +234,7 @@ class SubAllocator
                     it = std::lower_bound(
                         freeList.begin(), freeList.end(), off,
                         [](const auto &a, VkDeviceSize b) { return a.first < b; });
+                    merged = true;
                 }
             }
             if (it != freeList.end() && off + sz == it->first)
@@ -233,15 +244,23 @@ class SubAllocator
                 it = std::lower_bound(
                     freeList.begin(), freeList.end(), off,
                     [](const auto &a, VkDeviceSize b) { return a.first < b; });
+                merged = true;
             }
             freeList.insert(it, {off, sz});
+
+            if (merged)
+            {
+                std::println("[SubAlloc] Free merged: released offset={}, size={} -> new "
+                             "free range offset={}, size={}",
+                             origOff, origSz, off, sz);
+            }
         }
     };
 
     LogicalDevice &device_;
     uint32_t typeIndex_;
     VkDeviceSize blockSize_;
-    pNext pNext_; // 内部拥有扩展链副本
+    pNext pNext_;
     bool mapAll_;
     std::vector<std::unique_ptr<Block>> blocks_;
 };
@@ -569,7 +588,7 @@ try
     const std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
 
     const uint32_t INSTANCE_COUNT = 1000;
-    uint32_t dynamicInstanceCount = INSTANCE_COUNT; // 动态实例数量，初始1000
+    uint32_t dynamicInstanceCount = INSTANCE_COUNT;
     std::vector<InstanceData> instancesDta;
     instancesDta.reserve(INSTANCE_COUNT);
 
@@ -618,7 +637,6 @@ try
     bool isQuad = true;
 
     // ================= 子分配器初始化 =================
-    // 1. 获取内存类型索引（DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT）
     uint32_t memoryTypeIndex = 0;
     {
         VkBufferCreateInfo tmpInfo{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -636,13 +654,12 @@ try
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     }
 
-    // 2. 子分配器（块大小 64MB，启用设备地址标志）
-    SubAllocator subAlloc(device, memoryTypeIndex, 64 * 1024 * 1024,
+    // 块大小设置为 1MB，大于数据峰值（~400KB），以便在同一块内观察合并
+    SubAllocator subAlloc(device, memoryTypeIndex, 1 * 1024 * 1024,
                           make_pNext(structure_chain<VkMemoryAllocateFlagsInfo>{
                               {.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT}}),
                           true);
 
-    // 辅助函数：创建 VkBuffer 并从子分配器获取内存
     auto createSubBuffer = [&](VkDeviceSize size,
                                VkBufferUsageFlags usage) -> SubAllocatedBuffer {
         VkBufferCreateInfo bufferInfo{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -705,7 +722,6 @@ try
             const auto &newVerts = isQuad ? quadVertices : triVertices;
             const auto &newIdxs = isQuad ? quadIndices : triIndices;
 
-            // 如果缓冲区不够大，则重建（利用唯一所有权移动赋值，安全且触发子分配器波动）
             if (vb.alloc.size < newVerts.size() * sizeof(Vertex))
                 vb = createSubBuffer(newVerts.size() * sizeof(Vertex),
                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
@@ -721,9 +737,7 @@ try
                     {.sType = sType<VkBufferDeviceAddressInfo>(),
                      .buffer = instb.buffer});
             }
-            // 间接命令缓冲区大小不变，无需重建
 
-            // 上传数据到映射内存
             memcpy(vb.alloc.mappedPtr, newVerts.data(), newVerts.size() * sizeof(Vertex));
             memcpy(ib.alloc.mappedPtr, newIdxs.data(), newIdxs.size() * sizeof(uint32_t));
             memcpy(idb.alloc.mappedPtr, indirectCmds.data(),
@@ -733,7 +747,6 @@ try
 
             frameNeedsGeometryUpdate[frameIndex] = false;
 
-            // 缓冲区屏障
             std::array<VkBufferMemoryBarrier2, 4> barriers{{
                 {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
                  VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_WRITE_BIT,
@@ -877,6 +890,12 @@ try
         currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     };
 
+    // ================= 锯齿波实例数序列 =================
+    static int instanceTarget = 1000; // 当前目标实例数
+    static int instanceStep = 500;    // 每步变化量
+    static int direction = 1;         // 1: 增加, -1: 减少
+    static int changeCounter = 0;     // 计数器，每秒变化一次
+
     while (window.shouldClose() == 0)
     {
         surface::pollEvents();
@@ -903,16 +922,24 @@ try
                 frameCount = 0;
                 lastTime = now;
 
-                // 随机决定改变几何形状或实例数量
-                if (std::uniform_int_distribution<>(0, 1)(gen) == 0)
+                // 锯齿波序列：500 -> 1000 -> 1500 -> ... -> 19000 -> 19500 -> 19000 -> ... -> 1000 -> 500 ...
+                instanceTarget += instanceStep * direction;
+                if (instanceTarget >= 20000)
                 {
+                    instanceTarget = 20000;
+                    direction = -1;
+                }
+                else if (instanceTarget <= 500)
+                {
+                    instanceTarget = 500;
+                    direction = 1;
+                }
+                dynamicInstanceCount = static_cast<uint32_t>(instanceTarget);
+
+                // 每隔一次变化切换几何形状，增加多样性
+                changeCounter = (changeCounter + 1) % 2;
+                if (changeCounter == 0)
                     isQuad = !isQuad;
-                }
-                else
-                {
-                    dynamicInstanceCount =
-                        std::uniform_int_distribution<uint32_t>(100, 5000)(gen);
-                }
 
                 // 重新生成实例数据
                 instancesDta.clear();
@@ -924,7 +951,7 @@ try
                 indirectCmds[0].instanceCount =
                     static_cast<uint32_t>(instancesDta.size());
 
-                // 标记所有飞行帧需要更新数据（触发 recordCommandBuffer 中的数据上传和可能的缓冲区重建）
+                // 触发所有飞行帧更新数据
                 for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
                     frameNeedsGeometryUpdate[i] = true;
             }
