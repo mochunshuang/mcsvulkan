@@ -563,25 +563,29 @@ try
                                             .commandBufferCount = MAX_FRAMES_IN_FLIGHT});
     frame_context<MAX_FRAMES_IN_FLIGHT> frameContext{device, swapchain.imagesSize()};
 
-    // ================= 顶点/实例数据（不变） =================
+    // ================= 顶点/实例数据 =================
     const std::vector<Vertex> vertices = {
         {{-0.01f, -0.01f}}, {{0.01f, -0.01f}}, {{0.01f, 0.01f}}, {{-0.01f, 0.01f}}};
     const std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
 
     const uint32_t INSTANCE_COUNT = 1000;
+    uint32_t dynamicInstanceCount = INSTANCE_COUNT; // 动态实例数量，初始1000
     std::vector<InstanceData> instancesDta;
     instancesDta.reserve(INSTANCE_COUNT);
-    int gridSize = static_cast<int>(std::ceil(std::sqrt(INSTANCE_COUNT)));
-    const float cellWidth = 2.0f / gridSize;
-    const float cellHeight = 2.0f / gridSize;
+
     std::random_device rd;
     std::mt19937 gen(rd());
     std::uniform_real_distribution<float> dis(-0.4f, 0.4f);
+
     auto generateData = [&]() {
         instancesDta.clear();
+        instancesDta.reserve(dynamicInstanceCount);
+        int gridSize = static_cast<int>(std::ceil(std::sqrt(dynamicInstanceCount)));
+        const float cellWidth = 2.0f / gridSize;
+        const float cellHeight = 2.0f / gridSize;
         uint32_t generated = 0;
-        for (int i = 0; i < gridSize && generated < INSTANCE_COUNT; ++i)
-            for (int j = 0; j < gridSize && generated < INSTANCE_COUNT; ++j)
+        for (int i = 0; i < gridSize && generated < dynamicInstanceCount; ++i)
+            for (int j = 0; j < gridSize && generated < dynamicInstanceCount; ++j)
             {
                 float xCenter = -1.0f + (i + 0.5f) * cellWidth;
                 float yCenter = -1.0f + (j + 0.5f) * cellHeight;
@@ -647,17 +651,16 @@ try
                                       .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
         VkBuffer buf = device.createBuffer(bufferInfo, device.allocator());
         VkMemoryRequirements memReqs = device.getBufferMemoryRequirements(buf);
-        SubAllocation alloc = subAlloc.allocate(memReqs); // 传入整个结构体
+        SubAllocation alloc = subAlloc.allocate(memReqs);
         device.bindBufferMemory(buf, alloc.memory, alloc.offset);
         return SubAllocatedBuffer(buf, alloc, &device, &subAlloc);
     };
-    // 替换原有的 auto_map_buffer 数组
+
     std::array<SubAllocatedBuffer, MAX_FRAMES_IN_FLIGHT> vertexBuffers;
     std::array<SubAllocatedBuffer, MAX_FRAMES_IN_FLIGHT> indexBuffers;
     std::array<SubAllocatedBuffer, MAX_FRAMES_IN_FLIGHT> indirectBuffers;
     std::array<SubAllocatedBuffer, MAX_FRAMES_IN_FLIGHT> instanceBuffers;
     std::array<VkDeviceAddress, MAX_FRAMES_IN_FLIGHT> instanceBufferAddress{};
-    // NOTE: 初始化的时候，将数据上传的GPU
     std::array<bool, MAX_FRAMES_IN_FLIGHT> frameNeedsGeometryUpdate{true, true};
 
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
@@ -668,12 +671,6 @@ try
                                           VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
         indirectBuffers[i] = createSubBuffer(sizeof(VkDrawIndexedIndirectCommand),
                                              VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
-        /*
-         * 实例缓冲区需要同时具备 STORAGE_BUFFER 和 SHADER_DEVICE_ADDRESS 使用标志：
-         *   - VK_BUFFER_USAGE_STORAGE_BUFFER_BIT：作为 SSBO 在着色器中访问
-         *   - VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT：允许通过 vkGetBufferDeviceAddress
-         *     获取设备地址，并通过推送常量传递给着色器。
-         */
         instanceBuffers[i] =
             createSubBuffer(instancesDta.size() * sizeof(InstanceData),
                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -708,7 +705,25 @@ try
             const auto &newVerts = isQuad ? quadVertices : triVertices;
             const auto &newIdxs = isQuad ? quadIndices : triIndices;
 
-            // 直接 memcpy 到映射指针更新数据，因为内存是 HOST_COHERENT，GPU 自动可见
+            // 如果缓冲区不够大，则重建（利用唯一所有权移动赋值，安全且触发子分配器波动）
+            if (vb.alloc.size < newVerts.size() * sizeof(Vertex))
+                vb = createSubBuffer(newVerts.size() * sizeof(Vertex),
+                                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+            if (ib.alloc.size < newIdxs.size() * sizeof(uint32_t))
+                ib = createSubBuffer(newIdxs.size() * sizeof(uint32_t),
+                                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+            if (instb.alloc.size < instancesDta.size() * sizeof(InstanceData))
+            {
+                instb = createSubBuffer(instancesDta.size() * sizeof(InstanceData),
+                                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+                instanceBufferAddress[frameIndex] = device.getBufferDeviceAddress(
+                    {.sType = sType<VkBufferDeviceAddressInfo>(),
+                     .buffer = instb.buffer});
+            }
+            // 间接命令缓冲区大小不变，无需重建
+
+            // 上传数据到映射内存
             memcpy(vb.alloc.mappedPtr, newVerts.data(), newVerts.size() * sizeof(Vertex));
             memcpy(ib.alloc.mappedPtr, newIdxs.data(), newIdxs.size() * sizeof(uint32_t));
             memcpy(idb.alloc.mappedPtr, indirectCmds.data(),
@@ -718,11 +733,7 @@ try
 
             frameNeedsGeometryUpdate[frameIndex] = false;
 
-            /*
-             * 缓冲区屏障：offset 设为 0，size 设为缓冲区实际大小。
-             * 因为缓冲区已被绑定到大块内存的子区域，其“本地偏移”从 0 开始，
-             * 屏障只需要覆盖整个缓冲区范围即可。
-             */
+            // 缓冲区屏障
             std::array<VkBufferMemoryBarrier2, 4> barriers{{
                 {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, nullptr,
                  VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_WRITE_BIT,
@@ -777,10 +788,6 @@ try
             0, std::array<VkRect2D, 1>{
                    VkRect2D{.offset = {.x = 0, .y = 0}, .extent = imageExtent}});
 
-        /*
-         * 绑定缓冲区：偏移参数设为 0，因为缓冲区已在 vkBindBufferMemory 时
-         * 绑定到大块内存的正确子区域，它的本地偏移从 0 开始。
-         */
         commandBuffer.bindVertexBuffers(0, 1, vb.buffer, 0);
         commandBuffer.bindIndexBuffer(ib.buffer, 0, VK_INDEX_TYPE_UINT32);
 
@@ -788,9 +795,6 @@ try
         commandBuffer.pushConstants(*pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0,
                                     sizeof(PushData), &pushConstants);
 
-        /*
-         * 间接绘制：同样从缓冲区偏移 0 开始读取绘制命令。
-         */
         commandBuffer.drawIndexedIndirect(idb.buffer, 0, 1,
                                           sizeof(VkDrawIndexedIndirectCommand));
 
@@ -804,14 +808,14 @@ try
             VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT);
         commandBuffer.end();
     };
-    // NOLINTNEXTLINE
+
     const auto recreateSwapChain = [&]() {
         surface.waitGoodFramebufferSize();
         device.waitIdle();
         swapchain.destroy();
         swapchain = swapchainBuild.rebuild();
     };
-    // NOLINTNEXTLINE
+
     const auto drawFrame = [&]() {
         auto &inFlightFences = frameContext.inFlightFences;
         auto &currentFrame = frameContext.currentFrame;
@@ -841,7 +845,6 @@ try
         commandBuffer.reset({});
         recordCommandBuffer(commandBuffer, imageIndex, currentFrame);
 
-        // NOLINTNEXTLINE
         VkPipelineStageFlags waitDestinationStageMask[] = {
             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
         GRAPHICS_AND_PRESENT.submit(
@@ -900,13 +903,28 @@ try
                 frameCount = 0;
                 lastTime = now;
 
-                isQuad = !isQuad;
-                const auto &newIdxs = isQuad ? quadIndices : triIndices;
+                // 随机决定改变几何形状或实例数量
+                if (std::uniform_int_distribution<>(0, 1)(gen) == 0)
+                {
+                    isQuad = !isQuad;
+                }
+                else
+                {
+                    dynamicInstanceCount =
+                        std::uniform_int_distribution<uint32_t>(100, 5000)(gen);
+                }
+
+                // 重新生成实例数据
                 instancesDta.clear();
                 generateData();
+
+                // 更新间接命令
+                const auto &newIdxs = isQuad ? quadIndices : triIndices;
                 indirectCmds[0].indexCount = static_cast<uint32_t>(newIdxs.size());
                 indirectCmds[0].instanceCount =
                     static_cast<uint32_t>(instancesDta.size());
+
+                // 标记所有飞行帧需要更新数据（触发 recordCommandBuffer 中的数据上传和可能的缓冲区重建）
                 for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
                     frameNeedsGeometryUpdate[i] = true;
             }
