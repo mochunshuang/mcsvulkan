@@ -733,5 +733,12 @@ namespace mcs::vulkan
             MCS_ASSERT(table_.vkFlushMappedMemoryRanges != nullptr);
             table_.vkFlushMappedMemoryRanges(value_, memoryRangeCount, pMemoryRanges);
         }
+        constexpr void getDeviceBufferMemoryRequirements(
+            const VkDeviceBufferMemoryRequirements *requirements,
+            VkMemoryRequirements2 *out) const noexcept
+        {
+            MCS_ASSERT(table_.vkGetDeviceBufferMemoryRequirements != nullptr);
+            table_.vkGetDeviceBufferMemoryRequirements(value_, requirements, out);
+        }
     };
 }; // namespace mcs::vulkan

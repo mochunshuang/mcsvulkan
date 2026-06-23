@@ -152,6 +152,10 @@ namespace mcs::vulkan::tool
             return VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
         else if constexpr (std::is_same_v<T, VkMemoryBarrier2>)
             return VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        else if constexpr (std::is_same_v<T, VkDeviceBufferMemoryRequirements>)
+            return VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS;
+        else if constexpr (std::is_same_v<T, VkMemoryRequirements2>)
+            return VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
         else
             throw std::logic_error("Unknown Vulkan structure type");
     }

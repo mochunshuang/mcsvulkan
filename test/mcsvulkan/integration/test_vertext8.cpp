@@ -133,6 +133,7 @@ class SubAllocator
                 return;
             }
         }
+        std::cerr << "[SubAlloc] Warning: free unknown memory " << alloc.memory << "\n";
     }
 
   private:
@@ -147,15 +148,16 @@ class SubAllocator
 
         Block(LogicalDevice &dev, uint32_t typeIndex, VkDeviceSize sz, const void *pNext,
               bool doMap)
-            : device(dev), size(sz), mapped(doMap)
+            : device(dev),
+              memory{device.allocateMemory(
+                  VkMemoryAllocateInfo{.sType = sType<VkMemoryAllocateInfo>(),
+                                       .pNext = pNext,
+                                       .allocationSize = sz,
+                                       .memoryTypeIndex = typeIndex},
+                  device.allocator())},
+              size(sz), mapped(doMap)
         {
-            VkMemoryAllocateInfo allocInfo{};
-            allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-            allocInfo.pNext = pNext;
-            allocInfo.allocationSize = sz;
-            allocInfo.memoryTypeIndex = typeIndex;
 
-            memory = device.allocateMemory(allocInfo, device.allocator());
             if (mapped)
                 device.mapMemory(memory, 0, VK_WHOLE_SIZE, 0, &mapBase);
             freeList.emplace_back(0, sz);
@@ -180,34 +182,48 @@ class SubAllocator
         Block(Block &&) = delete;
         Block &operator=(Block &&) = delete;
 
+        // 找到大于或等于 value 的、最小的 alignment 倍数。
+        static VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment)
+        {
+            return (value + alignment - 1) & ~(alignment - 1);
+        }
+
         bool tryAlloc(VkDeviceSize reqSize, VkDeviceSize alignment,
                       VkDeviceSize &outOffset)
         {
-            for (auto it = freeList.begin(); it != freeList.end(); ++it)
+            for (size_t idx = 0; idx < freeList.size(); ++idx)
             {
-                VkDeviceSize first = it->first;
-                VkDeviceSize rangeEnd = first + it->second;
-                VkDeviceSize aligned = (first + alignment - 1) & ~(alignment - 1);
-                if (aligned + reqSize > rangeEnd)
-                    continue;
+                VkDeviceSize regionStart = freeList[idx].first;
+                VkDeviceSize regionSize = freeList[idx].second;
+                VkDeviceSize regionEnd = regionStart + regionSize;
 
-                VkDeviceSize before = aligned - first;
-                VkDeviceSize after = rangeEnd - (aligned + reqSize);
+                VkDeviceSize allocStart = alignUp(regionStart, alignment);
+                if (allocStart + reqSize > regionEnd)
+                    continue; // 对齐后空间不够
 
-                if (after > 0)
+                VkDeviceSize beforeSize = allocStart - regionStart;
+                VkDeviceSize afterSize = regionEnd - (allocStart + reqSize);
+
+                // 移除当前空闲块，idx 此时指向原本的下一个元素
+                freeList.erase(freeList.begin() + idx);
+
+                // 先插入 before 碎片（偏移更小）
+                if (beforeSize > 0)
                 {
-                    it->first = aligned + reqSize;
-                    it->second = after;
+                    freeList.insert(freeList.begin() + idx, {regionStart, beforeSize});
+                    // 若还要插入 after 碎片，需放在 before 之后
+                    if (afterSize > 0)
+                        freeList.insert(freeList.begin() + idx + 1,
+                                        {allocStart + reqSize, afterSize});
                 }
-                else
+                else if (afterSize > 0)
                 {
-                    it = freeList.erase(it);
+                    // 无 before 时，直接插入 after
+                    freeList.insert(freeList.begin() + idx,
+                                    {allocStart + reqSize, afterSize});
                 }
-                if (before > 0)
-                {
-                    freeList.insert(it, {first, before});
-                }
-                outOffset = aligned;
+
+                outOffset = allocStart;
                 return true;
             }
             return false;
@@ -215,45 +231,36 @@ class SubAllocator
 
         void dealloc(VkDeviceSize off, VkDeviceSize sz)
         {
-            VkDeviceSize origOff = off; // 保存原始值
-            VkDeviceSize origSz = sz;
+            if (sz == 0)
+                return;
 
-            bool merged = false;
-            auto it = std::lower_bound(
-                freeList.begin(), freeList.end(), off,
-                [](const auto &a, VkDeviceSize b) { return a.first < b; });
+            // 找到插入位置索引
+            size_t idx = 0;
+            while (idx < freeList.size() && freeList[idx].first < off)
+                ++idx;
 
-            if (it != freeList.begin())
+            // 尝试向前合并
+            if (idx > 0)
             {
-                auto prev = std::prev(it);
-                if (prev->first + prev->second == off)
+                auto &prev = freeList[idx - 1];
+                if (prev.first + prev.second == off)
                 {
-                    off = prev->first;
-                    sz += prev->second;
-                    freeList.erase(prev);
-                    it = std::lower_bound(
-                        freeList.begin(), freeList.end(), off,
-                        [](const auto &a, VkDeviceSize b) { return a.first < b; });
-                    merged = true;
+                    off = prev.first;
+                    sz += prev.second;
+                    freeList.erase(freeList.begin() + idx - 1);
+                    --idx; // 删除后索引前移
                 }
             }
-            if (it != freeList.end() && off + sz == it->first)
-            {
-                sz += it->second;
-                freeList.erase(it);
-                it = std::lower_bound(
-                    freeList.begin(), freeList.end(), off,
-                    [](const auto &a, VkDeviceSize b) { return a.first < b; });
-                merged = true;
-            }
-            freeList.insert(it, {off, sz});
 
-            if (merged)
+            // 尝试向后合并
+            if (idx < freeList.size() && off + sz == freeList[idx].first)
             {
-                std::println("[SubAlloc] Free merged: released offset={}, size={} -> new "
-                             "free range offset={}, size={}",
-                             origOff, origSz, off, sz);
+                sz += freeList[idx].second;
+                freeList.erase(freeList.begin() + idx);
             }
+
+            // 插入合并结果
+            freeList.insert(freeList.begin() + idx, {off, sz});
         }
     };
 
@@ -639,17 +646,26 @@ try
     // ================= 子分配器初始化 =================
     uint32_t memoryTypeIndex = 0;
     {
-        VkBufferCreateInfo tmpInfo{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                                   .size = 256,
-                                   .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                                   .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-        VkBuffer tmpBuf = device.createBuffer(tmpInfo, device.allocator());
-        VkMemoryRequirements memReqs = device.getBufferMemoryRequirements(tmpBuf);
-        device.destroyBuffer(tmpBuf, device.allocator());
+        // 定义我们要查询的缓冲区创建信息（可以是你实际要用的 usage 组合）
+        VkBufferCreateInfo bufferInfo{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                      .size = 256, // 大小无关紧要，主要影响对齐但可忽略
+                                      .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                               VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                               VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                                      .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+
+        VkDeviceBufferMemoryRequirements deviceReq{
+            .sType = sType<VkDeviceBufferMemoryRequirements>(),
+            .pCreateInfo = &bufferInfo};
+
+        VkMemoryRequirements2 memReqs2{.sType = sType<VkMemoryRequirements2>()};
+
+        device.getDeviceBufferMemoryRequirements(&deviceReq, &memReqs2);
 
         VkPhysicalDeviceMemoryProperties memProps = physical_device.getMemoryProperties();
         memoryTypeIndex = find_memory_type_index(
-            memReqs.memoryTypeBits, memProps,
+            memReqs2.memoryRequirements.memoryTypeBits, memProps,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     }
