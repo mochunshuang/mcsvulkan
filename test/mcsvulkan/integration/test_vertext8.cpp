@@ -73,10 +73,16 @@ struct SubAllocation
 class SubAllocator
 {
   public:
-    SubAllocator(LogicalDevice &device, uint32_t memoryTypeIndex, VkDeviceSize blockSize,
-                 pNext pnext, bool mapAll = true)
-        : device_(device), typeIndex_(memoryTypeIndex), blockSize_(blockSize),
+    SubAllocator(const LogicalDevice &device, uint32_t memoryTypeIndex,
+                 VkDeviceSize blockSize, pNext pnext, bool mapAll = true)
+        : device_(&device), typeIndex_(memoryTypeIndex), blockSize_(blockSize),
           pNext_(std::move(pnext)), mapAll_(mapAll)
+    {
+    }
+    template <typename GenIdx>
+    SubAllocator(const LogicalDevice &device, GenIdx gen, VkDeviceSize blockSize,
+                 pNext pnext, bool mapAll = true)
+        : SubAllocator(device, gen(device), blockSize, std::move(pnext), mapAll)
     {
     }
 
@@ -91,32 +97,30 @@ class SubAllocator
         for (auto &block : blocks_)
         {
             VkDeviceSize offset = 0;
-            if (block->tryAlloc(reqSize, alignment, offset))
+            if (block.tryAlloc(reqSize, alignment, offset))
             {
-                return {.memory = block->memory,
+                return {.memory = block.memory,
                         .offset = offset,
                         .size = reqSize,
-                        .mappedPtr = block->mapped
-                                         ? static_cast<char *>(block->mapBase) + offset
+                        .mappedPtr = block.mapped
+                                         ? static_cast<char *>(block.mapBase) + offset
                                          : nullptr};
             }
         }
         VkDeviceSize allocSize = std::max(blockSize_, reqSize);
         std::println("[SubAlloc] Need new block! Request={} bytes, Allocating={} bytes",
                      reqSize, allocSize);
-        auto newBlock = std::make_unique<Block>(device_, typeIndex_, allocSize,
-                                                pNext_.value(), mapAll_);
+        auto newBlock = Block(device_, typeIndex_, allocSize, pNext_.value(), mapAll_);
         VkDeviceSize offset = 0;
-        if (!newBlock->tryAlloc(reqSize, alignment, offset))
+        if (!newBlock.tryAlloc(reqSize, alignment, offset))
             throw std::runtime_error("SubAllocator: internal allocation failure");
 
-        SubAllocation result{.memory = newBlock->memory,
-                             .offset = offset,
-                             .size = reqSize,
-                             .mappedPtr =
-                                 newBlock->mapped
-                                     ? static_cast<char *>(newBlock->mapBase) + offset
-                                     : nullptr};
+        SubAllocation result{
+            .memory = newBlock.memory,
+            .offset = offset,
+            .size = reqSize,
+            .mappedPtr = newBlock.mapped ? static_cast<char *>(newBlock.mapBase) + offset
+                                         : nullptr};
         blocks_.push_back(std::move(newBlock));
         return result;
     }
@@ -127,9 +131,9 @@ class SubAllocator
             return;
         for (auto &block : blocks_)
         {
-            if (block->memory == alloc.memory)
+            if (block.memory == alloc.memory)
             {
-                block->dealloc(alloc.offset, alloc.size);
+                block.dealloc(alloc.offset, alloc.size);
                 return;
             }
         }
@@ -139,48 +143,88 @@ class SubAllocator
   private:
     struct Block
     {
-        LogicalDevice &device;
+        const LogicalDevice *device;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkDeviceSize size = 0;
         void *mapBase = nullptr;
         bool mapped = false;
         std::vector<std::pair<VkDeviceSize, VkDeviceSize>> freeList;
 
-        Block(LogicalDevice &dev, uint32_t typeIndex, VkDeviceSize sz, const void *pNext,
-              bool doMap)
-            : device(dev),
-              memory{device.allocateMemory(
+        Block(const LogicalDevice *dev, uint32_t typeIndex, VkDeviceSize sz,
+              const void *pNext, bool doMap)
+            : device{dev},
+              memory{dev->allocateMemory(
                   VkMemoryAllocateInfo{.sType = sType<VkMemoryAllocateInfo>(),
                                        .pNext = pNext,
                                        .allocationSize = sz,
                                        .memoryTypeIndex = typeIndex},
-                  device.allocator())},
+                  dev->allocator())},
               size(sz), mapped(doMap)
         {
-
+            assert(device != nullptr);
             if (mapped)
-                device.mapMemory(memory, 0, VK_WHOLE_SIZE, 0, &mapBase);
+                dev->mapMemory(memory, 0, VK_WHOLE_SIZE, 0, &mapBase);
             freeList.emplace_back(0, sz);
             std::println("[SubAlloc] Created new Block: size={} ({} MB), memory={}", sz,
                          sz / (1024 * 1024), (void *)memory);
         }
 
-        ~Block()
+        ~Block() noexcept
         {
-            if (mapped)
-                device.unmapMemory(memory);
-            if (memory)
+            if (device != nullptr)
             {
-                std::println("[SubAlloc] Destroying Block: size={} ({} MB), memory={}",
-                             size, size / (1024 * 1024), (void *)memory);
-                device.freeMemory(memory, device.allocator());
+                if (mapped)
+                    device->unmapMemory(memory);
+                if (memory != nullptr)
+                {
+                    std::println(
+                        "[SubAlloc] Destroying Block: size={} ({} MB), memory={}", size,
+                        size / (1024 * 1024), (void *)memory);
+                    device->freeMemory(memory, device->allocator());
+                }
+                device = nullptr;
+                memory = {};
+                size = {};
+                mapBase = {};
+                mapped = {};
+                freeList = {};
             }
         }
 
         Block(const Block &) = delete;
         Block &operator=(const Block &) = delete;
-        Block(Block &&) = delete;
-        Block &operator=(Block &&) = delete;
+        Block(Block &&o) noexcept
+            : device{std::exchange(o.device, {})}, memory{std::exchange(o.memory, {})},
+              size{std::exchange(o.size, {})}, mapBase{std::exchange(o.mapBase, {})},
+              mapped{std::exchange(o.mapped, {})}, freeList{std::exchange(o.freeList, {})}
+        {
+        }
+        Block &operator=(Block &&o) noexcept
+        {
+            if (this != &o)
+            {
+                if (device != nullptr)
+                {
+                    if (mapped)
+                        device->unmapMemory(memory);
+                    if (memory != nullptr)
+                    {
+                        std::println(
+                            "[SubAlloc] Destroying Block: size={} ({} MB), memory={}",
+                            size, size / (1024 * 1024), (void *)memory);
+                        device->freeMemory(memory, device->allocator());
+                    }
+                }
+
+                device = std::exchange(o.device, {});
+                memory = std::exchange(o.memory, {});
+                size = std::exchange(o.size, {});
+                mapBase = std::exchange(o.mapBase, {});
+                mapped = std::exchange(o.mapped, {});
+                freeList = std::exchange(o.freeList, {});
+            }
+            return *this;
+        }
 
         // 找到大于或等于 value 的、最小的 alignment 倍数。
         static VkDeviceSize alignUp(VkDeviceSize value, VkDeviceSize alignment)
@@ -261,15 +305,17 @@ class SubAllocator
 
             // 插入合并结果
             freeList.insert(freeList.begin() + idx, {off, sz});
+            std::println("[SubAlloc] Free offset={} size={} -> freeList size={}", off, sz,
+                         freeList.size());
         }
     };
 
-    LogicalDevice &device_;
+    const LogicalDevice *device_;
     uint32_t typeIndex_;
     VkDeviceSize blockSize_;
     pNext pNext_;
     bool mapAll_;
-    std::vector<std::unique_ptr<Block>> blocks_;
+    std::vector<Block> blocks_;
 };
 
 // ---------- 自管理缓冲区（所有权完全转移） ----------
@@ -644,49 +690,96 @@ try
     bool isQuad = true;
 
     // ================= 子分配器初始化 =================
-    uint32_t memoryTypeIndex = 0;
-    {
-        // 定义我们要查询的缓冲区创建信息（可以是你实际要用的 usage 组合）
-        VkBufferCreateInfo bufferInfo{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                                      .size = 256, // 大小无关紧要，主要影响对齐但可忽略
-                                      .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                                               VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                               VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-                                      .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
 
+    // 块大小设置为 1MB，大于数据峰值（~400KB），以便在同一块内观察合并
+    auto getMemoryTypeIndex = [&](VkBufferUsageFlags usage) -> uint32_t {
+        VkBufferCreateInfo bufferInfo{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                      .size = 256,
+                                      .usage = usage,
+                                      .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
         VkDeviceBufferMemoryRequirements deviceReq{
             .sType = sType<VkDeviceBufferMemoryRequirements>(),
             .pCreateInfo = &bufferInfo};
-
         VkMemoryRequirements2 memReqs2{.sType = sType<VkMemoryRequirements2>()};
-
         device.getDeviceBufferMemoryRequirements(&deviceReq, &memReqs2);
 
         VkPhysicalDeviceMemoryProperties memProps = physical_device.getMemoryProperties();
-        memoryTypeIndex = find_memory_type_index(
+        uint32_t idx = find_memory_type_index(
             memReqs2.memoryRequirements.memoryTypeBits, memProps,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    }
+        if (idx == UINT32_MAX) // 回退
+            idx = find_memory_type_index(memReqs2.memoryRequirements.memoryTypeBits,
+                                         memProps,
+                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        assert(idx != UINT32_MAX);
+        return idx;
+    };
+    SubAllocator vertexAlloc(device,
+                             getMemoryTypeIndex(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT),
+                             1 * 1024 * 1024, nullptr, true);
+    SubAllocator indexAlloc(device, getMemoryTypeIndex(VK_BUFFER_USAGE_INDEX_BUFFER_BIT),
+                            1 * 1024 * 1024, nullptr, true);
+    SubAllocator indirectAlloc(device,
+                               getMemoryTypeIndex(VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT),
+                               1 * 1024 * 1024, nullptr, true);
+    SubAllocator instanceAlloc(
+        device,
+        getMemoryTypeIndex(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                           VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT),
+        1 * 1024 * 1024,
+        make_pNext(structure_chain<VkMemoryAllocateFlagsInfo>{
+            {.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT}}),
+        true);
 
-    // 块大小设置为 1MB，大于数据峰值（~400KB），以便在同一块内观察合并
-    SubAllocator subAlloc(device, memoryTypeIndex, 1 * 1024 * 1024,
-                          make_pNext(structure_chain<VkMemoryAllocateFlagsInfo>{
-                              {.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT}}),
-                          true);
-
-    auto createSubBuffer = [&](VkDeviceSize size,
-                               VkBufferUsageFlags usage) -> SubAllocatedBuffer {
-        VkBufferCreateInfo bufferInfo{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                                      .size = size,
-                                      .usage = usage,
-                                      .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-        VkBuffer buf = device.createBuffer(bufferInfo, device.allocator());
+    auto createVertexBuffer = [&](VkDeviceSize size) -> SubAllocatedBuffer {
+        VkBufferCreateInfo info{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                .size = size,
+                                .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+        VkBuffer buf = device.createBuffer(info, device.allocator());
         VkMemoryRequirements memReqs = device.getBufferMemoryRequirements(buf);
-        SubAllocation alloc = subAlloc.allocate(memReqs);
+        SubAllocation alloc = vertexAlloc.allocate(memReqs);
         device.bindBufferMemory(buf, alloc.memory, alloc.offset);
-        return SubAllocatedBuffer(buf, alloc, &device, &subAlloc);
+        return SubAllocatedBuffer(buf, alloc, &device, &vertexAlloc);
+    };
+
+    auto createIndexBuffer = [&](VkDeviceSize size) -> SubAllocatedBuffer {
+        VkBufferCreateInfo info{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                .size = size,
+                                .usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                                .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+        VkBuffer buf = device.createBuffer(info, device.allocator());
+        VkMemoryRequirements memReqs = device.getBufferMemoryRequirements(buf);
+        SubAllocation alloc = indexAlloc.allocate(memReqs);
+        device.bindBufferMemory(buf, alloc.memory, alloc.offset);
+        return SubAllocatedBuffer(buf, alloc, &device, &indexAlloc);
+    };
+
+    auto createIndirectBuffer = [&](VkDeviceSize size) -> SubAllocatedBuffer {
+        VkBufferCreateInfo info{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                .size = size,
+                                .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                                .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+        VkBuffer buf = device.createBuffer(info, device.allocator());
+        VkMemoryRequirements memReqs = device.getBufferMemoryRequirements(buf);
+        SubAllocation alloc = indirectAlloc.allocate(memReqs);
+        device.bindBufferMemory(buf, alloc.memory, alloc.offset);
+        return SubAllocatedBuffer(buf, alloc, &device, &indirectAlloc);
+    };
+
+    auto createInstanceBuffer = [&](VkDeviceSize size) -> SubAllocatedBuffer {
+        VkBufferCreateInfo info{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                .size = size,
+                                .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+        VkBuffer buf = device.createBuffer(info, device.allocator());
+        VkMemoryRequirements memReqs = device.getBufferMemoryRequirements(buf);
+        SubAllocation alloc = instanceAlloc.allocate(memReqs);
+        device.bindBufferMemory(buf, alloc.memory, alloc.offset);
+        return SubAllocatedBuffer(buf, alloc, &device, &instanceAlloc);
     };
 
     std::array<SubAllocatedBuffer, MAX_FRAMES_IN_FLIGHT> vertexBuffers;
@@ -698,16 +791,11 @@ try
 
     for (uint32_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
     {
-        vertexBuffers[i] = createSubBuffer(vertices.size() * sizeof(Vertex),
-                                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-        indexBuffers[i] = createSubBuffer(indices.size() * sizeof(uint32_t),
-                                          VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-        indirectBuffers[i] = createSubBuffer(sizeof(VkDrawIndexedIndirectCommand),
-                                             VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+        vertexBuffers[i] = createVertexBuffer(vertices.size() * sizeof(Vertex));
+        indexBuffers[i] = createIndexBuffer(indices.size() * sizeof(uint32_t));
+        indirectBuffers[i] = createIndirectBuffer(sizeof(VkDrawIndexedIndirectCommand));
         instanceBuffers[i] =
-            createSubBuffer(instancesDta.size() * sizeof(InstanceData),
-                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            createInstanceBuffer(instancesDta.size() * sizeof(InstanceData));
         instanceBufferAddress[i] =
             device.getBufferDeviceAddress({.sType = sType<VkBufferDeviceAddressInfo>(),
                                            .buffer = instanceBuffers[i].buffer});
@@ -739,16 +827,12 @@ try
             const auto &newIdxs = isQuad ? quadIndices : triIndices;
 
             if (vb.alloc.size < newVerts.size() * sizeof(Vertex))
-                vb = createSubBuffer(newVerts.size() * sizeof(Vertex),
-                                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+                vb = createVertexBuffer(newVerts.size() * sizeof(Vertex));
             if (ib.alloc.size < newIdxs.size() * sizeof(uint32_t))
-                ib = createSubBuffer(newIdxs.size() * sizeof(uint32_t),
-                                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+                ib = createIndexBuffer(newIdxs.size() * sizeof(uint32_t));
             if (instb.alloc.size < instancesDta.size() * sizeof(InstanceData))
             {
-                instb = createSubBuffer(instancesDta.size() * sizeof(InstanceData),
-                                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+                instb = createInstanceBuffer(instancesDta.size() * sizeof(InstanceData));
                 instanceBufferAddress[frameIndex] = device.getBufferDeviceAddress(
                     {.sType = sType<VkBufferDeviceAddressInfo>(),
                      .buffer = instb.buffer});
