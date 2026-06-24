@@ -501,6 +501,26 @@ std::pair<std::vector<Vertex>, std::vector<uint32_t>> makePointMesh(float size)
     std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
     return {verts, indices};
 }
+/*
+你在同一个 Command Buffer 里做了：
+
+主渲染通道（使用你自己的 graphicsPipeline）
+
+endRendering
+
+拾取渲染通道（使用 pickingPipeline）
+
+endRendering
+
+ImGui 渲染通道（使用 ImGui 内部管线）
+
+endRendering
+
+每一个 Rendering 都是一个独立的、互不干扰的绘制环境，只要在该 Rendering 内部绑定的管线与其附件兼容即可。
+因此，你当然可以自由切换管线，Dynamic Rendering 就是为了让你能这样做而设计的。
+
+imgui 的测试有 3 个管线。屁事没有
+*/
 // diff: [test_vertext9] end
 
 // ------------------------- main 函数开始 -------------------------
