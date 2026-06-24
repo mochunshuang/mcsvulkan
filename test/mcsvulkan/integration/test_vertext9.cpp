@@ -4,6 +4,7 @@
 #include <exception>
 #include <iostream>
 #include <print>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include <random>
@@ -429,8 +430,8 @@ struct Mesh
     uint32_t indexOffset;
     uint32_t indexCount;
 
-    VkDrawIndexedIndirectCommand getDrawCommand(uint32_t instanceCount,
-                                                uint32_t firstInstance = 0) const
+    [[nodiscard]] VkDrawIndexedIndirectCommand getDrawCommand(
+        uint32_t instanceCount, uint32_t firstInstance = 0) const noexcept
     {
         return {.indexCount = indexCount,
                 .instanceCount = instanceCount,
@@ -897,11 +898,19 @@ try
     std::vector<VkDrawIndexedIndirectCommand> g_cmds(2);
     std::vector<InstanceData> g_allInstances;
 
-    auto draw_api = [&](const Mesh &mesh, const std::vector<InstanceData> &instances) {
-        auto firstInstance = static_cast<uint32_t>(g_allInstances.size()); // 追加前的索引
-        g_allInstances.append_range(instances);                            // 追加数据
-        g_cmds.emplace_back(
-            mesh.getDrawCommand(instances.size(), firstInstance)); // 生成命令
+    auto draw_api = [&](const std::string &mesh_name,
+                        const std::vector<InstanceData> &instances) {
+        // 查找 mesh
+        auto it = meshMap.find(mesh_name);
+        if (it == meshMap.end())
+        {
+            throw std::runtime_error(std::string("Mesh not found: ") + mesh_name);
+        }
+        const Mesh &mesh = it->second;
+
+        auto firstInstance = static_cast<uint32_t>(g_allInstances.size());
+        g_allInstances.append_range(instances);
+        g_cmds.emplace_back(mesh.getDrawCommand(instances.size(), firstInstance));
     };
 
     auto updateDrawCommands = [&](uint32_t frameIndex) {
@@ -910,9 +919,9 @@ try
         g_allInstances.clear();
         g_allInstances.reserve(MAX_DRAW_CALLS * INSTANCE_COUNT);
 
-        draw_api(meshMap["quad"],
+        draw_api("quad",
                  generateRandomInstances(INSTANCE_COUNT, -1.0f, 0.0f, -1.0f, 1.0f));
-        draw_api(meshMap["triangle"],
+        draw_api("triangle",
                  generateRandomInstances(INSTANCE_COUNT, 0.0f, 1.0f, -1.0f, 1.0f));
 
         // 上传实例数据到全局 buffer
