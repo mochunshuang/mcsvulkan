@@ -893,44 +893,27 @@ try
     };
 
     // ====================== 显式定义所有绘制命令（命令 = 指令 + 数据） ======================
-    std::vector<DrawCall> drawCalls = {
-        {.mesh = &meshMap["quad"],
-         .instanceCount = INSTANCE_COUNT,
-         .instances = generateRandomInstances(INSTANCE_COUNT, -1.0f, 0.0f, -1.0f, 1.0f)},
-        {.mesh = &meshMap["triangle"],
-         .instanceCount = INSTANCE_COUNT,
-         .instances = generateRandomInstances(INSTANCE_COUNT, 0.0f, 1.0f, -1.0f, 1.0f)}};
-
     constexpr float INSTANCE_UPDATE_INTERVAL = 0.5f;
-
-    std::vector<VkDrawIndexedIndirectCommand> g_cmds(drawCalls.size());
+    std::vector<VkDrawIndexedIndirectCommand> g_cmds(2);
     std::vector<InstanceData> g_allInstances;
 
-    // ====================== 参数化更新函数：遍历 drawCalls 生成间接命令和实例 buffer ======================
+    auto draw_api = [&](const Mesh &mesh, const std::vector<InstanceData> &instances) {
+        auto firstInstance = static_cast<uint32_t>(g_allInstances.size()); // 追加前的索引
+        g_allInstances.append_range(instances);                            // 追加数据
+        g_cmds.emplace_back(
+            mesh.getDrawCommand(instances.size(), firstInstance)); // 生成命令
+    };
+
     auto updateDrawCommands = [&](uint32_t frameIndex) {
+        // NOTE: 每一帧都重新记录，可以缓存？
+        g_cmds.clear();
         g_allInstances.clear();
         g_allInstances.reserve(MAX_DRAW_CALLS * INSTANCE_COUNT);
 
-        // 动态重新生成每个 drawCall 的实例数据（体现按需更新）
-        for (auto &dc : drawCalls)
-        {
-            if (dc.mesh == &meshMap["quad"])
-                dc.instances =
-                    generateRandomInstances(dc.instanceCount, -1.0f, 0.0f, -1.0f, 1.0f);
-            else if (dc.mesh == &meshMap["triangle"])
-                dc.instances =
-                    generateRandomInstances(dc.instanceCount, 0.0f, 1.0f, -1.0f, 1.0f);
-        }
-
-        for (size_t i = 0; i < drawCalls.size(); ++i)
-        {
-            auto &dc = drawCalls[i];
-            dc.firstInstance =
-                static_cast<uint32_t>(g_allInstances.size()); // 记录起始索引
-            g_allInstances.append_range(dc.instances);        // 追加数据
-            g_cmds[i] = dc.mesh->getDrawCommand(dc.instanceCount,
-                                                dc.firstInstance); // 生成间接命令
-        }
+        draw_api(meshMap["quad"],
+                 generateRandomInstances(INSTANCE_COUNT, -1.0f, 0.0f, -1.0f, 1.0f));
+        draw_api(meshMap["triangle"],
+                 generateRandomInstances(INSTANCE_COUNT, 0.0f, 1.0f, -1.0f, 1.0f));
 
         // 上传实例数据到全局 buffer
         void *mapped = globalInstanceBuffer.alloc.mappedPtr;
