@@ -648,17 +648,46 @@ try
     frame_context<MAX_FRAMES_IN_FLIGHT> frameContext{device, swapchain.imagesSize()};
 
     // ====================== 几何数据准备 ======================
-    const std::vector<Vertex> quadVertices = {
-        {{-0.1f, -0.1f}}, {{0.1f, -0.1f}}, {{0.1f, 0.1f}}, {{-0.1f, 0.1f}}};
+    static constexpr float scaling_factor = 000.1;
+    static constexpr uint32_t INSTANCE_COUNT = 10000;
+    const std::vector<Vertex> quadVertices = {{glm::vec2{-0.1f, -0.1f} * scaling_factor},
+                                              {glm::vec2{0.1f, -0.1f} * scaling_factor},
+                                              {glm::vec2{0.1f, 0.1f} * scaling_factor},
+                                              {glm::vec2{-0.1f, 0.1f} * scaling_factor}};
     const std::vector<uint32_t> quadIndices = {0, 1, 2, 0, 2, 3};
 
-    const std::vector<Vertex> triVertices = {
-        {{-0.1f, -0.1f}}, {{0.1f, -0.1f}}, {{0.0f, 0.1f}}};
+    const std::vector<Vertex> triVertices = {{glm::vec2{-0.1f, -0.1f} * scaling_factor},
+                                             {glm::vec2{0.1f, -0.1f} * scaling_factor},
+                                             {glm::vec2{0.0f, 0.1f} * scaling_factor}};
     const std::vector<uint32_t> triIndices = {0, 1, 2};
 
     std::vector<Vertex> allVertices;
     std::vector<uint32_t> allIndices;
-    std::unordered_map<std::string, Mesh> meshMap;
+    struct StringHash
+    {
+        using is_transparent = std::true_type; // 启用透明查找
+
+        size_t operator()(std::string_view sv) const noexcept
+        {
+            return std::hash<std::string_view>{}(sv);
+        }
+        size_t operator()(const std::string &s) const noexcept
+        {
+            return std::hash<std::string_view>{}(s);
+        }
+    };
+
+    struct StringEqual
+    {
+        using is_transparent = std::true_type;
+
+        bool operator()(std::string_view lhs, std::string_view rhs) const noexcept
+        {
+            return lhs == rhs;
+        }
+    };
+    // 使用自定义透明哈希/比较的 unordered_map
+    std::unordered_map<std::string, Mesh, StringHash, StringEqual> meshMap;
 
     uint32_t quadVOff = static_cast<uint32_t>(allVertices.size());
     uint32_t quadIOff = static_cast<uint32_t>(allIndices.size());
@@ -775,7 +804,6 @@ try
     memcpy(globalIndexBuffer.alloc.mappedPtr, allIndices.data(),
            allIndices.size() * sizeof(uint32_t));
 
-    constexpr uint32_t INSTANCE_COUNT = 10;
     constexpr uint32_t MAX_DRAW_CALLS = 2;
     constexpr VkDeviceSize MAX_INSTANCE_DATA_SIZE =
         MAX_DRAW_CALLS * INSTANCE_COUNT * sizeof(InstanceData);
@@ -868,7 +896,8 @@ try
         instances.reserve(count);
         std::random_device rd;
         std::mt19937 gen(rd());
-        std::uniform_real_distribution<float> dis(-0.15f, 0.15f);
+        std::uniform_real_distribution<float> dis(-0.15f * scaling_factor,
+                                                  0.15f * scaling_factor);
         int gridSize = static_cast<int>(std::ceil(std::sqrt(count)));
         const float cellWidth = (xMax - xMin) / gridSize;
         const float cellHeight = (yMax - yMin) / gridSize;
@@ -898,21 +927,16 @@ try
     std::vector<VkDrawIndexedIndirectCommand> g_cmds(2);
     std::vector<InstanceData> g_allInstances;
 
-    auto draw_api = [&](const std::string &mesh_name,
+    auto draw_api = [&](std::string_view mesh_name,
                         const std::vector<InstanceData> &instances) {
-        // 查找 mesh
         auto it = meshMap.find(mesh_name);
         if (it == meshMap.end())
-        {
-            throw std::runtime_error(std::string("Mesh not found: ") + mesh_name);
-        }
+            throw std::runtime_error(std::format("Mesh not found: {}", mesh_name));
         const Mesh &mesh = it->second;
-
         auto firstInstance = static_cast<uint32_t>(g_allInstances.size());
         g_allInstances.append_range(instances);
         g_cmds.emplace_back(mesh.getDrawCommand(instances.size(), firstInstance));
     };
-
     auto updateDrawCommands = [&](uint32_t frameIndex) {
         // NOTE: 每一帧都重新记录，可以缓存？
         g_cmds.clear();
