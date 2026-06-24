@@ -450,6 +450,59 @@ struct DrawCall
     uint32_t firstInstance = 0;          // 在全局 buffer 中的起始索引（自动计算）
 };
 
+//NOTE: 小心背面剔除
+// diff: [test_vertext9] start： 使用三角形模拟，点，线，面。imgui是这么做的
+// 生成一个线段（thickness = 线宽，两端半圆可选，这里用矩形近似）
+std::pair<std::vector<Vertex>, std::vector<uint32_t>> makeLineMesh(glm::vec2 p0,
+                                                                   glm::vec2 p1,
+                                                                   float thickness)
+{
+    glm::vec2 dir = p1 - p0;
+    float len = glm::length(dir);
+    if (len < 1e-6f)
+        return {}; // 退化
+
+    glm::vec2 normal = glm::normalize(glm::vec2(-dir.y, dir.x)) * thickness * 0.5f;
+
+    std::vector<Vertex> verts = {
+        {p0 - normal}, // 0
+        {p0 + normal}, // 1
+        {p1 + normal}, // 2
+        {p1 - normal}, // 3
+    };
+    std::vector<uint32_t> indices = {0, 2, 1, 0, 3, 2};
+    return {verts, indices};
+}
+std::pair<std::vector<Vertex>, std::vector<uint32_t>> makeCircleMesh(
+    glm::vec2 center, float radius, uint32_t segments = 32)
+{
+    std::vector<Vertex> verts;
+    std::vector<uint32_t> indices;
+
+    verts.push_back({center}); // 圆心，索引 0
+    for (uint32_t i = 0; i <= segments; ++i)
+    {
+        float angle = (float)i / segments * glm::two_pi<float>();
+        verts.push_back({center + glm::vec2(std::cos(angle), std::sin(angle)) * radius});
+    }
+    for (uint32_t i = 1; i <= segments; ++i)
+    {
+        indices.push_back(0);
+        indices.push_back(i);
+        indices.push_back(i + 1);
+    }
+    return {verts, indices};
+}
+std::pair<std::vector<Vertex>, std::vector<uint32_t>> makePointMesh(float size)
+{
+    float half = size * 0.5f;
+    std::vector<Vertex> verts = {
+        {{-half, -half}}, {{half, -half}}, {{half, half}}, {{-half, half}}};
+    std::vector<uint32_t> indices = {0, 1, 2, 0, 2, 3};
+    return {verts, indices};
+}
+// diff: [test_vertext9] end
+
 // ------------------------- main 函数开始 -------------------------
 int main()
 try
@@ -647,6 +700,7 @@ try
                                             .commandBufferCount = MAX_FRAMES_IN_FLIGHT});
     frame_context<MAX_FRAMES_IN_FLIGHT> frameContext{device, swapchain.imagesSize()};
 
+    // diff: [test_vertext9] start
     // ====================== 几何数据准备 ======================
     static constexpr float scaling_factor = 000.1;
     static constexpr uint32_t INSTANCE_COUNT = 10000;
@@ -700,6 +754,32 @@ try
     allVertices.insert(allVertices.end(), triVertices.begin(), triVertices.end());
     allIndices.insert(allIndices.end(), triIndices.begin(), triIndices.end());
     meshMap["triangle"] = {triVOff, triIOff, static_cast<uint32_t>(triIndices.size())};
+
+    // 假设我们想要一个线段从 (-0.5, -0.5) 到 (0.5, 0.5)，厚度 0.02
+    auto [lineVerts, lineIndices] =
+        makeLineMesh(glm::vec2(-0.5f, -0.5f), glm::vec2(0.5f, 0.5f), 0.02f);
+    uint32_t lineVOff = allVertices.size();
+    uint32_t lineIOff = allIndices.size();
+    allVertices.insert(allVertices.end(), lineVerts.begin(), lineVerts.end());
+    allIndices.insert(allIndices.end(), lineIndices.begin(), lineIndices.end());
+    meshMap["line1"] = {lineVOff, lineIOff, (uint32_t)lineIndices.size()};
+
+    // 一个圆心在原点、半径 0.3 的圆
+    auto [circleVerts, circleIndices] = makeCircleMesh(glm::vec2(0), 0.3f, 32);
+    uint32_t circleVOff = allVertices.size();
+    uint32_t circleIOff = allIndices.size();
+    allVertices.insert(allVertices.end(), circleVerts.begin(), circleVerts.end());
+    allIndices.insert(allIndices.end(), circleIndices.begin(), circleIndices.end());
+    meshMap["circle"] = {circleVOff, circleIOff, (uint32_t)circleIndices.size()};
+
+    // 一个点（小正方形）大小 0.05
+    auto [pointVerts, pointIndices] = makePointMesh(0.05f);
+    uint32_t pointVOff = allVertices.size();
+    uint32_t pointIOff = allIndices.size();
+    allVertices.insert(allVertices.end(), pointVerts.begin(), pointVerts.end());
+    allIndices.insert(allIndices.end(), pointIndices.begin(), pointIndices.end());
+    meshMap["point"] = {pointVOff, pointIOff, (uint32_t)pointIndices.size()};
+    // diff: [test_vertext9] end
 
     // ====================== 子分配器初始化 ======================
     auto getMemoryTypeIndex = [&](VkBufferUsageFlags usage) -> uint32_t {
@@ -804,7 +884,7 @@ try
     memcpy(globalIndexBuffer.alloc.mappedPtr, allIndices.data(),
            allIndices.size() * sizeof(uint32_t));
 
-    constexpr uint32_t MAX_DRAW_CALLS = 2;
+    constexpr uint32_t MAX_DRAW_CALLS = 10; //diff: [test_vertext9] 小心缓冲区溢出
     constexpr VkDeviceSize MAX_INSTANCE_DATA_SIZE =
         MAX_DRAW_CALLS * INSTANCE_COUNT * sizeof(InstanceData);
     SubAllocatedBuffer globalInstanceBuffer =
@@ -922,6 +1002,7 @@ try
         return instances;
     };
 
+    // diff: [test_vertext9] start
     // ====================== 显式定义所有绘制命令（命令 = 指令 + 数据） ======================
     constexpr float INSTANCE_UPDATE_INTERVAL = 0.5f;
     std::vector<VkDrawIndexedIndirectCommand> g_cmds(2);
@@ -943,10 +1024,19 @@ try
         g_allInstances.clear();
         g_allInstances.reserve(MAX_DRAW_CALLS * INSTANCE_COUNT);
 
-        draw_api("quad",
-                 generateRandomInstances(INSTANCE_COUNT, -1.0f, 0.0f, -1.0f, 1.0f));
-        draw_api("triangle",
-                 generateRandomInstances(INSTANCE_COUNT, 0.0f, 1.0f, -1.0f, 1.0f));
+        // draw_api("quad",
+        //          generateRandomInstances(INSTANCE_COUNT, -1.0f, 0.0f, -1.0f, 1.0f));
+        // draw_api("triangle",
+        //          generateRandomInstances(INSTANCE_COUNT, 0.0f, 1.0f, -1.0f, 1.0f));
+
+        // 绘制 100 个线段实例，随机偏移和颜色
+        draw_api("line1", generateRandomInstances(10, -1.0f, 1.0f, -1.0f, 1.0f));
+
+        // 绘制 50 个圆
+        draw_api("circle", generateRandomInstances(5, -1.0f, 1.0f, -1.0f, 1.0f));
+
+        // 绘制 200 个点
+        draw_api("point", generateRandomInstances(20, -1.0f, 1.0f, -1.0f, 1.0f));
 
         // 上传实例数据到全局 buffer
         void *mapped = globalInstanceBuffer.alloc.mappedPtr;
@@ -957,6 +1047,8 @@ try
         auto &idb = indirectBuffers[frameIndex];
         memcpy(idb.alloc.mappedPtr, g_cmds.data(),
                g_cmds.size() * sizeof(VkDrawIndexedIndirectCommand));
+
+        assert(g_cmds.size() < MAX_DRAW_CALLS);
     };
 
     // 初始化所有帧的间接命令缓冲区，避免首帧闪烁
@@ -968,6 +1060,7 @@ try
                g_cmds.size() * sizeof(VkDrawIndexedIndirectCommand));
     }
     auto lastUpdateTime = std::chrono::high_resolution_clock::now();
+    // diff: [test_vertext9] end
 
     // ====================== 每帧绘制 ======================
     const auto drawFrame = [&]() {
