@@ -28,6 +28,7 @@ std_glsl_target(test_vertext7 test_vertext2.vert test_triangle.frag)
 
 std_glsl_target(test_vertext8 test_vertext2.vert test_triangle.frag)
 std_glsl_target(test_vertext9 test_vertext2.vert test_triangle.frag)
+std_glsl_target(test_vertext10 test_vertext10.vert test_triangle.frag)
 
 # end
 std_glsl_env_destroy()
