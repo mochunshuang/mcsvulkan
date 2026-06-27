@@ -419,6 +419,33 @@ try
     {
         surface::pollEvents();
         drawFrame();
+        // FPS 统计
+        {
+            static auto lastTime = std::chrono::high_resolution_clock::now();
+            static int frameCount = 0;
+            static int totalFrames = 0;
+            static float accumulatedFPS = 0.0f;
+            static int avgSamples = 0;
+
+            frameCount++;
+            totalFrames++;
+
+            auto now = std::chrono::high_resolution_clock::now();
+            float elapsed = std::chrono::duration<float>(now - lastTime).count();
+            if (elapsed >= 1.0F)
+            {
+                float fps = frameCount / elapsed;
+                accumulatedFPS += fps;
+                avgSamples++;
+                float avgFPS = accumulatedFPS / avgSamples;
+                float frameTimeMs = (elapsed / frameCount) * 1000.0f;
+                std::println(
+                    "FPS: {:.1f} (avg: {:.1f}) | FrameTime: {:.2f}ms | Total: {}", fps,
+                    avgFPS, frameTimeMs, totalFrames);
+                frameCount = 0;
+                lastTime = now;
+            }
+        }
     }
     device.waitIdle();
 

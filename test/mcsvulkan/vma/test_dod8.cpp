@@ -1575,6 +1575,8 @@ try
         for (const auto &[objectData, modelState] :
              interactiveStore.view<"objectData", "modelState">(currentFrame))
         {
+            //diff: [test_dod8] 构造时的偏移迁移到这里
+            modelState.model_matrix.translation.z = 0.5f;
             objectData = object_data{modelState.model_matrix()};
         }
     };
@@ -1928,7 +1930,7 @@ try
 
         // NOTE: 函数执行耗时: 2 毫秒. [FPS]  77.1 (avg frame: 12.963 ms) 占用了1/6
         // 5. 打印耗时
-        std::cout << "函数执行耗时: " << duration.count() << " 毫秒" << std::endl;
+        // std::cout << "函数执行耗时: " << duration.count() << " 毫秒" << std::endl;
     };
 
     // diff: [test_indirectdraw] end
@@ -2509,6 +2511,34 @@ try
                                                                world);
 
         drawFrame(world);
+
+        // FPS 统计
+        {
+            static auto lastTime = std::chrono::high_resolution_clock::now();
+            static int frameCount = 0;
+            static int totalFrames = 0;
+            static float accumulatedFPS = 0.0f;
+            static int avgSamples = 0;
+
+            frameCount++;
+            totalFrames++;
+
+            auto now = std::chrono::high_resolution_clock::now();
+            float elapsed = std::chrono::duration<float>(now - lastTime).count();
+            if (elapsed >= 1.0F)
+            {
+                float fps = frameCount / elapsed;
+                accumulatedFPS += fps;
+                avgSamples++;
+                float avgFPS = accumulatedFPS / avgSamples;
+                float frameTimeMs = (elapsed / frameCount) * 1000.0f;
+                std::println(
+                    "FPS: {:.1f} (avg: {:.1f}) | FrameTime: {:.2f}ms | Total: {}", fps,
+                    avgFPS, frameTimeMs, totalFrames);
+                frameCount = 0;
+                lastTime = now;
+            }
+        }
     }
     device.waitIdle();
 

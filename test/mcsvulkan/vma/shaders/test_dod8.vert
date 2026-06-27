@@ -67,16 +67,13 @@ void main(){
     uint attrIdx=inst.vertexAttributeOffset+localVertexIndex;// 修正点
     VertexAttribute attr=attrPool.attributes[attrIdx];
     
-    vec3 position=vertBuf.vertices[gl_VertexIndex].pos;
-    vec2 texCoord=vertBuf.vertices[gl_VertexIndex].texCoord;
-    
     // 模型-视图-投影变换
     mat4 mvp=ubo.proj*ubo.view*inst.matrix;
-    gl_Position=mvp*vec4(position,1.);
+    gl_Position=mvp*vec4(v.pos,1.);
     
     // 将颜色、纹理坐标、纹理/采样器索引传递给片段着色器
     fragColor=attr.color;
-    fragTexCoord=texCoord;
+    fragTexCoord=v.texCoord;
     fragTextureIndex=inst.textureIndex;
     fragSamplerIndex=inst.samplerIndex;
     fragObjectId=inst.objectId;
