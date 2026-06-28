@@ -709,6 +709,41 @@ namespace mcs::vulkan::ecs
                 return std::span{ptr.data(), self.size()};
             }
         }
+        template <size_type I, typename Self>
+        constexpr decltype(auto) raw_field(this Self &&self,
+                                           size_type field_count) noexcept
+        {
+            if constexpr (info...[I].field_count() > 1)
+            {
+                auto &arr = std::forward_like<Self>(self.[:members[I]:]);
+                return arr[field_count];
+            }
+            else
+            {
+                auto &ptr = std::forward_like<Self>(self.[:members[I]:]);
+                return ptr;
+            }
+        }
+        template <static_string name, typename Self>
+        constexpr decltype(auto) raw_field(this Self &&self,
+                                           size_type field_count) noexcept
+        {
+            return std::forward_like<Self>(
+                self.template raw_field<find_name(name)>(field_count));
+        }
+        template <size_type... I, typename Self>
+        constexpr auto get(this Self &&self, size_type field_count) noexcept
+        {
+            return std::tie(
+                std::forward_like<Self>(self.template raw_field<I>(field_count))...);
+        }
+        template <static_string... name, typename Self>
+            requires(sizeof...(name) > 0 && ((find_name(name) != ~0) && ...))
+        constexpr auto get(this Self &&self, size_type field_count) noexcept
+        {
+            return std::forward_like<Self>(
+                self.template get<find_name(name)...>(field_count));
+        }
 
         template <static_string... name>
             requires(sizeof...(name) > 0 && ((find_name(name) != ~0) && ...))

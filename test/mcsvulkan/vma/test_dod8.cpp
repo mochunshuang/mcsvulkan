@@ -294,22 +294,27 @@ struct model_matrix
 // diff: [camera_model] end
 
 //diff: [test_indirectdraw] start
-// ---- 批量绘制相关 ----
-struct InstanceData
+struct object_data
 {
-    uint32_t textureIndex; // 纹理数组索引
-    uint32_t samplerIndex; // 采样器数组索引
-
-    uint32_t objectId;
-    uint32_t vertexAttributeOffset;
     glm::mat4 matrix;
 };
-
+struct InstanceData
+{
+    uint32_t objectId;
+    uint32_t textureIndex; // 纹理数组索引
+    uint32_t samplerIndex; // 采样器数组索引
+    object_data objectData;
+};
+struct CommandConstant
+{
+    uint32_t perInstanceAttributeCount;
+};
 struct PushData
 {
-    uint64_t vertexAddress;    // 全局顶点缓冲区地址
-    uint64_t attributeAddress; // 全局属性池地址
-    uint64_t instanceAddress;  // 全局实例缓冲区地址
+    uint64_t vertexAddress;           // 全局顶点缓冲区地址
+    uint64_t attributeAddress;        // 全局属性池地址
+    uint64_t instanceAddress;         // 全局实例缓冲区地址
+    uint64_t commandConstantsAddress; // 新增：命令常量缓冲区地址
 };
 
 struct Mesh
@@ -349,6 +354,10 @@ struct PerFrameBatch
 
     mcs::vulkan::memory::auto_map_buffer indirectDrawBuffer{};
     VkDeviceSize indirectDrawBufferCapacity = 0;
+
+    // 新增：命令常量缓冲区
+    mcs::vulkan::memory::auto_map_buffer commandConstantsBuffer{};
+    VkDeviceAddress commandConstantsBufferAddress = 0;
 
     uint32_t drawCount = 0;
 };
@@ -1020,6 +1029,24 @@ try
                 capacity);
             // NOTE: 绘制的时候，每帧填充
         }
+        {
+            // 新增 command constants buffer
+            constexpr VkDeviceSize MAX_CMD_CONST_SIZE =
+                MAX_DRAW_CALLS * sizeof(CommandConstant);
+            batche.commandConstantsBuffer = mcs::vulkan::memory::auto_map_buffer(
+                mcs::vulkan::memory::create_simple_buffer(
+                    device,
+                    {.size = MAX_CMD_CONST_SIZE,
+                     .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+                MAX_CMD_CONST_SIZE);
+            batche.commandConstantsBufferAddress = device.getBufferDeviceAddress(
+                {.sType = sType<VkBufferDeviceAddressInfo>(),
+                 .buffer = batche.commandConstantsBuffer.buffer()});
+        }
     }
 
     // diff: [test_dod8] end
@@ -1196,25 +1223,19 @@ try
         mcs::vulkan::event::position2d_event last_left_pos{};
         model_matrix model_matrix{};
     };
-    struct object_data
-    {
-        glm::mat4 matrix;
-    };
 
     // diff: [test_dod2] end
 
     //diff: [test_dod8.cpp] start
     using auto_spin_data_type =
-        gen_soa_aggregate<{"vertexAttribute", ^^std::vector<VertexAttribute>},
-                          {"objectData", ^^object_data}, {"textureData", ^^uint32_t},
-                          {"samplerData", ^^uint32_t}>;
+        gen_soa_aggregate<{"instanceData", ^^InstanceData},
+                          {"vertexAttribute", ^^std::array<VertexAttribute, 4>}>;
     auto_spin_data_type autoSpinStore{1};
 
     using interactive_type =
-        gen_soa_aggregate<{"vertexAttribute", ^^std::vector<VertexAttribute>},
-                          {"objectData", ^^object_data}, {"textureData", ^^uint32_t},
-                          {"samplerData", ^^uint32_t}, {"topLeftLocal", ^^glm::vec3},
-                          {"modelState", ^^model_state}>;
+        gen_soa_aggregate<{"instanceData", ^^InstanceData},
+                          {"vertexAttribute", ^^std::array<VertexAttribute, 4>},
+                          {"topLeftLocal", ^^glm::vec3}, {"modelState", ^^model_state}>;
     interactive_type interactiveStore{1};
 
     // NOTE: spinElapsed 全部mesh共享？
@@ -1368,26 +1389,26 @@ try
     // init data
 
     //diff: [test_dod3] start
-    auto autoSpinId = autoSpinStore.new_entity(
-        std::vector<VertexAttribute>{
-            {glm::vec3{1.0f, 0.0f, 0.0f}}, // 红
-            {glm::vec3{0.0f, 1.0f, 0.0f}}, // 绿
-            {glm::vec3{0.0f, 0.0f, 1.0f}}, // 蓝
-            {glm::vec3{1.0f, 1.0f, 0.0f}}, // 黄
-        },
-        object_data{}, 0, 0);
+    auto global_id = 0;
+    auto autoSpinId =
+        autoSpinStore.new_entity(InstanceData{global_id++, 0, 0, object_data{}},
+                                 std::array<VertexAttribute, 4>{
+                                     VertexAttribute{glm::vec3{1.0f, 0.0f, 0.0f}}, // 红
+                                     VertexAttribute{glm::vec3{0.0f, 1.0f, 0.0f}}, // 绿
+                                     VertexAttribute{glm::vec3{0.0f, 0.0f, 1.0f}}, // 蓝
+                                     VertexAttribute{glm::vec3{1.0f, 1.0f, 0.0f}}, // 黄
+                                 });
     auto interactiveId = interactiveStore.new_entity(
-        std::vector<VertexAttribute>{
-            {{1.0f, 0.0f, 1.0f}}, // 品红
-            {{0.0f, 1.0f, 1.0f}}, // 青
-            {{1.0f, 0.5f, 0.0f}}, // 橙
-            {{0.5f, 0.0f, 0.5f}}, // 紫
+        InstanceData{global_id++, 3, 1, object_data{}},
+        std::array<VertexAttribute, 4>{
+            VertexAttribute{{1.0f, 0.0f, 1.0f}}, // 品红
+            VertexAttribute{{0.0f, 1.0f, 1.0f}}, // 青
+            VertexAttribute{{1.0f, 0.5f, 0.0f}}, // 橙
+            VertexAttribute{{0.5f, 0.0f, 0.5f}}, // 紫
         },
-        object_data{}, 3, 1, mesh::get_topLeftLocal(std::span{quadVerts}), model_state{});
+        mesh::get_topLeftLocal(std::span{quadVerts}), model_state{});
 
     // 随机生成两个纹理索引和采样器索引
-    auto [textureIndex1] = autoSpinStore.view_entity<"textureData">(0, autoSpinId);
-    static_assert(std::is_reference_v<decltype(textureIndex1)>);
 
     //diff: [test_dod3] end
 
@@ -1563,22 +1584,62 @@ try
         const float dt = world.inputCtx.deltaTime;
         // 更新自旋动画的累积时间
         spinElapsed += dt;
-        // Buffer is already mapped. You can access its memory.
+
+        auto start = std::chrono::high_resolution_clock::now();
         uint32_t idx = 0;
-        for (auto [objectData] : autoSpinStore.view<"objectData">(currentFrame))
         {
-            float phaseOffset = idx * glm::radians(137.5f);
-            auto angle = spinElapsed * glm::radians(90.0f) + phaseOffset;
-            objectData = object_data{
-                glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0.0f, 0.0f, 1.0f))};
+            // Buffer is already mapped. You can access its memory.
+            for (auto [instanceData] : autoSpinStore.view<"instanceData">(currentFrame))
+            {
+                static_assert(std::is_reference_v<decltype(instanceData)>);
+                auto &mat = instanceData.objectData.matrix;
+                if (idx == 0) [[unlikely]]
+                {
+                    float phaseOffset = idx * glm::radians(137.5f);
+                    auto angle = spinElapsed * glm::radians(90.0f) + phaseOffset;
+                    mat =
+                        glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0.0f, 0.0f, 1.0f));
+                }
+                else [[likely]]
+                {
+                    // 提取现有的平移和缩放
+                    glm::vec3 translation = glm::vec3(mat[3]);       // 第4列是平移
+                    glm::vec3 scale(glm::length(glm::vec3(mat[0])),  // 第1列长度 = X缩放
+                                    glm::length(glm::vec3(mat[1])),  // 第2列长度 = Y缩放
+                                    glm::length(glm::vec3(mat[2]))); // 第3列长度 = Z缩放
+
+                    float phaseOffset = idx * glm::radians(137.5f);
+                    float angle = spinElapsed * glm::radians(90.0f) + phaseOffset;
+                    glm::mat4 rot =
+                        glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0.0f, 0.0f, 1.0f));
+
+                    // 重构：缩放 → 旋转 → 平移（与创建时的顺序保持一致）
+                    mat = glm::translate(glm::mat4(1.0f), translation) * rot *
+                          glm::scale(glm::mat4(1.0f), scale);
+                }
+
+                ++idx;
+            }
+            for (const auto &[instanceData, modelState] :
+                 interactiveStore.view<"instanceData", "modelState">(currentFrame))
+            {
+                //diff: [test_dod8] 构造时的偏移迁移到这里
+                auto &objectData = instanceData.objectData;
+                modelState.model_matrix.translation.z = 0.5f;
+                objectData = object_data{modelState.model_matrix()};
+            }
         }
-        for (const auto &[objectData, modelState] :
-             interactiveStore.view<"objectData", "modelState">(currentFrame))
-        {
-            //diff: [test_dod8] 构造时的偏移迁移到这里
-            modelState.model_matrix.translation.z = 0.5f;
-            objectData = object_data{modelState.model_matrix()};
-        }
+        // 3. 记录结束时间点
+        auto end = std::chrono::high_resolution_clock::now();
+
+        // 4. 计算时间差，并转换为毫秒
+        auto duration =
+            std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+        // 5. 打印耗时
+        if (auto count = duration.count(); count > 0)
+            std::cout << "updateObjectData耗时: " << duration.count()
+                      << " 毫秒,数据量: " << idx << std::endl;
     };
     // diff: [test_model_matrix2] end
 
@@ -1852,77 +1913,71 @@ try
 
         auto start = std::chrono::high_resolution_clock::now();
 
-        // 3. 记录结束时间点
-        auto end = std::chrono::high_resolution_clock::now();
-
         {
             static std::vector<VkDrawIndexedIndirectCommand> g_cmds;
             static std::vector<InstanceData> g_allInstances;
             static std::vector<VertexAttribute> g_allAttributes;
 
-            g_cmds.clear();
-            g_allInstances.clear();
-            g_allAttributes.clear();
+            // 临时命令和常量数组
+            std::vector<VkDrawIndexedIndirectCommand> cmds;
+            std::vector<CommandConstant> cmdConsts;
 
-            uint32_t objectId = 0;
-            const Mesh &quad_mesh = meshMap["quad"];
-            for (auto [vertexAttribute, objectData, textureData, samplerData] :
-                 autoSpinStore.view<"vertexAttribute", "objectData", "textureData",
-                                    "samplerData">(currentFrame))
-            {
-                InstanceData insts = {.textureIndex = textureData,
-                                      .samplerIndex = samplerData,
-                                      .objectId = objectId++,
-                                      .vertexAttributeOffset =
-                                          static_cast<uint32_t>(g_allAttributes.size()),
-                                      .matrix = objectData.matrix};
-                uint32_t firstInstance = static_cast<uint32_t>(g_allInstances.size());
+            // 用于写入 buffer 的偏移
+            VkDeviceSize instanceOffset = 0;
+            VkDeviceSize attributeOffset = 0;
 
-                g_allInstances.insert(g_allInstances.end(), insts);
-                g_allAttributes.insert(g_allAttributes.end(), vertexAttribute.begin(),
-                                       vertexAttribute.end());
+            // 处理一个 store（它绑定到一个 mesh，mesh 提供顶点数）
+            auto processStore = [&](auto &store, const Mesh &mesh, uint32_t frame) {
+                uint32_t count = store.size(); // 存活实体数
+                if (count == 0)
+                    return;
+                // ★ 计算正确的 firstInstance
+                uint32_t firstInstance =
+                    static_cast<uint32_t>(instanceOffset / sizeof(InstanceData));
 
-                g_cmds.push_back(
-                    quad_mesh.getDrawCommand(static_cast<uint32_t>(1), firstInstance));
-            }
-            for (auto [vertexAttribute, objectData, textureData, samplerData] :
-                 interactiveStore.view<"vertexAttribute", "objectData", "textureData",
-                                       "samplerData">(currentFrame))
-            {
-                InstanceData insts = {.textureIndex = textureData,
-                                      .samplerIndex = samplerData,
-                                      .objectId = objectId++,
-                                      .vertexAttributeOffset =
-                                          static_cast<uint32_t>(g_allAttributes.size()),
-                                      .matrix = objectData.matrix};
-                uint32_t firstInstance = static_cast<uint32_t>(g_allInstances.size());
+                // 1. 整体拷贝实例数据（每个实体一个 InstanceData）
+                // 假设 store 中有 "instanceData" 字段，且类型为 InstanceData
+                InstanceData *instSrc =
+                    store.template raw_field<"instanceData">(frame).data();
+                VkDeviceSize instSize = count * sizeof(InstanceData);
+                memcpy((char *)batch.globalInstanceBuffer.mapPtr() + instanceOffset,
+                       instSrc, instSize);
 
-                g_allInstances.insert(g_allInstances.end(), insts);
-                g_allAttributes.insert(g_allAttributes.end(), vertexAttribute.begin(),
-                                       vertexAttribute.end());
+                // 2. 整体拷贝属性数据（每个实体一个 std::array<VertexAttribute, 4>）
+                std::array<VertexAttribute, 4> *attrSrc =
+                    store.template raw_field<"vertexAttribute">(frame).data();
+                VkDeviceSize attrSize = count * sizeof(std::array<VertexAttribute, 4>);
+                memcpy((char *)batch.globalAttributeBuffer.mapPtr() + attributeOffset,
+                       attrSrc, attrSize);
 
-                g_cmds.push_back(
-                    quad_mesh.getDrawCommand(static_cast<uint32_t>(1), firstInstance));
-            }
+                // 3. 生成间接命令
+                cmds.push_back(mesh.getDrawCommand(count, firstInstance));
 
-            // 上传实例数据
-            memcpy(batch.globalInstanceBuffer.mapPtr(), g_allInstances.data(),
-                   g_allInstances.size() * sizeof(InstanceData));
+                // 4. 生成命令常量
+                cmdConsts.push_back(CommandConstant{mesh.vertexCount});
 
-            // 上传属性数据
-            VkDeviceSize requiredAttrSize =
-                g_allAttributes.size() * sizeof(VertexAttribute);
-            memcpy(batch.globalAttributeBuffer.mapPtr(), g_allAttributes.data(),
-                   requiredAttrSize);
+                instanceOffset += instSize;
+                attributeOffset += attrSize;
 
-            // 上传间接命令
-            memcpy(batch.indirectDrawBuffer.mapPtr(), g_cmds.data(),
-                   g_cmds.size() * sizeof(VkDrawIndexedIndirectCommand));
+                // std::cout << "写入了实体: " << count << std::endl;
+            };
 
-            assert(g_cmds.size() <= MAX_DRAW_CALLS);
+            const Mesh &quadMesh = meshMap["quad"];
+            processStore(autoSpinStore, quadMesh, currentFrame);
+            processStore(interactiveStore, quadMesh, currentFrame);
 
-            batch.drawCount = objectId;
+            uint32_t drawCount = static_cast<uint32_t>(cmds.size());
+            batch.drawCount = drawCount;
+
+            // 上传命令和常量
+            memcpy(batch.indirectDrawBuffer.mapPtr(), cmds.data(),
+                   drawCount * sizeof(VkDrawIndexedIndirectCommand));
+            memcpy(batch.commandConstantsBuffer.mapPtr(), cmdConsts.data(),
+                   drawCount * sizeof(CommandConstant));
         }
+
+        // 3. 记录结束时间点
+        auto end = std::chrono::high_resolution_clock::now();
 
         // 4. 计算时间差，并转换为毫秒
         auto duration =
@@ -1930,7 +1985,8 @@ try
 
         // NOTE: 函数执行耗时: 2 毫秒. [FPS]  77.1 (avg frame: 12.963 ms) 占用了1/6
         // 5. 打印耗时
-        // std::cout << "函数执行耗时: " << duration.count() << " 毫秒" << std::endl;
+        if (auto count = duration.count(); count > 0)
+            std::cout << "函数执行耗时: " << duration.count() << " 毫秒" << std::endl;
     };
 
     // diff: [test_indirectdraw] end
@@ -2144,7 +2200,8 @@ try
             PushData pushConstants = {
                 .vertexAddress = batch.globalVertexBufferAddress,
                 .attributeAddress = batch.globalAttributeBufferAddress,
-                .instanceAddress = batch.globalInstanceBufferAddress};
+                .instanceAddress = batch.globalInstanceBufferAddress,
+                .commandConstantsAddress = batch.commandConstantsBufferAddress};
             commandBuffer.pushConstants(*pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0,
                                         sizeof(PushData), &pushConstants);
             commandBuffer.drawIndexedIndirect(batch.indirectDrawBuffer.buffer(), 0,
@@ -2349,6 +2406,69 @@ try
         {
             pickMouse.valid = false;
         }
+
+        // 每1秒添加一批实体，直到总数达到1000
+        {
+            auto &autoSpinStore = world.soaCtx.autoSpinStore;
+            constexpr int TARGET_ENTITIES = 1000;
+            constexpr int BATCH_SIZE = 100;
+
+            if (autoSpinStore.size() < TARGET_ENTITIES)
+            {
+                static auto lastAddTime = std::chrono::steady_clock::now();
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(now -
+                                                                          lastAddTime)
+                        .count() >= 1000)
+                {
+                    lastAddTime = now;
+                    int toAdd =
+                        std::min(BATCH_SIZE, TARGET_ENTITIES -
+                                                 static_cast<int>(autoSpinStore.size()));
+
+                    if (toAdd > autoSpinStore.free_size())
+                        autoSpinStore.expansion_size(toAdd - autoSpinStore.free_size());
+
+                    std::mt19937 rng(std::random_device{}());
+                    std::uniform_real_distribution<float> colorDist(0.0f, 1.0f);
+                    std::uniform_real_distribution<float> posDist(-1.5f,
+                                                                  1.5f); // 散开范围
+                    std::uniform_real_distribution<float> scaleDist(0.01f,
+                                                                    0.05f); // 粒子极小
+                    // 可选：随机使用不同纹理和采样器
+                    std::uniform_int_distribution<int> texDist(0, 1);
+                    std::uniform_int_distribution<int> sampDist(0, 1);
+
+                    for (int i = 0; i < toAdd; ++i)
+                    {
+                        float scale = scaleDist(rng);
+                        glm::vec3 pos(posDist(rng), posDist(rng), 0.0f);
+
+                        // 构建模型矩阵：先缩放，后平移（重要！否则位置会被缩放影响）
+                        glm::mat4 model = glm::translate(glm::mat4(1.0f), pos) *
+                                          glm::scale(glm::mat4(1.0f), glm::vec3(scale));
+                        // 若需要粒子旋转（不关心朝向，可加随机旋转）
+                        // model = model * glm::toMat4(glm::angleAxis(posDist(rng), glm::vec3(0,0,1)));
+
+                        uint32_t texIdx = texDist(rng) ? 3 : 0;   // 纹理0或3（棋盘/渐变）
+                        uint32_t sampIdx = sampDist(rng) ? 1 : 0; // 采样器0或1
+
+                        InstanceData instData{
+                            .objectId = static_cast<uint32_t>(autoSpinStore.size()),
+                            .textureIndex = texIdx,
+                            .samplerIndex = sampIdx,
+                            .objectData = object_data{model}};
+
+                        std::array<VertexAttribute, 4> attrs;
+                        for (auto &attr : attrs)
+                            attr.color =
+                                glm::vec3(colorDist(rng), colorDist(rng), colorDist(rng));
+
+                        autoSpinStore.new_entity(instData, attrs);
+                    }
+                }
+            }
+        }
     };
 
     //NOTE: 下面的内联做的更好，编译期的数据更利于优化
@@ -2510,6 +2630,27 @@ try
         invoke_aggregate_ranges<"ProcessingWorldInput_", 0, 0>(vulaknDataTransformer,
                                                                world);
 
+        // ========== 新增：每 2 秒切换 autoSpinStore 第一个实体的纹理索引 ==========
+        {
+            auto &autoSpinStore = world.soaCtx.autoSpinStore;
+            if (autoSpinStore.size() > 0) // 确保至少有一个实体
+            {
+                static auto lastTexSwitch = std::chrono::steady_clock::now();
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::seconds>(now - lastTexSwitch)
+                        .count() >= 2)
+                {
+                    lastTexSwitch = now;
+
+                    // 直接通过 view_entity 获取第一个实体的 textureIndex 引用并修改
+                    // 注意：实体 ID 是 0（第一个创建的实体）
+                    auto [texRef] = autoSpinStore.view_entity<"instanceData">(0, 0);
+                    // 在 0 和 3 之间切换（这两个槽位已经绑定了纹理，确保有效）
+                    texRef.textureIndex = (texRef.textureIndex == 0) ? 3 : 0;
+                }
+            }
+        }
+        // ======================================================================
         drawFrame(world);
 
         // FPS 统计

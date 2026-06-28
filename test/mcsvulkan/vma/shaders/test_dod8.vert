@@ -21,12 +21,13 @@ struct VertexAttribute{
 };
 
 struct InstanceData{
+    uint objectId;
     uint textureIndex;// 纹理数组索引
     uint samplerIndex;// 采样器数组索引
-    
-    uint objectId;
-    uint vertexAttributeOffset;
     mat4 matrix;
+};
+struct CommandConstant{
+    uint perInstanceAttributeCount;
 };
 
 layout(buffer_reference,scalar)readonly buffer VertexBuffer{
@@ -38,11 +39,15 @@ layout(buffer_reference,scalar)readonly buffer AttributePool{
 layout(buffer_reference,scalar)readonly buffer InstanceBuffer{
     InstanceData instances[];
 };
+layout(buffer_reference,scalar)readonly buffer CommandConstBuffer{
+    CommandConstant consts[];
+};
 
 layout(push_constant)uniform PushConsts{
     uint64_t vertexAddress;
     uint64_t attributePoolAddress;
     uint64_t instanceAddress;
+    uint64_t commandConstantsAddress;
 }pc;
 
 // 输出到片段着色器
@@ -55,6 +60,11 @@ layout(location=3)out flat uint fragSamplerIndex;// 采样器索引（不需要�
 layout(location=4)out flat uint fragObjectId;
 
 void main(){
+    // 获取常量数组
+    CommandConstBuffer cmdConsts=CommandConstBuffer(pc.commandConstantsAddress);
+    CommandConstant cc=cmdConsts.consts[gl_DrawIDARB];
+    uint attrCount=cc.perInstanceAttributeCount;
+    
     VertexBuffer vertBuf=VertexBuffer(pc.vertexAddress);
     AttributePool attrPool=AttributePool(pc.attributePoolAddress);
     InstanceBuffer instBuf=InstanceBuffer(pc.instanceAddress);
@@ -64,7 +74,7 @@ void main(){
     
     // 计算本地顶点索引（0 ~ mesh.vertexCount-1）
     uint localVertexIndex=gl_VertexIndex-gl_BaseVertexARB;
-    uint attrIdx=inst.vertexAttributeOffset+localVertexIndex;// 修正点
+    uint attrIdx=gl_InstanceIndex*attrCount+localVertexIndex;
     VertexAttribute attr=attrPool.attributes[attrIdx];
     
     // 模型-视图-投影变换
