@@ -293,7 +293,7 @@ struct model_matrix
 
 // diff: [camera_model] end
 
-//diff: [test_indirectdraw] start
+//diff: [test_dod8] start
 struct object_data
 {
     glm::mat4 matrix;
@@ -361,7 +361,7 @@ struct PerFrameBatch
 
     uint32_t drawCount = 0;
 };
-//diff: [test_indirectdraw] end
+//diff: [test_dod8] end
 
 //diff: [test_indirectdraw2] start
 // NOLINTBEGIN
@@ -1388,7 +1388,7 @@ try
 
     // init data
 
-    //diff: [test_dod3] start
+    //diff: [test_dod8] start
     auto global_id = 0;
     auto autoSpinId =
         autoSpinStore.new_entity(InstanceData{global_id++, 0, 0, object_data{}},
@@ -1585,6 +1585,7 @@ try
         // 更新自旋动画的累积时间
         spinElapsed += dt;
 
+        //diff: [test_dod8] start
         auto start = std::chrono::high_resolution_clock::now();
         uint32_t idx = 0;
         {
@@ -1640,6 +1641,7 @@ try
         if (auto count = duration.count(); count > 0)
             std::cout << "updateObjectData耗时: " << duration.count()
                       << " 毫秒,数据量: " << idx << std::endl;
+        //diff: [test_dod8] end
     };
     // diff: [test_model_matrix2] end
 
@@ -1912,7 +1914,7 @@ try
         auto &interactiveStore = soaCtx.interactiveStore;
 
         auto start = std::chrono::high_resolution_clock::now();
-
+        //diff: [test_dod8] start
         {
             static std::vector<VkDrawIndexedIndirectCommand> g_cmds;
             static std::vector<InstanceData> g_allInstances;
@@ -1975,7 +1977,7 @@ try
             memcpy(batch.commandConstantsBuffer.mapPtr(), cmdConsts.data(),
                    drawCount * sizeof(CommandConstant));
         }
-
+        //diff: [test_dod8] end
         // 3. 记录结束时间点
         auto end = std::chrono::high_resolution_clock::now();
 
