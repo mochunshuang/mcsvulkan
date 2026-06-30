@@ -366,6 +366,11 @@ namespace mcs::vulkan
             pool_->device()->cmdSetDepthWriteEnable(
                 value_, static_cast<VkBool32>(depthWriteEnable));
         }
+        constexpr void setDepthTestEnable(bool depthTestEnable) const noexcept
+        {
+            pool_->device()->cmdSDepthTestEnable(value_,
+                                                 static_cast<VkBool32>(depthTestEnable));
+        }
         constexpr void drawIndexedIndirect(VkBuffer buffer, VkDeviceSize offset,
                                            uint32_t drawCount,
                                            uint32_t stride) const noexcept

@@ -142,5 +142,13 @@ add_std_glsl_target(test_dod7 test_indirectdraw_no_pick.vert test_indirectdraw_n
 add_std_glsl_target(test_dod8 test_dod8.vert test_indirectdraw_no_pick.frag)
 add_std_glsl_target(test_dod9 test_dod9.vert test_indirectdraw_no_pick.frag)
 
+# NOTE: 就顶点着色器不同： ubo.proj[1][1] *= -1; 是BUG的来源
+add_std_glsl_target(test_dod8_debug test_dod8_debug.vert test_indirectdraw_no_pick.frag)
+add_std_glsl_target(test_dod8_debug2 test_dod8.vert test_indirectdraw_no_pick.frag)
+
+# NDC 的重要性。矩阵/相机矩阵，有一个有问题，就是全部有问题
+add_std_glsl_target(test_dod10 test_dod9.vert test_indirectdraw_no_pick.frag)
+add_std_glsl_target(test_dod11 test_dod9.vert test_indirectdraw_no_pick.frag)
+
 # end
 std_glsl_env_destroy()

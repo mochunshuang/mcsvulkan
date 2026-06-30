@@ -715,6 +715,12 @@ namespace mcs::vulkan
             MCS_ASSERT(table_.vkCmdSetDepthWriteEnable != nullptr);
             table_.vkCmdSetDepthWriteEnable(commandBuffer, depthWriteEnable);
         }
+        constexpr void cmdSDepthTestEnable(VkCommandBuffer commandBuffer,
+                                           VkBool32 depthTestEnable) const noexcept
+        {
+            MCS_ASSERT(table_.vkCmdSetDepthTestEnable != nullptr);
+            table_.vkCmdSetDepthTestEnable(commandBuffer, depthTestEnable);
+        }
 
         constexpr void cmdDrawIndexedIndirect(VkCommandBuffer commandBuffer,
                                               VkBuffer buffer, VkDeviceSize offset,
