@@ -70,6 +70,14 @@ if(WIN32 AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 
     # https://github.com/msys2/MINGW-packages/issues/29279
     add_compile_definitions(__cpp_lib_constexpr_exceptions=0) # multiple definition of `std::runtime_error::runtime_error(std::runtime_error const&)'
+
+    # -Wl, → 将参数传递给链接器 (ld)
+    # -Wa, → 将参数传递给汇编器 (as)
+    # error: CMakeFiles/mcsvulkan-vma-test_dod12.dir/test/mcsvulkan/vma/test_dod12.cpp.obj: file too big
+    # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wa,-mbig-obj")
+    add_compile_options(
+        "$<$<COMPILE_LANGUAGE:CXX>:-Wa,-mbig-obj>"
+    )
 endif()
 
 # test add

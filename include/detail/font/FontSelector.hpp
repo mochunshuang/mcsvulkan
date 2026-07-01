@@ -3,7 +3,6 @@
 #include "FontContext.hpp"
 #include "FontFactory.hpp"
 #include <cassert>
-#include <cstddef>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -18,19 +17,20 @@
 
 namespace mcs::vulkan::font
 {
-    struct select_result // NOLINTBEGIN
-    {
-        const FontContext *font{nullptr};
-        hb_language_t language{nullptr};
-
-        operator bool() const noexcept
-        {
-            return font != nullptr;
-        }
-    }; // NOLINTEND
 
     class FontSelector
     {
+        struct select_result // NOLINTBEGIN
+        {
+            const FontContext *font{nullptr};
+            hb_language_t language{nullptr};
+
+            operator bool() const noexcept
+            {
+                return font != nullptr;
+            }
+        }; // NOLINTEND
+
         // 辅助：在 selectable_ 中查找满足谓词的字体
         const FontContext *findInSelectable(auto &&pred) const noexcept
         {
@@ -103,6 +103,8 @@ namespace mcs::vulkan::font
         }
 
       public:
+        using select_result_type = select_result;
+        using font_context_type = FontContext;
         // TODO(mcs): 可补充字体排序权重、缓存匹配结果、处理多语言回退顺序
         /*
         字体选择的核心是确定哪个字体能够提供该字符（码点）的合理字形，而具体字形形状、变体、合字等是通过

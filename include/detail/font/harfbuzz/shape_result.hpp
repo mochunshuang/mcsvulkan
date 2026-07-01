@@ -4,11 +4,11 @@
 #include <cstdint>
 
 #include "../GlyphInfo.hpp"
-#include "../FontContext.hpp"
 #include "hb.h"
 
 namespace mcs::vulkan::font::harfbuzz
 {
+    template <typename FontContext>
     struct shape_result // NOLINTBEGIN
     {
         uint32_t glyph_index;

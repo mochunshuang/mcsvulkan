@@ -1,10 +1,10 @@
 #pragma once
 
-#include "shape_info.hpp"
 #include <vector>
 
 namespace mcs::vulkan::font
 {
+    template <typename shape_info>
     struct shape_run
     {
         hb_direction_t direction; // bidi

@@ -1,8 +1,8 @@
 #pragma once
 
-#include "FontContext.hpp"
 namespace mcs::vulkan::font
 {
+    template <typename FontContext>
     struct shape_info
     {
         size_t logical_start;

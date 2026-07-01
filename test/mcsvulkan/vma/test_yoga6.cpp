@@ -1087,7 +1087,9 @@ try
     using RenderMeshes = std::vector<mesh_base>;
     auto generate_line_meshes =
         [](VmaAllocator allocator, const CommandPool &pool, const Queue &queue,
-           const std::vector<std::vector<font_ns::harfbuzz::shape_result>> &shape_results,
+           const std::vector<
+               std::vector<font_ns::harfbuzz::shape_result<font::FontContext>>>
+               &shape_results,
            const std::vector<char> &break_types,
            double maxLineWidth,        // 行宽（世界坐标系）
            double InputFontSize = 0.2, // 字体大小（整体缩放）
@@ -1106,8 +1108,10 @@ try
         // diff: [test_yoga2] end
 
         // 1. 建立逻辑索引 -> 字形指针的映射（假设一对一）
-        std::vector<const font_ns::harfbuzz::shape_result *> visual_glyphs;
-        std::unordered_map<size_t, const font_ns::harfbuzz::shape_result *>
+        std::vector<const font_ns::harfbuzz::shape_result<font::FontContext> *>
+            visual_glyphs;
+        std::unordered_map<size_t,
+                           const font_ns::harfbuzz::shape_result<font::FontContext> *>
             logical_to_glyph;
         for (const auto &run : shape_results)
         {
@@ -1169,7 +1173,8 @@ try
         {
             std::unordered_set<size_t> log_set(line.logical_indices.begin(),
                                                line.logical_indices.end());
-            std::vector<const font_ns::harfbuzz::shape_result *> line_glyphs;
+            std::vector<const font_ns::harfbuzz::shape_result<font::FontContext> *>
+                line_glyphs;
             for (const auto *glyph : visual_glyphs)
             {
                 if (log_set.count(glyph->logical_idx))

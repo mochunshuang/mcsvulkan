@@ -12,8 +12,6 @@
 #include "../../utils/unique_handle.hpp"
 #include "../../utils/mcslog.hpp"
 
-#include "../GlyphInfo.hpp"
-
 #include "../utf8proc/codepoint_to_utf8.hpp"
 
 #include "hb.h"
@@ -30,6 +28,7 @@ namespace mcs::vulkan::font::harfbuzz
             unsigned int glyph_count;
         };
 
+        template <typename shape_info>
         static constexpr glyph_info get_glyph_info(
             const std::vector<uint32_t> &logical_codepoints, hb_buffer_t *buf,
             hb_direction_t direction, const shape_info &run)
@@ -52,11 +51,14 @@ namespace mcs::vulkan::font::harfbuzz
                     .glyph_count = glyph_count};
         }
 
+        template <typename FontContext>
+            requires(requires() { typename FontContext::glyph_info_type; })
         static constexpr void add_shape_result(
-            std::vector<shape_result> &run_result,
+            std::vector<shape_result<FontContext>> &run_result,
             const std::vector<uint32_t> &logical_codepoints, hb_direction_t direction,
-            const shape_info &run, const glyph_info &glyph_info)
+            const shape_info<FontContext> &run, const glyph_info &glyph_info)
         {
+            using GlyphInfo = FontContext::glyph_info_type;
             const double fontSizePixels = run.font->font.atlas.size; // NOLINT
             // HarfBuzz uses 26.6 fixed-point numbers for positions (1 unit = 1/64 pixel)
             constexpr double fixed_point_value = 64.0; // NOLINT
@@ -111,11 +113,15 @@ namespace mcs::vulkan::font::harfbuzz
             }
         }
 
+        template <typename FontContext>
         static constexpr void replacement_shape_result(
-            std::vector<shape_result> &run_result, hb_buffer_t *buf,
-            hb_direction_t direction, const shape_info &run, const FontContext *font)
+            std::vector<shape_result<FontContext>> &run_result, hb_buffer_t *buf,
+            hb_direction_t direction, const shape_info<FontContext> &run,
+            const FontContext *font)
         {
             assert(font->glyph_index_to_glyphs.contains(0));
+
+            using GlyphInfo = FontContext::glyph_info_type;
 
             std::vector<uint32_t> logical_codepoints(run.length, 0);
             hb_buffer_add_utf32(buf, logical_codepoints.data(), run.length, 0,
@@ -169,10 +175,19 @@ namespace mcs::vulkan::font::harfbuzz
 
     }; // namespace detail
 
-    static constexpr std::vector<std::vector<shape_result>> shape(
+    template <typename FontContext>
+        requires(requires(std::vector<shape_result<FontContext>> &run_result,
+                          hb_buffer_t *buf, hb_direction_t direction,
+                          const shape_info<FontContext> &run, const FontContext *font) {
+            detail::replacement_shape_result(run_result, buf, direction, run, font);
+            typename FontContext::glyph_info_type;
+        })
+    static constexpr auto shape(
         const std::vector<uint32_t> &logical_codepoints,
-        const std::vector<shape_run> &shape_runs, const FontContext *notdefFont)
+        const std::vector<shape_run<shape_info<FontContext>>> &shape_runs,
+        const FontContext *notdefFont)
     {
+        using shape_result_type = shape_result<FontContext>;
         using HBBufferPtr = unique_handle<hb_buffer_t *, [](hb_buffer_t *value) noexcept {
             hb_buffer_destroy(value);
         }>;
@@ -180,13 +195,13 @@ namespace mcs::vulkan::font::harfbuzz
         HBBufferPtr raii_buf = HBBufferPtr{hb_buffer_create()};
         hb_buffer_t *buf = raii_buf.get();
 
-        std::vector<std::vector<shape_result>> result;
+        std::vector<std::vector<shape_result_type>> result;
         result.reserve(shape_runs.size());
 
         for (const auto &shape_run : shape_runs)
         {
             hb_direction_t direction = shape_run.direction;
-            std::vector<shape_result> run_result;
+            std::vector<shape_result_type> run_result;
             if (direction == HB_DIRECTION_LTR)
             {
                 for (const auto &run : shape_run.runs)
@@ -224,19 +239,20 @@ namespace mcs::vulkan::font::harfbuzz
 
         return result;
     }
-
+    template <typename FontContext>
     static constexpr void print_shape_result(
         const std::vector<uint32_t> &logical_codepoints,
-        std::vector<std::vector<shape_result>> &results)
+        std::vector<std::vector<shape_result<FontContext>>> &results)
     {
+        using shape_result_type = shape_result<FontContext>;
         std::println("---Stage 6: Shape Result: Glyphs grouped by logical character ---");
         std::println("Total runs: {}", results.size());
 
         // 按 logical_idx 分组
-        std::unordered_map<size_t, std::vector<const shape_result *>> char_to_glyphs;
+        std::unordered_map<size_t, std::vector<const shape_result_type *>> char_to_glyphs;
         size_t total_glyphs{};
         for (const auto &run_result : results)
-            for (const shape_result &run : run_result)
+            for (const shape_result_type &run : run_result)
             {
                 char_to_glyphs[run.logical_idx].push_back(&run);
                 ++total_glyphs;
@@ -249,7 +265,7 @@ namespace mcs::vulkan::font::harfbuzz
         for (const auto &run_result : results)
         {
             int i = 0;
-            for (const shape_result &run : run_result)
+            for (const shape_result_type &run : run_result)
             {
                 auto index = run.logical_idx;
                 uint32_t cp = logical_codepoints[index];
