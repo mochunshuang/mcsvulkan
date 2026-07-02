@@ -2362,20 +2362,196 @@ try
     layout.print();
     std::println("layout.print [end]");
 
-    // #define random_z
+    //diff: [test_dod12] start
+    auto generate_text_instances_for_node = [&](ui_data_type &uiStore,
+                                                uint32_t &global_id, float nodeLeft,
+                                                float nodeTop, float nodeWidth,
+                                                float nodeHeight, float padLeft,
+                                                float padRight, float padTop,
+                                                float padBottom,
+                                                const auto &shape_results,
+                                                const auto &break_types,
+                                                uint32_t modulateFlag = 1) {
+        // 计算内容区域
+        float x = nodeLeft + padLeft;
+        float y = nodeTop + padTop;
+        float contentWidth = nodeWidth - padLeft - padRight;
+        float contentHeight = nodeHeight - padTop - padBottom;
 
-    auto generateUIInstances = [&](Layout &layout) {
-        // uiStore.clear();
+        std::println("=== generate_text_instances_for_node ===");
+        std::println("  nodeLeft={}, nodeTop={}, nodeWidth={}, nodeHeight={}", nodeLeft,
+                     nodeTop, nodeWidth, nodeHeight);
+        std::println("  pads: l={}, r={}, t={}, b={}", padLeft, padRight, padTop,
+                     padBottom);
+        std::println("  content x={}, y={}, width={}, height={}", x, y, contentWidth,
+                     contentHeight);
 
+        // 字体大小和行高（根据内容高度自适应）
+        const double FONT_SIZE_PX = (std::min<double>)(contentHeight, 12.0);
+        const double LINE_HEIGHT_PX = FONT_SIZE_PX * 1.5;
+        const double ORIGIN_X = static_cast<double>(x);
+        const double ORIGIN_Y = static_cast<double>(y) + FONT_SIZE_PX; // 基线
+        const double MAX_LINE_WIDTH = static_cast<double>(contentWidth);
+
+        // 建立逻辑索引到字形指针的映射（复用原逻辑）
+        using FontContext = font::FontContext<mcs::vulkan::memory::resource>;
+        std::vector<const font_ns::harfbuzz::shape_result<FontContext> *> visual_glyphs;
+        std::unordered_map<size_t, const font_ns::harfbuzz::shape_result<FontContext> *>
+            logical_to_glyph;
+        for (const auto &run : shape_results)
+        {
+            for (const auto &glyph : run)
+            {
+                visual_glyphs.push_back(&glyph);
+                logical_to_glyph[glyph.logical_idx] = &glyph;
+            }
+        }
+
+        // 分行（复制自原 generate_line_meshes）
+        struct LineInfo
+        {
+            std::vector<size_t> logical_indices;
+        };
+        std::vector<LineInfo> lines;
+        LineInfo current_line;
+        double cursorX = ORIGIN_X;
+        for (size_t log_idx = 0; log_idx < break_types.size(); ++log_idx)
+        {
+            char break_type = break_types[log_idx];
+            if (break_type == LINEBREAK_MUSTBREAK)
+            {
+                if (!current_line.logical_indices.empty())
+                {
+                    lines.push_back(std::move(current_line));
+                    current_line = LineInfo{};
+                    cursorX = ORIGIN_X;
+                }
+                continue;
+            }
+            auto it = logical_to_glyph.find(log_idx);
+            if (it == logical_to_glyph.end())
+                continue;
+            const auto *glyph = it->second;
+            double advance = glyph->advance_x * FONT_SIZE_PX;
+            double new_width = cursorX + advance - ORIGIN_X;
+            if (!current_line.logical_indices.empty() && new_width > MAX_LINE_WIDTH)
+            {
+                lines.push_back(std::move(current_line));
+                current_line = LineInfo{};
+                cursorX = ORIGIN_X;
+            }
+            current_line.logical_indices.push_back(log_idx);
+            cursorX += advance;
+        }
+        if (!current_line.logical_indices.empty())
+        {
+            lines.push_back(std::move(current_line));
+        }
+
+        // 生成实例
         float w = static_cast<float>(swapchain.refImageExtent().width);
         float h = static_cast<float>(swapchain.refImageExtent().height);
         auto pixelToNDC = [=](float px, float py) -> glm::vec2 {
             return {2.0f * px / w - 1.0f, 2.0f * py / h - 1.0f};
         };
+
+        double currentY = ORIGIN_Y;
+        for (const auto &line : lines)
+        {
+            std::unordered_set<size_t> log_set(line.logical_indices.begin(),
+                                               line.logical_indices.end());
+            std::vector<const font_ns::harfbuzz::shape_result<FontContext> *> line_glyphs;
+            for (const auto *glyph : visual_glyphs)
+            {
+                if (log_set.count(glyph->logical_idx))
+                {
+                    line_glyphs.push_back(glyph);
+                }
+            }
+
+            cursorX = ORIGIN_X;
+            std::println("  New line at currentY={}, cursorX={}", currentY, cursorX);
+            for (const auto *g : line_glyphs)
+            {
+                double baselineY = currentY + g->offset_y * FONT_SIZE_PX;
+                float left =
+                    static_cast<float>(cursorX + g->plane_bounds.left * FONT_SIZE_PX);
+                float bottom =
+                    static_cast<float>(baselineY + g->plane_bounds.bottom * FONT_SIZE_PX);
+                float right =
+                    static_cast<float>(cursorX + g->plane_bounds.right * FONT_SIZE_PX);
+                float top =
+                    static_cast<float>(baselineY + g->plane_bounds.top * FONT_SIZE_PX);
+                std::println(
+                    "    Glyph id={} [logical_idx: {}] char U+{:04X}: left={:.2f}, "
+                    "right={:.2f}, "
+                    "top={:.2f}, bottom={:.2f}",
+                    global_id, g->logical_idx, codepoints[g->logical_idx], left, right,
+                    top, bottom);
+
+                // ★ 修正：p0 = 左上，p2 = 右下
+                glm::vec2 p0 = pixelToNDC(left, top);
+                glm::vec2 p2 = pixelToNDC(right, bottom);
+                glm::mat4 M = make_ndc_quad_matrix(p0, p2, 0.0f);
+                std::println("      NDC p0=({:.3f},{:.3f}), p2=({:.3f},{:.3f})", p0.x,
+                             p0.y, p2.x, p2.y);
+                std::println("      Matrix translation: ({:.3f},{:.3f},{:.3f})", M[3][0],
+                             M[3][1], M[3][2]);
+
+                // UV变换：将标准[0,1]²映射到字形的UV边界
+                UvTransform uv = UvTransform::from_target_verts(
+                    std::array<glm::vec2, 4>{{{g->uv_bounds.left, g->uv_bounds.bottom},
+                                              {g->uv_bounds.right, g->uv_bounds.bottom},
+                                              {g->uv_bounds.right, g->uv_bounds.top},
+                                              {g->uv_bounds.left, g->uv_bounds.top}}});
+
+                auto cur_id = global_id++;
+                InstanceData inst{
+                    .objectId = cur_id,
+                    .textureIndex = g->font_ctx->bind.texture_index,
+                    .samplerIndex = g->font_ctx->bind.sampler_index,
+                    .objectData = object_data{M},
+                    .uvTransform = uv,
+                    .fontType = static_cast<uint32_t>(g->font_ctx->type),
+                    .pxRange = static_cast<float>(
+                        g->font_ctx->font.atlas.distanceRange.value_or(0.0)),
+                    .modulateFlag = modulateFlag};
+
+                // 顶点颜色设为左上角顺时针：白色-> 红 -> 绿 -> 蓝
+                std::array<VertexAttribute, 4> attrs = {
+                    VertexAttribute{{1.0f, 1.0f, 1.0f}},
+                    VertexAttribute{{1.0f, 0.0f, 0.0f}},
+                    VertexAttribute{{0.0f, 1.0f, 0.0f}},
+                    VertexAttribute{{0.0f, 0.0f, 1.0f}}};
+
+                uiStore.new_entity(inst, attrs);
+                cursorX += g->advance_x * FONT_SIZE_PX;
+
+                std::println("uiStore add_text id: {}", cur_id);
+            }
+            currentY += LINE_HEIGHT_PX;
+        }
+    };
+
+    //diff: [test_dod12] end
+
+    // #define random_z
+
+    auto generateUIInstances = [&](Layout &layout) {
+        uiStore.clear();
+
+        float w = static_cast<float>(swapchain.refImageExtent().width);
+        float h = static_cast<float>(swapchain.refImageExtent().height);
+        layout.calculate({w, h});
+        auto pixelToNDC = [=](float px, float py) -> glm::vec2 {
+            return {2.0f * px / w - 1.0f, 2.0f * py / h - 1.0f};
+        };
         uint32_t global_id = 0;
-        const auto traverse = [&uiStore, &pixelToNDC, &global_id, &w,
-                               &h](this auto &self, uint32_t cur_id, const Node *node,
-                                   float parentLeft, float parentTop) {
+        const auto traverse = [&uiStore, &pixelToNDC, &global_id, &w, &h,
+                               &generate_text_instances_for_node, &test_shape_result,
+                               &break_result](this auto &self, uint32_t cur_id,
+                                              const Node *node, float parentLeft,
+                                              float parentTop) {
             if (!node)
                 return;
             auto *ygNode = **node;
@@ -2479,6 +2655,34 @@ try
                     printMat4(M);
                 }
                 uiStore.new_entity(inst, attrs);
+
+                if (node->id() == "text_display")
+                {
+                    std::println("=== text_display node detected ===");
+                    std::println("  position: left={}, top={}, width={}, height={}", x, y,
+                                 nw, nh);
+                    // 获取内边距
+                    YGValue padLeftVal = YGNodeStyleGetPadding(ygNode, YGEdgeLeft);
+                    YGValue padRightVal = YGNodeStyleGetPadding(ygNode, YGEdgeRight);
+                    YGValue padTopVal = YGNodeStyleGetPadding(ygNode, YGEdgeTop);
+                    YGValue padBottomVal = YGNodeStyleGetPadding(ygNode, YGEdgeBottom);
+                    float padLeft =
+                        padLeftVal.unit != YGUnitUndefined ? padLeftVal.value : 0.0f;
+                    float padRight =
+                        padRightVal.unit != YGUnitUndefined ? padRightVal.value : 0.0f;
+                    float padTop =
+                        padTopVal.unit != YGUnitUndefined ? padTopVal.value : 0.0f;
+                    float padBottom =
+                        padBottomVal.unit != YGUnitUndefined ? padBottomVal.value : 0.0f;
+
+                    std::println("  padding: left={}, right={}, top={}, bottom={}",
+                                 padLeft, padRight, padTop, padBottom);
+                    // 生成文本实例
+                    generate_text_instances_for_node(
+                        uiStore, ++global_id, x, y, nw, nh, padLeft, padRight, padTop,
+                        padBottom, test_shape_result, break_result.types);
+                    // 注意：文本节点本身不生成面板矩形
+                }
             }
 
             for (const auto &child : node->childrens())
@@ -2487,6 +2691,15 @@ try
 
         traverse(global_id, layout.root(), 0.0f, 0.0f);
     };
+    auto screen_resize = [&](VkExtent2D newSize) {
+        uint32_t newWidth = newSize.width;
+        uint32_t newHeight = newSize.height;
+
+        on_resize(layout, {.available_width = static_cast<float>(newWidth),
+                           .available_height = static_cast<float>(newHeight)});
+        generateUIInstances(
+            layout); //NOTE: [test_dod12] 覆盖上面的布局。导致一闪的成功。 投影的想法，或许才是对的.总之被覆盖
+    };
 
     // 初始调用
     generateUIInstances(layout);
@@ -2494,9 +2707,11 @@ try
     std::println("uiStore.size(): {}", uiStore.size());
     //diff: [test_dod10] end
 
-    auto soaCtx = make_aggregate_ref<"soaCtx", "autoSpinStore", "interactiveStore",
-                                     "autoSpinStoreShareData", "uiStore">(
-        autoSpinStore, interactiveStore, autoSpinStoreShareData, uiStore);
+    auto soaCtx =
+        make_aggregate_ref<"soaCtx", "autoSpinStore", "interactiveStore",
+                           "autoSpinStoreShareData", "uiStore", "screen_resize">(
+            autoSpinStore, interactiveStore, autoSpinStoreShareData, uiStore,
+            screen_resize);
 
     //diff: [test_dod8.cpp] end
 
@@ -2979,35 +3194,37 @@ try
                     bases.push_back(instanceData.objectData.matrix);
                 return bases;
             }();
-
-            if (uiBaseMatrices.size() == uiStore.size())
-            {
-                // 1. 计算整个 UI 组的包围盒中心（或者直接使用 NDC 原点 (0,0)）
-                glm::vec2 center(0.0f); // 如果希望绕屏幕中心旋转，就用 (0,0)
-                // 如果想绕 UI 组的真实中心旋转，可以遍历 baseMatrices 的平移分量求平均：
-                // for (const auto& mat : uiBaseMatrices) center += glm::vec2(mat[3]);
-                // center /= static_cast<float>(uiBaseMatrices.size());
-
-                // 2. 动画参数（绝对时间）
-                float angle = time * 0.5f;
-                float s = 1.0f + 0.3f * sinf(time * 2.0f);
-
-                // 3. 构建全局变换矩阵：平移到中心 → 旋转 → 缩放 → 平移回原点
-                glm::mat4 globalTransform =
-                    glm::translate(glm::mat4(1.0f), glm::vec3(center, 0.0f)) *
-                    glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0, 0, 1)) *
-                    glm::scale(glm::mat4(1.0f), glm::vec3(s, s, 1.0f)) *
-                    glm::translate(glm::mat4(1.0f), glm::vec3(-center, 0.0f));
-
-                // 4. 对每个 UI 面板应用全局变换
-                int idx = 0;
-                for (auto [instanceData] : uiStore.view<"instanceData">(currentFrame))
+            //diff: [test_dod12] start
+            if (0)
+                if (uiBaseMatrices.size() == uiStore.size())
                 {
-                    instanceData.objectData.matrix =
-                        globalTransform * uiBaseMatrices[idx];
-                    ++idx;
+                    // 1. 计算整个 UI 组的包围盒中心（或者直接使用 NDC 原点 (0,0)）
+                    glm::vec2 center(0.0f); // 如果希望绕屏幕中心旋转，就用 (0,0)
+                    // 如果想绕 UI 组的真实中心旋转，可以遍历 baseMatrices 的平移分量求平均：
+                    // for (const auto& mat : uiBaseMatrices) center += glm::vec2(mat[3]);
+                    // center /= static_cast<float>(uiBaseMatrices.size());
+
+                    // 2. 动画参数（绝对时间）
+                    float angle = time * 0.5f;
+                    float s = 1.0f + 0.3f * sinf(time * 2.0f);
+
+                    // 3. 构建全局变换矩阵：平移到中心 → 旋转 → 缩放 → 平移回原点
+                    glm::mat4 globalTransform =
+                        glm::translate(glm::mat4(1.0f), glm::vec3(center, 0.0f)) *
+                        glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0, 0, 1)) *
+                        glm::scale(glm::mat4(1.0f), glm::vec3(s, s, 1.0f)) *
+                        glm::translate(glm::mat4(1.0f), glm::vec3(-center, 0.0f));
+
+                    // 4. 对每个 UI 面板应用全局变换
+                    int idx = 0;
+                    for (auto [instanceData] : uiStore.view<"instanceData">(currentFrame))
+                    {
+                        instanceData.objectData.matrix =
+                            globalTransform * uiBaseMatrices[idx];
+                        ++idx;
+                    }
                 }
-            }
+            //diff: [test_dod12] end
         }
         // diff: [test_dod11] end
         // 3. 记录结束时间点
@@ -3373,6 +3590,8 @@ try
                     elapsed = 0.0f;
                 }
                 bool showUI = (elapsed < UI_ON_DURATION);
+
+                showUI = true; //diff: [test_dod12] 强制可见
 
                 if (showUI)
                 {
@@ -3758,6 +3977,7 @@ try
         auto &globalCtx = world.globalCtx;
         auto &pickCtx = world.pickCtx;
         auto &mainCtx = world.mainCtx;
+        auto &soaCtx = world.soaCtx;
 
         auto &device = globalCtx.device;
         auto &surface = globalCtx.surface;
@@ -3796,6 +4016,10 @@ try
             resolveResourcesBuild.setCreateInfoExtent(imageExtent).build(device);
 
         pickMouse.valid = false;
+
+        // diff: [test_dod12.cpp] start
+        soaCtx.screen_resize(newExtent);
+        // diff: [test_dod12.cpp] end
 
         frameContext.rebuild(swapchain.imagesSize());
     };

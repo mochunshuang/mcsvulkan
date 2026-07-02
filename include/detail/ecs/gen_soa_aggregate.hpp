@@ -645,6 +645,17 @@ namespace mcs::vulkan::ecs
             for (size_type i = new_cap; i > old_cap; --i)
                 free_entities_.push_back(i - 1);
         }
+        void clear() noexcept
+        {
+            // 从 dense_ 末尾开始释放，避免频繁交换
+            while (!dense_.empty())
+                release_entity(dense_.back()); // release_entity 本身是 noexcept
+
+            // 重置所有辅助容器和计数器
+            sparse_.clear();
+            free_entities_.clear();
+            next_entity_id_ = 0;
+        }
 
         constexpr void expansion_size(size_type additional) // NOLINT
         {
