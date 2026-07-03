@@ -416,7 +416,6 @@ namespace font
     using texture_bind_sampler = mcs::vulkan::font::texture_bind_sampler;
     using FontContext = mcs::vulkan::font::FontContext;
 
-    using glyph_info = mcs::vulkan::font::GlyphInfo;
     using texture_info = mcs::vulkan::font::texture_info;
     using FontInfo = mcs::vulkan::font::FontInfo;
     using font_register = mcs::vulkan::font::font_register;
@@ -426,110 +425,6 @@ namespace font
     using FontFactory = mcs::vulkan::font::FontFactory;
     using FontMetadata = mcs::vulkan::font::FontMetadata;
 
-    class FontLibrary
-    {
-
-        std::vector<FontContext> fonts_;
-        struct font_value
-        {
-            size_t font_index;
-            int score;
-
-            [[nodiscard]] glyph_info getDefaultGlyph(
-                Font::glyphs_type::UNICODE_CODEPOINT unicode,
-                const FontLibrary &lib) const
-            {
-                auto &font = lib.fonts_[font_index];
-                assert(!font.unicode_default_glyphs.empty());
-                assert(font.unicode_default_glyphs.contains(unicode));
-                auto &glyph = font.unicode_default_glyphs.at(
-                    unicode); // 使用 at() 而不是 operator[]
-                return glyph_info::make(*glyph, font);
-            }
-        };
-        struct font_value_greater
-        {
-            constexpr bool operator()(const font_value &a,
-                                      const font_value &b) const noexcept
-            {
-                if (a.score != b.score)
-                    return a.score > b.score; // 分数越大越靠前
-                return a.font_index < b.font_index;
-            }
-        };
-        // 在 unordered_multimap 的值类型中使用该比较器
-        std::unordered_multimap<char32_t, std::set<font_value, font_value_greater>>
-            unicodeDefaultFont_;
-
-      public:
-        auto &operator[](size_t i) noexcept
-        {
-            return fonts_[i];
-        }
-        auto &operator[](size_t i) const noexcept
-        {
-            return fonts_[i];
-        }
-
-        FontLibrary() = default;
-        void load(FontType type, texture_bind_sampler bind,
-                  const FontTexture::msdf_info &info, const std::string &jsonPath,
-                  freetype_face face, int score = 0)
-        {
-            // 先构造一个完整的 FontAtlas 对象（但此时 hb_font 还未初始化）
-            fonts_.emplace_back(jsonPath, info, std::move(face), type, bind,
-                                FontMetadata{});
-
-            auto &newFont = fonts_.back();
-
-            // 遍历当前字体的 Unicode→字形信息映射
-            for (const auto &[ch, glyphPtr] : newFont.unicode_default_glyphs)
-            {
-                size_t font_index = fonts_.size() - 1; // 当前字体索引
-                font_value fv{font_index, score};
-                auto it = unicodeDefaultFont_.find(ch);
-                if (it == unicodeDefaultFont_.end())
-                {
-                    // 首次出现该 Unicode，创建新的有序集合
-                    std::set<font_value, font_value_greater> s;
-                    s.insert(fv);
-                    unicodeDefaultFont_.emplace(ch, std::move(s));
-                }
-                else
-                {
-                    // 已存在，直接插入（set 会自动排序并去重）
-                    it->second.insert(fv);
-                }
-            }
-
-            std::println("Font {} loaded, glyph_index_to_glyphs size: {},  "
-                         "unicode_default_glyphs size: {}",
-                         newFont.name, newFont.glyph_index_to_glyphs.size(),
-                         newFont.unicode_default_glyphs.size());
-            if (newFont.unicode_default_glyphs.empty())
-            {
-                std::println("Warning: unicode_default_glyphs is empty for font {}",
-                             newFont.name);
-            }
-        }
-        [[nodiscard]] std::optional<font_value> getFont(char32_t unicode) const noexcept
-        {
-            auto it = unicodeDefaultFont_.find(unicode);
-            if (it != unicodeDefaultFont_.end() && !it->second.empty())
-                return *it->second.begin(); // 返回集合中第一个元素（最高分字体）
-
-            return std::nullopt;
-        }
-
-        // 从 fonts_ 集合 得到 texture_image_base 的 views 集合
-        [[nodiscard]] auto getTextureImageBases() const noexcept
-        {
-            return fonts_ | std::views::transform([](const FontContext &atlas) noexcept
-                                                      -> const texture_image_base & {
-                       return atlas.texture.view();
-                   });
-        }
-    };
 }; // namespace font
 
 // 屏幕坐标系下（Y 轴向下）判断三角形绕向

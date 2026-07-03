@@ -23,3 +23,9 @@
 #include "font/assign_fonts.hpp"
 #include "font/libunibreak/analyze_line_breaks.hpp"
 #include "font/harfbuzz/shape.hpp"
+
+// gen
+#include "font/GenFontContext.hpp"
+#include "font/GenFontFactory.hpp"
+#include "font/GenFontSelector.hpp"
+#include "font/make_font_factory.hpp"

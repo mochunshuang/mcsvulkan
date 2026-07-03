@@ -1,9 +1,8 @@
 #pragma once
 
-#include "FontContext.hpp"
-
 namespace mcs::vulkan::font
 {
+    template <typename FontContext>
     class GlyphInfo
     {
       public:

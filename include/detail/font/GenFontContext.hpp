@@ -1,42 +1,43 @@
 #pragma once
 
-#include "Font.hpp"
-#include "FontMetadata.hpp"
-#include "FontType.hpp"
-#include "FontTexture.hpp"
 #include "GlyphInfo.hpp"
-
+#include "Font.hpp"
+#include "FontType.hpp"
 #include "freetype/face.hpp"
 #include "harfbuzz/font.hpp"
+#include "FontMetadata.hpp"
 #include "texture_bind_sampler.hpp"
-#include <cassert>
-#include <variant>
+#include <unordered_map>
 
 namespace mcs::vulkan::font
 {
-    class FontContext
+    template <typename FontTexture>
+    class GenFontContext
     {
       public: // NOLINTBEGIN
+        using texture_type = FontTexture;
+        using ft_face_type = freetype::face;
+        using hb_font_type = harfbuzz::font;
+
         std::string name;
         Font font;
         FontTexture texture;
-        freetype::face face;
+        ft_face_type face;
 
         FontType type;
         texture_bind_sampler bind;
 
         std::unordered_map<FT_UInt, const Font::glyphs_type *> glyph_index_to_glyphs;
         std::unordered_map<uint32_t, const Font::glyphs_type *> unicode_default_glyphs;
-        harfbuzz::font hb_font;
+        hb_font_type hb_font;
 
         FontMetadata meta_data;
         // NOLINTEND
 
-        constexpr FontContext(const std::string &jsonPath,
-                              const FontTexture::msdf_info &info, freetype::face &&face,
-                              FontType type, texture_bind_sampler bind,
-                              FontMetadata meta_data)
-            : name(jsonPath), font(Font::make(jsonPath)), texture(info),
+        constexpr GenFontContext(const std::string &jsonPath, FontTexture texture,
+                                 ft_face_type &&face, FontType type,
+                                 texture_bind_sampler bind, FontMetadata meta_data)
+            : name(jsonPath), font(Font::make(jsonPath)), texture(std::move(texture)),
               face(std::move(face)), type(type), bind(bind),
               meta_data{std::move(meta_data)}
         {
@@ -44,8 +45,9 @@ namespace mcs::vulkan::font
             FT_Set_Pixel_Sizes(raw_face, 0,
                                static_cast<FT_UInt>(font.atlas.size)); // 设置像素大小
 
-            hb_font = harfbuzz::font{raw_face}; // 创建 HarfBuzz 字体
+            hb_font = hb_font_type{raw_face}; // 创建 HarfBuzz 字体
 
+            using mcs::vulkan::MCS_ASSERT;
             // 1. 填充 glyph_index_to_info
             for (const auto &glyph : font.glyphs)
             {
@@ -129,7 +131,7 @@ namespace mcs::vulkan::font
             return contain_script(meta_data, script);
         }
 
-        using glyph_info_type = GlyphInfo<FontContext>;
+        using glyph_info_type = GlyphInfo<GenFontContext>;
         // NOLINTEND
     };
 }; // namespace mcs::vulkan::font
