@@ -1941,7 +1941,7 @@ try
         }
         if (curMiddlePressed)
         {
-            // 检测 Shift 键（独立于左键修饰键）
+            // 检测 Shift 键
             bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
                                 input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
 
@@ -1951,32 +1951,63 @@ try
             glm::vec4 viewport(0.0f, 0.0f, static_cast<float>(windowSize.width),
                                static_cast<float>(windowSize.height));
 
+            // 计算偏移量（旧版：仅使用 model_state）
             glm::vec3 currentScale = modelMatrix.scale;
             glm::quat currentRot = modelMatrix.rotation;
             glm::vec3 localTopLeft = topLeftLocal;
             glm::vec3 scaledTopLeft = currentScale * localTopLeft;
-            glm::vec3 rotatedOffset =
-                currentRot * scaledTopLeft; // 从平移位置指向左上角的偏移量
+            glm::vec3 rotatedOffset = currentRot * scaledTopLeft;
             glm::vec3 currentTopLeftWorld = modelMatrix.translation + rotatedOffset;
 
-            glm::vec3 winNear(static_cast<float>(cur.xpos),
-                              static_cast<float>(windowSize.height - cur.ypos), 0.0f);
-            glm::vec3 winFar(static_cast<float>(cur.xpos),
-                             static_cast<float>(windowSize.height - cur.ypos), 1.0f);
+            // 构建射线
+            float winY = static_cast<float>(windowSize.height - cur.ypos);
+            glm::vec3 winNear(static_cast<float>(cur.xpos), winY, 0.0f);
+            glm::vec3 winFar(static_cast<float>(cur.xpos), winY, 1.0f);
             glm::vec3 nearWorld = glm::unProject(winNear, view, proj, viewport);
             glm::vec3 farWorld = glm::unProject(winFar, view, proj, viewport);
             glm::vec3 dirWorld = glm::normalize(farWorld - nearWorld);
 
-            const float eps = 1e-6f;
-            const float maxT = 1000.0f;   // 最大射线距离，根据场景调整
-            const float maxDelta = 10.0f; // 单次最大平移变化量（可选）
+            // ========== 调试打印开始 ==========
+            std::println("--- Middle Button Drag (OLD) ---");
+            std::println("Mouse: ({}, {}), Window: {}x{}", cur.xpos, cur.ypos,
+                         windowSize.width, windowSize.height);
+            std::println("model_state: trans=({:.4f},{:.4f},{:.4f}), "
+                         "scale=({:.4f},{:.4f},{:.4f}), "
+                         "rot=({:.4f},{:.4f},{:.4f},{:.4f})",
+                         modelMatrix.translation.x, modelMatrix.translation.y,
+                         modelMatrix.translation.z, modelMatrix.scale.x,
+                         modelMatrix.scale.y, modelMatrix.scale.z, modelMatrix.rotation.w,
+                         modelMatrix.rotation.x, modelMatrix.rotation.y,
+                         modelMatrix.rotation.z);
+            std::println("topLeftLocal: ({:.4f},{:.4f},{:.4f})", topLeftLocal.x,
+                         topLeftLocal.y, topLeftLocal.z);
+            std::println("rotatedOffset: ({:.4f},{:.4f},{:.4f})", rotatedOffset.x,
+                         rotatedOffset.y, rotatedOffset.z);
+            std::println("currentTopLeftWorld: ({:.4f},{:.4f},{:.4f})",
+                         currentTopLeftWorld.x, currentTopLeftWorld.y,
+                         currentTopLeftWorld.z);
 
-            glm::vec3 newTranslation = modelMatrix.translation; // 默认不变
+            // 将左上角投影回屏幕检查
+            glm::vec3 screenPos = glm::project(currentTopLeftWorld, view, proj, viewport);
+            std::println("projected left-top on screen: ({:.2f},{:.2f})", screenPos.x,
+                         screenPos.y);
+
+            std::println("nearWorld: ({:.4f},{:.4f},{:.4f})", nearWorld.x, nearWorld.y,
+                         nearWorld.z);
+            std::println("farWorld:  ({:.4f},{:.4f},{:.4f})", farWorld.x, farWorld.y,
+                         farWorld.z);
+            // ========== 调试打印结束 ==========
+
+            const float eps = 1e-6f;
+            const float maxT = 1000.0f;
+            const float maxDelta = 10.0f;
+
+            glm::vec3 newTranslation = modelMatrix.translation;
 
             if (shiftPressed)
             {
-                // ========== 旧模式：世界 XY 平面平移（固定世界 Z） ==========
-                float targetZ = currentTopLeftWorld.z; // 保持当前左上角的世界 Z
+                // 世界 XY 平面平移
+                float targetZ = currentTopLeftWorld.z;
                 if (std::fabs(dirWorld.z) > eps)
                 {
                     float t = (targetZ - nearWorld.z) / dirWorld.z;
@@ -1989,21 +2020,18 @@ try
             }
             else
             {
-                // ========== 新模式：屏幕空间平移（固定相机空间 Z） ==========
-                // 将当前左上角转换到相机空间，获取其深度
+                // 相机空间深度固定
                 glm::vec4 currentTopLeftView =
                     view * glm::vec4(currentTopLeftWorld, 1.0f);
-                float depthView = currentTopLeftView.z; // 相机空间 Z
-
-                // 将射线端点转换到相机空间
+                float depthView = currentTopLeftView.z;
                 glm::vec4 nearView = view * glm::vec4(nearWorld, 1.0f);
                 glm::vec4 farView = view * glm::vec4(farWorld, 1.0f);
-                glm::vec3 dirView = glm::vec3(farView - nearView); // 相机空间射线方向
+                glm::vec3 dirView = glm::vec3(farView - nearView);
 
                 if (std::fabs(dirView.z) > eps)
                 {
                     float t = (depthView - nearView.z) / dirView.z;
-                    if (t >= 0.0f && t <= 1.0f) // 交点在射线范围内
+                    if (t >= 0.0f && t <= 1.0f)
                     {
                         glm::vec3 pointView = glm::vec3(nearView) + t * dirView;
                         glm::vec4 pointWorld = viewInv * glm::vec4(pointView, 1.0f);
@@ -2013,13 +2041,17 @@ try
                 }
             }
 
-            // 可选：限制平移变化量，防止跳变
+            // 打印最终计算结果
             glm::vec3 delta = newTranslation - modelMatrix.translation;
+            std::println("newTranslation: ({:.4f},{:.4f},{:.4f})", newTranslation.x,
+                         newTranslation.y, newTranslation.z);
+            std::println("delta: ({:.4f},{:.4f},{:.4f})", delta.x, delta.y, delta.z);
+            std::println("-----------------------------------");
+
             if (glm::length(delta) < maxDelta)
             {
                 modelMatrix.translation = newTranslation;
             }
-            // 若超过限制，可以忽略本次更新，或按比例缩放
 
             if (!isMiddleButtonPressed)
                 isMiddleButtonPressed = true;
@@ -2672,7 +2704,8 @@ try
                     ubo.view = camera.viewsMatrix();
 
                     ubo.proj = camera.perspectiveMatrix();
-                    ubo.proj[1][1] *= -1;
+                    ubo.proj[1][1] *=
+                        -1; //diff: [test_dod9] 和 [test_dod14] 左上角不一致的原因
 
                     // 复制数据到Uniform Buffer
                     memcpy(uniformBuffersPtr, &ubo, sizeof(ubo));
