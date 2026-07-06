@@ -1,5 +1,6 @@
 #include <meta>
 #include <iostream>
+#include <print>
 using namespace std::meta;
 
 // ===== 全局模板 =====
@@ -122,8 +123,127 @@ static_assert(is_constructor_template(S_ctor_tmpl));
 static_assert(is_conversion_function_template(S_conv_tmpl));
 static_assert(is_operator_function_template(S_op_tmpl));
 
+// 一个简单的函数模板
+template <typename T>
+void greet(T val, const char *msg)
+{
+    std::cout << "Greet: " << val << ", " << msg << '\n';
+}
+
+//substitute 需要产生一个外部可链接的实体信息，而 static 函数模板的特化仍然具有内部链接，反射元信息可能拒绝生成。.所以放在
+struct fun
+{
+    template <typename... T>
+    static constexpr auto print_count(T &...args)
+    {
+        static_assert((std::is_lvalue_reference_v<decltype(args)> && ...));
+        std::println("{}", sizeof...(args));
+    }
+};
 int main()
 {
-    std::cout << "main done\n";
-    return 0;
+    using namespace std::meta;
+
+    // 1. 在编译期用 substitute 得到 greet<int> 的信息
+    constexpr info instantiated = substitute(^^greet, {
+                                                          ^^int});
+
+    // 2. 用 [:...:] 将信息“拼”回代码，变成一个可调用实体
+    //    然后用 auto&&...args 完美转发调用
+    auto callable = [](auto &&...args) {
+        return [:instantiated:](std::forward<decltype(args)>(args)...);
+    };
+
+    // 3. 调用
+    callable(100, "hello world"); // 输出 Greet: 100, hello world
+
+    {
+        struct A
+        {
+        };
+        struct B
+        {
+        };
+        A a;
+        B b;
+        auto printable = [](A &a, B &b) {
+            constexpr info print_count_impl =
+                substitute(^^fun::print_count, {
+                                                   ^^A, ^^B});
+            return [:print_count_impl:](a, b);
+        };
+        using P = decltype(printable);
+        struct task
+        {
+            P p;
+        };
+        task{}.p(a, b);
+        {
+            auto printable = [](auto &&...args) {
+                constexpr info print_info = substitute(
+                    ^^fun::print_count, {
+                                            ^^std::remove_cvref_t<decltype(args)>...});
+                [:print_info:](std::forward<decltype(args)>(args)...);
+            };
+            printable(a, b);
+            using P = decltype(printable);
+            struct task
+            {
+                P p;
+            };
+            task{}.p(a, b);
+        }
+        {
+            auto printable = [](auto &&...args) {
+                constexpr info print_info =
+                    substitute(^^fun::print_count,
+                               {
+                                   std::meta::remove_cvref(^^decltype(args))...});
+                [:print_info:](std::forward<decltype(args)>(args)...);
+            };
+            printable(a, b);
+        }
+        {
+            auto printable = [](auto &&...args) {
+                constexpr info print_info =
+                    substitute(^^fun::print_count, {
+                                                       ^^decltype(args)...});
+                [:print_info:](std::forward<decltype(args)>(args)...);
+            };
+            printable(a, b);
+            using P = decltype(printable);
+            struct task
+            {
+                P p;
+            };
+            task{}.p(a, b);
+        }
+        {
+            auto printable = [](auto &&...args) {
+                static_assert((std::is_lvalue_reference_v<decltype(args)> && ...));
+                std::println("{}", sizeof...(args));
+            };
+            printable(a, b);
+            using P = decltype(printable);
+            struct task
+            {
+                P p;
+            };
+            task{}.p(a, b);
+
+            struct storage;
+            consteval
+            {
+                std::meta::define_aggregate(
+                    ^^storage, {
+                                   std::meta::data_member_spec(^^P, {
+                                                                        .name = "p"})});
+            }
+            int c;
+            storage{}.p(a, b, c);
+        }
+    }
+    // NOTE:我要干嘛？？？？ 肯定的面向对象啊。问题是 面向集合的 使用 static 非常合理啊
+
+    std::cout << "done\n";
 }
