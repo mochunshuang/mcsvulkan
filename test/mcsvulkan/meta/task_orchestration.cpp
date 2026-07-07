@@ -18,11 +18,7 @@
 #include <utility>
 #include <vector>
 
-using mcs::vulkan::meta::make_aggregate;
-using bind_member = mcs::vulkan::meta::bind_member;
 using mcs::vulkan::meta::static_string;
-using mcs::vulkan::meta::static_nsdms_of;
-using mcs::vulkan::meta::static_parameters_of;
 
 // NOLINTBEGIN
 consteval int parse_int(std::string_view sv)
@@ -198,51 +194,72 @@ consteval auto buildSchedule(std::vector<task_spec> init_scheduled, Task... task
 template <typename T>
 struct static_span
 {
-    T *data_;          // 成员变量
-    std::size_t size_; // 成员变量
+    const T *data_;
+    std::size_t size_;
 
-    constexpr static_span(const std::span<T> &s) noexcept
+    consteval static_span(const std::span<const T> &s) noexcept
         : data_(s.data()), size_(s.size())
     {
     }
-
-    // 迭代器支持
-    constexpr T *begin() const noexcept
+    consteval static_span(std::vector<T> vec) noexcept
+        : static_span(std::define_static_array(std::move(vec)))
     {
-        return data_;
     }
-    constexpr T *end() const noexcept
+    // ---------- 迭代器 ----------
+    // 注意：begin/end/data 必须返回指针，且 const 对象需要返回 const T*
+    // forward_like 无法把 T* 变成 const T*（它只能转发指针本身的 const），所以这里保留 if constexpr
+    constexpr auto begin(this auto &&self) noexcept
     {
-        return data_ + size_;
-    }
-
-    // 访问器（与成员变量区分）
-    constexpr T *data() const noexcept
-    {
-        return data_;
-    }
-    constexpr std::size_t size() const noexcept
-    {
-        return size_;
+        using U = std::remove_reference_t<decltype(self)>;
+        if constexpr (std::is_const_v<U>)
+            return static_cast<const T *>(self.data_);
+        else
+            return self.data_;
     }
 
-    constexpr T &operator[](std::size_t i) const
+    constexpr auto end(this auto &&self) noexcept
     {
-        return data_[i];
+        using U = std::remove_reference_t<decltype(self)>;
+        if constexpr (std::is_const_v<U>)
+            return static_cast<const T *>(self.data_ + self.size_);
+        else
+            return self.data_ + self.size_;
     }
 
-    // 可选：其他接口
-    constexpr bool empty() const noexcept
+    constexpr auto data(this auto &&self) noexcept
     {
-        return size_ == 0;
+        using U = std::remove_reference_t<decltype(self)>;
+        if constexpr (std::is_const_v<U>)
+            return static_cast<const T *>(self.data_);
+        else
+            return self.data_;
     }
-    constexpr T &front() const
+
+    // ---------- 只读接口（不依赖 const） ----------
+    constexpr std::size_t size(this const auto &self) noexcept
     {
-        return data_[0];
+        return self.size_;
     }
-    constexpr T &back() const
+    constexpr bool empty(this const auto &self) noexcept
     {
-        return data_[size_ - 1];
+        return self.size_ == 0;
+    }
+
+    // ---------- 使用 std::forward_like 完美转发元素引用 ----------
+    // 自动处理：左值对象 -> T&, const 左值 -> const T&, 右值 -> T&&
+    constexpr decltype(auto) operator[](this auto &&self, std::size_t i)
+    {
+        return std::forward_like<decltype(self)>(self.data_[i]);
+    }
+
+    constexpr decltype(auto) front(this auto &&self)
+    {
+        return std::forward_like<decltype(self)>(self.data_[0]);
+    }
+
+    constexpr decltype(auto) back(this auto &&self)
+    {
+        return std::forward_like<decltype(self)>(self.data_[self.size_ - 1]);
     }
 };
 
@@ -310,7 +327,8 @@ struct system_fixed_functions
 {
     static void fixed_0(auto &...)
     {
-        std::println("system_fixed_functions::fixed_0 call...");
+        // std::println("system_fixed_functions::fixed_0 call...");
+        std::cout << "system_fixed_functions::fixed_0 call...\n";
     }
     static void fixed_1(auto &...)
     {
@@ -330,7 +348,9 @@ struct data_change_function
 {
     static auto fun_0(auto &...)
     {
-        std::println("data_change_function::fixed_0 call...");
+        //NOTE: 汇编从 5828 到 150 行。 print太照顾周全了: Unicode 表 + 格式化解析器 + 错误字符串 + 状态机
+        // std::println("data_change_function::fixed_0 call...");
+        std::cout << "data_change_function::fun_0 call...🐕\n";
     }
 };
 
@@ -521,6 +541,24 @@ try
         constexpr auto graph = build_task_graph<"m_", span>();
 
         invoke_aggregate_ranges<"m_", 0, 100>(graph, world, input);
+
+        {
+            constexpr auto span = static_span{buildSchedule(
+                {task_spec{.spec = ^^decltype([](auto &world, auto &input) {
+                               return system_fixed_functions::fixed_0(world, input);
+                           }),
+                           .name = "system_fixed_functions::fixed_0"}},
+                scheduling_task{
+                    task_spec{.spec = ^^decltype([](auto &world, auto &input) {
+                                  return data_change_function::fun_0(world, input);
+                              }),
+                              .name = "data_change_function::fun_0"},
+                    [](tasks_view_type scheduled, tasks_view_type candidates) constexpr
+                        -> dispatch_location { return 0; }})};
+            constexpr auto graph = build_task_graph<"m_", span>();
+
+            // invoke_aggregate_ranges<"m_", 0, 100>(graph, world, input);
+        }
     }
 
     // 真正的循环依赖：A 需要 B，B 需要 C，C 需要 A
