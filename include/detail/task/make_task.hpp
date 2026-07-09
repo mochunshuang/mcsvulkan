@@ -3,6 +3,7 @@
 #include "gen_schedulable_task.hpp"
 #include <ranges>
 #include <algorithm>
+#include <utility>
 
 namespace mcs::vulkan::task
 {
@@ -514,6 +515,39 @@ namespace mcs::vulkan::task
         static consteval auto get_member_name()
         {
             return field_name<I>();
+        }
+        static consteval auto field_index(static_string name)
+        {
+            for (auto I : std::views::indices(members.size()))
+                if (std::meta::identifier_of(members[I]) == name)
+                    return I;
+            auto msg = " field [" + std::string(name.view()) + "] is not find in members";
+            throw std::meta::exception{msg, std::meta::current_function()};
+        };
+        static constexpr auto prefix_args_invoke = [](this auto &self, auto &&members,
+                                                      auto &&...args) {
+            if constexpr (sizeof...(args) == 0)
+                members();
+            else if constexpr (requires() {
+                                   members(std::forward<decltype(args)>(args)...);
+                               })
+                members(std::forward<decltype(args)>(args)...);
+            else
+            {
+                constexpr auto [... I] = std::make_index_sequence<sizeof...(args) - 1>{};
+                self(members, std::forward<decltype(args...[I])>(args...[I])...);
+            }
+        };
+        template <static_string beign, static_string end>
+            requires(field_index(beign) <= field_index(end))
+        constexpr void invoke_ranges(this auto &&self, auto &&...args)
+        {
+            template for (constexpr auto I : std::ranges::views::iota(
+                              field_index(beign), field_index(end) + 1))
+            {
+                prefix_args_invoke(
+                    self.[:members[I]:], std::forward<decltype(args)>(args)...);
+            }
         }
     };
 

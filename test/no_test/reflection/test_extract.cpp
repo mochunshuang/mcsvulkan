@@ -218,6 +218,21 @@ static_assert(test_extract_array_of_infos<int, double, char>());
 static_assert(test_extract_array_of_infos<>()); // 空包也 OK
 
 // ============================================================
+struct Test
+{
+    static constexpr int a = 10; // ✅ 常量
+    static int b;                // 声明，定义在别处
+};
+int Test::b = 20; // 运行时初始化
+
+consteval bool test()
+{
+    [[maybe_unused]] int x = extract<int>(^^Test::a); // ✅ 通过
+    //  error: the value of 'Test::b' is not usable in a constant expression
+    // int y = extract<int>(^^Test::b); // ❌ 编译错误：b 不是常量
+    return true;
+}
+static_assert(test());
 int main()
 {
     std::cout << "All extract tests passed.\n";

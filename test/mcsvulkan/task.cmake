@@ -13,7 +13,7 @@ macro(add_vulkan_task_test fileName)
     add_test(NAME "${TAGET_NAME}" COMMAND $<TARGET_FILE:${TAGET_NAME}>)
 endmacro()
 
-add_vulkan_task_test(task_task)
+add_vulkan_task_test(test_task)
 
 # end
 unset(BASE_LIBS)

@@ -4,7 +4,6 @@
 #include <print>
 
 using mcs::vulkan::meta::static_string;
-using mcs::vulkan::task::invoke_aggregate_ranges;
 using mcs::vulkan::task::make_task;
 using mcs::vulkan::task::init_task;
 using mcs::vulkan::task::schedulable_task;
@@ -56,6 +55,10 @@ struct test_systems
     static void gamma(auto &...)
     {
         std::println("gamma");
+    }
+    static void delta_mid() //NOTE: cece
+    {
+        std::println("delta_mid");
     }
     static void delta(auto &...)
     {
@@ -130,10 +133,10 @@ constexpr bool test_complex_orchestration(bool print = false)
         // 候选 3.5
         [] {
             return schedulable_task{
-                .task = {.name = "middle_task",
-                         .function = ^^decltype([](auto &world, auto &input) {
-                             test_systems::delta(world, input);
-                         })},
+                .task =
+                    {.name =
+                         "middle_task", //NOTE: 特别的，我们不需要必须接受最上层的函数列表，但是如果使用必须前缀匹配
+                     .function = ^^decltype([]() { test_systems::delta_mid(); })},
                 .befores = {"fixed_1"},
                 .afters = {"fixed_2"},
                 .fixed = {}};
@@ -164,7 +167,8 @@ constexpr bool test_complex_orchestration(bool print = false)
 
         world_type world;
         input_type input;
-        invoke_aggregate_ranges<"fixed_0", "epsilon">(task, world, input);
+        task.invoke_ranges<"fixed_0", "epsilon">(world, input);
+        task.fixed_0(world, input);
     }
 
     static_assert(task.get_member_name<0>() == "beta");
