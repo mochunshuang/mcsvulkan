@@ -36,7 +36,7 @@ consteval int parse_int(std::string_view sv)
     }
     return result;
 }
-template <static_string prefix, size_t min, size_t max>
+template <static_string beign, static_string end>
 static constexpr void invoke_aggregate_ranges(auto &object, auto &&...args)
 {
     using T = std::remove_cvref_t<decltype(object)>;
@@ -47,23 +47,20 @@ static constexpr void invoke_aggregate_ranges(auto &object, auto &&...args)
             return std::define_static_array(std::meta::nonstatic_data_members_of(
                 ^^T, std::meta::access_context::current()));
     }();
-    template for (constexpr auto I : std::views::indices(members.size()))
-    {
+    constexpr auto find_index = [](static_string name, const auto &members) consteval {
+        for (auto I : std::views::indices(members.size()))
+            if (std::meta::identifier_of(members[I]) == name)
+                return I;
+        auto msg = " field [" + std::string(name.view()) + "] is not find in members";
+        throw std::meta::exception{msg, std::meta::current_function()};
+    };
 
-        constexpr auto member_name = [&] {
-            if constexpr (requires() { T::template get_member_name<I>().view(); })
-                return T::template get_member_name<I>().view();
-            else
-                return std::meta::identifier_of(members[I]);
-        }();
-        constexpr auto prefix_name = prefix.view();
-        if constexpr (member_name.starts_with(prefix_name))
-        {
-            constexpr auto num_str = member_name.substr(prefix_name.size());
-            constexpr int num = parse_int(num_str);
-            if constexpr (num >= min && num <= max)
-                object.[:members[I]:](std::forward<decltype(args)>(args)...);
-        }
+    constexpr auto beign_index = find_index(beign, members);
+    constexpr auto end_index = find_index(end, members);
+    static_assert(beign_index <= end_index, "requires beign_index <= end_index");
+    template for (constexpr auto I : std::ranges::views::iota(beign_index, end_index + 1))
+    {
+        object.[:members[I]:](std::forward<decltype(args)>(args)...);
     }
 };
 
@@ -166,8 +163,8 @@ struct input_type
 // ------------------------------------------------------------------
 struct task_info
 {
-    std::meta::info function;
     static_string name;
+    std::meta::info function;
 };
 
 struct schedulable_task
@@ -191,7 +188,7 @@ concept gen_schedulable_task = requires(Gen gen) {
 
 template <task_info...>
 struct init_task;
-template <static_string prefix, typename init_spec, gen_schedulable_task auto... genTask>
+template <typename init_spec, gen_schedulable_task auto... genTask>
 struct make_task;
 
 namespace detail
@@ -218,6 +215,94 @@ namespace detail
         throw std::meta::exception{"Name not found", std::meta::current_function()};
     }
 
+    // ===========================================================================
+    // 一、什么是“差分约束系统”？
+    // ===========================================================================
+    // 就是把所有任务之间的顺序要求写成统一的不等式：
+    //   pos[后] - pos[前] >= 距离
+    // NOTE: 两个 点  + 边权 恰好可以使用有向图论来解决
+    //
+    // 例如你的任务：
+    //   init 顺序： fixed_0 -> fixed_1 -> fixed_2
+    //     意思是： pos[fixed_1] - pos[fixed_0] >= 1
+    //            pos[fixed_2] - pos[fixed_1] >= 1
+    //
+    //   data_fun 固定在 fixed_0 之前 1 位：
+    //     意思是： pos[data_fun] - pos[fixed_0] = -1
+    //     拆成两条不等式：
+    //       pos[data_fun] - pos[fixed_0] >= -1    (这条保证不超前太多)
+    //       pos[fixed_0] - pos[data_fun] >=  1    (这条保证至少超前1位)
+    //
+    //   gamma 必须在 fixed_1 之后 (befores)：
+    //     意思是： pos[gamma] - pos[fixed_1] >= 1
+    //
+    // 所有任务的要求最后都变成了一堆“pos[A] - pos[B] >= 某个数字”。
+    // 这就是差分约束系统。
+    //
+    // 我们要求解出一组 pos[任务] 的值，使得所有不等式同时成立。
+
+    // ===========================================================================
+    // 二、为什么变成“图”和“最长路”？
+    // ===========================================================================
+    // 把每个任务看成一个点，每条不等式 pos[后] - pos[前] >= gap
+    // 想象成一根从“前”指向“后”的箭头，箭头上写着 gap。
+    //
+    // 现在我们从某个起点出发（加入一个虚拟点 S，连接所有任务，gap=0），
+    // 沿着箭头走，每走一步就把箭头上的数字加起来。
+    //
+    // 如果要求 pos[后] >= pos[前] + gap，那么 “从起点走到这个任务的最长距离”
+    // 正好就是它能取到的最小（最早）时间值。 所以我们求最长路。
+    // “最长路”不是指任务最终执行顺序上的“晚”，而是指为了满足所有“至少”约束，必须取的下界中的最大值，而这个最大值恰好就是任务的最早合法时间
+    // NOTE: 后 可能由多个 前 走来。 pos[X] = max( pos[A]+2 , pos[B]+1 , pos[C]+3 ，....) 走到 X 有 A,B,C,....多条路径，必须都满足
+    //
+    // 示例： fixed_0->fixed_1 (gap=1)
+    // 如果起点到 fixed_0 的距离是 3，那么走到 fixed_1 至少是 3+1=4。
+    // 这正是我们的约束：fixed_1 必须在 fixed_0 之后至少 1 位。
+
+    // ===========================================================================
+    // 三、Bellman-Ford 算法（求最长路版本）在干什么？
+    // ===========================================================================
+    // Bellman-Ford 是一个经典的图算法，原来用于求最短路，但它可以求最长路，
+    // 并且能处理负的 gap（比如 data_fun 相对 fixed_0 的 -1 就变负权）。
+    // NOTE: Bellman-Ford: 反复对每个节点取 max(自身, 所有前驱的 dist + gap).即：当前节点路径的最长路，就满足所有前驱的约束
+    //
+    // 它不断尝试“走更远”：对于每条箭头 u->v (gap)，
+    // 如果 dist[u] + gap > dist[v]，就把 dist[v] 更新为更大的值。
+    // 这个过程叫“松弛”。
+    // 因为最长简单路径最多经过 N-1 条边，所以重复 N-1 轮一般就够了。
+    //
+    // 第 N 轮如果还能更新，说明图中存在一个循环，
+    // 沿着这个循环走一圈 gap 总和 > 0，也就是“正环”。
+
+    // ===========================================================================
+    // 四、“环”是什么？为什么检测到环就报错？
+    // ===========================================================================
+    // 环就是从某个点出发，沿着箭头走，最后回到自己的路径。
+    // 如果环上所有 gap 加起来 > 0，就是正环。
+    //
+    // 为什么正环意味着无解？
+    // 假设 A -> B (gap=1), B -> C (gap=2), C -> A (gap=1)
+    // 这意味着：
+    //   pos[B] >= pos[A] + 1
+    //   pos[C] >= pos[B] + 2
+    //   pos[A] >= pos[C] + 1
+    // 三式相加得到 pos[A] >= pos[A] + 4，显然不可能。
+    //
+    // 所以只要出现正环，调度就一定无法满足，代码抛出异常。
+
+    // ===========================================================================
+    // 五、它们之间的联系：一个完整的流水线
+    // ===========================================================================
+    // 1. 你把任务依赖关系（init, befores, afters, fixed）声明出来。
+    // 2. 程序把这些声明自动翻译成统一的差分约束不等式。
+    // 3. 用 Bellman-Ford 最长路算法算出每个任务的最早合法位置（dist[]）。
+    //    如果发现有正环，直接报编译期错误。
+    // 4. 把任务按照 dist 从小到大排序（同 dist 的任务可以并发）。
+    // 5. 在同 dist 的任务里，根据 fixed 的正负做二次排序，
+    //    让固定任务“贴紧”它的锚点。
+    // 6. 最终生成一个确定的任务序列。
+    //
+    // 整个过程在编译期完成，零运行时开销。
     static consteval auto get_task_sequence(std::vector<task_info> init_sequence,
                                             gen_schedulable_task auto... genTask)
     {
@@ -448,7 +533,7 @@ namespace detail
         return result;
     }
 
-    template <static_string prefix, auto init_task, gen_schedulable_task auto... genTask>
+    template <auto init_task, gen_schedulable_task auto... genTask>
     struct gen_task
     {
         static constexpr auto task_sequence = std::define_static_array(
@@ -570,21 +655,19 @@ namespace detail
             int i = 0;
             for (const task_info &spec : task_sequence)
             {
-                nsdms.push_back(std::meta::data_member_spec(
-                    spec.function, {.name = make_name(prefix.view(), i++)}));
+                nsdms.push_back(std::meta::data_member_spec(spec.function,
+                                                            {.name = spec.name.view()}));
             }
             std::meta::define_aggregate(^^type, nsdms);
         }
     };
 }; // namespace detail
-template <static_string prefix, task_info... task, gen_schedulable_task auto... genTask>
-struct make_task<prefix, init_task<task...>, genTask...>
-    : detail::gen_task<prefix, std::array<task_info, sizeof...(task)>{task...},
-                       genTask...>::type
+template <task_info... task, gen_schedulable_task auto... genTask>
+struct make_task<init_task<task...>, genTask...>
+    : detail::gen_task<std::array<task_info, sizeof...(task)>{task...}, genTask...>::type
 {
     using gen_type =
-        detail::gen_task<prefix, std::array<task_info, sizeof...(task)>{task...},
-                         genTask...>;
+        detail::gen_task<std::array<task_info, sizeof...(task)>{task...}, genTask...>;
     using base_type = gen_type::type;
     static constexpr auto members =
         std::define_static_array(std::meta::nonstatic_data_members_of(
@@ -597,39 +680,17 @@ struct make_task<prefix, init_task<task...>, genTask...>
     {
         std::cout << gen_type::task_sequence_detail_string() << "\n";
     }
-};
-
-constexpr auto test_make_task(bool print = false)
-{
-
-    constexpr auto task =
-        make_task<"m_",
-                  init_task<task_info{
-                      .function = ^^decltype([](auto &world, auto &input) constexpr {
-                          return system_fixed_functions::fixed_0(world, input);
-                      }),
-                      .name = "system_fixed_functions::fixed_0"}>,
-                  [] constexpr {
-                      return schedulable_task{
-                          .task =
-                              {
-                                  .function = ^^decltype([](auto &world,
-                                                            auto &input) constexpr {
-                                      return data_change_function::fun_0(world, input);
-                                  }),
-                                  .name = "data_change_function::fun_0",
-                              },
-                          .befores = {"system_fixed_functions::fixed_0"}};
-                  }>{};
-    if (print)
+    template <size_t I>
+    static consteval static_string field_name()
     {
-        task.print_task_sequence();
-        task.print_task_sequence_detail();
+        return gen_type::task_sequence[I].name;
     }
-
-    return true;
-}
-static_assert(test_make_task());
+    template <size_t I>
+    static consteval auto get_member_name()
+    {
+        return field_name<I>();
+    }
+};
 
 //------------------------------------------------------------------
 
@@ -637,88 +698,85 @@ static_assert(test_make_task());
 constexpr bool test_complex_orchestration(bool print = false)
 {
     constexpr auto task = make_task<
-        "sys_",
-        init_task<task_info{.function = ^^decltype([](auto &world, auto &input) {
-                                system_fixed_functions::fixed_0(world, input);
-                            }),
-                            .name = "fixed_0"},
-                  task_info{.function = ^^decltype([](auto &world, auto &input) {
-                                system_fixed_functions::fixed_1(world, input);
-                            }),
-                            .name = "fixed_1"},
-                  task_info{.function = ^^decltype([](auto &world, auto &input) {
-                                system_fixed_functions::fixed_2(world, input);
-                            }),
-                            .name = "fixed_2"}>,
-        // 候选 0：数据变化函数，固定在 fixed_0 之前一位
+        init_task<
+            {.name = "fixed_0", .function = ^^decltype([](auto &world, auto &input) {
+                                    system_fixed_functions::fixed_0(world, input);
+                                })},
+            {.name = "fixed_1", .function = ^^decltype([](auto &world, auto &input) {
+                                    system_fixed_functions::fixed_1(world, input);
+                                })},
+            {.name = "fixed_2", .function = ^^decltype([](auto &world, auto &input) {
+                                    system_fixed_functions::fixed_2(world, input);
+                                })}>,
+        // 候选 0
         [] constexpr {
             return schedulable_task{
-                .task = {.function = ^^decltype([](auto &world, auto &input) {
+                .task = {.name = "data_fun",
+                         .function = ^^decltype([](auto &world, auto &input) {
                              data_change_function::fun_0(world, input);
-                         }),
-                         .name = "data_fun"},
+                         })},
                 .fixed = schedulable_task::fixed_position{"fixed_0", -1}};
         },
-        // 候选 1：alpha 必须在 fixed_1 之后
+        // 候选 1
         [] constexpr {
             return schedulable_task{
-                .task = {.function = ^^decltype([](auto &world, auto &input) {
+                .task = {.name = "alpha",
+                         .function = ^^decltype([](auto &world, auto &input) {
                              test_systems::alpha(world, input);
-                         }),
-                         .name = "alpha"},
+                         })},
                 .befores = {"fixed_1"},
                 .afters = {},
                 .fixed = std::nullopt};
         },
-        // 候选 2：beta 必须在 fixed_2 之前
+        // 候选 2
         [] constexpr {
             return schedulable_task{
-                .task = {.function = ^^decltype([](auto &world, auto &input) {
+                .task = {.name = "beta",
+                         .function = ^^decltype([](auto &world, auto &input) {
                              test_systems::beta(world, input);
-                         }),
-                         .name = "beta"},
+                         })},
                 .befores = {},
                 .afters = {"fixed_2"},
                 .fixed = std::nullopt};
         },
-        // 候选 3：gamma 固定在 fixed_1 之后一位
+        // 候选 3
         [] constexpr {
             return schedulable_task{
-                .task = {.function = ^^decltype([](auto &world, auto &input) {
+                .task = {.name = "gamma",
+                         .function = ^^decltype([](auto &world, auto &input) {
                              test_systems::gamma(world, input);
-                         }),
-                         .name = "gamma"},
+                         })},
                 .fixed = schedulable_task::fixed_position{"fixed_1", 1}};
         },
-        // 候选 3.5：middle_task，同时有 befores 和 afters
+        // 候选 3.5
         [] constexpr {
             return schedulable_task{
-                .task = {.function = ^^decltype([](auto &world, auto &input) {
-                             test_systems::delta(world, input); // 复用函数
-                         }),
-                         .name = "middle_task"},
+                .task = {.name = "middle_task",
+                         .function = ^^decltype([](auto &world, auto &input) {
+                             test_systems::delta(world, input);
+                         })},
                 .befores = {"fixed_1"},
                 .afters = {"fixed_2"},
                 .fixed = std::nullopt};
         },
-        // 候选 4：delta 必须在 fixed_0 之前
+        // 候选 4
         [] constexpr {
             return schedulable_task{
-                .task = {.function = ^^decltype([](auto &world, auto &input) {
+                .task = {.name = "delta",
+                         .function = ^^decltype([](auto &world, auto &input) {
                              test_systems::delta(world, input);
-                         }),
-                         .name = "delta"},
+                         })},
                 .befores = {},
                 .afters = {"fixed_0"},
                 .fixed = std::nullopt};
         },
-        // 候选 5：epsilon 必须在 gamma 之后
+        // 候选 5
         [] constexpr {
             return schedulable_task{
-                .task = {.function = ^^decltype([](auto &world, auto &input) {
+                .task = {.name = "epsilon",
+                         .function = ^^decltype([](auto &world, auto &input) {
                              test_systems::epsilon(world, input);
-                         }),
-                         .name = "epsilon"},
+                         })},
                 .befores = {"gamma"},
                 .afters = {},
                 .fixed = std::nullopt};
@@ -728,7 +786,13 @@ constexpr bool test_complex_orchestration(bool print = false)
     {
         task.print_task_sequence();
         task.print_task_sequence_detail();
+
+        world_type world;
+        input_type input;
+        invoke_aggregate_ranges<"fixed_0", "epsilon">(task, world, input);
     }
+
+    static_assert(task.get_member_name<0>() == "beta");
 
     return decltype(task)::gen_type::task_sequence_string().view() ==
            "beta -> delta -> data_fun -> fixed_0 -> fixed_1 -> gamma -> alpha -> "
@@ -740,10 +804,7 @@ static_assert(test_complex_orchestration()); // 编译期自检
 int main()
 try
 {
-    test_make_task(true);
     test_complex_orchestration(true);
-    world_type world;
-    input_type input;
 
     std::cout << "main done\n";
     return 0;

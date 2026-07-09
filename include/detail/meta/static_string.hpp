@@ -1,5 +1,6 @@
 #pragma once
 
+#include <format>
 #include <meta>
 #include <string_view>
 
@@ -38,5 +39,22 @@ namespace mcs::vulkan::meta
         {
             return view() < o.view();
         }
+
+        friend std::ostream &operator<<(std::ostream &os, const static_string &s)
+        {
+            return os << s.view();
+        }
     };
 }; // namespace mcs::vulkan::meta
+
+namespace std
+{
+    template <>
+    struct formatter<mcs::vulkan::meta::static_string> : formatter<string_view>
+    {
+        auto format(const mcs::vulkan::meta::static_string &s, format_context &ctx) const
+        {
+            return formatter<string_view>::format(s.view(), ctx);
+        }
+    };
+} // namespace std
