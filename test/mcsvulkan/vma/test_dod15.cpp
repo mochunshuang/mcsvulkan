@@ -70,6 +70,10 @@ using mcs::vulkan::meta::make_aggregate;
 
 using mcs::vulkan::ecs::gen_soa_aggregate;
 
+using mcs::vulkan::task::make_task;
+using mcs::vulkan::task::init_task;
+using mcs::vulkan::task::schedulable_task;
+
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
 constexpr auto TITLE = "test_my_triangle";
@@ -451,50 +455,6 @@ auto generateGradientTexture(const LogicalDevice &device, const CommandPool &poo
 }
 // NOLINTEND
 //diff: [test_indirectdraw2] end
-
-//diff: [test_dod4] start
-consteval int parse_int(std::string_view sv)
-{
-    int result = 0;
-    for (char c : sv)
-    {
-        if (c < '0' || c > '9')
-            throw std::meta::exception{"sv is not number", std::meta::current_function()};
-        result = result * 10 + (c - '0');
-    }
-    return result;
-}
-template <mcs::vulkan::ecs::static_string prefix, size_t min, size_t max>
-constexpr void invoke_aggregate_ranges(auto &object, auto &&...args)
-{
-    using T = std::remove_cvref_t<decltype(object)>;
-    constexpr auto members = [] {
-        if constexpr (requires() { T::members; })
-            return T::members;
-        else
-            return std::define_static_array(std::meta::nonstatic_data_members_of(
-                ^^T, std::meta::access_context::current()));
-    }();
-    template for (constexpr auto I : std::views::indices(members.size()))
-    {
-
-        constexpr auto member_name = [&] {
-            if constexpr (requires() { T::template get_member_name<I>().view(); })
-                return T::template get_member_name<I>().view();
-            else
-                return std::meta::identifier_of(members[I]);
-        }();
-        constexpr auto prefix_name = prefix.view();
-        if constexpr (member_name.starts_with(prefix_name))
-        {
-            constexpr auto num_str = member_name.substr(prefix_name.size());
-            constexpr int num = parse_int(num_str);
-            if constexpr (num >= min && num <= max)
-                object.[:members[I]:](std::forward<decltype(args)>(args)...);
-        }
-    }
-};
-//diff: [test_dod4] end
 
 namespace camera
 {
@@ -3572,67 +3532,101 @@ try
     };
 
     //NOTE: 下面的内联做的更好，编译期的数据更利于优化
-    static constexpr auto vulaknDataTransformer =
-        make_aggregate<"vulaknDataTransformer", "ProcessingWorldInput_0",
-                       "AfterWaitForFences_0", "BeforeRecordCommandBuffer_0">(
-            std::constant_wrapper<[](world_type &world, input_type &inputCtx,
-                                     data_type &soaCtx) {
-                tickClock(inputCtx);               // ① 唯一的时间推进
-                limit_frame_rate(inputCtx, 60.0f); // ② 帧率限制（可选）
-                InputController(world, inputCtx, soaCtx);
-                views_matrix_update(world, inputCtx, soaCtx);
-                views_perspective_update(world, inputCtx, soaCtx);
-                // diff: [test_dod14] 新增：UI 相机更新（Alt + 按键）
-                views_ui_camera_update(world, inputCtx, soaCtx);
-                model_update(world, inputCtx, soaCtx);
-                FrameRateMonitor(world, inputCtx, soaCtx); // ③ 纯监控
-                inputCtx.input.scroll() = {};              // 滚轮清零放在最后
-            }>{},
-            std::constant_wrapper<[](world_type &world, input_type &inputCtx,
-                                     data_type &soaCtx) {
-                auto &globalCtx = world.globalCtx;
-                auto &pickCtx = world.pickCtx;
+    constexpr auto marking_function = ^^decltype([](auto &&...) noexcept {});
+    static constexpr auto task_graph = make_task<
+        init_task<
+            {.name = "input_start", .function = marking_function},
+            {.name = "input_end", .function = marking_function},
+            {.name = "after_waitForfences_start", .function = marking_function},
+            {.name = "after_waitForfences_end", .function = marking_function},
+            {.name = "before_recordCommandBuffer_start", .function = marking_function},
+            {.name = "before_recordCommandBuffer_end", .function = marking_function}>,
+        [] {
+            return schedulable_task{
+                .task = {.name = "input_handle",
+                         .function =
+                             ^^decltype([](world_type &world, input_type &inputCtx,
+                                           data_type &soaCtx) {
+                                 tickClock(inputCtx); // ① 唯一的时间推进
+                                 limit_frame_rate(inputCtx,
+                                                  60.0f); // ② 帧率限制（可选）
+                                 InputController(world, inputCtx, soaCtx);
+                                 views_matrix_update(world, inputCtx, soaCtx);
+                                 views_perspective_update(world, inputCtx, soaCtx);
+                                 // diff: [test_dod14] 新增：UI 相机更新（Alt + 按键）
+                                 views_ui_camera_update(world, inputCtx, soaCtx);
+                                 model_update(world, inputCtx, soaCtx);
+                                 FrameRateMonitor(world, inputCtx,
+                                                  soaCtx);     // ③ 纯监控
+                                 inputCtx.input.scroll() = {}; // 滚轮清零放在最后
+                             })},
+                .befores = {"input_start"},
+                .afters = {"input_end"}};
+        },
+        [] {
+            return schedulable_task{
+                .task = {.name = "waitforfences_post_processing",
+                         .function =
+                             ^^decltype([](world_type &world, input_type &inputCtx,
+                                           data_type &soaCtx) {
+                                 auto &globalCtx = world.globalCtx;
+                                 auto &pickCtx = world.pickCtx;
 
-                auto &frameContext = globalCtx.frameContext;
+                                 auto &frameContext = globalCtx.frameContext;
 
-                auto &pickMouse = pickCtx.mouse;
-                auto &pickingFrames = pickCtx.frames;
+                                 auto &pickMouse = pickCtx.mouse;
+                                 auto &pickingFrames = pickCtx.frames;
 
-                auto &currentFrame = frameContext.currentFrame;
+                                 auto &currentFrame = frameContext.currentFrame;
 
-                // 等待栅栏后，正式获取图像前
-                if (currentFrame > 0 && pickMouse.valid)
-                {
-                    uint32_t readIdx =
-                        (currentFrame - 1 + MAX_FRAMES_IN_FLIGHT) % MAX_FRAMES_IN_FLIGHT;
-                    auto *data = static_cast<uint32_t *>(pickingFrames[readIdx].mapPtr());
-                    uint32_t objId = data[0];
-                    uint32_t primId = data[1];
-                    if (objId != 0xFFFFFFFF)
-                    {
-                        std::cout << "Hover: Object=" << objId << ", Triangle=" << primId
-                                  << "\n";
-                    }
-                }
-            }>{},
-            std::constant_wrapper<[](world_type &world, input_type &inputCtx,
-                                     data_type &soaCtx) {
-                auto &globalCtx = world.globalCtx;
-                auto &mainShaderCtx = world.mainShaderCtx;
+                                 // 等待栅栏后，正式获取图像前
+                                 if (currentFrame > 0 && pickMouse.valid)
+                                 {
+                                     uint32_t readIdx =
+                                         (currentFrame - 1 + MAX_FRAMES_IN_FLIGHT) %
+                                         MAX_FRAMES_IN_FLIGHT;
+                                     auto *data = static_cast<uint32_t *>(
+                                         pickingFrames[readIdx].mapPtr());
+                                     uint32_t objId = data[0];
+                                     uint32_t primId = data[1];
+                                     if (objId != 0xFFFFFFFF)
+                                     {
+                                         std::cout << "Hover: Object=" << objId
+                                                   << ", Triangle=" << primId << "\n";
+                                     }
+                                 }
+                             })},
+                .befores = {"after_waitForfences_start"},
+                .afters = {"after_waitForfences_end"},
+            };
+        },
+        [] {
+            return schedulable_task{
+                .task = {.name = "update_upload_data",
+                         .function =
+                             ^^decltype([](world_type &world, input_type &inputCtx,
+                                           data_type &soaCtx) {
+                                 auto &globalCtx = world.globalCtx;
+                                 auto &mainShaderCtx = world.mainShaderCtx;
 
-                auto &frameContext = globalCtx.frameContext;
-                auto &camera = inputCtx.camera;
+                                 auto &frameContext = globalCtx.frameContext;
+                                 auto &camera = inputCtx.camera;
 
-                auto &currentFrame = frameContext.currentFrame;
+                                 auto &currentFrame = frameContext.currentFrame;
 
-                auto &uniformBuffers = mainShaderCtx.uniformBuffers;
+                                 auto &uniformBuffers = mainShaderCtx.uniformBuffers;
 
-                //diff: [test_dod3] start
-                updateObjectData(world, inputCtx, soaCtx, currentFrame);
-                updateVertexData(world, inputCtx, soaCtx, currentFrame);
-                prepareBatch(world, inputCtx, soaCtx, currentFrame);
-                //diff: [test_dod3] end
-            }>{});
+                                 //diff: [test_dod3] start
+                                 updateObjectData(world, inputCtx, soaCtx, currentFrame);
+                                 updateVertexData(world, inputCtx, soaCtx, currentFrame);
+                                 prepareBatch(world, inputCtx, soaCtx, currentFrame);
+                                 //diff: [test_dod3] end
+                             })},
+                .befores = {"before_recordCommandBuffer_start"},
+                .afters = {"before_recordCommandBuffer_end"}};
+        }>{};
+    std::cout << "task_graph: [begin]\n"
+              << task_graph.task_sequence_string_detail() << "\ntask_graph: [end]\n";
 
     // NOLINTNEXTLINE
     static constexpr auto drawFrame = [](world_type &world, input_type &inputCtx,
@@ -3661,9 +3655,8 @@ try
         while (device.waitForFences(1, inFlightFences[currentFrame], VK_TRUE,
                                     UINT64_MAX) == VK_TIMEOUT)
             ;
-
-        invoke_aggregate_ranges<"AfterWaitForFences_", 0, 0>(vulaknDataTransformer, world,
-                                                             inputCtx, soaCtx);
+        task_graph.invoke_ranges<"after_waitForfences_start", "after_waitForfences_end">(
+            world, inputCtx, soaCtx);
 
         auto [result, imageIndex] = swapchain.acquireNextImage(
             UINT64_MAX, presentCompleteSemaphore[semaphoreIndex], nullptr);
@@ -3676,13 +3669,13 @@ try
             throw std::runtime_error("failed to acquire swap chain image!");
         device.resetFences(1, inFlightFences[currentFrame]);
 
-        invoke_aggregate_ranges<"BeforeRecordCommandBuffer_", 0, 0>(
-            vulaknDataTransformer, world, inputCtx, soaCtx);
+        task_graph.invoke_ranges<"before_recordCommandBuffer_start",
+                                 "before_recordCommandBuffer_end">(world, inputCtx,
+                                                                   soaCtx);
 
         const auto &commandBuffer = commandBuffers[currentFrame];
         commandBuffer.reset({});
         recordCtx.info = {.current_frame = currentFrame, .image_index = imageIndex};
-
         recordCommandBuffer(world, inputCtx, soaCtx);
 
         // NOLINTNEXTLINE
@@ -3719,8 +3712,7 @@ try
     };
     while (globalCtx.window.shouldClose() == 0)
     {
-        invoke_aggregate_ranges<"ProcessingWorldInput_", 0, 0>(vulaknDataTransformer,
-                                                               world, inputCtx, soaCtx);
+        task_graph.invoke_ranges<"input_start", "input_end">(world, inputCtx, soaCtx);
 
         // ========== 新增：每 2 秒切换 autoSpinStore 第一个实体的纹理索引 ==========
         {

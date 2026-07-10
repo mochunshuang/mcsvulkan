@@ -133,10 +133,12 @@ namespace mcs::vulkan::task
             for (std::size_t i = 0; i < all_name.size(); ++i)
                 for (std::size_t j = i + 1; j < all_name.size(); ++j)
                     if (all_name[i] == all_name[j])
-                        throw std::meta::exception{
-                            "buildSchedule requires unique task name",
-                            std::meta::current_function()};
-
+                    {
+                        auto msg = "error by multiple task name [" +
+                                   std::string(all_name[i].view()) +
+                                   "] requires unique task name";
+                        throw std::meta::exception{msg, std::meta::current_function()};
+                    }
             auto find_all_dependents = [](const schedulable_task &candidate,
                                           auto ranges) {
                 std::vector<static_string> dependents;
@@ -166,32 +168,43 @@ namespace mcs::vulkan::task
             // 2. check candidate value
             for (auto candidate : candidates)
             {
+                auto task_name = candidate.task.name;
                 // conflict check
                 if (candidate.fixed.has_value() &&
                     (not candidate.befores.empty() || not candidate.afters.empty()))
-                    throw std::meta::exception{
-                        "schedulable_task is error: fixed conflict with befores,afters",
-                        std::meta::current_function()};
+                {
+                    auto msg = "error by task [" + std::string(task_name.view()) +
+                               "] definition error: fixed conflict with befores,afters";
+                    throw std::meta::exception{msg, std::meta::current_function()};
+                }
 
                 // do not dependent itself
-                auto task_name = candidate.task.name;
                 auto is_self = [&](static_string t) {
                     return t == task_name;
                 };
                 if (candidate.fixed.has_value() &&
                     candidate.fixed.value().anchor == task_name)
-                    throw std::meta::exception{"error by anchor itself",
-                                               std::meta::current_function()};
+                {
+                    auto msg = "error by task [" + std::string(task_name.view()) +
+                               "] anchor depend on itself.";
+                    throw std::meta::exception{msg, std::meta::current_function()};
+                }
                 else
                 {
                     if (auto result = std::ranges::find_if(candidate.befores, is_self);
                         result != candidate.befores.end())
-                        throw std::meta::exception{"error by before itself",
-                                                   std::meta::current_function()};
+                    {
+                        auto msg = "error by task [" + std::string(task_name.view()) +
+                                   "] before depend on itself.";
+                        throw std::meta::exception{msg, std::meta::current_function()};
+                    }
                     if (auto result = std::ranges::find_if(candidate.afters, is_self);
                         result != candidate.afters.end())
-                        throw std::meta::exception{"error by after itself",
-                                                   std::meta::current_function()};
+                    {
+                        auto msg = "error by task [" + std::string(task_name.view()) +
+                                   "] after depend on itself.";
+                        throw std::meta::exception{msg, std::meta::current_function()};
+                    }
                 }
                 // all dependent names exist
                 if (not find_all_dependents(
@@ -199,8 +212,11 @@ namespace mcs::vulkan::task
                         all_name | std::views::filter([&is_self](static_string t) {
                             return not is_self(t);
                         })))
-                    throw std::meta::exception{"error by dependent task does not exist",
-                                               std::meta::current_function()};
+                {
+                    auto msg = "error by task [" + std::string(task_name.view()) +
+                               "] depend on the tasks that does not exist.";
+                    throw std::meta::exception{msg, std::meta::current_function()};
+                }
             }
 
             // 3. generate id
