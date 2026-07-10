@@ -12,8 +12,8 @@
 
 namespace mcs::vulkan::tool
 {
-    template <surface Surface>
-    struct [[deprecated("use create_swapchain instead.")]] create_swap_chain
+    // NOTE: 替换 create_swap_chain
+    struct create_swapchain
     {
         constexpr static VkSurfaceFormatKHR selectSurfaceFormat(
             const std::span<VkSurfaceFormatKHR> &selects,
@@ -119,10 +119,11 @@ namespace mcs::vulkan::tool
         }; // NOLINTEND
 
         // NOTE: 这样确实更好
-        constexpr auto rebuild() &
+        constexpr auto rebuild(const LogicalDevice &device,
+                               const surface auto &surfaceInterface) &
         {
-            auto capabilities = surfaceInterface_->surfaceCapabilities();
-            VkExtent2D imageExtent = surfaceInterface_->chooseSwapExtent(capabilities);
+            auto capabilities = surfaceInterface.surfaceCapabilities();
+            VkExtent2D imageExtent = surfaceInterface.chooseSwapExtent(capabilities);
             swapchainCreateInfo_.imageExtent = imageExtent;
 
             VkSwapchainKHR swapchain = nullptr;
@@ -132,39 +133,40 @@ namespace mcs::vulkan::tool
             {
                 auto &CI = swapchainCreateInfo_;
                 auto &viewCI = imageViewCreateInfo_;
-                swapchain = device_->createSwapchainKHR(CI, device_->allocator());
-                swapChainImages = device_->getSwapchainImagesKHR(swapchain);
+                swapchain = device.createSwapchainKHR(CI, device.allocator());
+                swapChainImages = device.getSwapchainImagesKHR(swapchain);
 
                 swapChainImageViews.reserve(swapChainImages.size());
                 for (auto *image : swapChainImages)
                 {
                     viewCI.image = image;
                     swapChainImageViews.emplace_back(
-                        device_->createImageView(viewCI, device_->allocator()));
+                        device.createImageView(viewCI, device.allocator()));
                 }
-                return Swapchain(device_, swapchain, std::move(swapChainImages),
+                return Swapchain(device, swapchain, std::move(swapChainImages),
                                  std::move(swapChainImageViews), imageExtent);
             }
             catch (...)
             {
                 for (auto *imageView : swapChainImageViews)
-                    device_->destroyImageView(imageView, device_->allocator());
+                    device.destroyImageView(imageView, device.allocator());
                 swapChainImageViews.clear();
 
                 if (swapchain != nullptr)
-                    device_->destroySwapchainKHR(swapchain, device_->allocator());
+                    device.destroySwapchainKHR(swapchain, device.allocator());
 
                 throw;
             }
         }
 
-        constexpr auto build() &
+        constexpr auto build(const LogicalDevice &device,
+                             const surface auto &surfaceInterface)
         {
-            auto capabilities = surfaceInterface_->surfaceCapabilities();
+            auto capabilities = surfaceInterface.surfaceCapabilities();
             std::vector<VkSurfaceFormatKHR> availableFormats =
-                surfaceInterface_->surfaceFormats();
+                surfaceInterface.surfaceFormats();
             std::vector<VkPresentModeKHR> availablePresentModes =
-                surfaceInterface_->surfacePresentModes();
+                surfaceInterface.surfacePresentModes();
 
             auto minImageCount = capabilities.minImageCount;
             if (createInfo_.changeMinImageCount != nullptr)
@@ -177,7 +179,7 @@ namespace mcs::vulkan::tool
             }
             auto [imageFormat, imageColorSpace] = selectSurfaceFormat(
                 createInfo_.candidateSurfaceFormats, availableFormats);
-            VkExtent2D imageExtent = surfaceInterface_->chooseSwapExtent(capabilities);
+            VkExtent2D imageExtent = surfaceInterface.chooseSwapExtent(capabilities);
 
             auto imageArrayLayers = createInfo_.imageArrayLayers;
             if (imageArrayLayers > capabilities.maxImageArrayLayers)
@@ -205,7 +207,7 @@ namespace mcs::vulkan::tool
                 .sType = sType<VkSwapchainCreateInfoKHR>(),
                 .pNext = createInfo_.pNext.value(),
                 .flags = createInfo_.flags,
-                .surface = **surfaceInterface_,
+                .surface = *surfaceInterface,
                 .minImageCount = minImageCount,
                 .imageFormat = imageFormat,
                 .imageColorSpace = imageColorSpace,
@@ -232,29 +234,29 @@ namespace mcs::vulkan::tool
             std::vector<VkImageView> swapChainImageViews;
             try
             {
-                swapchain = device_->createSwapchainKHR(CI, device_->allocator());
-                swapChainImages = device_->getSwapchainImagesKHR(swapchain);
+                swapchain = device.createSwapchainKHR(CI, device.allocator());
+                swapChainImages = device.getSwapchainImagesKHR(swapchain);
 
                 swapChainImageViews.reserve(swapChainImages.size());
                 for (auto *image : swapChainImages)
                 {
                     viewCI.image = image;
                     swapChainImageViews.emplace_back(
-                        device_->createImageView(viewCI, device_->allocator()));
+                        device.createImageView(viewCI, device.allocator()));
                 }
                 swapchainCreateInfo_ = CI;
                 imageViewCreateInfo_ = viewCI;
-                return Swapchain(device_, swapchain, std::move(swapChainImages),
+                return Swapchain(device, swapchain, std::move(swapChainImages),
                                  std::move(swapChainImageViews), imageExtent);
             }
             catch (...)
             {
                 for (auto *imageView : swapChainImageViews)
-                    device_->destroyImageView(imageView, device_->allocator());
+                    device.destroyImageView(imageView, device.allocator());
                 swapChainImageViews.clear();
 
                 if (swapchain != nullptr)
-                    device_->destroySwapchainKHR(swapchain, device_->allocator());
+                    device.destroySwapchainKHR(swapchain, device.allocator());
 
                 throw;
             }
@@ -272,28 +274,16 @@ namespace mcs::vulkan::tool
             return std::move(*this);
         }
 
-        constexpr create_swap_chain(const Surface &surface,
-                                    const LogicalDevice &device) noexcept
-            : surfaceInterface_{&surface}, device_{&device}
-        {
-        }
-
         const VkFormat &refImageFormat() noexcept
         {
             return swapchainCreateInfo_.imageFormat;
         };
 
       private:
-        const Surface *surfaceInterface_{};
-        const LogicalDevice *device_{};
-        create_info createInfo_;
-        view_create_info viewCreateInfo_;
+        create_info createInfo_{};
+        view_create_info viewCreateInfo_{};
         VkSwapchainCreateInfoKHR swapchainCreateInfo_{};
         VkImageViewCreateInfo imageViewCreateInfo_{};
     };
-
-    template <surface Surface>
-    create_swap_chain(const Surface &surface, const LogicalDevice &device)
-        -> create_swap_chain<Surface>;
 
 }; // namespace mcs::vulkan::tool

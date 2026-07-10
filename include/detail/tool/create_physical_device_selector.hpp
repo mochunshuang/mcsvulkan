@@ -9,25 +9,13 @@
 
 namespace mcs::vulkan::tool
 {
-    struct [[deprecated("usd create_physical_device_selector instead.")]]
-    physical_device_selector
+    struct create_physical_device_selector
     {
         using check_VkPhysicalDeviceProperties =
             std::function<bool(const VkPhysicalDeviceProperties &)>;
         using check_VkQueueFamilyProperties =
             std::function<bool(const VkQueueFamilyProperties &qfp)>;
         using check_features = std::function<bool(const PhysicalDevice &device)>;
-
-        constexpr explicit physical_device_selector(const Instance &instance)
-            : devices_{instance.enumeratePhysicalDevices() |
-                       std::views::transform(
-                           [&](VkPhysicalDevice physicalDevice) constexpr noexcept {
-                               return PhysicalDevice{instance, physicalDevice};
-                           }) |
-                       std::ranges::to<std::vector<PhysicalDevice>>()}
-        {
-            MCS_ASSERT(not devices_.empty());
-        }
 
         constexpr auto &requiredDeviceExtension(
             std::vector<const char *> &requiredDeviceExtension)
@@ -57,13 +45,16 @@ namespace mcs::vulkan::tool
             size_t id{};
             PhysicalDevice physical_device;
         };
-        [[nodiscard]] constexpr auto select()
+        template <std::ranges::random_access_range R>
+            requires std::same_as<std::ranges::range_value_t<R>, PhysicalDevice>
+        [[nodiscard]] constexpr auto select(const R &devices)
         {
+            MCS_ASSERT(not devices.empty());
             std::vector<result> ret;
 
-            for (size_t i = 0, size = devices_.size(); i < size; ++i)
+            for (size_t i = 0, size = devices.size(); i < size; ++i)
             {
-                const PhysicalDevice &physicalDevice = devices_[i];
+                const PhysicalDevice &physicalDevice = devices[i];
 
                 // Check device properties
                 if (requiredProperties_.has_value() &&
@@ -92,10 +83,16 @@ namespace mcs::vulkan::tool
                 throw make_vk_exception("failed to find a suitable GPU!.");
             return ret;
         }
+        [[nodiscard]] constexpr auto select(const Instance &instance)
+        {
+            return select(instance.enumeratePhysicalDevices() |
+                          std::views::transform(
+                              [&](VkPhysicalDevice physicalDevice) constexpr noexcept {
+                                  return PhysicalDevice{instance, physicalDevice};
+                              }));
+        }
 
       private:
-        std::vector<PhysicalDevice> devices_;
-
         std::span<const char *> requiredDeviceExtension_;
         std::optional<check_VkPhysicalDeviceProperties> requiredProperties_;
         std::optional<check_VkQueueFamilyProperties> requiredQueueFamily_;

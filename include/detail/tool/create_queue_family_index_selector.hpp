@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -10,18 +9,10 @@
 
 namespace mcs::vulkan::tool
 {
-    struct [[deprecated("use queue_family_index_selector instead.")]]
-    queue_family_index_selector
+    struct create_queue_family_index_selector
     {
         using check_VkQueueFamilyProperties = std::function<bool(
             const VkQueueFamilyProperties &qfp, uint32_t queueFamilyIndex)>;
-        using select_callback =
-            std::function<uint32_t(const std::vector<uint32_t> &candidate)>;
-
-        constexpr explicit queue_family_index_selector(PhysicalDevice &physicalDevice)
-            : queueFamilies_{physicalDevice.getQueueFamilyProperties()}
-        {
-        }
 
         constexpr auto &requiredQueueFamily(
             check_VkQueueFamilyProperties checkQueueFamilyFun) noexcept
@@ -30,28 +21,33 @@ namespace mcs::vulkan::tool
             return *this;
         }
 
-        [[nodiscard]] constexpr auto select()
+        template <std::ranges::random_access_range R>
+            requires std::same_as<std::ranges::range_value_t<R>, VkQueueFamilyProperties>
+        [[nodiscard]] constexpr auto select(const R &queueFamilies)
         {
-            std::vector<uint32_t> candidate_;
+            std::vector<uint32_t> candidate;
             if (checkQueueFamily_.has_value())
             {
-                for (uint32_t i = 0, queueFamilyCount = queueFamilies_.size();
+                for (uint32_t i = 0, queueFamilyCount = queueFamilies.size();
                      i < queueFamilyCount; i++)
                 {
-                    if ((*checkQueueFamily_)(queueFamilies_[i], i))
+                    if ((*checkQueueFamily_)(queueFamilies[i], i))
                     {
-                        candidate_.emplace_back(i);
+                        candidate.emplace_back(i);
                     }
                 }
             }
-            if (candidate_.empty())
+            if (candidate.empty())
                 throw make_vk_exception("failed to find a suitable family index.");
-            return candidate_;
+            return candidate;
+        }
+        [[nodiscard]] constexpr auto select(const PhysicalDevice &physicalDevice)
+        {
+            return select(physicalDevice.getQueueFamilyProperties());
         }
 
       private:
         std::optional<check_VkQueueFamilyProperties> checkQueueFamily_;
-        std::vector<VkQueueFamilyProperties> queueFamilies_;
     };
 
 }; // namespace mcs::vulkan::tool

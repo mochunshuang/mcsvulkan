@@ -25,15 +25,15 @@
 using Instance = mcs::vulkan::Instance;
 using create_instance = mcs::vulkan::tool::create_instance;
 using create_debugger = mcs::vulkan::tool::create_debugger;
-using physical_device_selector = mcs::vulkan::tool::physical_device_selector;
+using mcs::vulkan::tool::create_physical_device_selector;
 using mcs::vulkan::vkMakeVersion;
 using mcs::vulkan::vkApiVersion;
 
 using mcs::vulkan::tool::enable_intance_build;
 using mcs::vulkan::tool::structure_chain;
-using mcs::vulkan::tool::queue_family_index_selector;
+using mcs::vulkan::tool::create_queue_family_index_selector;
 using mcs::vulkan::tool::create_logical_device;
-using mcs::vulkan::tool::create_swap_chain;
+using mcs::vulkan::tool::create_swapchain;
 using mcs::vulkan::tool::create_pipeline_layout;
 using mcs::vulkan::tool::create_graphics_pipeline;
 using mcs::vulkan::tool::create_command_pool;
@@ -567,7 +567,7 @@ try
             {.extendedDynamicState = VK_TRUE}};
 
     auto [id [[maybe_unused]], physical_device [[maybe_unused]]] =
-        physical_device_selector{instance}
+        create_physical_device_selector{}
             .requiredDeviceExtension(requiredDeviceExtension)
             .requiredProperties([](const VkPhysicalDeviceProperties
                                        &device_properties) constexpr noexcept {
@@ -612,17 +612,17 @@ try
                            .shaderDrawParameters && //diff: [test_indirectdraw]
                        query_extended_dynamic_state_features.extendedDynamicState;
             })
-            .select()[0];
+            .select(instance)[0];
 
     mcs::vulkan::surface auto surface = surface_impl(physical_device, window);
     const uint32_t GRAPHICS_QUEUE_FAMILY_IDX =
-        queue_family_index_selector{physical_device}
+        create_queue_family_index_selector{}
             .requiredQueueFamily([&](const VkQueueFamilyProperties &qfp,
                                      uint32_t queueFamilyIndex) -> bool {
                 return (qfp.queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
                        physical_device.getSurfaceSupportKHR(queueFamilyIndex, *surface);
             })
-            .select()[0];
+            .select(physical_device)[0];
 
     LogicalDevice device =
         create_logical_device{}
@@ -642,7 +642,7 @@ try
         device, {.queue_family_index = GRAPHICS_QUEUE_FAMILY_IDX, .queue_index = 0});
 
     auto swapchainBuild =
-        create_swap_chain{surface, device}
+        create_swapchain{}
             .setCreateInfo(
                 {.changeMinImageCount =
                      [](uint32_t minImageCount) noexcept { return minImageCount + 1; },
@@ -669,7 +669,7 @@ try
                                       .levelCount = 1,
                                       .baseArrayLayer = 0,
                                       .layerCount = 1}});
-    auto swapchain = swapchainBuild.build();
+    auto swapchain = swapchainBuild.build(device, surface);
 
     CommandPool commandPool =
         create_command_pool{}
@@ -3363,7 +3363,7 @@ try
         surface.waitGoodFramebufferSize();
         device.waitIdle();
 
-        swapchain = swapchainBuild.rebuild();
+        swapchain = swapchainBuild.rebuild(device, surface);
         auto newExtent = swapchain.refImageExtent();
         VkExtent3D imageExtent = {
             .width = newExtent.width, .height = newExtent.height, .depth = 1};

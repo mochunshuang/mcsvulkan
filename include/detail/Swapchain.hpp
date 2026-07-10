@@ -2,6 +2,7 @@
 
 #include "LogicalDevice.hpp"
 #include <cstddef>
+#include <utility>
 
 namespace mcs::vulkan
 {
@@ -95,6 +96,14 @@ namespace mcs::vulkan
               swapChainImages_{std::move(swapChainImages)},
               swapChainImageViews_{std::move(swapChainImageViews)},
               imageExtent_{imageExtent}
+        {
+        }
+        constexpr Swapchain(const LogicalDevice &device, VkSwapchainKHR swapchain,
+                            std::vector<VkImage> swapChainImages,
+                            std::vector<VkImageView> swapChainImageViews,
+                            VkExtent2D imageExtent) noexcept
+            : Swapchain(&device, swapchain, std::move(swapChainImages),
+                        std::move(swapChainImageViews), imageExtent)
         {
         }
         constexpr void destroy() noexcept
