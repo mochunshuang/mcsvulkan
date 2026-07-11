@@ -16,6 +16,7 @@
 #include <random>
 #include <span>
 #include <stdexcept>
+#include <stdint.h>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -929,20 +930,23 @@ try
     auto descriptorSets = descriptorPool.allocateDescriptorSets(
         {.descriptorSets = std::vector<VkDescriptorSetLayout>{MAX_FRAMES_IN_FLIGHT,
                                                               *descriptorSetLayout}});
-    constexpr VkDeviceSize BUFFER_SIZE = sizeof(UniformBufferObject);
+
     // diff: [test_dod7] start: 不再是 vma 的内存
     std::array<mcs::vulkan::memory::auto_map_buffer, MAX_FRAMES_IN_FLIGHT> uniformBuffers;
-    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
     {
-        uniformBuffers[i] = mcs::vulkan::memory::auto_map_buffer(
-            mcs::vulkan::memory::create_simple_buffer(
-                device,
-                {.size = BUFFER_SIZE,
-                 .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
-            BUFFER_SIZE);
+        constexpr VkDeviceSize BUFFER_SIZE = sizeof(UniformBufferObject);
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+        {
+            uniformBuffers[i] = mcs::vulkan::memory::auto_map_buffer(
+                mcs::vulkan::memory::create_simple_buffer(
+                    device,
+                    {.size = BUFFER_SIZE,
+                     .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+                BUFFER_SIZE);
+        }
     }
     // diff: [test_dod7] end
     uint32_t create_texture_mipLevels = 1;
@@ -1116,61 +1120,8 @@ try
     constexpr auto texture_indexs = std::array{10, 11, 12, 13, 14};
     constexpr auto texture_sampler_indexs = std::array{2, 3};
 
-    auto make_font_registration = [&]() {
-    };
-
     // 添加字体
     font::freetype_loader loader{};
-    std::vector<font::FontInfo> registe_fonts = font::font_register::makeFontInfos(
-        loader, {
-                    //
-                    font::font_registration{
-                        .font_path = FONT_PATH_0,
-                        .json_path = JSON_PATH_0,
-                        .type = font::FontType::eMSDF,
-                        .texture_info = {.bind = {}, //NOTE: lazy_bind
-                                         .image_variant =
-                                             font::texture_info::stbi_image_type{
-                                                 .image_format = STBI_rgb_alpha,
-                                                 .image_path = TEXTURE_PATH_0}}},
-                    font::font_registration{
-                        .font_path = FONT_PATH_1,
-                        .json_path = JSON_PATH_1,
-                        .type = font::FontType::eMSDF,
-                        .texture_info = {.bind = {},
-                                         .image_variant =
-                                             font::texture_info::stbi_image_type{
-                                                 .image_format = STBI_rgb_alpha,
-                                                 .image_path = TEXTURE_PATH_1}}},
-                    font::font_registration{
-                        .font_path = FONT_PATH_2,
-                        .json_path = JSON_PATH_2,
-                        .type = font::FontType::eBITMAP,
-                        .texture_info = {.bind = {},
-                                         .image_variant =
-                                             font::texture_info::stbi_image_type{
-                                                 .image_format = STBI_rgb_alpha,
-                                                 .image_path = TEXTURE_PATH_2}}},
-                    font::font_registration{
-                        .font_path = FONT_PATH_3,
-                        .json_path = JSON_PATH_3,
-                        .type = font::FontType::eMSDF,
-                        .texture_info = {.bind = {},
-                                         .image_variant =
-                                             font::texture_info::stbi_image_type{
-                                                 .image_format = STBI_rgb_alpha,
-                                                 .image_path = TEXTURE_PATH_3}}},
-                    font::font_registration{
-                        .font_path = FONT_PATH_4,
-                        .json_path = JSON_PATH_4,
-                        .type = font::FontType::eMSDF,
-                        .texture_info = {.bind = {},
-                                         .image_variant =
-                                             font::texture_info::stbi_image_type{
-                                                 .image_format = STBI_rgb_alpha,
-                                                 .image_path = TEXTURE_PATH_4}}},
-                });
-
     auto font_factory = font::make_font_factory(
         [&device, &commandPool, &GRAPHICS_AND_PRESENT, &textureManager,
          &samplerManager](font::FontInfo &info) {
@@ -1260,8 +1211,56 @@ try
         },
         *loader);
     using FontContext = std::decay_t<decltype(font_factory)>::font_context_type;
-    auto font_selct =
-        font::GenFontSelector{&font_factory, "zh-CN"}.load(std::move(registe_fonts));
+    auto font_selct = font::GenFontSelector{&font_factory, "zh-CN"}.load(
+        font::font_register::makeFontInfos(
+            loader, //
+            {
+                font::font_registration{
+                    .font_path = FONT_PATH_0,
+                    .json_path = JSON_PATH_0,
+                    .type = font::FontType::eMSDF,
+                    .texture_info = {.bind = {}, //NOTE: lazy_bind
+                                     .image_variant =
+                                         font::texture_info::stbi_image_type{
+                                             .image_format = STBI_rgb_alpha,
+                                             .image_path = TEXTURE_PATH_0}}},
+                font::font_registration{
+                    .font_path = FONT_PATH_1,
+                    .json_path = JSON_PATH_1,
+                    .type = font::FontType::eMSDF,
+                    .texture_info = {.bind = {},
+                                     .image_variant =
+                                         font::texture_info::stbi_image_type{
+                                             .image_format = STBI_rgb_alpha,
+                                             .image_path = TEXTURE_PATH_1}}},
+                font::font_registration{
+                    .font_path = FONT_PATH_2,
+                    .json_path = JSON_PATH_2,
+                    .type = font::FontType::eBITMAP,
+                    .texture_info = {.bind = {},
+                                     .image_variant =
+                                         font::texture_info::stbi_image_type{
+                                             .image_format = STBI_rgb_alpha,
+                                             .image_path = TEXTURE_PATH_2}}},
+                font::font_registration{
+                    .font_path = FONT_PATH_3,
+                    .json_path = JSON_PATH_3,
+                    .type = font::FontType::eMSDF,
+                    .texture_info = {.bind = {},
+                                     .image_variant =
+                                         font::texture_info::stbi_image_type{
+                                             .image_format = STBI_rgb_alpha,
+                                             .image_path = TEXTURE_PATH_3}}},
+                font::font_registration{
+                    .font_path = FONT_PATH_4,
+                    .json_path = JSON_PATH_4,
+                    .type = font::FontType::eMSDF,
+                    .texture_info = {.bind = {},
+                                     .image_variant =
+                                         font::texture_info::stbi_image_type{
+                                             .image_format = STBI_rgb_alpha,
+                                             .image_path = TEXTURE_PATH_4}}},
+            }));
     font_selct.initNotdefFont();
     assert(font_selct.notdefFont() != nullptr);
 
@@ -1270,78 +1269,94 @@ try
     //diff: [test_dod12] end
 
     //NOTE: 不需要保存 VkDescriptorImageInfo。 有textureMap和索引够了
-    {
-        // 采样器信息：只一份，所有帧共用
-        std::vector<VkDescriptorImageInfo> samplerInfos(SAMPLER_COUNT);
-        for (auto [index, sampler] : samplerManager.view_used_textures())
-        {
-            samplerInfos[index] =
-                VkDescriptorImageInfo{.sampler = sampler->data(),
-                                      .imageView = nullptr,
-                                      .imageLayout = VK_IMAGE_LAYOUT_UNDEFINED};
-        }
-
-        // 纹理信息：只一份，所有帧共用
-        std::vector<VkDescriptorImageInfo> imageInfos(MAX_TEXTURES);
-        for (auto [index, image] : textureManager.view_used_textures())
-        {
-            imageInfos[index] = VkDescriptorImageInfo{
-                .sampler = nullptr,
-                .imageView = image->imageView(),
-                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        }
-        // 一个循环搞定所有帧的描述符更新
-        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
-        {
-            std::vector<VkWriteDescriptorSet> writes;
-
-            // 绑定 0: Uniform Buffer
-            VkDescriptorBufferInfo uniformInfo{
-                .buffer = uniformBuffers[i].buffer(), .offset = 0, .range = BUFFER_SIZE};
-            writes.push_back({
-                .sType = sType<VkWriteDescriptorSet>(),
-                .dstSet = descriptorSets[i],
-                .dstBinding = 0,
-                .dstArrayElement = 0,
-                .descriptorCount = 1,
-                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                .pBufferInfo = &uniformInfo,
-            });
-
-            // 绑定 1: Sampled Images（指向全局 imageInfos 的对应槽位）
-            for (uint32_t slot : textureManager.view_used_indexes())
+    auto descriptorSetManager = make_aggregate<"descriptorSetManager",
+                                               "update_uniform_buffer", "update_texture",
+                                               "update_sampler">(
+        [&device, &uniformBuffers, &descriptorSets]() {
+            constexpr auto dstBinding = 0;
+            for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
             {
-                writes.push_back({
+                VkDescriptorBufferInfo uniformInfo{.buffer = uniformBuffers[i].buffer(),
+                                                   .offset = 0,
+                                                   .range = sizeof(UniformBufferObject)};
+                VkWriteDescriptorSet writes{
                     .sType = sType<VkWriteDescriptorSet>(),
                     .dstSet = descriptorSets[i],
-                    .dstBinding = 1,
-                    .dstArrayElement = slot,
+                    .dstBinding = dstBinding,
+                    .dstArrayElement = 0,
                     .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-                    .pImageInfo =
-                        &imageInfos[slot], // 安全：imageInfos 生命周期远长于此处
-                });
+                    .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                    .pBufferInfo = &uniformInfo,
+                };
+                device.updateDescriptorSets(1, &writes, 0, nullptr);
             }
-
-            // 绑定 2: Samplers
-            for (uint32_t slot : samplerManager.view_used_indexes())
+        },
+        [&device, &textureManager, &descriptorSets](auto used_indexes) {
+            constexpr auto dstBinding = 1;
+            std::vector<VkDescriptorImageInfo> imageInfos(MAX_TEXTURES);
+            for (auto index : used_indexes)
             {
-                writes.push_back({
-                    .sType = sType<VkWriteDescriptorSet>(),
-                    .dstSet = descriptorSets[i],
-                    .dstBinding = 2,
-                    .dstArrayElement = static_cast<uint32_t>(slot),
-                    // NOTE: 上面是 shader的信息。下面是传输的信息
-                    .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
-                    .pImageInfo =
-                        &samplerInfos[slot], // 安全：imageInfos 生命周期远长于此处
-                });
+                auto &image = textureManager.resources[index];
+                imageInfos[index] = VkDescriptorImageInfo{
+                    .sampler = nullptr,
+                    .imageView = image.imageView(),
+                    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
             }
-            device.updateDescriptorSets(static_cast<uint32_t>(writes.size()),
-                                        writes.data(), 0, nullptr);
-        }
-    }
+            for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+            {
+                std::vector<VkWriteDescriptorSet> writes;
+                for (uint32_t slot : used_indexes)
+                {
+                    writes.push_back({
+                        .sType = sType<VkWriteDescriptorSet>(),
+                        .dstSet = descriptorSets[i],
+                        .dstBinding = dstBinding,
+                        .dstArrayElement = slot,
+                        .descriptorCount = 1,
+                        .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                        .pImageInfo =
+                            &imageInfos[slot], // 安全：imageInfos 生命周期远长于此处
+                    });
+                }
+                device.updateDescriptorSets(static_cast<uint32_t>(writes.size()),
+                                            writes.data(), 0, nullptr);
+            }
+        },
+        [&device, &samplerManager, &descriptorSets](auto used_indexes) {
+            constexpr auto dstBinding = 2;
+            std::vector<VkDescriptorImageInfo> samplerInfos(SAMPLER_COUNT);
+            for (auto index : used_indexes)
+            {
+                auto &sampler = samplerManager.resources[index];
+                samplerInfos[index] =
+                    VkDescriptorImageInfo{.sampler = sampler.data(),
+                                          .imageView = nullptr,
+                                          .imageLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+            }
+            for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+            {
+                std::vector<VkWriteDescriptorSet> writes;
+                for (uint32_t slot : used_indexes)
+                {
+                    writes.push_back({
+                        .sType = sType<VkWriteDescriptorSet>(),
+                        .dstSet = descriptorSets[i],
+                        .dstBinding = dstBinding,
+                        .dstArrayElement = static_cast<uint32_t>(slot),
+                        // NOTE: 上面是 shader的信息。下面是传输的信息
+                        .descriptorCount = 1,
+                        .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
+                        .pImageInfo =
+                            &samplerInfos[slot], // 安全：imageInfos 生命周期远长于此处
+                    });
+                }
+                device.updateDescriptorSets(static_cast<uint32_t>(writes.size()),
+                                            writes.data(), 0, nullptr);
+            }
+        });
+    descriptorSetManager.update_uniform_buffer();
+    descriptorSetManager.update_texture(textureManager.view_used_indexes());
+    descriptorSetManager.update_sampler(samplerManager.view_used_indexes());
 
     //diff: [test_dod12] start: 解析字符串。生成一些元信息
     constexpr auto ltr = 0; // NOLINT
