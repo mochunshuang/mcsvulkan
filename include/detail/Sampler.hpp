@@ -23,6 +23,10 @@ namespace mcs::vulkan
         {
             return value_;
         }
+        [[nodiscard]] constexpr auto data() const noexcept
+        {
+            return value_;
+        }
         constexpr Sampler() = default;
         constexpr Sampler(const LogicalDevice &device, VkSampler value) noexcept
             : device_{&device}, value_{value}

@@ -242,6 +242,33 @@ namespace mcs::vulkan::font
             return std::forward<decltype(self)>(self);
         }
 
+        bool unloadFont(const FontContext *font)
+        {
+            // 1. 从 selectable_ 移除
+            auto it = std::find(selectable_.begin(), selectable_.end(), font);
+            if (it == selectable_.end())
+                return false;
+            selectable_.erase(it);
+
+            // 2. 更新 notdefFont_
+            if (notdefFont_ == font)
+            {
+                notdefFont_ = nullptr;
+                for (auto *f : selectable_)
+                {
+                    if (f->glyph_index_to_glyphs.contains(0))
+                    {
+                        notdefFont_ = f;
+                        break;
+                    }
+                }
+            }
+
+            // 3. 通知 factory 销毁对象（只有友元才能访问 private 的 removeFont）
+            factory_->removeFont(font); // 此处可调用，因为是 friend
+            return true;
+        }
+
       private:
         FontFactory *factory_;
         harfbuzz::language_type language_;

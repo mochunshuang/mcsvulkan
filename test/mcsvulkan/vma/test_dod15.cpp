@@ -9,6 +9,7 @@
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/fwd.hpp>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <print>
 #include <chrono>
@@ -22,9 +23,9 @@
 
 #include "../head.hpp"
 
-using Instance = mcs::vulkan::Instance;
-using create_instance = mcs::vulkan::tool::create_instance;
-using create_debugger = mcs::vulkan::tool::create_debugger;
+using mcs::vulkan::Instance;
+using mcs::vulkan::tool::create_instance;
+using mcs::vulkan::tool::create_debugger;
 using mcs::vulkan::tool::create_physical_device_selector;
 using mcs::vulkan::vkMakeVersion;
 using mcs::vulkan::vkApiVersion;
@@ -47,8 +48,9 @@ using mcs::vulkan::input::glfw_input;
 
 using mcs::vulkan::raii_vulkan;
 using mcs::vulkan::PhysicalDevice;
+using mcs::vulkan::Debugger;
 using mcs::vulkan::surface_impl;
-using surface = mcs::vulkan::wsi::glfw::Window;
+using mcs::vulkan::wsi::glfw::Window;
 using mcs::vulkan::Queue;
 
 using mcs::vulkan::LogicalDevice;
@@ -482,32 +484,22 @@ struct FrameClock
     float deltaTime = 0.016f; // 占位值，避免第一帧为0
 };
 
-int main()
-try
+auto init()
 {
-#ifdef VERT_SHADER_PATH
-    std::cout << "VERT_SHADER_PATH: " << VERT_SHADER_PATH << '\n';
-#endif
-#ifdef FRAG_SHADER_PATH
-    std::cout << "FRAG_SHADER_PATH: " << FRAG_SHADER_PATH << '\n';
-#endif
-    raii_vulkan ctx{};
-    surface window{};
-    window.setup({.width = WIDTH, .height = HEIGHT}, TITLE); // NOLINT
-
-    constexpr auto APIVERSION = VK_API_VERSION_1_4;
-    static_assert(vkApiVersion(1, 4, 0) == VK_API_VERSION_1_4);
-    static_assert(vkApiVersion(0, 1, 4, 0) == VK_API_VERSION_1_4);
+    //NOTE: make_unique 保证地址稳定
+    auto ctx = std::make_unique<raii_vulkan>();
+    auto window = std::make_unique<Window>();
+    window->setup({.width = WIDTH, .height = HEIGHT}, TITLE); // NOLINT
 
     auto enables = enable_intance_build{}
                        .enableDebugExtension()
                        .enableValidationLayer()
-                       .enableSurfaceExtension<surface>();
+                       .enableSurfaceExtension<Window>();
 
+    constexpr auto APIVERSION = VK_API_VERSION_1_4;
     enables.check();
     enables.print();
-
-    Instance instance =
+    auto instance = std::make_unique<Instance>(
         create_instance{}
             .setCreateInfo(
                 {.applicationInfo = {.pApplicationName = "Hello Triangle",
@@ -517,11 +509,11 @@ try
                                      .apiVersion = APIVERSION},
                  .enabledLayers = enables.enabledLayers(),
                  .enabledExtensions = enables.enabledExtensions()})
-            .build();
-    auto debuger = create_debugger{}
-                       .setCreateInfo(create_debugger::defaultCreateInfo())
-                       .build(instance);
-
+            .build());
+    auto debuger = std::make_unique<Debugger>(
+        create_debugger{}
+            .setCreateInfo(create_debugger::defaultCreateInfo())
+            .build(*instance.get()));
     std::vector<const char *> requiredDeviceExtension = {
         VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_SPIRV_1_4_EXTENSION_NAME,
         VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
@@ -612,19 +604,18 @@ try
                            .shaderDrawParameters && //diff: [test_indirectdraw]
                        query_extended_dynamic_state_features.extendedDynamicState;
             })
-            .select(instance)[0];
-
-    mcs::vulkan::surface auto surface = surface_impl(physical_device, window);
+            .select(*instance.get())[0];
+    auto physical = std::make_unique<PhysicalDevice>(std::move(physical_device));
+    auto surface = std::make_unique<surface_impl<Window>>(*physical.get(), *window.get());
     const uint32_t GRAPHICS_QUEUE_FAMILY_IDX =
         create_queue_family_index_selector{}
             .requiredQueueFamily([&](const VkQueueFamilyProperties &qfp,
                                      uint32_t queueFamilyIndex) -> bool {
                 return (qfp.queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
-                       physical_device.getSurfaceSupportKHR(queueFamilyIndex, *surface);
+                       physical->getSurfaceSupportKHR(queueFamilyIndex, **surface);
             })
-            .select(physical_device)[0];
-
-    LogicalDevice device =
+            .select(*physical.get())[0];
+    auto device = std::make_unique<LogicalDevice>(
         create_logical_device{}
             .setCreateInfo({
                 .pNext = make_pNext(enablefeatureChain),
@@ -635,11 +626,19 @@ try
                         .queuePrioritie = 1.0}),
                 .enabledExtensions = requiredDeviceExtension,
             })
-            .build(physical_device);
-    requiredDeviceExtension.clear();
-
-    const auto GRAPHICS_AND_PRESENT = Queue(
-        device, {.queue_family_index = GRAPHICS_QUEUE_FAMILY_IDX, .queue_index = 0});
+            .build(*physical.get()));
+    auto GRAPHICS_AND_PRESENT = std::make_unique<Queue>(
+        Queue{*device.get(),
+              {.queue_family_index = GRAPHICS_QUEUE_FAMILY_IDX, .queue_index = 0}});
+    auto commandPool = std::make_unique<CommandPool>(
+        create_command_pool{}
+            .setCreateInfo({.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+                            .queueFamilyIndex = GRAPHICS_QUEUE_FAMILY_IDX})
+            .build(*device.get()));
+    auto commandBuffers =
+        std::make_unique<CommandBuffers>(commandPool->allocateCommandBuffers(
+            {.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+             .commandBufferCount = MAX_FRAMES_IN_FLIGHT}));
 
     auto swapchainBuild =
         create_swapchain{}
@@ -669,17 +668,189 @@ try
                                       .levelCount = 1,
                                       .baseArrayLayer = 0,
                                       .layerCount = 1}});
-    auto swapchain = swapchainBuild.build(device, surface);
+    auto swapchain = swapchainBuild.build(*device.get(), *surface.get());
+    frame_context<MAX_FRAMES_IN_FLIGHT> frameContext{*device.get(),
+                                                     swapchain.imagesSize()};
+    // hardware
+    return make_aggregate<"hardwareCtx", "vulkan", "window", "instance", "debuger",
+                          "physicalDevice", "surface", "device", "queue", "commandPool",
+                          "commandBuffers", "swapchainBuild", "swapchain",
+                          "frameContext">(
+        std::move(ctx), std::move(window), std::move(instance), std::move(debuger),
+        std::move(physical), std::move(surface), std::move(device),
+        std::move(GRAPHICS_AND_PRESENT), std::move(commandPool),
+        std::move(commandBuffers), std::move(swapchainBuild), std::move(swapchain),
+        std::move(frameContext));
+}
 
-    CommandPool commandPool =
-        create_command_pool{}
-            .setCreateInfo({.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-                            .queueFamilyIndex = GRAPHICS_QUEUE_FAMILY_IDX})
-            .build(device);
+template <class resource_type, uint32_t MAX_TEXTURES>
+struct resource_manager
+{
+    using slot_type = uint32_t;
+    static constexpr slot_type MARK_FREE = 0;
+    static constexpr slot_type MARK_USED = 1;
+    static constexpr auto invalid_index = (std::numeric_limits<slot_type>::max)();
 
-    constexpr int MAX_TEXTURES = 64;       // 预分配最大纹理槽位数（足够大）
-    std::set<uint32_t> activeTextureSlots; // 记录当前已占用的槽位
-    constexpr int SAMPLER_COUNT = 4;       // 创建2个不同的采样器
+    // 状态标记：0 空闲，1 已占用
+    std::array<slot_type, MAX_TEXTURES> slot_status{};
+    // 纹理资源数组
+    std::array<resource_type, MAX_TEXTURES> resources;
+    std::array<std::string, MAX_TEXTURES> resources_key;
+
+    constexpr void use_slot(slot_type index, resource_type resource,
+                            std::string key) noexcept
+    {
+        mark_used(index);
+        resources[index] = std::move(resource);
+        resources_key[index] = std::move(key);
+    }
+    constexpr void free_slot(slot_type index) noexcept
+    {
+        mark_free(index);
+        resources[index] = {};
+        resources_key[index] = {};
+    }
+    constexpr std::optional<slot_type> find_slot_by_name(std::string key) const noexcept
+    {
+        for (slot_type i = 0; i < resources_key.size(); ++i)
+        {
+            if (resources_key[i] == key)
+                return i;
+        }
+        return std::nullopt;
+    }
+
+    constexpr auto free_count() const noexcept
+    {
+        return std::ranges::count(slot_status, MARK_FREE);
+    }
+    constexpr auto used_count() const noexcept
+    {
+        return std::ranges::count(slot_status, MARK_USED);
+    }
+    constexpr bool is_free(slot_type index) const noexcept
+    {
+        return slot_status[index] == MARK_FREE;
+    }
+    constexpr bool is_used(slot_type index) const noexcept
+    {
+        return slot_status[index] == MARK_USED;
+    }
+    constexpr void mark_free(slot_type index) noexcept
+    {
+        assert(is_used(index) && "该槽已经是空闲的(Double free)");
+        slot_status[index] = MARK_FREE;
+    }
+    constexpr void mark_used(slot_type index) noexcept
+    {
+        assert(is_free(index) && "该槽已经是空闲的(Double used)");
+        slot_status[index] = MARK_USED;
+    }
+    constexpr auto view_free_indexes() const noexcept
+    {
+        return slot_status | std::views::enumerate |
+               std::views::filter([](auto tup) noexcept {
+                   auto [index, status] = tup;
+                   return status == MARK_FREE;
+               }) |
+               std::views::transform([](auto tup) noexcept -> slot_type {
+                   auto [index, status] = tup;
+                   return index;
+               });
+    }
+    constexpr auto view_used_indexes() const noexcept
+    {
+        return slot_status | std::views::enumerate |
+               std::views::filter([](auto tup) noexcept {
+                   auto [index, status] = tup;
+                   return status == MARK_USED;
+               }) |
+               std::views::transform([](auto tup) noexcept -> slot_type {
+                   auto [index, status] = tup;
+                   return index;
+               });
+    }
+    constexpr auto view_used_textures() const noexcept
+    {
+        return view_used_indexes() |
+               std::views::transform([&](slot_type i) noexcept -> auto {
+                   return std::make_pair(i, &resources[i]);
+               });
+    }
+    struct auto_free_slot_type
+    {
+      private:
+        resource_manager *manager{nullptr};
+        slot_type index{invalid_index};
+
+      public:
+        constexpr auto valid() const noexcept
+        {
+            return manager != nullptr;
+        }
+        constexpr operator bool() const noexcept
+        {
+            return valid();
+        }
+        auto_free_slot_type() = default;
+        constexpr auto_free_slot_type(resource_manager &mgr, slot_type idx) noexcept
+            : manager(&mgr), index(idx)
+        {
+        }
+        constexpr ~auto_free_slot_type() noexcept
+        {
+            if (manager)
+            {
+                manager->free_slot(index);
+                manager = nullptr;
+                index = invalid_index;
+            }
+        }
+        auto_free_slot_type(const auto_free_slot_type &) = delete;
+        auto_free_slot_type &operator=(const auto_free_slot_type &) = delete;
+        constexpr auto_free_slot_type(auto_free_slot_type &&other) noexcept
+            : manager(std::exchange(other.manager, nullptr)),
+              index(std::exchange(other.index, invalid_index))
+        {
+        }
+        constexpr auto_free_slot_type &operator=(auto_free_slot_type &&other) noexcept
+        {
+            if (this != &other)
+            {
+                if (manager)
+                    manager->free_slot(index);
+                manager = std::exchange(other.manager, nullptr);
+                index = std::exchange(other.index, std::numeric_limits<slot_type>::max());
+            }
+            return *this;
+        }
+    };
+};
+
+int main()
+try
+{
+#ifdef VERT_SHADER_PATH
+    std::cout << "VERT_SHADER_PATH: " << VERT_SHADER_PATH << '\n';
+#endif
+#ifdef FRAG_SHADER_PATH
+    std::cout << "FRAG_SHADER_PATH: " << FRAG_SHADER_PATH << '\n';
+#endif
+    auto hardwareCtx = init();
+    auto &window = *hardwareCtx.window.get();
+    auto &physical_device = *hardwareCtx.physicalDevice.get();
+    auto &surface = *hardwareCtx.surface.get();
+    auto &device = *hardwareCtx.device.get();
+    auto &GRAPHICS_AND_PRESENT = *hardwareCtx.queue.get();
+    auto &commandPool = *hardwareCtx.commandPool.get();
+    auto &commandBuffers = *hardwareCtx.commandBuffers.get();
+
+    auto &swapchainBuild = hardwareCtx.swapchainBuild;
+    auto &swapchain = hardwareCtx.swapchain;
+    auto &frameContext = hardwareCtx.frameContext;
+
+    constexpr int MAX_TEXTURES = 64; // 预分配最大纹理槽位数（足够大）
+    constexpr int SAMPLER_COUNT = 4; // 创建2个不同的采样器
 
     std::array<VkDescriptorBindingFlags, 4> bindingFlags = {
         // 绑定0：Uniform Buffer - 通常不需要绑定后更新
@@ -806,59 +977,64 @@ try
                                          .baseArrayLayer = 0,
                                          .layerCount = 1}};
         }};
-
-    std::map<uint32_t, mcs::vulkan::memory::resource> textureMap; // 槽位 → 纹理
-    {
-        raw_stbi_image{"textures/texture.jpg", STBI_rgb_alpha};
-
-        textureMap.emplace(0, create_texture.templateForImage2d(
-                                  device, commandPool, GRAPHICS_AND_PRESENT,
-                                  raw_stbi_image{"textures/texture.jpg", STBI_rgb_alpha},
-                                  true));
-    }
-    activeTextureSlots.insert(0);
-
-    textureMap.emplace(3,
-                       generateGradientTexture(device, commandPool, GRAPHICS_AND_PRESENT,
-                                               1)); // 棋盘
-    activeTextureSlots.insert(3);
-
-    textureMap.emplace(9,
-                       generateGradientTexture(device, commandPool, GRAPHICS_AND_PRESENT,
-                                               2)); // 渐变
-    activeTextureSlots.insert(9);
-
+    resource_manager<mcs::vulkan::memory::resource, MAX_TEXTURES> textureManager{};
     // 创建纯白纹理（槽 1）
     static constexpr auto UITextureIndex = 1;
     {
+
+        std::vector<mcs::vulkan::memory::resource> upload;
+        std::vector<std::string> upload_keys;
+        upload.reserve(4);
+        upload.push_back(create_texture.templateForImage2d(
+            device, commandPool, GRAPHICS_AND_PRESENT,
+            raw_stbi_image{"textures/texture.jpg", STBI_rgb_alpha}, true));
+        upload_keys.emplace_back("texture");
         uint32_t white = 0xFFFFFFFF;
-        auto tex =
+        upload.push_back(
             create_texture.build(device, commandPool, GRAPHICS_AND_PRESENT,
                                  mcs::vulkan::memory::create_texture::image_info{
                                      .extent = {.width = 1, .height = 1},
                                      .pixels = std::span<const uint8_t>(
                                          reinterpret_cast<const uint8_t *>(&white), 4),
-                                     .mipLevels = 1});
-        textureMap.emplace(UITextureIndex, std::move(tex));
-        activeTextureSlots.insert(UITextureIndex);
+                                     .mipLevels = 1})); //创建纯白纹理
+        upload_keys.emplace_back("white");
+
+        upload.push_back(generateGradientTexture(device, commandPool,
+                                                 GRAPHICS_AND_PRESENT, 2)); // 渐变
+        upload_keys.emplace_back("gradient");
+        upload.push_back(generateGradientTexture(device, commandPool,
+                                                 GRAPHICS_AND_PRESENT, 1)); // 棋盘
+        upload_keys.emplace_back("chessboard");
+
+        for (auto [resource, index, key] :
+             std::views::zip(upload, textureManager.view_free_indexes(), upload_keys))
+        {
+            textureManager.use_slot(index, std::move(resource), std::move(key));
+        }
     }
 
-    std::vector<Sampler> samplers;
-    samplers.reserve(SAMPLER_COUNT);
-    samplers.emplace_back(
-        create_sampler{}
-            .setCreateInfo(create_sampler::templateLinear())
-            .enableAnisotropy(
-                device.physicalDevice()->getProperties().limits.maxSamplerAnisotropy)
-            .updateMaxLodByMipmap(create_texture_mipLevels)
-            .build(device)); // 线性采样器
-    samplers.emplace_back(create_sampler{}
-                              .setCreateInfo(create_sampler::templateNearest())
-                              .build(device)); // 最近邻采样器
-
-    // diff: [test_dod12] start
-    // NOTE: 字体的采样器
+    resource_manager<Sampler, SAMPLER_COUNT> samplerManager{};
+    constexpr static auto font_linear_sampler_key = "font_linear_sampler";
+    constexpr static auto font_nearest_neighbor_sampler_key =
+        "font_nearest_neighbor_sampler";
     {
+        std::vector<Sampler> samplers;
+        std::vector<std::string> upload_keys;
+
+        samplers.reserve(SAMPLER_COUNT);
+        samplers.emplace_back(
+            create_sampler{}
+                .setCreateInfo(create_sampler::templateLinear())
+                .enableAnisotropy(
+                    device.physicalDevice()->getProperties().limits.maxSamplerAnisotropy)
+                .updateMaxLodByMipmap(create_texture_mipLevels)
+                .build(device)); // 线性采样器
+        upload_keys.emplace_back("linear_sampler");
+        samplers.emplace_back(create_sampler{}
+                                  .setCreateInfo(create_sampler::templateNearest())
+                                  .build(device)); // 最近邻采样器
+        upload_keys.emplace_back("nearest_neighbor_sampler");
+
         // 采样器类型2：线性过滤，重复寻址，各向异性
         samplers.emplace_back(
             create_sampler{}
@@ -883,6 +1059,7 @@ try
                      .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
                      .unnormalizedCoordinates = VK_FALSE})
                 .build(device));
+        upload_keys.emplace_back(font_linear_sampler_key);
 
         // 采样器类型1：最近邻过滤，钳位到边缘
         samplers.emplace_back(
@@ -905,8 +1082,14 @@ try
                                 .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
                                 .unnormalizedCoordinates = VK_FALSE})
                 .build(device));
+        upload_keys.emplace_back(font_nearest_neighbor_sampler_key);
+
+        for (auto [resource, index, key] :
+             std::views::zip(samplers, samplerManager.view_free_indexes(), upload_keys))
+        {
+            samplerManager.use_slot(index, std::move(resource), std::move(key));
+        }
     }
-    // diff: [test_dod12] end
 
     //diff: [test_dod12] start: 加载字符纹理
     auto pre = std::string{MSDF_OUTPUT_DIR};
@@ -933,67 +1116,64 @@ try
     constexpr auto texture_indexs = std::array{10, 11, 12, 13, 14};
     constexpr auto texture_sampler_indexs = std::array{2, 3};
 
+    auto make_font_registration = [&]() {
+    };
+
     // 添加字体
     font::freetype_loader loader{};
-    std::vector<font::FontInfo> registe_fonts =
-        font::font_register::makeFontInfos(
-            loader,
-            {
-                //
-                font::font_registration{
-                    .font_path = FONT_PATH_0,
-                    .json_path = JSON_PATH_0,
-                    .type = font::FontType::eMSDF,
-                    .texture_info = {.bind = {.texture_index = texture_indexs[0],
-                                              .sampler_index = texture_sampler_indexs[0]},
-                                     .image_variant =
-                                         font::texture_info::stbi_image_type{
-                                             .image_format = STBI_rgb_alpha,
-                                             .image_path = TEXTURE_PATH_0}}},
-                font::font_registration{
-                    .font_path = FONT_PATH_1,
-                    .json_path = JSON_PATH_1,
-                    .type = font::FontType::eMSDF,
-                    .texture_info = {.bind = {.texture_index = texture_indexs[1],
-                                              .sampler_index = texture_sampler_indexs[0]},
-                                     .image_variant =
-                                         font::texture_info::stbi_image_type{
-                                             .image_format = STBI_rgb_alpha,
-                                             .image_path = TEXTURE_PATH_1}}},
-                font::font_registration{
-                    .font_path = FONT_PATH_2,
-                    .json_path = JSON_PATH_2,
-                    .type = font::FontType::eBITMAP,
-                    .texture_info = {.bind = {.texture_index = texture_indexs[2],
-                                              .sampler_index = texture_sampler_indexs[0]},
-                                     .image_variant =
-                                         font::texture_info::stbi_image_type{
-                                             .image_format = STBI_rgb_alpha,
-                                             .image_path = TEXTURE_PATH_2}}},
-                font::font_registration{
-                    .font_path = FONT_PATH_3,
-                    .json_path = JSON_PATH_3,
-                    .type = font::FontType::eMSDF,
-                    .texture_info = {.bind = {.texture_index = texture_indexs[3],
-                                              .sampler_index = texture_sampler_indexs[0]},
-                                     .image_variant =
-                                         font::texture_info::stbi_image_type{
-                                             .image_format = STBI_rgb_alpha,
-                                             .image_path = TEXTURE_PATH_3}}},
-                font::font_registration{
-                    .font_path = FONT_PATH_4,
-                    .json_path = JSON_PATH_4,
-                    .type = font::FontType::eMSDF,
-                    .texture_info = {.bind = {.texture_index = texture_indexs[4],
-                                              .sampler_index = texture_sampler_indexs[0]},
-                                     .image_variant =
-                                         font::texture_info::stbi_image_type{
-                                             .image_format = STBI_rgb_alpha,
-                                             .image_path = TEXTURE_PATH_4}}},
-            });
+    std::vector<font::FontInfo> registe_fonts = font::font_register::makeFontInfos(
+        loader, {
+                    //
+                    font::font_registration{
+                        .font_path = FONT_PATH_0,
+                        .json_path = JSON_PATH_0,
+                        .type = font::FontType::eMSDF,
+                        .texture_info = {.bind = {}, //NOTE: lazy_bind
+                                         .image_variant =
+                                             font::texture_info::stbi_image_type{
+                                                 .image_format = STBI_rgb_alpha,
+                                                 .image_path = TEXTURE_PATH_0}}},
+                    font::font_registration{
+                        .font_path = FONT_PATH_1,
+                        .json_path = JSON_PATH_1,
+                        .type = font::FontType::eMSDF,
+                        .texture_info = {.bind = {},
+                                         .image_variant =
+                                             font::texture_info::stbi_image_type{
+                                                 .image_format = STBI_rgb_alpha,
+                                                 .image_path = TEXTURE_PATH_1}}},
+                    font::font_registration{
+                        .font_path = FONT_PATH_2,
+                        .json_path = JSON_PATH_2,
+                        .type = font::FontType::eBITMAP,
+                        .texture_info = {.bind = {},
+                                         .image_variant =
+                                             font::texture_info::stbi_image_type{
+                                                 .image_format = STBI_rgb_alpha,
+                                                 .image_path = TEXTURE_PATH_2}}},
+                    font::font_registration{
+                        .font_path = FONT_PATH_3,
+                        .json_path = JSON_PATH_3,
+                        .type = font::FontType::eMSDF,
+                        .texture_info = {.bind = {},
+                                         .image_variant =
+                                             font::texture_info::stbi_image_type{
+                                                 .image_format = STBI_rgb_alpha,
+                                                 .image_path = TEXTURE_PATH_3}}},
+                    font::font_registration{
+                        .font_path = FONT_PATH_4,
+                        .json_path = JSON_PATH_4,
+                        .type = font::FontType::eMSDF,
+                        .texture_info = {.bind = {},
+                                         .image_variant =
+                                             font::texture_info::stbi_image_type{
+                                                 .image_format = STBI_rgb_alpha,
+                                                 .image_path = TEXTURE_PATH_4}}},
+                });
 
     auto font_factory = font::make_font_factory(
-        [&device, &commandPool, &GRAPHICS_AND_PRESENT](const font::FontInfo &info) {
+        [&device, &commandPool, &GRAPHICS_AND_PRESENT, &textureManager,
+         &samplerManager](font::FontInfo &info) {
             mcs::vulkan::memory::create_texture create_font_texture{
                 [](mcs::vulkan::memory::create_texture::image_info imageInfo)
                     -> mcs::vulkan::memory::create_texture::create_info {
@@ -1029,10 +1209,18 @@ try
                 }};
 
             using stbi_image_type = mcs::vulkan::font::texture_info::stbi_image_type;
+            using texture_bind_sampler = mcs::vulkan::font::texture_bind_sampler;
             const auto &registration = info.registration;
             if (std::holds_alternative<stbi_image_type>(
                     registration.texture_info.image_variant))
             {
+                auto sampler_index = samplerManager.find_slot_by_name(
+                    info.registration.type == font::FontType::eMSDF
+                        ? font_linear_sampler_key
+                        : font_nearest_neighbor_sampler_key);
+                if (not sampler_index)
+                    throw std::logic_error{"couldn't find a suitable sampler_index"};
+
                 using image_type = stbi_image_type::type;
                 const auto &imageInfo =
                     std::get<stbi_image_type>(registration.texture_info.image_variant);
@@ -1042,26 +1230,40 @@ try
                 auto texHeight = image.height();
                 auto imageSize = image.size();
 
-                return create_font_texture.build(
-                    device, commandPool, GRAPHICS_AND_PRESENT,
-                    mcs::vulkan::memory::create_texture::image_info{
-                        .extent = {.width = static_cast<uint32_t>(texWidth),
-                                   .height = static_cast<uint32_t>(texHeight)},
-                        .pixels =
-                            std::span<const uint8_t>{image.data(),
-                                                     static_cast<uint64_t>(imageSize)},
-                        .mipLevels = 1});
+                for (auto texture_index :
+                     textureManager.view_free_indexes() | std::views::take(1))
+                {
+                    // NOTE: update: bind
+                    info.registration.texture_info.bind = texture_bind_sampler{
+                        .texture_index = static_cast<uint32_t>(texture_index),
+                        .sampler_index = static_cast<uint32_t>(*sampler_index)};
+
+                    textureManager.use_slot(
+                        texture_index,
+                        create_font_texture.build(
+                            device, commandPool, GRAPHICS_AND_PRESENT,
+                            mcs::vulkan::memory::create_texture::image_info{
+                                .extent = {.width = static_cast<uint32_t>(texWidth),
+                                           .height = static_cast<uint32_t>(texHeight)},
+                                .pixels =
+                                    std::span<const uint8_t>{
+                                        image.data(), static_cast<uint64_t>(imageSize)},
+                                .mipLevels = 1}),
+                        imageInfo.image_path);
+                    using ManagerType = std::decay_t<decltype(textureManager)>;
+                    return ManagerType::auto_free_slot_type{textureManager,
+                                                            texture_index};
+                }
+                throw std::logic_error{"couldn't find a suitable texture_index"};
             }
             throw std::logic_error{"check image_variant"};
         },
         *loader);
+    using FontContext = std::decay_t<decltype(font_factory)>::font_context_type;
     auto font_selct =
         font::GenFontSelector{&font_factory, "zh-CN"}.load(std::move(registe_fonts));
     font_selct.initNotdefFont();
     assert(font_selct.notdefFont() != nullptr);
-
-    // NOTE: 标记激活 占用
-    // activeTextureSlots.insert_range(texture_indexs); //NOTE: 分开。
 
     namespace font_ns = mcs::vulkan::font;
 
@@ -1070,34 +1272,24 @@ try
     //NOTE: 不需要保存 VkDescriptorImageInfo。 有textureMap和索引够了
     {
         // 采样器信息：只一份，所有帧共用
-        auto samplerInfos =
-            samplers | std::views::transform([](const auto &s) constexpr noexcept {
-                return VkDescriptorImageInfo{.sampler = *s,
-                                             .imageView = nullptr,
-                                             .imageLayout = VK_IMAGE_LAYOUT_UNDEFINED};
-            }) |
-            std::ranges::to<std::vector>();
+        std::vector<VkDescriptorImageInfo> samplerInfos(SAMPLER_COUNT);
+        for (auto [index, sampler] : samplerManager.view_used_textures())
+        {
+            samplerInfos[index] =
+                VkDescriptorImageInfo{.sampler = sampler->data(),
+                                      .imageView = nullptr,
+                                      .imageLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+        }
 
         // 纹理信息：只一份，所有帧共用
         std::vector<VkDescriptorImageInfo> imageInfos(MAX_TEXTURES);
-        for (uint32_t slot : activeTextureSlots)
+        for (auto [index, image] : textureManager.view_used_textures())
         {
-            imageInfos[slot] = VkDescriptorImageInfo{
+            imageInfos[index] = VkDescriptorImageInfo{
                 .sampler = nullptr,
-                .imageView = textureMap[slot].imageView(),
+                .imageView = image->imageView(),
                 .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         }
-        //diff: [test_dod12] start
-        auto &selectables = font_selct.selectable();
-        for (auto const [index, slot] : std::views::enumerate(texture_indexs))
-        {
-            imageInfos[slot] = VkDescriptorImageInfo{
-                .sampler = nullptr,
-                .imageView = selectables[index]->texture.imageView(),
-                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        }
-        //diff: [test_dod12] end
-
         // 一个循环搞定所有帧的描述符更新
         for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
         {
@@ -1117,9 +1309,8 @@ try
             });
 
             // 绑定 1: Sampled Images（指向全局 imageInfos 的对应槽位）
-            for (uint32_t slot : activeTextureSlots)
+            for (uint32_t slot : textureManager.view_used_indexes())
             {
-
                 writes.push_back({
                     .sType = sType<VkWriteDescriptorSet>(),
                     .dstSet = descriptorSets[i],
@@ -1131,34 +1322,22 @@ try
                         &imageInfos[slot], // 安全：imageInfos 生命周期远长于此处
                 });
             }
-            //diff: [test_dod12] start
-            for (auto const [index, slot] : std::views::enumerate(texture_indexs))
-            {
 
+            // 绑定 2: Samplers
+            for (uint32_t slot : samplerManager.view_used_indexes())
+            {
                 writes.push_back({
                     .sType = sType<VkWriteDescriptorSet>(),
                     .dstSet = descriptorSets[i],
-                    .dstBinding = 1,
+                    .dstBinding = 2,
                     .dstArrayElement = static_cast<uint32_t>(slot),
+                    // NOTE: 上面是 shader的信息。下面是传输的信息
                     .descriptorCount = 1,
-                    .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
                     .pImageInfo =
-                        &imageInfos[slot], // 安全：imageInfos 生命周期远长于此处
+                        &samplerInfos[slot], // 安全：imageInfos 生命周期远长于此处
                 });
             }
-            //diff: [test_dod12] end
-
-            // 绑定 2: Samplers
-            writes.push_back({
-                .sType = sType<VkWriteDescriptorSet>(),
-                .dstSet = descriptorSets[i],
-                .dstBinding = 2,
-                .dstArrayElement = 0,
-                // NOTE: 上面是 shader的信息。下面是传输的信息
-                .descriptorCount = SAMPLER_COUNT,
-                .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
-                .pImageInfo = samplerInfos.data(),
-            });
             device.updateDescriptorSets(static_cast<uint32_t>(writes.size()),
                                         writes.data(), 0, nullptr);
         }
@@ -1564,12 +1743,6 @@ try
                  .layout = *pipelineLayout})
             .build(device);
 
-    static constexpr auto MAX_FRAMES_IN_FLIGHT = 2;
-    CommandBuffers commandBuffers =
-        commandPool.allocateCommandBuffers({.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-                                            .commandBufferCount = MAX_FRAMES_IN_FLIGHT});
-    frame_context<MAX_FRAMES_IN_FLIGHT> frameContext{device, swapchain.imagesSize()};
-
     // NOLINTBEGIN
 
     // diff: [test_dod2] start 定义全部数据
@@ -1712,7 +1885,7 @@ try
         const double MAX_LINE_WIDTH = static_cast<double>(contentWidth);
 
         // 建立逻辑索引到字形指针的映射（复用原逻辑）
-        using FontContext = font::GenFontContext<mcs::vulkan::memory::resource>;
+
         std::vector<const font_ns::harfbuzz::shape_result<FontContext> *> visual_glyphs;
         std::unordered_map<size_t, const font_ns::harfbuzz::shape_result<FontContext> *>
             logical_to_glyph;
@@ -3452,7 +3625,7 @@ try
         auto &pickMouse = pickCtx.mouse;
         auto &swapchain = globalCtx.swapchain;
 
-        surface::pollEvents();
+        Window::pollEvents();
 
         auto cur = input.cursorPos();
         auto ext = swapchain.refImageExtent();
@@ -3716,23 +3889,23 @@ try
 
         // ========== 新增：每 2 秒切换 autoSpinStore 第一个实体的纹理索引 ==========
         {
-            auto &autoSpinStore = soaCtx.autoSpinStore;
-            if (autoSpinStore.size() > 0) // 确保至少有一个实体
-            {
-                static auto lastTexSwitch = std::chrono::steady_clock::now();
-                auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration_cast<std::chrono::seconds>(now - lastTexSwitch)
-                        .count() >= 2)
-                {
-                    lastTexSwitch = now;
+            // auto &autoSpinStore = soaCtx.autoSpinStore;
+            // if (autoSpinStore.size() > 0) // 确保至少有一个实体
+            // {
+            //     static auto lastTexSwitch = std::chrono::steady_clock::now();
+            //     auto now = std::chrono::steady_clock::now();
+            //     if (std::chrono::duration_cast<std::chrono::seconds>(now - lastTexSwitch)
+            //             .count() >= 2)
+            //     {
+            //         lastTexSwitch = now;
 
-                    // 直接通过 view_entity 获取第一个实体的 textureIndex 引用并修改
-                    // 注意：实体 ID 是 0（第一个创建的实体）
-                    auto [texRef] = autoSpinStore.view_entity<"instanceData">(0, 0);
-                    // 在 0 和 3 之间切换（这两个槽位已经绑定了纹理，确保有效）
-                    texRef.textureIndex = (texRef.textureIndex == 0) ? 3 : 0;
-                }
-            }
+            //         // 直接通过 view_entity 获取第一个实体的 textureIndex 引用并修改
+            //         // 注意：实体 ID 是 0（第一个创建的实体）
+            //         auto [texRef] = autoSpinStore.view_entity<"instanceData">(0, 0);
+            //         // 在 0 和 3 之间切换（这两个槽位已经绑定了纹理，确保有效）
+            //         texRef.textureIndex = (texRef.textureIndex == 0) ? 3 : 0;
+            //     }
+            // }
         }
         // ======================================================================
         drawFrame(world, inputCtx, soaCtx);

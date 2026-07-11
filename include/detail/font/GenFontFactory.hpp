@@ -5,12 +5,13 @@
 
 #include <concepts>
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace mcs::vulkan::font
 {
     template <typename FontContext, typename MakeFontTexture>
-        requires(requires(MakeFontTexture make, FontInfo info) {
+        requires(requires(MakeFontTexture make, FontInfo &info) {
             { make(info) } -> std::same_as<typename FontContext::texture_type>;
         })
     class GenFontFactory
@@ -31,8 +32,9 @@ namespace mcs::vulkan::font
             if (std::holds_alternative<stbi_image_type>(
                     registration.texture_info.image_variant))
             {
+                auto bind_texture = make_(info);
                 fonts_.emplace_back(std::make_unique<FontContext>(
-                    registration.json_path, make_(info),
+                    registration.json_path, std::move(bind_texture),
                     ft_face_type{library_, registration.font_path,
                                  info.meta_data.face_index},
                     registration.type, registration.texture_info.bind,
@@ -42,7 +44,18 @@ namespace mcs::vulkan::font
             return nullptr;
         }
 
+        template <typename FontFactory>
+        friend class GenFontSelector;
+
       private:
+        void removeFont(const FontContext *font)
+        {
+            if (auto it =
+                    std::find_if(fonts_.begin(), fonts_.end(),
+                                 [font](const auto &ptr) { return ptr.get() == font; });
+                it != fonts_.end())
+                fonts_.erase(it); // 释放 unique_ptr，即销毁 FontContext
+        }
         MakeFontTexture make_;
         FT_Library library_;
         std::vector<std::unique_ptr<FontContext>> fonts_;

@@ -3,6 +3,7 @@
 #include "../LogicalDevice.hpp"
 #include "sType.hpp"
 #include <array>
+#include <utility>
 
 namespace mcs::vulkan::tool
 {
@@ -18,7 +19,8 @@ namespace mcs::vulkan::tool
         uint32_t currentFrame = 0;
         // NOLINTEND
 
-        explicit frame_context(const LogicalDevice &device, size_t swapChainImagesSize)
+        constexpr explicit frame_context(const LogicalDevice &device,
+                                         size_t swapChainImagesSize)
             : device_{&device}
         {
             presentCompleteSemaphore.resize(swapChainImagesSize);
@@ -26,16 +28,39 @@ namespace mcs::vulkan::tool
             // inFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
             createSyncObjects(device);
         }
-        ~frame_context() noexcept
+        constexpr ~frame_context() noexcept
         {
             destroy();
         }
         frame_context(const frame_context &) = delete;
-        frame_context(frame_context &&) = delete;
+        constexpr frame_context(frame_context &&o) noexcept
+            : device_{std::exchange(o.device_, {})},
+              presentCompleteSemaphore{std::exchange(o.presentCompleteSemaphore, {})},
+              renderFinishedSemaphore{std::exchange(o.renderFinishedSemaphore, {})},
+              inFlightFences{std::exchange(o.inFlightFences, {})},
+              semaphoreIndex{std::exchange(o.semaphoreIndex, {})},
+              currentFrame{std::exchange(o.currentFrame, {})}
+        {
+        }
         frame_context &operator=(const frame_context &) = delete;
-        frame_context &operator=(frame_context &&) = delete;
+        constexpr frame_context &operator=(frame_context &&o) noexcept
+        {
+            if (*o != this)
+            {
+                destroy();
+                device_ = {std::exchange(o.device_, {})};
+                presentCompleteSemaphore = {
+                    std::exchange(o.presentCompleteSemaphore, {})};
+                renderFinishedSemaphore = {std::exchange(o.renderFinishedSemaphore, {})};
+                inFlightFences = {std::exchange(o.inFlightFences, {})};
+                semaphoreIndex = {std::exchange(o.semaphoreIndex, {})};
+                currentFrame = {std::exchange(o.currentFrame, {})};
+            }
+            return *this;
+        }
 
-        constexpr void rebuild(size_t swapChainImagesSize)
+        [[deprecated("use re-new instead.")]] constexpr void rebuild(
+            size_t swapChainImagesSize)
         {
             // 销毁旧的信号量和栅栏
             destroySyncObject();
@@ -52,7 +77,7 @@ namespace mcs::vulkan::tool
         }
 
       private:
-        void createSyncObjects(const LogicalDevice &device)
+        constexpr void createSyncObjects(const LogicalDevice &device)
         {
             using tool::sType;
 
