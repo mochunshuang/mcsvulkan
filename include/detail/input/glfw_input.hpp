@@ -41,10 +41,11 @@ namespace mcs::vulkan::input
             event::cursor_enter_event_dispatcher::instance().unsubscribe(
                 this, &glfw_input::onCursorEnter);
         }
-        glfw_input(const glfw_input &) = default;
-        glfw_input(glfw_input &&) = default;
-        glfw_input &operator=(const glfw_input &) = default;
-        glfw_input &operator=(glfw_input &&) = default;
+        // 和 this 有关 最好是全部删除
+        glfw_input(const glfw_input &) = delete;
+        glfw_input(glfw_input &&) = delete;
+        glfw_input &operator=(const glfw_input &) = delete;
+        glfw_input &operator=(glfw_input &&) = delete;
 
         static void onKeyboardEvent(void *self, keyboard_event key) noexcept
         {

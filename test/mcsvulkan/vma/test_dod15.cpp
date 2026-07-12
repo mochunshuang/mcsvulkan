@@ -1368,7 +1368,59 @@ constexpr auto initFont(auto &hardwareCtx, auto &descriptorCtx)
     return make_aggregate<"fontCtx", "loader", "font_factory", "font_select">(
         std::move(loaderPtr), std::move(font_factoryPtr), std::move(font_select));
 }
+auto inputInit(auto &swapchain)
+{
+    auto camera = [&]() {
+        using namespace camera; // 你的 camera 命名空间
+        // 视图：从 eye/center/up 构建 ViewMatrixObject
+        glm::vec3 eye(0.0f, 0.0f, 2.0f);
+        glm::vec3 center(0.0f, 0.0f, 0.0f);
+        glm::vec3 up(0.0f, 1.0f, 0.0f);
+        glm::vec3 forward = glm::normalize(center - eye);
+        RightHandedView view;
+        view.setPosition(eye).setOrientation(glm::quatLookAt(forward, up)); // 右手系
 
+        // 投影：注意原 fovy 是弧度，这里要转成度数，因为构造函数接收度数
+        float fovDeg = glm::degrees(glm::radians(45.0f)); // 就是 45.0f
+        float aspect = swapchain.refImageExtent().width /
+                       static_cast<float>(swapchain.refImageExtent().height);
+        VulkanPerspectiveProjection proj(fovDeg, aspect, 0.1f, 10.0f);
+        return GenCamera(RightHandedView::lookAt(glm::vec3(0, 0, 2), glm::vec3(0, 0, 0),
+                                                 glm::vec3(0, 1, 0)),
+                         std::move(proj));
+    }();
+    // 在创建 camera 之后，创建 uiCamera.与i开始是单位矩阵
+    auto uiCamera = []() {
+        using namespace camera;
+        // 视图：相机位于原点，无旋转 → 视图矩阵 = I
+        auto uiView = camera::RightHandedView{
+            glm::vec3(0.0f, 0.0f, 0.0f), // 位置为原点
+            glm::identity<glm::quat>()   // 无旋转
+        };
+        // 投影：正交范围 [-1,1] 且 near=0, far=1 → 投影矩阵 = I
+        auto uiProj =
+            camera::VulkanUIOrthographicProjection{-1.0f, 1.0f, -1.0f, 1.0f, 0.0f, 1.0f};
+        return camera::GenCamera(uiView, uiProj);
+    }();
+    {
+        auto v = uiCamera.getViewMatrix();
+        auto p = uiCamera.getProjMatrix();
+
+        std::println("=== UI Camera matrices ===");
+        for (int i = 0; i < 4; ++i)
+            std::println("V[{}]: {:8.6f} {:8.6f} {:8.6f} {:8.6f}", i, v[i][0], v[i][1],
+                         v[i][2], v[i][3]);
+        std::println("");
+        for (int i = 0; i < 4; ++i)
+            std::println("P[{}]: {:8.6f} {:8.6f} {:8.6f} {:8.6f}", i, p[i][0], p[i][1],
+                         p[i][2], p[i][3]);
+    }
+    assert(uiCamera.getViewMatrix() == glm::mat4(1) &&
+           uiCamera.getProjMatrix() == glm::mat4(1));
+    auto input = std::make_unique<glfw_input>();
+    return make_aggregate<"inputDataCtx", "input", "camera", "uiCamera", "clock">(
+        std::move(input), std::move(camera), std::move(uiCamera), FrameClock{});
+}
 int main()
 try
 {
@@ -1413,6 +1465,12 @@ try
     descriptorSetManager.update_uniform_buffer();
     descriptorSetManager.update_texture(textureManager.view_used_indexes());
     descriptorSetManager.update_sampler(samplerManager.view_used_indexes());
+
+    auto inputDataCtx = inputInit(swapchain);
+    auto &input = *inputDataCtx.input.get();
+    auto &camera = inputDataCtx.camera;
+    auto &uiCamera = inputDataCtx.uiCamera;
+    auto &clock = inputDataCtx.clock;
 
     //diff: [test_dod12] end
 
@@ -2280,58 +2338,6 @@ try
         uint32_t image_index;
     };
 
-    //diff: [test_dod14] start
-    auto camera = [&]() {
-        using namespace camera; // 你的 camera 命名空间
-        // 视图：从 eye/center/up 构建 ViewMatrixObject
-        glm::vec3 eye(0.0f, 0.0f, 2.0f);
-        glm::vec3 center(0.0f, 0.0f, 0.0f);
-        glm::vec3 up(0.0f, 1.0f, 0.0f);
-        glm::vec3 forward = glm::normalize(center - eye);
-        RightHandedView view;
-        view.setPosition(eye).setOrientation(glm::quatLookAt(forward, up)); // 右手系
-
-        // 投影：注意原 fovy 是弧度，这里要转成度数，因为构造函数接收度数
-        float fovDeg = glm::degrees(glm::radians(45.0f)); // 就是 45.0f
-        float aspect = swapchain.refImageExtent().width /
-                       static_cast<float>(swapchain.refImageExtent().height);
-        VulkanPerspectiveProjection proj(fovDeg, aspect, 0.1f, 10.0f);
-        return GenCamera(RightHandedView::lookAt(glm::vec3(0, 0, 2), glm::vec3(0, 0, 0),
-                                                 glm::vec3(0, 1, 0)),
-                         std::move(proj));
-    }();
-    // 在创建 camera 之后，创建 uiCamera.与i开始是单位矩阵
-    auto uiCamera = []() {
-        using namespace camera;
-        // 视图：相机位于原点，无旋转 → 视图矩阵 = I
-        auto uiView = camera::RightHandedView{
-            glm::vec3(0.0f, 0.0f, 0.0f), // 位置为原点
-            glm::identity<glm::quat>()   // 无旋转
-        };
-        // 投影：正交范围 [-1,1] 且 near=0, far=1 → 投影矩阵 = I
-        auto uiProj =
-            camera::VulkanUIOrthographicProjection{-1.0f, 1.0f, -1.0f, 1.0f, 0.0f, 1.0f};
-        return camera::GenCamera(uiView, uiProj);
-    }();
-    {
-        auto v = uiCamera.getViewMatrix();
-        auto p = uiCamera.getProjMatrix();
-
-        std::println("=== UI Camera matrices ===");
-        for (int i = 0; i < 4; ++i)
-            std::println("V[{}]: {:8.6f} {:8.6f} {:8.6f} {:8.6f}", i, v[i][0], v[i][1],
-                         v[i][2], v[i][3]);
-        std::println("");
-        for (int i = 0; i < 4; ++i)
-            std::println("P[{}]: {:8.6f} {:8.6f} {:8.6f} {:8.6f}", i, p[i][0], p[i][1],
-                         p[i][2], p[i][3]);
-    }
-    assert(uiCamera.getViewMatrix() == glm::mat4(1) &&
-           uiCamera.getProjMatrix() == glm::mat4(1));
-    //diff: [test_dod14] end
-
-    glfw_input input{};
-
     // ========== 拾取资源 ==========
     // 创建拾取图像（R32G32_UINT）
 
@@ -2437,7 +2443,6 @@ try
     auto mainShaderCtx =
         make_aggregate_ref<"mainShaderCtx", "indirectDrawBatches", "uniformBuffers",
                            "descriptorSets">(batches, uniformBuffers, descriptorSets);
-    FrameClock clock;
     auto inputCtx =
         make_aggregate_ref<"inputCtx", "input", "camera", "uiCamera", "clock">(
             input, camera, uiCamera, clock);
@@ -2656,8 +2661,8 @@ try
                 proj.adjustFarSafe(-stepDeg);
 
             // 打印当前值
-            std::print("fov: {} deg, aspect: {}, near: {}, far: {}\n", proj.getFov(),
-                       proj.getAspect(), proj.getNear(), proj.getFar());
+            // std::print("fov: {} deg, aspect: {}, near: {}, far: {}\n", proj.getFov(),
+            //            proj.getAspect(), proj.getNear(), proj.getFar());
         };
 
     // diff: [test_model_matrix3] 小小调整
