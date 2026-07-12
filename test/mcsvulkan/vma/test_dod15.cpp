@@ -64,6 +64,11 @@ using mcs::vulkan::CommandBuffer;
 using mcs::vulkan::CommandBufferView;
 using mcs::vulkan::Fence;
 
+using mcs::vulkan::DescriptorSetLayout;
+using mcs::vulkan::DescriptorPool;
+using mcs::vulkan::DescriptorSets;
+using mcs::vulkan::DescriptorSetLayout;
+
 using raii_vma = mcs::vulkan::raii_vma;
 
 using mcs::vulkan::tool::simple_copy_buffer;
@@ -484,8 +489,7 @@ struct FrameClock
     Clock::time_point lastTime{};
     float deltaTime = 0.016f; // 占位值，避免第一帧为0
 };
-
-auto init()
+constexpr auto init()
 {
     //NOTE: make_unique 保证地址稳定
     auto ctx = std::make_unique<raii_vulkan>();
@@ -828,27 +832,16 @@ struct resource_manager
     };
 };
 
-int main()
-try
+constexpr static auto font_linear_sampler_key = "font_linear_sampler";
+constexpr static auto font_nearest_neighbor_sampler_key = "font_nearest_neighbor_sampler";
+constexpr static auto texture_ui_key = "white";
+constexpr auto descriptorInit(auto &hardwareCtx)
 {
-#ifdef VERT_SHADER_PATH
-    std::cout << "VERT_SHADER_PATH: " << VERT_SHADER_PATH << '\n';
-#endif
-#ifdef FRAG_SHADER_PATH
-    std::cout << "FRAG_SHADER_PATH: " << FRAG_SHADER_PATH << '\n';
-#endif
-    auto hardwareCtx = init();
-    auto &window = *hardwareCtx.window.get();
     auto &physical_device = *hardwareCtx.physicalDevice.get();
     auto &surface = *hardwareCtx.surface.get();
     auto &device = *hardwareCtx.device.get();
     auto &GRAPHICS_AND_PRESENT = *hardwareCtx.queue.get();
     auto &commandPool = *hardwareCtx.commandPool.get();
-    auto &commandBuffers = *hardwareCtx.commandBuffers.get();
-
-    auto &swapchainBuild = hardwareCtx.swapchainBuild;
-    auto &swapchain = hardwareCtx.swapchain;
-    auto &frameContext = hardwareCtx.frameContext;
 
     constexpr int MAX_TEXTURES = 64; // 预分配最大纹理槽位数（足够大）
     constexpr int SAMPLER_COUNT = 4; // 创建2个不同的采样器
@@ -862,7 +855,7 @@ try
         0, // 对应 binding 3（Storage Buffer）
     };
 
-    auto descriptorSetLayout =
+    auto descriptorSetLayoutPtr = std::make_unique<DescriptorSetLayout>(
         create_descriptor_set_layout{}
             .setCreateInfo(
                 {.pNext = make_pNext(
@@ -898,9 +891,10 @@ try
                              .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
                          }, //diff: [test_indirectdraw] end
                      }})
-            .build(device);
+            .build(device));
+    auto &descriptorSetLayout = *descriptorSetLayoutPtr.get();
 
-    auto descriptorPool =
+    auto descriptorPoolPtr = std::make_unique<DescriptorPool>(
         create_descriptor_pool{}
             .setCreateInfo(
                 {.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT |
@@ -926,13 +920,20 @@ try
                              .descriptorCount =
                                  MAX_FRAMES_IN_FLIGHT}, //diff: [test_indirectdraw] end
                      }})
-            .build(device);
-    auto descriptorSets = descriptorPool.allocateDescriptorSets(
+            .build(device));
+    using descriptorSetsType = decltype(descriptorPoolPtr->allocateDescriptorSets(
         {.descriptorSets = std::vector<VkDescriptorSetLayout>{MAX_FRAMES_IN_FLIGHT,
-                                                              *descriptorSetLayout}});
+                                                              *descriptorSetLayout}}));
+    auto descriptorSetsPtr =
+        std::make_unique<descriptorSetsType>(descriptorPoolPtr->allocateDescriptorSets(
+            {.descriptorSets = std::vector<VkDescriptorSetLayout>{
+                 MAX_FRAMES_IN_FLIGHT, *descriptorSetLayout}}));
+    auto &descriptorSets = *descriptorSetsPtr.get();
 
     // diff: [test_dod7] start: 不再是 vma 的内存
-    std::array<mcs::vulkan::memory::auto_map_buffer, MAX_FRAMES_IN_FLIGHT> uniformBuffers;
+    auto uniformBuffersPtr = std::make_unique<
+        std::array<mcs::vulkan::memory::auto_map_buffer, MAX_FRAMES_IN_FLIGHT>>();
+    auto &uniformBuffers = *uniformBuffersPtr.get();
     {
         constexpr VkDeviceSize BUFFER_SIZE = sizeof(UniformBufferObject);
         for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
@@ -981,9 +982,9 @@ try
                                          .baseArrayLayer = 0,
                                          .layerCount = 1}};
         }};
-    resource_manager<mcs::vulkan::memory::resource, MAX_TEXTURES> textureManager{};
-    // 创建纯白纹理（槽 1）
-    static constexpr auto UITextureIndex = 1;
+    auto textureManagerPtr =
+        std::make_unique<resource_manager<mcs::vulkan::memory::resource, MAX_TEXTURES>>();
+    auto &textureManager = *textureManagerPtr.get();
     {
 
         std::vector<mcs::vulkan::memory::resource> upload;
@@ -1016,11 +1017,8 @@ try
             textureManager.use_slot(index, std::move(resource), std::move(key));
         }
     }
-
-    resource_manager<Sampler, SAMPLER_COUNT> samplerManager{};
-    constexpr static auto font_linear_sampler_key = "font_linear_sampler";
-    constexpr static auto font_nearest_neighbor_sampler_key =
-        "font_nearest_neighbor_sampler";
+    auto samplerManagerPtr = std::make_unique<resource_manager<Sampler, SAMPLER_COUNT>>();
+    auto &samplerManager = *samplerManagerPtr.get();
     {
         std::vector<Sampler> samplers;
         std::vector<std::string> upload_keys;
@@ -1094,181 +1092,6 @@ try
             samplerManager.use_slot(index, std::move(resource), std::move(key));
         }
     }
-
-    //diff: [test_dod12] start: 加载字符纹理
-    auto pre = std::string{MSDF_OUTPUT_DIR};
-    const std::string TEXTURE_PATH_0 = pre + "/english_atlas.png";
-    const std::string JSON_PATH_0 = pre + "/english_atlas.json";
-    const std::string FONT_PATH_0 = pre + "/english_atlas.ttf";
-
-    const std::string TEXTURE_PATH_1 = pre + "/msyh_chinese.png";
-    const std::string JSON_PATH_1 = pre + "/msyh_chinese.json";
-    const std::string FONT_PATH_1 = pre + "/msyh_chinese.ttc";
-
-    const std::string TEXTURE_PATH_2 = pre + "/emoji.png";
-    const std::string JSON_PATH_2 = pre + "/emoji.json";
-    const std::string FONT_PATH_2 = pre + "/emoji.ttf";
-
-    const std::string TEXTURE_PATH_3 = pre + "/arial_all.png";
-    const std::string JSON_PATH_3 = pre + "/arial_all.json";
-    const std::string FONT_PATH_3 = pre + "/arial_all.ttf";
-
-    const std::string TEXTURE_PATH_4 = pre + "/missing_char.png";
-    const std::string JSON_PATH_4 = pre + "/missing_char.json";
-    const std::string FONT_PATH_4 = pre + "/missing_char.ttf";
-
-    constexpr auto texture_indexs = std::array{10, 11, 12, 13, 14};
-    constexpr auto texture_sampler_indexs = std::array{2, 3};
-
-    // 添加字体
-    font::freetype_loader loader{};
-    auto font_factory = font::make_font_factory(
-        [&device, &commandPool, &GRAPHICS_AND_PRESENT, &textureManager,
-         &samplerManager](font::FontInfo &info) {
-            mcs::vulkan::memory::create_texture create_font_texture{
-                [](mcs::vulkan::memory::create_texture::image_info imageInfo)
-                    -> mcs::vulkan::memory::create_texture::create_info {
-                    return {
-                        .imageType = VK_IMAGE_TYPE_2D,
-                        .format =
-                            VK_FORMAT_R8G8B8A8_UNORM, //diff: [test_dod14] msdf是距离场。这个格式更好
-                        .extent = {.width = imageInfo.extent.width,
-                                   .height = imageInfo.extent.height,
-                                   .depth = 1},
-                        .mipLevels = imageInfo.mipLevels,
-                        .arrayLayers = 1,
-                        .samples = VK_SAMPLE_COUNT_1_BIT,
-                        .tiling = VK_IMAGE_TILING_OPTIMAL,
-                        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                                 VK_IMAGE_USAGE_SAMPLED_BIT,
-                        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
-                },
-                mcs::vulkan::memory::gen_memory_allocate_info(
-                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
-                [](VkImageCreateInfo imageCreateInfo, VkImage image)
-                    -> mcs::vulkan::memory::create_texture::view_create_info {
-                    return {.image = image,
-                            .viewType = VK_IMAGE_VIEW_TYPE_2D,
-                            .format = imageCreateInfo.format,
-                            .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                                                 .baseMipLevel = 0,
-                                                 .levelCount = imageCreateInfo.mipLevels,
-                                                 .baseArrayLayer = 0,
-                                                 .layerCount = 1}};
-                }};
-
-            using stbi_image_type = mcs::vulkan::font::texture_info::stbi_image_type;
-            using texture_bind_sampler = mcs::vulkan::font::texture_bind_sampler;
-            const auto &registration = info.registration;
-            if (std::holds_alternative<stbi_image_type>(
-                    registration.texture_info.image_variant))
-            {
-                auto sampler_index = samplerManager.find_slot_by_name(
-                    info.registration.type == font::FontType::eMSDF
-                        ? font_linear_sampler_key
-                        : font_nearest_neighbor_sampler_key);
-                if (not sampler_index)
-                    throw std::logic_error{"couldn't find a suitable sampler_index"};
-
-                using image_type = stbi_image_type::type;
-                const auto &imageInfo =
-                    std::get<stbi_image_type>(registration.texture_info.image_variant);
-                auto image =
-                    image_type{imageInfo.image_path.data(), imageInfo.image_format};
-                auto texWidth = image.width();
-                auto texHeight = image.height();
-                auto imageSize = image.size();
-
-                for (auto texture_index :
-                     textureManager.view_free_indexes() | std::views::take(1))
-                {
-                    // NOTE: update: bind
-                    info.registration.texture_info.bind = texture_bind_sampler{
-                        .texture_index = static_cast<uint32_t>(texture_index),
-                        .sampler_index = static_cast<uint32_t>(*sampler_index)};
-
-                    textureManager.use_slot(
-                        texture_index,
-                        create_font_texture.build(
-                            device, commandPool, GRAPHICS_AND_PRESENT,
-                            mcs::vulkan::memory::create_texture::image_info{
-                                .extent = {.width = static_cast<uint32_t>(texWidth),
-                                           .height = static_cast<uint32_t>(texHeight)},
-                                .pixels =
-                                    std::span<const uint8_t>{
-                                        image.data(), static_cast<uint64_t>(imageSize)},
-                                .mipLevels = 1}),
-                        imageInfo.image_path);
-                    using ManagerType = std::decay_t<decltype(textureManager)>;
-                    return ManagerType::auto_free_slot_type{textureManager,
-                                                            texture_index};
-                }
-                throw std::logic_error{"couldn't find a suitable texture_index"};
-            }
-            throw std::logic_error{"check image_variant"};
-        },
-        *loader);
-    using FontContext = std::decay_t<decltype(font_factory)>::font_context_type;
-    auto font_selct = font::GenFontSelector{&font_factory, "zh-CN"}.load(
-        font::font_register::makeFontInfos(
-            loader, //
-            {
-                font::font_registration{
-                    .font_path = FONT_PATH_0,
-                    .json_path = JSON_PATH_0,
-                    .type = font::FontType::eMSDF,
-                    .texture_info = {.bind = {}, //NOTE: lazy_bind
-                                     .image_variant =
-                                         font::texture_info::stbi_image_type{
-                                             .image_format = STBI_rgb_alpha,
-                                             .image_path = TEXTURE_PATH_0}}},
-                font::font_registration{
-                    .font_path = FONT_PATH_1,
-                    .json_path = JSON_PATH_1,
-                    .type = font::FontType::eMSDF,
-                    .texture_info = {.bind = {},
-                                     .image_variant =
-                                         font::texture_info::stbi_image_type{
-                                             .image_format = STBI_rgb_alpha,
-                                             .image_path = TEXTURE_PATH_1}}},
-                font::font_registration{
-                    .font_path = FONT_PATH_2,
-                    .json_path = JSON_PATH_2,
-                    .type = font::FontType::eBITMAP,
-                    .texture_info = {.bind = {},
-                                     .image_variant =
-                                         font::texture_info::stbi_image_type{
-                                             .image_format = STBI_rgb_alpha,
-                                             .image_path = TEXTURE_PATH_2}}},
-                font::font_registration{
-                    .font_path = FONT_PATH_3,
-                    .json_path = JSON_PATH_3,
-                    .type = font::FontType::eMSDF,
-                    .texture_info = {.bind = {},
-                                     .image_variant =
-                                         font::texture_info::stbi_image_type{
-                                             .image_format = STBI_rgb_alpha,
-                                             .image_path = TEXTURE_PATH_3}}},
-                font::font_registration{
-                    .font_path = FONT_PATH_4,
-                    .json_path = JSON_PATH_4,
-                    .type = font::FontType::eMSDF,
-                    .texture_info = {.bind = {},
-                                     .image_variant =
-                                         font::texture_info::stbi_image_type{
-                                             .image_format = STBI_rgb_alpha,
-                                             .image_path = TEXTURE_PATH_4}}},
-            }));
-    font_selct.initNotdefFont();
-    assert(font_selct.notdefFont() != nullptr);
-
-    namespace font_ns = mcs::vulkan::font;
-
-    //diff: [test_dod12] end
-
-    //NOTE: 不需要保存 VkDescriptorImageInfo。 有textureMap和索引够了
     auto descriptorSetManager = make_aggregate<"descriptorSetManager",
                                                "update_uniform_buffer", "update_texture",
                                                "update_sampler">(
@@ -1354,9 +1177,244 @@ try
                                             writes.data(), 0, nullptr);
             }
         });
+
+    return make_aggregate<"descriptorCtx", "descriptorSetLayout", "descriptorPool",
+                          "descriptorSets", "uniformBuffers", "textureManager",
+                          "samplerManager", "descriptorSetManager">(
+        std::move(descriptorSetLayoutPtr), std::move(descriptorPoolPtr),
+        std::move(descriptorSetsPtr), std::move(uniformBuffersPtr),
+        std::move(textureManagerPtr), std::move(samplerManagerPtr),
+        std::move(descriptorSetManager));
+}
+constexpr auto initFont(auto &hardwareCtx, auto &descriptorCtx)
+{
+    auto &device = *hardwareCtx.device.get();
+    auto &GRAPHICS_AND_PRESENT = *hardwareCtx.queue.get();
+    auto &commandPool = *hardwareCtx.commandPool.get();
+
+    auto &textureManager = *descriptorCtx.textureManager.get();
+    auto &samplerManager = *descriptorCtx.samplerManager.get();
+
+    //diff: [test_dod12] start: 加载字符纹理
+    auto pre = std::string{MSDF_OUTPUT_DIR};
+    const std::string TEXTURE_PATH_0 = pre + "/english_atlas.png";
+    const std::string JSON_PATH_0 = pre + "/english_atlas.json";
+    const std::string FONT_PATH_0 = pre + "/english_atlas.ttf";
+
+    const std::string TEXTURE_PATH_1 = pre + "/msyh_chinese.png";
+    const std::string JSON_PATH_1 = pre + "/msyh_chinese.json";
+    const std::string FONT_PATH_1 = pre + "/msyh_chinese.ttc";
+
+    const std::string TEXTURE_PATH_2 = pre + "/emoji.png";
+    const std::string JSON_PATH_2 = pre + "/emoji.json";
+    const std::string FONT_PATH_2 = pre + "/emoji.ttf";
+
+    const std::string TEXTURE_PATH_3 = pre + "/arial_all.png";
+    const std::string JSON_PATH_3 = pre + "/arial_all.json";
+    const std::string FONT_PATH_3 = pre + "/arial_all.ttf";
+
+    const std::string TEXTURE_PATH_4 = pre + "/missing_char.png";
+    const std::string JSON_PATH_4 = pre + "/missing_char.json";
+    const std::string FONT_PATH_4 = pre + "/missing_char.ttf";
+
+    // 添加字体
+    auto loaderPtr = std::make_unique<font::freetype_loader>();
+    auto &loader = *loaderPtr.get();
+    auto factory = font::make_font_factory(
+        [&device, &commandPool, &GRAPHICS_AND_PRESENT, &textureManager,
+         &samplerManager](font::FontInfo &info) {
+            mcs::vulkan::memory::create_texture create_font_texture{
+                [](mcs::vulkan::memory::create_texture::image_info imageInfo)
+                    -> mcs::vulkan::memory::create_texture::create_info {
+                    return {
+                        .imageType = VK_IMAGE_TYPE_2D,
+                        .format =
+                            VK_FORMAT_R8G8B8A8_UNORM, //diff: [test_dod14] msdf是距离场。这个格式更好
+                        .extent = {.width = imageInfo.extent.width,
+                                   .height = imageInfo.extent.height,
+                                   .depth = 1},
+                        .mipLevels = imageInfo.mipLevels,
+                        .arrayLayers = 1,
+                        .samples = VK_SAMPLE_COUNT_1_BIT,
+                        .tiling = VK_IMAGE_TILING_OPTIMAL,
+                        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                 VK_IMAGE_USAGE_SAMPLED_BIT,
+                        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+                },
+                mcs::vulkan::memory::gen_memory_allocate_info(
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+                [](VkImageCreateInfo imageCreateInfo, VkImage image)
+                    -> mcs::vulkan::memory::create_texture::view_create_info {
+                    return {.image = image,
+                            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                            .format = imageCreateInfo.format,
+                            .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                                 .baseMipLevel = 0,
+                                                 .levelCount = imageCreateInfo.mipLevels,
+                                                 .baseArrayLayer = 0,
+                                                 .layerCount = 1}};
+                }};
+
+            using stbi_image_type = mcs::vulkan::font::texture_info::stbi_image_type;
+            using texture_bind_sampler = mcs::vulkan::font::texture_bind_sampler;
+            const auto &registration = info.registration;
+            if (std::holds_alternative<stbi_image_type>(
+                    registration.texture_info.image_variant))
+            {
+                auto sampler_index = samplerManager.find_slot_by_name(
+                    info.registration.type == font::FontType::eMSDF
+                        ? font_linear_sampler_key
+                        : font_nearest_neighbor_sampler_key);
+                if (not sampler_index)
+                    throw std::logic_error{"couldn't find a suitable sampler_index"};
+
+                using image_type = stbi_image_type::type;
+                const auto &imageInfo =
+                    std::get<stbi_image_type>(registration.texture_info.image_variant);
+                auto image =
+                    image_type{imageInfo.image_path.data(), imageInfo.image_format};
+                auto texWidth = image.width();
+                auto texHeight = image.height();
+                auto imageSize = image.size();
+
+                for (auto texture_index :
+                     textureManager.view_free_indexes() | std::views::take(1))
+                {
+                    // NOTE: update: bind
+                    info.registration.texture_info.bind = texture_bind_sampler{
+                        .texture_index = static_cast<uint32_t>(texture_index),
+                        .sampler_index = static_cast<uint32_t>(*sampler_index)};
+
+                    textureManager.use_slot(
+                        texture_index,
+                        create_font_texture.build(
+                            device, commandPool, GRAPHICS_AND_PRESENT,
+                            mcs::vulkan::memory::create_texture::image_info{
+                                .extent = {.width = static_cast<uint32_t>(texWidth),
+                                           .height = static_cast<uint32_t>(texHeight)},
+                                .pixels =
+                                    std::span<const uint8_t>{
+                                        image.data(), static_cast<uint64_t>(imageSize)},
+                                .mipLevels = 1}),
+                        imageInfo.image_path);
+                    using ManagerType = std::remove_cvref_t<decltype(textureManager)>;
+                    using auto_free_slot_type = typename ManagerType::auto_free_slot_type;
+                    return auto_free_slot_type{textureManager, texture_index};
+                }
+                throw std::logic_error{"couldn't find a suitable texture_index"};
+            }
+            throw std::logic_error{"check image_variant"};
+        },
+        *loader);
+
+    using factoryType = decltype(factory);
+    auto font_factoryPtr = std::make_unique<factoryType>(std::move(factory));
+    auto &font_factory = *font_factoryPtr.get();
+    auto font_select = font::GenFontSelector{&font_factory, "zh-CN"}.load(
+        font::font_register::makeFontInfos(
+            loader, //
+            {
+                font::font_registration{
+                    .font_path = FONT_PATH_0,
+                    .json_path = JSON_PATH_0,
+                    .type = font::FontType::eMSDF,
+                    .texture_info = {.bind = {}, //NOTE: lazy_bind
+                                     .image_variant =
+                                         font::texture_info::stbi_image_type{
+                                             .image_format = STBI_rgb_alpha,
+                                             .image_path = TEXTURE_PATH_0}}},
+                font::font_registration{
+                    .font_path = FONT_PATH_1,
+                    .json_path = JSON_PATH_1,
+                    .type = font::FontType::eMSDF,
+                    .texture_info = {.bind = {},
+                                     .image_variant =
+                                         font::texture_info::stbi_image_type{
+                                             .image_format = STBI_rgb_alpha,
+                                             .image_path = TEXTURE_PATH_1}}},
+                font::font_registration{
+                    .font_path = FONT_PATH_2,
+                    .json_path = JSON_PATH_2,
+                    .type = font::FontType::eBITMAP,
+                    .texture_info = {.bind = {},
+                                     .image_variant =
+                                         font::texture_info::stbi_image_type{
+                                             .image_format = STBI_rgb_alpha,
+                                             .image_path = TEXTURE_PATH_2}}},
+                font::font_registration{
+                    .font_path = FONT_PATH_3,
+                    .json_path = JSON_PATH_3,
+                    .type = font::FontType::eMSDF,
+                    .texture_info = {.bind = {},
+                                     .image_variant =
+                                         font::texture_info::stbi_image_type{
+                                             .image_format = STBI_rgb_alpha,
+                                             .image_path = TEXTURE_PATH_3}}},
+                font::font_registration{
+                    .font_path = FONT_PATH_4,
+                    .json_path = JSON_PATH_4,
+                    .type = font::FontType::eMSDF,
+                    .texture_info = {.bind = {},
+                                     .image_variant =
+                                         font::texture_info::stbi_image_type{
+                                             .image_format = STBI_rgb_alpha,
+                                             .image_path = TEXTURE_PATH_4}}},
+            }));
+    font_select.initNotdefFont();
+    assert(font_select.notdefFont() != nullptr);
+
+    return make_aggregate<"fontCtx", "loader", "font_factory", "font_select">(
+        std::move(loaderPtr), std::move(font_factoryPtr), std::move(font_select));
+}
+
+int main()
+try
+{
+#ifdef VERT_SHADER_PATH
+    std::cout << "VERT_SHADER_PATH: " << VERT_SHADER_PATH << '\n';
+#endif
+#ifdef FRAG_SHADER_PATH
+    std::cout << "FRAG_SHADER_PATH: " << FRAG_SHADER_PATH << '\n';
+#endif
+    auto hardwareCtx = init();
+    auto &window = *hardwareCtx.window.get();
+    auto &physical_device = *hardwareCtx.physicalDevice.get();
+    auto &surface = *hardwareCtx.surface.get();
+    auto &device = *hardwareCtx.device.get();
+    auto &GRAPHICS_AND_PRESENT = *hardwareCtx.queue.get();
+    auto &commandPool = *hardwareCtx.commandPool.get();
+    auto &commandBuffers = *hardwareCtx.commandBuffers.get();
+
+    auto &swapchainBuild = hardwareCtx.swapchainBuild;
+    auto &swapchain = hardwareCtx.swapchain;
+    auto &frameContext = hardwareCtx.frameContext;
+
+    auto descriptorCtx = descriptorInit(hardwareCtx);
+    auto &descriptorSetLayout = *descriptorCtx.descriptorSetLayout.get();
+    auto &descriptorPool = *descriptorCtx.descriptorPool.get();
+    auto &descriptorSets = *descriptorCtx.descriptorSets.get();
+    auto &uniformBuffers = *descriptorCtx.uniformBuffers.get();
+    auto &textureManager = *descriptorCtx.textureManager.get();
+    auto &samplerManager = *descriptorCtx.samplerManager.get();
+
+    auto &descriptorSetManager = descriptorCtx.descriptorSetManager;
+
+    static uint32_t UITextureIndex =
+        textureManager.find_slot_by_name(texture_ui_key).value();
+
+    auto fontCtx = initFont(hardwareCtx, descriptorCtx);
+    auto &font_factory = *fontCtx.font_factory.get();
+    auto &font_select = fontCtx.font_select;
+    using FontContext = std::remove_cvref_t<decltype(font_factory)>::font_context_type;
+    namespace font_ns = mcs::vulkan::font;
+
     descriptorSetManager.update_uniform_buffer();
     descriptorSetManager.update_texture(textureManager.view_used_indexes());
     descriptorSetManager.update_sampler(samplerManager.view_used_indexes());
+
+    //diff: [test_dod12] end
 
     //diff: [test_dod12] start: 解析字符串。生成一些元信息
     constexpr auto ltr = 0; // NOLINT
@@ -1372,11 +1430,11 @@ try
     auto analyze_result = font_ns::bidi::analyze(codepoints, ltr);
     font_ns::bidi::print_bidi_result(codepoints, analyze_result);
 
-    auto test_text_runs = font_ns::assign_fonts(analyze_result, font_selct);
+    auto test_text_runs = font_ns::assign_fonts(analyze_result, font_select);
     font_ns::print_text_runs(test_text_runs);
 
     auto test_shape_result = font_ns::harfbuzz::shape(
-        analyze_result.mirrored_codepoints, test_text_runs, font_selct.notdefFont());
+        analyze_result.mirrored_codepoints, test_text_runs, font_select.notdefFont());
     font_ns::harfbuzz::print_shape_result(analyze_result.mirrored_codepoints,
                                           test_shape_result);
 
