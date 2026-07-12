@@ -341,24 +341,6 @@ struct PushData
     uint32_t cameraIndex;
 };
 
-struct Mesh
-{
-    uint32_t vertexCount;  // 网格的顶点数量
-    uint32_t vertexOffset; // 在全局顶点池中的偏移
-    uint32_t indexOffset;  // 在全局索引池中的偏移
-    uint32_t indexCount;   // 索引数量
-
-    [[nodiscard]] VkDrawIndexedIndirectCommand getDrawCommand(
-        uint32_t instanceCount, uint32_t firstInstance = 0) const noexcept
-    {
-        return {.indexCount = indexCount,
-                .instanceCount = instanceCount,
-                .firstIndex = indexOffset,
-                .vertexOffset = static_cast<int32_t>(vertexOffset),
-                .firstInstance = firstInstance};
-    }
-};
-
 struct PerFrameBatch
 {
     mcs::vulkan::memory::auto_map_buffer globalVertexBuffer{};
@@ -1311,8 +1293,8 @@ constexpr auto initFont(auto &hardwareCtx, auto &descriptorCtx)
 
     using factoryType = decltype(factory);
     auto font_factoryPtr = std::make_unique<factoryType>(std::move(factory));
-    auto &font_factory = *font_factoryPtr.get();
-    auto font_select = font::GenFontSelector{&font_factory, "zh-CN"}.load(
+    auto &fontFactory = *font_factoryPtr.get();
+    auto fontSelect = font::GenFontSelector{&fontFactory, "zh-CN"}.load(
         font::font_register::makeFontInfos(
             loader, //
             {
@@ -1362,11 +1344,11 @@ constexpr auto initFont(auto &hardwareCtx, auto &descriptorCtx)
                                              .image_format = STBI_rgb_alpha,
                                              .image_path = TEXTURE_PATH_4}}},
             }));
-    font_select.initNotdefFont();
-    assert(font_select.notdefFont() != nullptr);
+    fontSelect.initNotdefFont();
+    assert(fontSelect.notdefFont() != nullptr);
 
-    return make_aggregate<"fontCtx", "loader", "font_factory", "font_select">(
-        std::move(loaderPtr), std::move(font_factoryPtr), std::move(font_select));
+    return make_aggregate<"fontCtx", "loader", "fontFactory", "fontSelect">(
+        std::move(loaderPtr), std::move(font_factoryPtr), std::move(fontSelect));
 }
 auto inputInit(auto &swapchain)
 {
@@ -1421,6 +1403,58 @@ auto inputInit(auto &swapchain)
     return make_aggregate<"inputDataCtx", "input", "camera", "uiCamera", "clock">(
         std::move(input), std::move(camera), std::move(uiCamera), FrameClock{});
 }
+struct mesh_data
+{
+    uint32_t vertexCount;  // 网格的顶点数量
+    uint32_t vertexOffset; // 在全局顶点池中的偏移
+    uint32_t indexOffset;  // 在全局索引池中的偏移
+    uint32_t indexCount;   // 索引数量
+
+    [[nodiscard]] VkDrawIndexedIndirectCommand getDrawCommand(
+        uint32_t instanceCount, uint32_t firstInstance = 0) const noexcept
+    {
+        return {.indexCount = indexCount,
+                .instanceCount = instanceCount,
+                .firstIndex = indexOffset,
+                .vertexOffset = static_cast<int32_t>(vertexOffset),
+                .firstInstance = firstInstance};
+    }
+};
+struct mesh_manager
+{
+    std::vector<Vertex> allVertices;
+    std::vector<uint32_t> allIndices;
+    std::unordered_map<std::string, mesh_data> meshMap;
+
+    void addMesh(const std::string &name, const std::span<const Vertex> &verts,
+                 const std::span<const uint32_t> &indices)
+    {
+        assert(not name.empty());
+        assert(not verts.empty());
+        assert(not indices.empty());
+        uint32_t vOff = static_cast<uint32_t>(allVertices.size());
+        uint32_t iOff = static_cast<uint32_t>(allIndices.size());
+        allVertices.insert(allVertices.end(), verts.begin(), verts.end());
+        allIndices.insert(allIndices.end(), indices.begin(), indices.end());
+        meshMap[name] = {static_cast<uint32_t>(verts.size()), vOff, iOff,
+                         static_cast<uint32_t>(indices.size())};
+    }
+};
+
+// NOTE: 考虑放到一个命名空间或等区域统一处理
+constexpr std::array<Vertex, 4> quadVerts = {
+    Vertex{{-1.0f, -1.0f, 0.0f}, {0.0f, 0.0f}}, // 左上
+    Vertex{{1.0f, -1.0f, 0.0f}, {1.0f, 0.0f}},  // 右上
+    Vertex{{1.0f, 1.0f, 0.0f}, {1.0f, 1.0f}},   // 右下
+    Vertex{{-1.0f, 1.0f, 0.0f}, {0.0f, 1.0f}}   // 左下
+};
+constexpr auto quadIdx = std::array<uint32_t, 6>{0, 1, 2, 0, 2, 3};
+constexpr auto initMeshManager()
+{
+    mesh_manager m;
+    m.addMesh("quad", std::span{quadVerts}, std::span{quadIdx});
+    return m;
+}
 int main()
 try
 {
@@ -1457,9 +1491,9 @@ try
         textureManager.find_slot_by_name(texture_ui_key).value();
 
     auto fontCtx = initFont(hardwareCtx, descriptorCtx);
-    auto &font_factory = *fontCtx.font_factory.get();
-    auto &font_select = fontCtx.font_select;
-    using FontContext = std::remove_cvref_t<decltype(font_factory)>::font_context_type;
+    auto &fontFactory = *fontCtx.fontFactory.get();
+    auto &fontSelect = fontCtx.fontSelect;
+    using FontContext = std::remove_cvref_t<decltype(fontFactory)>::font_context_type;
     namespace font_ns = mcs::vulkan::font;
 
     descriptorSetManager.update_uniform_buffer();
@@ -1488,11 +1522,11 @@ try
     auto analyze_result = font_ns::bidi::analyze(codepoints, ltr);
     font_ns::bidi::print_bidi_result(codepoints, analyze_result);
 
-    auto test_text_runs = font_ns::assign_fonts(analyze_result, font_select);
+    auto test_text_runs = font_ns::assign_fonts(analyze_result, fontSelect);
     font_ns::print_text_runs(test_text_runs);
 
     auto test_shape_result = font_ns::harfbuzz::shape(
-        analyze_result.mirrored_codepoints, test_text_runs, font_select.notdefFont());
+        analyze_result.mirrored_codepoints, test_text_runs, fontSelect.notdefFont());
     font_ns::harfbuzz::print_shape_result(analyze_result.mirrored_codepoints,
                                           test_shape_result);
 
@@ -1504,72 +1538,8 @@ try
     //diff: [test_dod12] end
 
     //diff: [test_dod8] start
-    std::vector<Vertex> allVertices;
-    std::vector<uint32_t> allIndices;
-    std::unordered_map<std::string, Mesh> meshMap;
-    auto addMesh = [&](const std::string &name, const std::span<const Vertex> &verts,
-                       const std::span<const uint32_t> &indices) {
-        uint32_t vOff = static_cast<uint32_t>(allVertices.size());
-        uint32_t iOff = static_cast<uint32_t>(allIndices.size());
-        allVertices.insert(allVertices.end(), verts.begin(), verts.end());
-        allIndices.insert(allIndices.end(), indices.begin(), indices.end());
-        meshMap[name] = {static_cast<uint32_t>(verts.size()), vOff, iOff,
-                         static_cast<uint32_t>(indices.size())};
-    };
-
-    // 构建全局几何池
-    //diff: [test_dod10] start: 改成 -1 1 更标准一点
-    static constexpr std::array<Vertex, 4> quadVerts = {
-        Vertex{{-1.0f, -1.0f, 0.0f}, {0.0f, 0.0f}}, // 左上
-        Vertex{{1.0f, -1.0f, 0.0f}, {1.0f, 0.0f}},  // 右上
-        Vertex{{1.0f, 1.0f, 0.0f}, {1.0f, 1.0f}},   // 右下
-        Vertex{{-1.0f, 1.0f, 0.0f}, {0.0f, 1.0f}}   // 左下
-    };
-
-    //diff: [test_dod10] end
-    constexpr auto quadIdx = std::array<uint32_t, 6>{0, 1, 2, 0, 2, 3};
-    addMesh("quad", std::span{quadVerts}, std::span{quadIdx});
-
-    static constexpr auto make_instance_matrix_from_verts =
-        [](std::span<const glm::vec3> origin, // 4 个顶点：左下,右下,右上,左上
-           std::span<const glm::vec3> target) // 4 个顶点：左下,右下,右上,左上
-        constexpr noexcept {
-            // 1. 提取 origin 边向量和基
-            const glm::vec3 O0 = origin[0];
-            const glm::vec3 Uo = origin[1] - O0;
-            const glm::vec3 Vo = origin[3] - O0;
-            glm::vec3 Wo = glm::cross(Uo, Vo);
-            if (glm::length2(Wo) < 1e-12f)
-                Wo = glm::vec3(0.0f, 0.0f, 1.0f);
-            else
-                Wo = glm::normalize(Wo);
-
-            // 2. 提取 target 边向量和基
-            const glm::vec3 T0 = target[0];
-            const glm::vec3 Ut = target[1] - T0;
-            const glm::vec3 Vt = target[3] - T0;
-            glm::vec3 Wt = glm::cross(Ut, Vt);
-            if (glm::length2(Wt) < 1e-12f)
-                Wt = glm::vec3(0.0f, 0.0f, 1.0f);
-            else
-                Wt = glm::normalize(Wt);
-
-            // 3. 构建基矩阵并计算 A = B_t * inverse(B_o)
-            glm::mat3 Bo(Uo, Vo, Wo); // 列分别为 Uo, Vo, Wo
-            glm::mat3 Bt(Ut, Vt, Wt);
-            glm::mat3 A = Bt * glm::inverse(Bo);
-
-            // 4. 计算平移 t = T0 - A * O0
-            glm::vec3 t = T0 - A * O0;
-
-            // 5. 构造 4x4 矩阵 (glm 列主序)
-            glm::mat4 M(1.0f);
-            M[0] = glm::vec4(A[0], 0.0f); // 第一列
-            M[1] = glm::vec4(A[1], 0.0f); // 第二列
-            M[2] = glm::vec4(A[2], 0.0f); // 第三列
-            M[3] = glm::vec4(t, 1.0f);    // 第四列 (平移)
-            return M;
-        };
+    auto meshManager = initMeshManager();
+    auto &[allVertices, allIndices, meshMap] = meshManager;
 
     constexpr uint32_t MAX_INSTANCE_COUNT = 1000;
     constexpr uint32_t MAX_DRAW_CALLS = 10;
@@ -3141,7 +3111,7 @@ try
             batch.drawCountUI = 0;
 
             // 处理一个 store（它绑定到一个 mesh，mesh 提供顶点数）
-            auto processStore = [&](auto &store, const Mesh &mesh, uint32_t frame) {
+            auto processStore = [&](auto &store, const mesh_data &mesh, uint32_t frame) {
                 uint32_t count = store.size(); // 存活实体数
                 if (count == 0)
                     return;
@@ -3176,7 +3146,7 @@ try
                 // std::cout << "写入了实体: " << count << std::endl;
             };
 
-            const Mesh &quadMesh = meshMap["quad"];
+            const mesh_data &quadMesh = meshMap["quad"];
             // 3D
             {
                 processStore(autoSpinStore, quadMesh, currentFrame);
