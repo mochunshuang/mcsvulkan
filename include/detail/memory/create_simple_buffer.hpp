@@ -5,7 +5,7 @@
 
 namespace mcs::vulkan::memory
 {
-    static constexpr auto create_simple_buffer(LogicalDevice &device,
+    static constexpr auto create_simple_buffer(const LogicalDevice &device,
                                                create_buffer::create_info info,
                                                VkMemoryPropertyFlags properties) // NOLINT
     {

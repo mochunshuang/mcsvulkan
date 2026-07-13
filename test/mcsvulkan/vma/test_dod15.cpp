@@ -341,33 +341,6 @@ struct PushData
     uint32_t cameraIndex;
 };
 
-struct PerFrameBatch
-{
-    mcs::vulkan::memory::auto_map_buffer globalVertexBuffer{};
-    VkDeviceSize globalVertexBufferCapacity = 0;
-    VkDeviceAddress globalVertexBufferAddress = 0;
-
-    mcs::vulkan::memory::auto_map_buffer globalIndexBuffer{};
-    VkDeviceSize globalIndexBufferCapacity = 0;
-
-    mcs::vulkan::memory::auto_map_buffer globalInstanceBuffer{};
-    VkDeviceSize globalInstanceBufferCapacity = 0;
-    VkDeviceAddress globalInstanceBufferAddress = {};
-
-    mcs::vulkan::memory::auto_map_buffer globalAttributeBuffer{};
-    VkDeviceSize globalAttributeBufferCapacity = 0;
-    VkDeviceAddress globalAttributeBufferAddress = 0;
-
-    mcs::vulkan::memory::auto_map_buffer indirectDrawBuffer{};
-    VkDeviceSize indirectDrawBufferCapacity = 0;
-
-    // 新增：命令常量缓冲区
-    mcs::vulkan::memory::auto_map_buffer commandConstantsBuffer{};
-    VkDeviceAddress commandConstantsBufferAddress = 0;
-
-    uint32_t draw3DCount = 0;
-    uint32_t drawCountUI = 0;
-};
 //diff: [test_dod8] end
 
 //diff: [test_indirectdraw2] start
@@ -1350,7 +1323,7 @@ constexpr auto initFont(auto &hardwareCtx, auto &descriptorCtx)
     return make_aggregate<"fontCtx", "loader", "fontFactory", "fontSelect">(
         std::move(loaderPtr), std::move(font_factoryPtr), std::move(fontSelect));
 }
-auto inputInit(auto &swapchain)
+constexpr auto inputInit(auto &swapchain)
 {
     auto camera = [&]() {
         using namespace camera; // 你的 camera 命名空间
@@ -1426,8 +1399,8 @@ struct mesh_manager
     std::vector<uint32_t> allIndices;
     std::unordered_map<std::string, mesh_data> meshMap;
 
-    void addMesh(const std::string &name, const std::span<const Vertex> &verts,
-                 const std::span<const uint32_t> &indices)
+    constexpr void addMesh(const std::string &name, const std::span<const Vertex> &verts,
+                           const std::span<const uint32_t> &indices)
     {
         assert(not name.empty());
         assert(not verts.empty());
@@ -1455,6 +1428,151 @@ constexpr auto initMeshManager()
     m.addMesh("quad", std::span{quadVerts}, std::span{quadIdx});
     return m;
 }
+
+struct BufferResource
+{
+    mcs::vulkan::memory::auto_map_buffer buffer{};
+    VkDeviceSize size{};
+    constexpr auto write(size_t offset, const void *src, size_t size) noexcept
+    {
+        return ::memcpy(static_cast<char *>(buffer.mapPtr()) + offset, src, size);
+    }
+    BufferResource() = default;
+    constexpr BufferResource(const LogicalDevice &device, VkDeviceSize capacity,
+                             VkBufferUsageFlags usage, VkSharingMode sharingMode,
+                             VkMemoryPropertyFlags properties)
+        : buffer{mcs::vulkan::memory::auto_map_buffer(
+              mcs::vulkan::memory::create_simple_buffer(
+                  device, {.size = capacity, .usage = usage, .sharingMode = sharingMode},
+                  properties),
+              capacity)},
+          size{capacity}
+    {
+    }
+};
+struct BufferResourceWithAddress
+{
+    mcs::vulkan::memory::auto_map_buffer buffer{};
+    VkDeviceSize size{};
+    VkDeviceAddress address{};
+
+    constexpr auto write(size_t offset, const void *src, size_t size) noexcept
+    {
+        return ::memcpy(static_cast<char *>(buffer.mapPtr()) + offset, src, size);
+    }
+
+    BufferResourceWithAddress() = default;
+    constexpr BufferResourceWithAddress(const LogicalDevice &device,
+                                        VkDeviceSize capacity, VkBufferUsageFlags usage,
+                                        VkSharingMode sharingMode,
+                                        VkMemoryPropertyFlags properties)
+        : buffer{mcs::vulkan::memory::auto_map_buffer(
+              mcs::vulkan::memory::create_simple_buffer(
+                  device, {.size = capacity, .usage = usage, .sharingMode = sharingMode},
+                  properties),
+              capacity)},
+          size{capacity},
+          address{device.getBufferDeviceAddress(
+              {.sType = sType<VkBufferDeviceAddressInfo>(), .buffer = buffer.buffer()})}
+    {
+    }
+};
+struct FrameResources
+{
+    BufferResourceWithAddress globalVertexBuffer{};
+
+    BufferResource globalIndexBuffer{};
+
+    BufferResourceWithAddress globalInstanceBuffer{};
+
+    BufferResourceWithAddress globalAttributeBuffer{};
+
+    BufferResource indirectDrawBuffer{};
+
+    // 新增：命令常量缓冲区
+    BufferResourceWithAddress commandConstantsBuffer{};
+
+    uint32_t drawCount3D = 0;
+    uint32_t drawCountUI = 0;
+};
+
+constexpr uint32_t MAX_INSTANCE_COUNT = 1000;
+constexpr uint32_t MAX_DRAW_CALLS = 10;
+constexpr auto initFrameResources(const LogicalDevice &device, const mesh_manager &m)
+{
+    auto &[allVertices, allIndices, meshMap] = m;
+    std::array<FrameResources, MAX_FRAMES_IN_FLIGHT> frameResources;
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+    {
+        auto &batche = frameResources[i];
+        {
+            auto capacity = allVertices.size() * sizeof(Vertex);
+            batche.globalVertexBuffer =
+                BufferResourceWithAddress{device, capacity,
+                                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                          VK_SHARING_MODE_EXCLUSIVE,
+                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+            batche.globalVertexBuffer.write(0, allVertices.data(), capacity);
+        }
+        {
+            auto capacity = allIndices.size() * sizeof(uint32_t);
+            batche.globalIndexBuffer =
+                BufferResource{device, capacity, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                               VK_SHARING_MODE_EXCLUSIVE,
+                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+            batche.globalIndexBuffer.write(0, allIndices.data(), capacity);
+        }
+        {
+            constexpr VkDeviceSize MAX_INSTANCE_DATA_SIZE =
+                MAX_DRAW_CALLS * MAX_INSTANCE_COUNT * sizeof(InstanceData);
+            batche.globalInstanceBuffer =
+                BufferResourceWithAddress{device, MAX_INSTANCE_DATA_SIZE,
+                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                          VK_SHARING_MODE_EXCLUSIVE,
+                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+
+            // NOTE: 绘制的时候，每帧填充
+        }
+        {
+            constexpr VkDeviceSize MAX_Attribute_SIZE = 1 * 1024 * 1024;
+            batche.globalAttributeBuffer =
+                BufferResourceWithAddress{device, MAX_Attribute_SIZE,
+                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                          VK_SHARING_MODE_EXCLUSIVE,
+                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+        {
+
+            constexpr VkDeviceSize MAX_IndirectDraw_SIZE = 1 * 1024 * 1024;
+            batche.indirectDrawBuffer = BufferResource{
+                device, MAX_IndirectDraw_SIZE, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                VK_SHARING_MODE_EXCLUSIVE,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+        {
+            // 新增 command constants buffer
+            constexpr VkDeviceSize MAX_CMD_CONST_SIZE =
+                MAX_DRAW_CALLS * sizeof(CommandConstant);
+            batche.commandConstantsBuffer =
+                BufferResourceWithAddress{device, MAX_CMD_CONST_SIZE,
+                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                          VK_SHARING_MODE_EXCLUSIVE,
+                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+    }
+    return frameResources;
+}
+
 int main()
 try
 {
@@ -1541,130 +1659,7 @@ try
     auto meshManager = initMeshManager();
     auto &[allVertices, allIndices, meshMap] = meshManager;
 
-    constexpr uint32_t MAX_INSTANCE_COUNT = 1000;
-    constexpr uint32_t MAX_DRAW_CALLS = 10;
-
-    std::array<PerFrameBatch, MAX_FRAMES_IN_FLIGHT> batches;
-    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
-    {
-        auto &batche = batches[i];
-        {
-            auto &buffer = batche.globalVertexBuffer;
-            auto &capacity = batche.globalVertexBufferCapacity;
-            auto &address = batche.globalVertexBufferAddress;
-            capacity = allVertices.size() * sizeof(Vertex);
-            buffer = mcs::vulkan::memory::auto_map_buffer(
-                mcs::vulkan::memory::create_simple_buffer(
-                    device,
-                    {.size = capacity,
-                     .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
-                capacity);
-            address = device.getBufferDeviceAddress(
-                {.sType = sType<VkBufferDeviceAddressInfo>(), .buffer = buffer.buffer()});
-            memcpy(buffer.mapPtr(), allVertices.data(), capacity);
-        }
-        {
-            auto &buffer = batche.globalIndexBuffer;
-            auto &capacity = batche.globalIndexBufferCapacity;
-            capacity = allIndices.size() * sizeof(uint32_t);
-            buffer = mcs::vulkan::memory::auto_map_buffer(
-                mcs::vulkan::memory::create_simple_buffer(
-                    device,
-                    {.size = capacity,
-                     .usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
-                capacity);
-            memcpy(buffer.mapPtr(), allIndices.data(), capacity);
-        }
-        {
-            constexpr VkDeviceSize MAX_INSTANCE_DATA_SIZE =
-                MAX_DRAW_CALLS * MAX_INSTANCE_COUNT * sizeof(InstanceData);
-
-            auto &buffer = batche.globalInstanceBuffer;
-            auto &capacity = batche.globalInstanceBufferCapacity;
-            auto &address = batche.globalInstanceBufferAddress;
-            capacity = MAX_INSTANCE_DATA_SIZE;
-            buffer = mcs::vulkan::memory::auto_map_buffer(
-                mcs::vulkan::memory::create_simple_buffer(
-                    device,
-                    {.size = capacity,
-                     .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
-                capacity);
-            address = device.getBufferDeviceAddress(
-                {.sType = sType<VkBufferDeviceAddressInfo>(), .buffer = buffer.buffer()});
-
-            // NOTE: 绘制的时候，每帧填充
-        }
-        {
-
-            constexpr VkDeviceSize MAX_Attribute_SIZE = 1 * 1024 * 1024;
-
-            auto &buffer = batche.globalAttributeBuffer;
-            auto &capacity = batche.globalAttributeBufferCapacity;
-            auto &address = batche.globalAttributeBufferAddress;
-            capacity = MAX_Attribute_SIZE;
-            buffer = mcs::vulkan::memory::auto_map_buffer(
-                mcs::vulkan::memory::create_simple_buffer(
-                    device,
-                    {.size = capacity,
-                     .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
-                capacity);
-            address = device.getBufferDeviceAddress(
-                {.sType = sType<VkBufferDeviceAddressInfo>(), .buffer = buffer.buffer()});
-
-            // NOTE: 绘制的时候，每帧填充
-        }
-        {
-
-            constexpr VkDeviceSize MAX_IndirectDraw_SIZE = 1 * 1024 * 1024;
-
-            auto &buffer = batche.indirectDrawBuffer;
-            auto &capacity = batche.indirectDrawBufferCapacity;
-            capacity = MAX_IndirectDraw_SIZE;
-            buffer = mcs::vulkan::memory::auto_map_buffer(
-                mcs::vulkan::memory::create_simple_buffer(
-                    device,
-                    {.size = capacity,
-                     .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
-                capacity);
-            // NOTE: 绘制的时候，每帧填充
-        }
-        {
-            // 新增 command constants buffer
-            constexpr VkDeviceSize MAX_CMD_CONST_SIZE =
-                MAX_DRAW_CALLS * sizeof(CommandConstant);
-            batche.commandConstantsBuffer = mcs::vulkan::memory::auto_map_buffer(
-                mcs::vulkan::memory::create_simple_buffer(
-                    device,
-                    {.size = MAX_CMD_CONST_SIZE,
-                     .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
-                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
-                MAX_CMD_CONST_SIZE);
-            batche.commandConstantsBufferAddress = device.getBufferDeviceAddress(
-                {.sType = sType<VkBufferDeviceAddressInfo>(),
-                 .buffer = batche.commandConstantsBuffer.buffer()});
-        }
-    }
+    auto frameResources = initFrameResources(device, meshManager);
 
     // diff: [test_dod8] end
 
@@ -2285,7 +2280,8 @@ try
 
         on_resize(layout, {.available_width = static_cast<float>(newWidth),
                            .available_height = static_cast<float>(newHeight)});
-        layout.calculate({.available_width = newWidth, .available_height = newHeight});
+        layout.calculate({.available_width = static_cast<float>(newWidth),
+                          .available_height = static_cast<float>(newHeight)});
         generateUIInstances(layout); //NOTE: 应该保持，基于layout生成实例数据
     }; //diff: [test_dod13] end
 
@@ -2410,9 +2406,9 @@ try
             graphicsPipeline, pipelineLayout, depthResourcesBuild, depthResource,
             msaaResourcesBuild, msaaResource);
 
-    auto mainShaderCtx =
-        make_aggregate_ref<"mainShaderCtx", "indirectDrawBatches", "uniformBuffers",
-                           "descriptorSets">(batches, uniformBuffers, descriptorSets);
+    auto mainShaderCtx = make_aggregate_ref<"mainShaderCtx", "indirectDrawBatches",
+                                            "uniformBuffers", "descriptorSets">(
+        frameResources, uniformBuffers, descriptorSets);
     auto inputCtx =
         make_aggregate_ref<"inputCtx", "input", "camera", "uiCamera", "clock">(
             input, camera, uiCamera, clock);
@@ -2431,7 +2427,7 @@ try
     // init data
 
     //diff: [test_dod8] start
-    auto global_id = 0;
+    uint32_t global_id = 0;
     // 从模型矩阵生成 model_state（其他交互字段保持默认）
     constexpr auto make_model_state_from_matrix = [](const glm::mat4 &M) {
         glm::vec3 trans, scale;
@@ -3084,10 +3080,10 @@ try
         auto &meshMap = globalCtx.meshMap;
 
         auto &descriptorSets = mainShaderCtx.descriptorSets;
-        auto &batches = mainShaderCtx.indirectDrawBatches;
+        auto &frameResources = mainShaderCtx.indirectDrawBatches;
 
         auto &descriptorSet = descriptorSets[currentFrame];
-        auto &batch = batches[currentFrame];
+        auto &batch = frameResources[currentFrame];
 
         auto &autoSpinStore = soaCtx.autoSpinStore;
         auto &interactiveStore = soaCtx.interactiveStore;
@@ -3107,7 +3103,7 @@ try
             // 用于写入 buffer 的偏移
             VkDeviceSize instanceOffset = 0;
             VkDeviceSize attributeOffset = 0;
-            batch.draw3DCount = 0;
+            batch.drawCount3D = 0;
             batch.drawCountUI = 0;
 
             // 处理一个 store（它绑定到一个 mesh，mesh 提供顶点数）
@@ -3124,15 +3120,13 @@ try
                 InstanceData *instSrc =
                     store.template raw_field<"instanceData">(frame).data();
                 VkDeviceSize instSize = count * sizeof(InstanceData);
-                memcpy((char *)batch.globalInstanceBuffer.mapPtr() + instanceOffset,
-                       instSrc, instSize);
+                batch.globalInstanceBuffer.write(instanceOffset, instSrc, instSize);
 
                 // 2. 整体拷贝属性数据（每个实体一个 std::array<VertexAttribute, 4>）
                 std::array<VertexAttribute, 4> *attrSrc =
                     store.template raw_field<"vertexAttribute">(frame).data();
                 VkDeviceSize attrSize = count * sizeof(std::array<VertexAttribute, 4>);
-                memcpy((char *)batch.globalAttributeBuffer.mapPtr() + attributeOffset,
-                       attrSrc, attrSize);
+                batch.globalAttributeBuffer.write(attributeOffset, attrSrc, attrSize);
 
                 // 3. 生成间接命令
                 cmds.push_back(mesh.getDrawCommand(count, firstInstance));
@@ -3152,8 +3146,8 @@ try
                 processStore(autoSpinStore, quadMesh, currentFrame);
                 processStore(interactiveStore, quadMesh, currentFrame);
             }
-            uint32_t draw3DCount = static_cast<uint32_t>(cmds.size());
-            batch.draw3DCount = draw3DCount;
+            uint32_t drawCount3D = static_cast<uint32_t>(cmds.size());
+            batch.drawCount3D = drawCount3D;
 
             // UI
             if (1)
@@ -3179,15 +3173,15 @@ try
                     processStore(uiStore, quadMesh, currentFrame);
                 }
             }
-            batch.drawCountUI = cmds.size() - draw3DCount;
+            batch.drawCountUI = cmds.size() - drawCount3D;
 
             // 上传命令和常量
             // 所有命令（3D+UI）一次性拷贝
-            uint32_t totalDrawCount = static_cast<uint32_t>(cmds.size());
-            memcpy(batch.indirectDrawBuffer.mapPtr(), cmds.data(),
-                   totalDrawCount * sizeof(VkDrawIndexedIndirectCommand));
-            memcpy(batch.commandConstantsBuffer.mapPtr(), cmdConsts.data(),
-                   totalDrawCount * sizeof(CommandConstant));
+            size_t totalDrawCount = cmds.size();
+            batch.indirectDrawBuffer.write(
+                0, cmds.data(), totalDrawCount * sizeof(VkDrawIndexedIndirectCommand));
+            batch.commandConstantsBuffer.write(0, cmdConsts.data(),
+                                               totalDrawCount * sizeof(CommandConstant));
         }
         //diff: [test_dod11] end
         // 3. 记录结束时间点
@@ -3411,11 +3405,11 @@ try
             const auto &[currentFrame, imageIndex] = recordCtx.info;
             const auto &commandBuffer = commandBuffers[currentFrame];
 
-            auto &batches = mainShaderCtx.indirectDrawBatches;
+            auto &frameResources = mainShaderCtx.indirectDrawBatches;
 
             // diff: [test_dod8] start 使用合并索引缓冲和间接绘制
-            auto &batch = batches[currentFrame];
-            commandBuffer.bindIndexBuffer(batch.globalIndexBuffer.buffer(), 0,
+            auto &batch = frameResources[currentFrame];
+            commandBuffer.bindIndexBuffer(batch.globalIndexBuffer.buffer.buffer(), 0,
                                           VK_INDEX_TYPE_UINT32);
 
             // diff: [test_dod11] start
@@ -3433,39 +3427,39 @@ try
             };
             uploadUniformBuffers();
 
-            if (batch.draw3DCount > 0)
+            if (batch.drawCount3D > 0)
             {
-                PushData push = {.vertexAddress = batch.globalVertexBufferAddress,
-                                 .attributeAddress = batch.globalAttributeBufferAddress,
-                                 .instanceAddress = batch.globalInstanceBufferAddress,
+                PushData push = {.vertexAddress = batch.globalVertexBuffer.address,
+                                 .attributeAddress = batch.globalAttributeBuffer.address,
+                                 .instanceAddress = batch.globalInstanceBuffer.address,
                                  .commandConstantsAddress =
-                                     batch.commandConstantsBufferAddress,
+                                     batch.commandConstantsBuffer.address,
                                  .cameraIndex = 0};
                 commandBuffer.pushConstants(*pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
                                             0, sizeof(PushData), &push);
                 commandBuffer.setDepthWriteEnable(true);
                 commandBuffer.setDepthTestEnable(true);
-                commandBuffer.drawIndexedIndirect(batch.indirectDrawBuffer.buffer(), 0,
-                                                  batch.draw3DCount,
-                                                  sizeof(VkDrawIndexedIndirectCommand));
+                commandBuffer.drawIndexedIndirect(
+                    batch.indirectDrawBuffer.buffer.buffer(), 0, batch.drawCount3D,
+                    sizeof(VkDrawIndexedIndirectCommand));
             }
             if (batch.drawCountUI)
             {
-                PushData push = {.vertexAddress = batch.globalVertexBufferAddress,
-                                 .attributeAddress = batch.globalAttributeBufferAddress,
-                                 .instanceAddress = batch.globalInstanceBufferAddress,
+                PushData push = {.vertexAddress = batch.globalVertexBuffer.address,
+                                 .attributeAddress = batch.globalAttributeBuffer.address,
+                                 .instanceAddress = batch.globalInstanceBuffer.address,
                                  .commandConstantsAddress =
-                                     batch.commandConstantsBufferAddress,
+                                     batch.commandConstantsBuffer.address,
                                  .cameraIndex = 1};
                 commandBuffer.pushConstants(*pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
                                             0, sizeof(PushData), &push);
                 commandBuffer.setDepthWriteEnable(false);
                 commandBuffer.setDepthTestEnable(false);
                 VkDeviceSize offset =
-                    batch.draw3DCount * sizeof(VkDrawIndexedIndirectCommand);
-                commandBuffer.drawIndexedIndirect(batch.indirectDrawBuffer.buffer(),
-                                                  offset, batch.drawCountUI,
-                                                  sizeof(VkDrawIndexedIndirectCommand));
+                    batch.drawCount3D * sizeof(VkDrawIndexedIndirectCommand);
+                commandBuffer.drawIndexedIndirect(
+                    batch.indirectDrawBuffer.buffer.buffer(), offset, batch.drawCountUI,
+                    sizeof(VkDrawIndexedIndirectCommand));
             }
             // diff: [test_dod11] end
             // diff: [test_dod8] start
