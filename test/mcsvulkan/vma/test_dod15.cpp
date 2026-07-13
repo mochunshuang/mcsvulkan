@@ -1656,12 +1656,6 @@ try
 
     //diff: [test_dod12] end
 
-    //diff: [test_dod12] start: 解析字符串。生成一些元信息
-    constexpr auto ltr = 0; // NOLINT
-    constexpr auto rtl = 1; // NOLINT
-
-    //diff: [test_dod12] end
-
     //diff: [test_dod8] start
     auto meshManager = initMeshManager();
     auto &[allVertices, allIndices, meshMap] = meshManager;
