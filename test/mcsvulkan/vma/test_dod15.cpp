@@ -1959,165 +1959,145 @@ try
                                                 const auto &shape_results,
                                                 const auto &break_types,
                                                 uint32_t modulateFlag = 1) {
-        // 计算内容区域
+        // -------- 1. 排版参数 --------
         float x = nodeLeft + padLeft;
         float y = nodeTop + padTop;
         float contentWidth = nodeWidth - padLeft - padRight;
         float contentHeight = nodeHeight - padTop - padBottom;
 
-        std::println("=== generate_text_instances_for_node ===");
-        std::println("  nodeLeft={}, nodeTop={}, nodeWidth={}, nodeHeight={}", nodeLeft,
-                     nodeTop, nodeWidth, nodeHeight);
-        std::println("  pads: l={}, r={}, t={}, b={}", padLeft, padRight, padTop,
-                     padBottom);
-        std::println("  content x={}, y={}, width={}, height={}", x, y, contentWidth,
-                     contentHeight);
-
-        // 字体大小和行高（根据内容高度自适应）
-        const double FONT_SIZE_PX = (std::min<double>)(contentHeight, 12.0);
+        const double FONT_SIZE_PX = std::min<double>(contentHeight, 12.0);
         const double LINE_HEIGHT_PX = FONT_SIZE_PX * 1.5;
         const double ORIGIN_X = static_cast<double>(x);
-        const double ORIGIN_Y = static_cast<double>(y) + FONT_SIZE_PX; // 基线
+        const double ORIGIN_Y = static_cast<double>(y) + FONT_SIZE_PX;
         const double MAX_LINE_WIDTH = static_cast<double>(contentWidth);
 
-        // 建立逻辑索引到字形指针的映射（复用原逻辑）
+        // -------- 2. 推导字形类型并收集视觉顺序字形列表 --------
+        using GlyphType = std::remove_cvref_t<decltype(shape_results[0][0])>;
+        std::vector<const GlyphType *> visual_glyphs;
 
-        std::vector<const font_ns::harfbuzz::shape_result<FontContext> *> visual_glyphs;
-        std::unordered_map<size_t, const font_ns::harfbuzz::shape_result<FontContext> *>
-            logical_to_glyph;
+        // 每个逻辑字符的总 advance（像素），用于分行
+        std::vector<double> char_advance(codepoints.size(), 0.0);
+
         for (const auto &run : shape_results)
         {
             for (const auto &glyph : run)
             {
                 visual_glyphs.push_back(&glyph);
-                logical_to_glyph[glyph.logical_idx] = &glyph;
+                char_advance[glyph.logical_idx] += glyph.advance_x * FONT_SIZE_PX;
             }
         }
 
-        // 分行（复制自原 generate_line_meshes）
-        struct LineInfo
+        // -------- 3. 分行：计算每个逻辑索引的行号 --------
+        std::vector<int> line_of_logical(codepoints.size(), -1);
+        int current_line = 0;
+        double line_width = 0.0;
+        bool line_has_content = false;
+
+        for (size_t i = 0; i < break_types.size(); ++i)
         {
-            std::vector<size_t> logical_indices;
-        };
-        std::vector<LineInfo> lines;
-        LineInfo current_line;
-        double cursorX = ORIGIN_X;
-        for (size_t log_idx = 0; log_idx < break_types.size(); ++log_idx)
-        {
-            char break_type = break_types[log_idx];
-            if (break_type == LINEBREAK_MUSTBREAK)
+            if (break_types[i] == LINEBREAK_MUSTBREAK)
             {
-                if (!current_line.logical_indices.empty())
+                if (line_has_content)
                 {
-                    lines.push_back(std::move(current_line));
-                    current_line = LineInfo{};
-                    cursorX = ORIGIN_X;
+                    ++current_line;
+                    line_width = 0.0;
+                    line_has_content = false;
                 }
                 continue;
             }
-            auto it = logical_to_glyph.find(log_idx);
-            if (it == logical_to_glyph.end())
-                continue;
-            const auto *glyph = it->second;
-            double advance = glyph->advance_x * FONT_SIZE_PX;
-            double new_width = cursorX + advance - ORIGIN_X;
-            if (!current_line.logical_indices.empty() && new_width > MAX_LINE_WIDTH)
+
+            double adv = char_advance[i];
+            if (adv == 0.0)
+                continue; // 没有字形（如换行符本身）
+
+            if (line_has_content && (line_width + adv) > MAX_LINE_WIDTH)
             {
-                lines.push_back(std::move(current_line));
-                current_line = LineInfo{};
-                cursorX = ORIGIN_X;
+                ++current_line;
+                line_width = 0.0;
+                line_has_content = false;
             }
-            current_line.logical_indices.push_back(log_idx);
-            cursorX += advance;
-        }
-        if (!current_line.logical_indices.empty())
-        {
-            lines.push_back(std::move(current_line));
+
+            line_of_logical[i] = current_line;
+            line_width += adv;
+            line_has_content = true;
         }
 
-        // 生成实例
+        // -------- 4. 按视觉顺序动态生成实例 --------
         float w = static_cast<float>(swapchain.refImageExtent().width);
         float h = static_cast<float>(swapchain.refImageExtent().height);
+        const float ndc_scale_x = 2.0f / w;
+        const float ndc_scale_y = 2.0f / h;
 
         double currentY = ORIGIN_Y;
-        for (const auto &line : lines)
+        double cursorX = ORIGIN_X;
+        int active_line = 0;
+
+        for (const auto *g : visual_glyphs)
         {
-            std::unordered_set<size_t> log_set(line.logical_indices.begin(),
-                                               line.logical_indices.end());
-            std::vector<const font_ns::harfbuzz::shape_result<FontContext> *> line_glyphs;
-            for (const auto *glyph : visual_glyphs)
+            int target_line = line_of_logical[g->logical_idx];
+            if (target_line < 0)
+                continue; // 属强制换行符，跳过
+
+            // 检测到行变化，重置光标并下移基线
+            if (target_line != active_line)
             {
-                if (log_set.count(glyph->logical_idx))
-                {
-                    line_glyphs.push_back(glyph);
-                }
+                currentY = ORIGIN_Y + LINE_HEIGHT_PX * target_line;
+                cursorX = ORIGIN_X;
+                active_line = target_line;
             }
 
-            cursorX = ORIGIN_X;
-            std::println("  New line at currentY={}, cursorX={}", currentY, cursorX);
-            for (const auto *g : line_glyphs)
+            // 零面积字形只推进光标，不生成实例
+            using bound_type = decltype(g->plane_bounds);
+            if (g->plane_bounds == bound_type{})
             {
-                double baselineY = currentY + g->offset_y * FONT_SIZE_PX;
-                float left =
-                    static_cast<float>(cursorX + g->plane_bounds.left * FONT_SIZE_PX);
-                float bottom =
-                    static_cast<float>(baselineY + g->plane_bounds.bottom * FONT_SIZE_PX);
-                float right =
-                    static_cast<float>(cursorX + g->plane_bounds.right * FONT_SIZE_PX);
-                float top =
-                    static_cast<float>(baselineY + g->plane_bounds.top * FONT_SIZE_PX);
-                std::println(
-                    "    Glyph id={} [logical_idx: {}] char U+{:04X}: left={:.2f}, "
-                    "right={:.2f}, "
-                    "top={:.2f}, bottom={:.2f}",
-                    global_id, g->logical_idx, codepoints[g->logical_idx], left, right,
-                    top, bottom);
-
-                // ★ 修正：p0 = 左上，p2 = 右下
-                glm::vec2 p0 = camera::VulkanNDCConfig::screenToNDC(left, top, w, h);
-                glm::vec2 p2 = camera::VulkanNDCConfig::screenToNDC(right, bottom, w, h);
-                glm::mat4 M = camera::VulkanNDCConfig::rectTransform(p0, p2, 0.0f);
-                std::println("      NDC p0=({:.3f},{:.3f}), p2=({:.3f},{:.3f})", p0.x,
-                             p0.y, p2.x, p2.y);
-                std::println("      Matrix translation: ({:.3f},{:.3f},{:.3f})", M[3][0],
-                             M[3][1], M[3][2]);
-
-                // UV变换：将标准[0,1]²映射到字形的UV边界
-                UvTransform uv = UvTransform::from_target_verts(
-                    std::array<glm::vec2, 4>{{{g->uv_bounds.left, g->uv_bounds.bottom},
-                                              {g->uv_bounds.right, g->uv_bounds.bottom},
-                                              {g->uv_bounds.right, g->uv_bounds.top},
-                                              {g->uv_bounds.left, g->uv_bounds.top}}});
-
-                auto cur_id = global_id++;
-                InstanceData inst{
-                    .objectId = cur_id,
-                    .textureIndex = g->font_ctx->bind.texture_index,
-                    .samplerIndex = g->font_ctx->bind.sampler_index,
-                    .objectData = object_data{glm::mat4(1.0f)}, // 动态部分初始为单位
-                    .vertexTransform = VertexTransform{M},      // 静态布局矩阵
-                    .uvTransform = uv,
-                    .fontType = static_cast<uint32_t>(g->font_ctx->type),
-                    .pxRange = static_cast<float>(
-                        g->font_ctx->font.atlas.distanceRange.value_or(0.0)),
-                    .modulateFlag = modulateFlag};
-
-                // 顶点颜色设为左上角顺时针：白色-> 红 -> 绿 -> 蓝
-                std::array<VertexAttribute, 4> attrs = {
-                    VertexAttribute{{1.0f, 1.0f, 1.0f}},
-                    VertexAttribute{{1.0f, 0.0f, 0.0f}},
-                    VertexAttribute{{0.0f, 1.0f, 0.0f}},
-                    VertexAttribute{{0.0f, 0.0f, 1.0f}}};
-
-                uiStore.new_entity(inst, attrs);
                 cursorX += g->advance_x * FONT_SIZE_PX;
-
-                std::println("uiStore add_text id: {}", cur_id);
+                continue;
             }
-            currentY += LINE_HEIGHT_PX;
+
+            double baselineY = currentY + g->offset_y * FONT_SIZE_PX;
+            float left =
+                static_cast<float>(cursorX + g->plane_bounds.left * FONT_SIZE_PX);
+            float bottom =
+                static_cast<float>(baselineY + g->plane_bounds.bottom * FONT_SIZE_PX);
+            float right =
+                static_cast<float>(cursorX + g->plane_bounds.right * FONT_SIZE_PX);
+            float top =
+                static_cast<float>(baselineY + g->plane_bounds.top * FONT_SIZE_PX);
+
+            glm::vec2 p0(left * ndc_scale_x - 1.0f, top * ndc_scale_y - 1.0f);
+            glm::vec2 p2(right * ndc_scale_x - 1.0f, bottom * ndc_scale_y - 1.0f);
+            glm::mat4 M = camera::VulkanNDCConfig::rectTransform(p0, p2, 0.0f);
+
+            UvTransform uv = UvTransform::from_target_verts(
+                std::array<glm::vec2, 4>{{{static_cast<float>(g->uv_bounds.left),
+                                           static_cast<float>(g->uv_bounds.bottom)},
+                                          {static_cast<float>(g->uv_bounds.right),
+                                           static_cast<float>(g->uv_bounds.bottom)},
+                                          {static_cast<float>(g->uv_bounds.right),
+                                           static_cast<float>(g->uv_bounds.top)},
+                                          {static_cast<float>(g->uv_bounds.left),
+                                           static_cast<float>(g->uv_bounds.top)}}});
+
+            auto cur_id = global_id++;
+            InstanceData inst{.objectId = cur_id,
+                              .textureIndex = g->font_ctx->bind.texture_index,
+                              .samplerIndex = g->font_ctx->bind.sampler_index,
+                              .objectData = object_data{glm::mat4(1.0f)},
+                              .vertexTransform = VertexTransform{M},
+                              .uvTransform = uv,
+                              .fontType = static_cast<uint32_t>(g->font_ctx->type),
+                              .pxRange = static_cast<float>(
+                                  g->font_ctx->font.atlas.distanceRange.value_or(0.0)),
+                              .modulateFlag = modulateFlag};
+
+            std::array<VertexAttribute, 4> attrs = {
+                VertexAttribute{{1.0f, 1.0f, 1.0f}}, VertexAttribute{{1.0f, 0.0f, 0.0f}},
+                VertexAttribute{{0.0f, 1.0f, 0.0f}}, VertexAttribute{{0.0f, 0.0f, 1.0f}}};
+
+            uiStore.new_entity(inst, attrs);
+            cursorX += g->advance_x * FONT_SIZE_PX;
         }
     };
-
     //diff: [test_dod12] end
 
     auto generateUIInstances = [&](Layout &layout) {
@@ -3092,10 +3072,6 @@ try
         auto start = std::chrono::high_resolution_clock::now();
         //diff: [test_dod11] start
         {
-            static std::vector<VkDrawIndexedIndirectCommand> g_cmds;
-            static std::vector<InstanceData> g_allInstances;
-            static std::vector<VertexAttribute> g_allAttributes;
-
             // 临时命令和常量数组
             std::vector<VkDrawIndexedIndirectCommand> cmds;
             std::vector<CommandConstant> cmdConsts;

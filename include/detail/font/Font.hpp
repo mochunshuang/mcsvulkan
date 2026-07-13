@@ -159,6 +159,7 @@ namespace mcs::vulkan::font
               public:
                 //%.17g 使用double
                 double left, bottom, right, top;
+                constexpr bool operator==(const Bounds &) const = default;
             };
             using PlaneBounds = Bounds;
             using AtlasBounds = Bounds;

@@ -85,8 +85,9 @@ namespace mcs::vulkan::font::bidi
             // 镜像部分保持注释（未启用）
             // ...
 
+            // separatorLength = 2，说明分隔符 \r\n 的长度为 2 字节. actualLength 已经包含\r\n 了
             // 移动到下一段落
-            offset += actualLength + separatorLength;
+            offset += actualLength;
         }
 
         // 注意：这里返回的 mirrored_codepoints 与原 codepoints 相同（未镜像）
