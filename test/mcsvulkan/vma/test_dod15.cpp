@@ -1572,6 +1572,37 @@ constexpr auto initFrameResources(const LogicalDevice &device, const mesh_manage
     }
     return frameResources;
 }
+constexpr auto run_text_pipeline(auto &fontSelect, const char8_t *rawText,
+                                 std::string_view langBcp47, bool ltr = true)
+{
+    constexpr auto ltr_value = 0; // NOLINT
+    constexpr auto rtl_value = 1; // NOLINT
+    namespace font_ns = mcs::vulkan::font;
+
+    auto norm = font_ns::utf8proc::normalize(rawText);
+    const std::vector<uint32_t> &codepoints = norm.codepoints;
+    font_ns::utf8proc::print_normalized(norm, rawText);
+
+    auto analyze_result = font_ns::bidi::analyze(codepoints, ltr ? ltr_value : rtl_value);
+    font_ns::bidi::print_bidi_result(codepoints, analyze_result);
+
+    auto test_text_runs = font_ns::assign_fonts(analyze_result, fontSelect);
+    font_ns::print_text_runs(test_text_runs);
+
+    auto test_shape_result = font_ns::harfbuzz::shape(
+        analyze_result.mirrored_codepoints, test_text_runs, fontSelect.notdefFont());
+    font_ns::harfbuzz::print_shape_result(analyze_result.mirrored_codepoints,
+                                          test_shape_result);
+
+    auto break_result = font_ns::libunibreak::analyze_line_breaks(
+        analyze_result.mirrored_codepoints, langBcp47);
+    font_ns::libunibreak::print_break_result(break_result,
+                                             analyze_result.mirrored_codepoints);
+    return make_aggregate<"text_pipeline_result", "codepoints", "shape_result",
+                          "break_result">(std::move(analyze_result.mirrored_codepoints),
+                                          std::move(test_shape_result),
+                                          std::move(break_result));
+}
 
 int main()
 try
@@ -1612,7 +1643,6 @@ try
     auto &fontFactory = *fontCtx.fontFactory.get();
     auto &fontSelect = fontCtx.fontSelect;
     using FontContext = std::remove_cvref_t<decltype(fontFactory)>::font_context_type;
-    namespace font_ns = mcs::vulkan::font;
 
     descriptorSetManager.update_uniform_buffer();
     descriptorSetManager.update_texture(textureManager.view_used_indexes());
@@ -1629,29 +1659,6 @@ try
     //diff: [test_dod12] start: 解析字符串。生成一些元信息
     constexpr auto ltr = 0; // NOLINT
     constexpr auto rtl = 1; // NOLINT
-
-    constexpr auto rawText =
-        u8"我你好世界你好世界你好世界🤣\nW3C (World)👪 ﷲ é \nמעביר את "
-        u8"שירותי- ERCIM."; // NOTE: BUG
-    auto norm = font_ns::utf8proc::normalize(rawText);
-    const std::vector<uint32_t> &codepoints = norm.codepoints;
-    font_ns::utf8proc::print_normalized(norm, rawText);
-
-    auto analyze_result = font_ns::bidi::analyze(codepoints, ltr);
-    font_ns::bidi::print_bidi_result(codepoints, analyze_result);
-
-    auto test_text_runs = font_ns::assign_fonts(analyze_result, fontSelect);
-    font_ns::print_text_runs(test_text_runs);
-
-    auto test_shape_result = font_ns::harfbuzz::shape(
-        analyze_result.mirrored_codepoints, test_text_runs, fontSelect.notdefFont());
-    font_ns::harfbuzz::print_shape_result(analyze_result.mirrored_codepoints,
-                                          test_shape_result);
-
-    auto break_result = font_ns::libunibreak::analyze_line_breaks(
-        analyze_result.mirrored_codepoints, "zh-CN");
-    font_ns::libunibreak::print_break_result(break_result,
-                                             analyze_result.mirrored_codepoints);
 
     //diff: [test_dod12] end
 
@@ -1950,166 +1957,162 @@ try
     std::println("layout.print [end]");
 
     //diff: [test_dod12] start
-    auto generate_text_instances_for_node = [&](ui_data_type &uiStore,
-                                                uint32_t &global_id, float nodeLeft,
-                                                float nodeTop, float nodeWidth,
-                                                float nodeHeight, float padLeft,
-                                                float padRight, float padTop,
-                                                float padBottom,
-                                                const auto &shape_results,
-                                                const auto &break_types,
-                                                uint32_t modulateFlag = 1) {
-        // -------- 1. 排版参数 --------
-        float x = nodeLeft + padLeft;
-        float y = nodeTop + padTop;
-        float contentWidth = nodeWidth - padLeft - padRight;
-        float contentHeight = nodeHeight - padTop - padBottom;
+    static constexpr auto generate_text_instances_for_node =
+        [](float w, float h, ui_data_type &uiStore, uint32_t &global_id, float nodeLeft,
+           float nodeTop, float nodeWidth, float nodeHeight, float padLeft,
+           float padRight, float padTop, float padBottom,
+           const std::vector<uint32_t> &codepoints, const auto &shape_results,
+           const auto &break_types, uint32_t modulateFlag = 1) {
+            // -------- 1. 排版参数 --------
+            float x = nodeLeft + padLeft;
+            float y = nodeTop + padTop;
+            float contentWidth = nodeWidth - padLeft - padRight;
+            float contentHeight = nodeHeight - padTop - padBottom;
 
-        const double FONT_SIZE_PX = std::min<double>(contentHeight, 12.0);
-        const double LINE_HEIGHT_PX = FONT_SIZE_PX * 1.5;
-        const double ORIGIN_X = static_cast<double>(x);
-        const double ORIGIN_Y = static_cast<double>(y) + FONT_SIZE_PX;
-        const double MAX_LINE_WIDTH = static_cast<double>(contentWidth);
+            const double FONT_SIZE_PX = std::min<double>(contentHeight, 12.0);
+            const double LINE_HEIGHT_PX = FONT_SIZE_PX * 1.5;
+            const double ORIGIN_X = static_cast<double>(x);
+            const double ORIGIN_Y = static_cast<double>(y) + FONT_SIZE_PX;
+            const double MAX_LINE_WIDTH = static_cast<double>(contentWidth);
 
-        // -------- 2. 推导字形类型并收集视觉顺序字形列表 --------
-        using GlyphType = std::remove_cvref_t<decltype(shape_results[0][0])>;
-        std::vector<const GlyphType *> visual_glyphs;
+            // -------- 2. 推导字形类型并收集视觉顺序字形列表 --------
+            using GlyphType = std::remove_cvref_t<decltype(shape_results[0][0])>;
+            std::vector<const GlyphType *> visual_glyphs;
 
-        // 每个逻辑字符的总 advance（像素），用于分行
-        std::vector<double> char_advance(codepoints.size(), 0.0);
+            // 每个逻辑字符的总 advance（像素），用于分行
+            std::vector<double> char_advance(codepoints.size(), 0.0);
 
-        for (const auto &run : shape_results)
-        {
-            for (const auto &glyph : run)
+            for (const auto &run : shape_results)
             {
-                visual_glyphs.push_back(&glyph);
-                char_advance[glyph.logical_idx] += glyph.advance_x * FONT_SIZE_PX;
+                for (const auto &glyph : run)
+                {
+                    visual_glyphs.push_back(&glyph);
+                    char_advance[glyph.logical_idx] += glyph.advance_x * FONT_SIZE_PX;
+                }
             }
-        }
 
-        // -------- 3. 分行：计算每个逻辑索引的行号 --------
-        std::vector<int> line_of_logical(codepoints.size(), -1);
-        int current_line = 0;
-        double line_width = 0.0;
-        bool line_has_content = false;
+            // -------- 3. 分行：计算每个逻辑索引的行号 --------
+            std::vector<int> line_of_logical(codepoints.size(), -1);
+            int current_line = 0;
+            double line_width = 0.0;
+            bool line_has_content = false;
 
-        for (size_t i = 0; i < break_types.size(); ++i)
-        {
-            if (break_types[i] == LINEBREAK_MUSTBREAK)
+            for (size_t i = 0; i < break_types.size(); ++i)
             {
-                if (line_has_content)
+                if (break_types[i] == LINEBREAK_MUSTBREAK)
+                {
+                    if (line_has_content)
+                    {
+                        ++current_line;
+                        line_width = 0.0;
+                        line_has_content = false;
+                    }
+                    continue;
+                }
+
+                double adv = char_advance[i];
+                if (adv == 0.0)
+                    continue; // 没有字形（如换行符本身）
+
+                if (line_has_content && (line_width + adv) > MAX_LINE_WIDTH)
                 {
                     ++current_line;
                     line_width = 0.0;
                     line_has_content = false;
                 }
-                continue;
+
+                line_of_logical[i] = current_line;
+                line_width += adv;
+                line_has_content = true;
             }
 
-            double adv = char_advance[i];
-            if (adv == 0.0)
-                continue; // 没有字形（如换行符本身）
+            // -------- 4. 按视觉顺序动态生成实例 --------
+            const float ndc_scale_x = 2.0f / w;
+            const float ndc_scale_y = 2.0f / h;
 
-            if (line_has_content && (line_width + adv) > MAX_LINE_WIDTH)
+            double currentY = ORIGIN_Y;
+            double cursorX = ORIGIN_X;
+            int active_line = 0;
+
+            for (const auto *g : visual_glyphs)
             {
-                ++current_line;
-                line_width = 0.0;
-                line_has_content = false;
-            }
+                int target_line = line_of_logical[g->logical_idx];
+                if (target_line < 0)
+                    continue; // 属强制换行符，跳过
 
-            line_of_logical[i] = current_line;
-            line_width += adv;
-            line_has_content = true;
-        }
+                // 检测到行变化，重置光标并下移基线
+                if (target_line != active_line)
+                {
+                    currentY = ORIGIN_Y + LINE_HEIGHT_PX * target_line;
+                    cursorX = ORIGIN_X;
+                    active_line = target_line;
+                }
 
-        // -------- 4. 按视觉顺序动态生成实例 --------
-        float w = static_cast<float>(swapchain.refImageExtent().width);
-        float h = static_cast<float>(swapchain.refImageExtent().height);
-        const float ndc_scale_x = 2.0f / w;
-        const float ndc_scale_y = 2.0f / h;
+                // 零面积字形只推进光标，不生成实例
+                using bound_type = decltype(g->plane_bounds);
+                if (g->plane_bounds == bound_type{})
+                {
+                    cursorX += g->advance_x * FONT_SIZE_PX;
+                    continue;
+                }
 
-        double currentY = ORIGIN_Y;
-        double cursorX = ORIGIN_X;
-        int active_line = 0;
+                double baselineY = currentY + g->offset_y * FONT_SIZE_PX;
+                float left =
+                    static_cast<float>(cursorX + g->plane_bounds.left * FONT_SIZE_PX);
+                float bottom =
+                    static_cast<float>(baselineY + g->plane_bounds.bottom * FONT_SIZE_PX);
+                float right =
+                    static_cast<float>(cursorX + g->plane_bounds.right * FONT_SIZE_PX);
+                float top =
+                    static_cast<float>(baselineY + g->plane_bounds.top * FONT_SIZE_PX);
 
-        for (const auto *g : visual_glyphs)
-        {
-            int target_line = line_of_logical[g->logical_idx];
-            if (target_line < 0)
-                continue; // 属强制换行符，跳过
+                glm::vec2 p0(left * ndc_scale_x - 1.0f, top * ndc_scale_y - 1.0f);
+                glm::vec2 p2(right * ndc_scale_x - 1.0f, bottom * ndc_scale_y - 1.0f);
+                glm::mat4 M = camera::VulkanNDCConfig::rectTransform(p0, p2, 0.0f);
 
-            // 检测到行变化，重置光标并下移基线
-            if (target_line != active_line)
-            {
-                currentY = ORIGIN_Y + LINE_HEIGHT_PX * target_line;
-                cursorX = ORIGIN_X;
-                active_line = target_line;
-            }
+                UvTransform uv = UvTransform::from_target_verts(
+                    std::array<glm::vec2, 4>{{{static_cast<float>(g->uv_bounds.left),
+                                               static_cast<float>(g->uv_bounds.bottom)},
+                                              {static_cast<float>(g->uv_bounds.right),
+                                               static_cast<float>(g->uv_bounds.bottom)},
+                                              {static_cast<float>(g->uv_bounds.right),
+                                               static_cast<float>(g->uv_bounds.top)},
+                                              {static_cast<float>(g->uv_bounds.left),
+                                               static_cast<float>(g->uv_bounds.top)}}});
 
-            // 零面积字形只推进光标，不生成实例
-            using bound_type = decltype(g->plane_bounds);
-            if (g->plane_bounds == bound_type{})
-            {
+                auto cur_id = global_id++;
+                InstanceData inst{
+                    .objectId = cur_id,
+                    .textureIndex = g->font_ctx->bind.texture_index,
+                    .samplerIndex = g->font_ctx->bind.sampler_index,
+                    .objectData = object_data{glm::mat4(1.0f)},
+                    .vertexTransform = VertexTransform{M},
+                    .uvTransform = uv,
+                    .fontType = static_cast<uint32_t>(g->font_ctx->type),
+                    .pxRange = static_cast<float>(
+                        g->font_ctx->font.atlas.distanceRange.value_or(0.0)),
+                    .modulateFlag = modulateFlag};
+
+                std::array<VertexAttribute, 4> attrs = {
+                    VertexAttribute{{1.0f, 1.0f, 1.0f}},
+                    VertexAttribute{{1.0f, 0.0f, 0.0f}},
+                    VertexAttribute{{0.0f, 1.0f, 0.0f}},
+                    VertexAttribute{{0.0f, 0.0f, 1.0f}}};
+
+                uiStore.new_entity(inst, attrs);
                 cursorX += g->advance_x * FONT_SIZE_PX;
-                continue;
             }
-
-            double baselineY = currentY + g->offset_y * FONT_SIZE_PX;
-            float left =
-                static_cast<float>(cursorX + g->plane_bounds.left * FONT_SIZE_PX);
-            float bottom =
-                static_cast<float>(baselineY + g->plane_bounds.bottom * FONT_SIZE_PX);
-            float right =
-                static_cast<float>(cursorX + g->plane_bounds.right * FONT_SIZE_PX);
-            float top =
-                static_cast<float>(baselineY + g->plane_bounds.top * FONT_SIZE_PX);
-
-            glm::vec2 p0(left * ndc_scale_x - 1.0f, top * ndc_scale_y - 1.0f);
-            glm::vec2 p2(right * ndc_scale_x - 1.0f, bottom * ndc_scale_y - 1.0f);
-            glm::mat4 M = camera::VulkanNDCConfig::rectTransform(p0, p2, 0.0f);
-
-            UvTransform uv = UvTransform::from_target_verts(
-                std::array<glm::vec2, 4>{{{static_cast<float>(g->uv_bounds.left),
-                                           static_cast<float>(g->uv_bounds.bottom)},
-                                          {static_cast<float>(g->uv_bounds.right),
-                                           static_cast<float>(g->uv_bounds.bottom)},
-                                          {static_cast<float>(g->uv_bounds.right),
-                                           static_cast<float>(g->uv_bounds.top)},
-                                          {static_cast<float>(g->uv_bounds.left),
-                                           static_cast<float>(g->uv_bounds.top)}}});
-
-            auto cur_id = global_id++;
-            InstanceData inst{.objectId = cur_id,
-                              .textureIndex = g->font_ctx->bind.texture_index,
-                              .samplerIndex = g->font_ctx->bind.sampler_index,
-                              .objectData = object_data{glm::mat4(1.0f)},
-                              .vertexTransform = VertexTransform{M},
-                              .uvTransform = uv,
-                              .fontType = static_cast<uint32_t>(g->font_ctx->type),
-                              .pxRange = static_cast<float>(
-                                  g->font_ctx->font.atlas.distanceRange.value_or(0.0)),
-                              .modulateFlag = modulateFlag};
-
-            std::array<VertexAttribute, 4> attrs = {
-                VertexAttribute{{1.0f, 1.0f, 1.0f}}, VertexAttribute{{1.0f, 0.0f, 0.0f}},
-                VertexAttribute{{0.0f, 1.0f, 0.0f}}, VertexAttribute{{0.0f, 0.0f, 1.0f}}};
-
-            uiStore.new_entity(inst, attrs);
-            cursorX += g->advance_x * FONT_SIZE_PX;
-        }
-    };
+        };
     //diff: [test_dod12] end
 
-    auto generateUIInstances = [&](Layout &layout) {
+    auto generateUIInstances = [&swapchain, &uiStore, &fontSelect](Layout &layout) {
         float w = static_cast<float>(swapchain.refImageExtent().width);
         float h = static_cast<float>(swapchain.refImageExtent().height);
 
         uint32_t global_id = 0;
-        const auto traverse = [&uiStore, &global_id, &w, &h,
-                               &generate_text_instances_for_node, &test_shape_result,
-                               &break_result](this auto &self, uint32_t cur_id,
-                                              const Node *node, float parentLeft,
-                                              float parentTop) {
+        const auto traverse = [&uiStore, &global_id, &w, &h, &fontSelect](
+                                  this auto &self, uint32_t cur_id, const Node *node,
+                                  float parentLeft, float parentTop) {
             if (!node)
                 return;
             auto *ygNode = **node;
@@ -2234,9 +2237,15 @@ try
                     std::println("  padding: left={}, right={}, top={}, bottom={}",
                                  padLeft, padRight, padTop, padBottom);
                     // 生成文本实例
+                    constexpr auto rawText =
+                        u8"我你好世界你好世界你好世界🤣\nW3C (World)👪 ﷲ é \nמעביר את "
+                        u8"שירותי- ERCIM."; // NOTE: BUG
+                    auto [codepoints, test_shape_result, break_result] =
+                        run_text_pipeline(fontSelect, rawText, "zh-CN");
                     generate_text_instances_for_node(
-                        uiStore, ++global_id, x, y, nw, nh, padLeft, padRight, padTop,
-                        padBottom, test_shape_result, break_result.types);
+                        w, h, uiStore, ++global_id, x, y, nw, nh, padLeft, padRight,
+                        padTop, padBottom, codepoints, test_shape_result,
+                        break_result.types);
                     // 注意：文本节点本身不生成面板矩形
                 }
             }
