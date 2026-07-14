@@ -440,9 +440,16 @@ using mcs::vulkan::match;
 
 struct FrameClock
 {
-    using Clock = std::chrono::high_resolution_clock;
-    Clock::time_point lastTime{};
-    float deltaTime = 0.016f; // 占位值，避免第一帧为0
+    using Clock = std::chrono::steady_clock;    // 单调时钟，适合测时间间隔
+    Clock::time_point startTime = Clock::now(); // 程序启动时自动记录
+    Clock::time_point lastTime = startTime;
+    float deltaTime = 0.016f;
+
+    // 返回从 startTime 到现在的秒数（float）
+    float getElapsed() const noexcept
+    {
+        return std::chrono::duration<float>(Clock::now() - startTime).count();
+    }
 };
 constexpr auto init()
 {
@@ -1972,10 +1979,6 @@ try
     constexpr auto interactiveStoreFuns =
         make_aggregate<"interactiveStoreFuns", "model_update">(float{});
 
-    // NOTE: spinElapsed 全部mesh共享？
-    auto autoSpinStoreShareData =
-        make_aggregate<"autoSpinStoreShareData", "spinElapsed">(float{});
-
     //diff: [test_dod10] start
 
     // 新增 UI store（结构与其他 store 完全一致）
@@ -2377,9 +2380,9 @@ try
     //diff: [test_dod10] end
 
     //diff: [test_dod14] 不再需要  topLeftLocal 字段，因为我们使用的公共的顶点我们是知道的
-    auto soaCtx = make_aggregate_ref<"soaCtx", "autoSpinStore", "autoSpinStoreShareData",
-                                     "interactiveStore", "uiStore", "screen_resize">(
-        autoSpinStore, autoSpinStoreShareData, interactiveStore, uiStore, screen_resize);
+    auto soaCtx = make_aggregate_ref<"soaCtx", "autoSpinStore", "interactiveStore",
+                                     "uiStore", "screen_resize">(
+        autoSpinStore, interactiveStore, uiStore, screen_resize);
 
     //diff: [test_dod8.cpp] end
 
@@ -2758,12 +2761,7 @@ try
         auto &autoSpinStore = soaCtx.autoSpinStore;
         auto &interactiveStore = soaCtx.interactiveStore;
 
-        auto &spinElapsed = soaCtx.autoSpinStoreShareData.spinElapsed;
-
-        // 获取 deltaTime（从 inputCtx 读取）
-        const float dt = inputCtx.clock.deltaTime;
-        // 更新自旋动画的累积时间
-        spinElapsed += dt;
+        float elapsed = inputCtx.clock.getElapsed(); // 直接获取当前累积时间
 
         //diff: [test_dod8] start
         auto start = std::chrono::high_resolution_clock::now();
@@ -2778,7 +2776,7 @@ try
                 if (idx == 0) [[unlikely]]
                 {
                     float phaseOffset = idx * glm::radians(137.5f);
-                    float angle = spinElapsed * glm::radians(90.0f) + phaseOffset;
+                    float angle = elapsed * glm::radians(90.0f) + phaseOffset;
                     // 从现有矩阵提取原始平移和缩放
                     auto [trans, scale] = camera::extractTranslationScale(mat);
                     glm::quat rot = glm::angleAxis(angle, glm::vec3(0, 0, 1));
@@ -2788,9 +2786,9 @@ try
                     // ---- 动态 UV 变换 ----
                     auto &uv = instanceData.uvTransform;
                     // 示例1：纹理随时间向右滚动（重复模式）
-                    uv.offset.x = fmodf(spinElapsed * 0.2f, 1.0f);
+                    uv.offset.x = fmodf(elapsed * 0.2f, 1.0f);
                     // 示例2：纹理在 0.5 倍到 1.5 倍之间周期性缩放
-                    float s = 1.0f + 0.5f * sinf(spinElapsed * 2.0f);
+                    float s = 1.0f + 0.5f * sinf(elapsed * 2.0f);
                     uv.scale = glm::vec2(s, s);
                     //diff: [test_dod9] end
                 }
@@ -2799,7 +2797,7 @@ try
                     // 提取现有的平移和缩放
 
                     float phaseOffset = idx * glm::radians(137.5f);
-                    float angle = spinElapsed * glm::radians(90.0f) + phaseOffset;
+                    float angle = elapsed * glm::radians(90.0f) + phaseOffset;
                     glm::quat rot = glm::angleAxis(angle, glm::vec3(0, 0, 1));
                     auto [trans, scale] = camera::extractTranslationScale(mat);
                     // 重构：缩放 → 旋转 → 平移（与创建时的顺序保持一致）
@@ -2822,13 +2820,12 @@ try
         if (0)
         {
             auto &uiStore = soaCtx.uiStore;
-            float time = soaCtx.autoSpinStoreShareData.spinElapsed;
 
             int idx = 0;
             for (auto [instanceData] : uiStore.view<"instanceData">(currentFrame))
             {
-                float angle = time * 0.5f + idx * 0.2f;
-                float s = 1.0f + 0.3f * sinf(time * 2.0f + idx);
+                float angle = elapsed * 0.5f + idx * 0.2f;
+                float s = 1.0f + 0.3f * sinf(elapsed * 2.0f + idx);
                 glm::mat4 dynamicMat =
                     glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0, 0, 1)) *
                     glm::scale(glm::mat4(1.0f), glm::vec3(s, s, 1.0f));
@@ -2839,10 +2836,9 @@ try
         else if (0) // 整体 UI 组动画
         {
             auto &uiStore = soaCtx.uiStore;
-            float time = soaCtx.autoSpinStoreShareData.spinElapsed;
 
-            float angle = time * 0.5f;
-            float s = 1.0f + 0.3f * sinf(time * 2.0f);
+            float angle = elapsed * 0.5f;
+            float s = 1.0f + 0.3f * sinf(elapsed * 2.0f);
             glm::mat4 dynamicTransform =
                 glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0, 0, 1)) *
                 glm::scale(glm::mat4(1.0f), glm::vec3(s, s, 1.0f));
