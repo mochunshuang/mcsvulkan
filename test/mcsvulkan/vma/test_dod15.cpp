@@ -77,6 +77,7 @@ using mcs::vulkan::meta::make_aggregate_ref;
 using mcs::vulkan::meta::make_aggregate;
 
 using mcs::vulkan::ecs::gen_soa_aggregate;
+using mcs::vulkan::ecs::gen_soa_struct;
 
 using mcs::vulkan::task::make_task;
 using mcs::vulkan::task::init_task;
@@ -1886,6 +1887,74 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
         std::move(pipelineLayout), std::move(graphicsPipeline),
         std::move(swapchainAttachments), std::move(pickingAttachments));
 }
+struct triat_inputController_for_autoSpinStore
+{
+    static constexpr auto triat_inputController(auto &world, auto &inputCtx, auto &soaCtx)
+    {
+        // 每1秒添加一批实体，直到总数达到1000
+        {
+            auto &autoSpinStore = soaCtx.autoSpinStore;
+            constexpr int TARGET_ENTITIES = 1000;
+            constexpr int BATCH_SIZE = 100;
+
+            if (autoSpinStore.size() < TARGET_ENTITIES)
+            {
+                static auto lastAddTime = std::chrono::steady_clock::now();
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(now -
+                                                                          lastAddTime)
+                        .count() >= 1000)
+                {
+                    lastAddTime = now;
+                    int toAdd =
+                        std::min(BATCH_SIZE, TARGET_ENTITIES -
+                                                 static_cast<int>(autoSpinStore.size()));
+
+                    if (toAdd > autoSpinStore.free_size())
+                        autoSpinStore.expansion_size(toAdd - autoSpinStore.free_size());
+
+                    std::mt19937 rng(std::random_device{}());
+                    std::uniform_real_distribution<float> colorDist(0.0f, 1.0f);
+                    std::uniform_real_distribution<float> posDist(-1.5f,
+                                                                  1.5f); // 散开范围
+                    std::uniform_real_distribution<float> scaleDist(0.01f,
+                                                                    0.05f); // 粒子极小
+                    // 可选：随机使用不同纹理和采样器
+                    std::uniform_int_distribution<int> texDist(0, 1);
+                    std::uniform_int_distribution<int> sampDist(0, 1);
+
+                    for (int i = 0; i < toAdd; ++i)
+                    {
+                        float scale = scaleDist(rng);
+                        glm::vec3 pos(posDist(rng), posDist(rng), 0.0f);
+
+                        // 构建模型矩阵：先缩放，后平移（重要！否则位置会被缩放影响）
+                        glm::mat4 model = glm::translate(glm::mat4(1.0f), pos) *
+                                          glm::scale(glm::mat4(1.0f), glm::vec3(scale));
+                        // 若需要粒子旋转（不关心朝向，可加随机旋转）
+                        // model = model * glm::toMat4(glm::angleAxis(posDist(rng), glm::vec3(0,0,1)));
+
+                        uint32_t texIdx = texDist(rng) ? 3 : 0;   // 纹理0或3（棋盘/渐变）
+                        uint32_t sampIdx = sampDist(rng) ? 1 : 0; // 采样器0或1
+
+                        InstanceData instData{
+                            .objectId = static_cast<uint32_t>(autoSpinStore.size()),
+                            .textureIndex = texIdx,
+                            .samplerIndex = sampIdx,
+                            .objectData = object_data{model}};
+
+                        std::array<VertexAttribute, 4> attrs;
+                        for (auto &attr : attrs)
+                            attr.color =
+                                glm::vec3(colorDist(rng), colorDist(rng), colorDist(rng));
+
+                        autoSpinStore.new_entity(instData, attrs);
+                    }
+                }
+            }
+        }
+    }
+};
 
 int main()
 try
@@ -1966,9 +2035,10 @@ try
     // diff: [test_dod2] end
 
     //diff: [test_dod8.cpp] start
-    using auto_spin_data_type =
-        gen_soa_aggregate<{"instanceData", ^^InstanceData},
-                          {"vertexAttribute", ^^std::array<VertexAttribute, 4>}>;
+    using auto_spin_data_type = //NOTE: triat_inputController_for_autoSpinStore 仅仅一个trait不行，开
+        gen_soa_struct<triat_inputController_for_autoSpinStore,
+                       {"instanceData", ^^InstanceData},
+                       {"vertexAttribute", ^^std::array<VertexAttribute, 4>}>;
     auto_spin_data_type autoSpinStore{1};
 
     using interactive_type =
@@ -3675,68 +3745,9 @@ try
             pickMouse.valid = false;
         }
 
-        // 每1秒添加一批实体，直到总数达到1000
-        {
-            auto &autoSpinStore = soaCtx.autoSpinStore;
-            constexpr int TARGET_ENTITIES = 1000;
-            constexpr int BATCH_SIZE = 100;
-
-            if (autoSpinStore.size() < TARGET_ENTITIES)
-            {
-                static auto lastAddTime = std::chrono::steady_clock::now();
-                auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration_cast<std::chrono::milliseconds>(now -
-                                                                          lastAddTime)
-                        .count() >= 1000)
-                {
-                    lastAddTime = now;
-                    int toAdd =
-                        std::min(BATCH_SIZE, TARGET_ENTITIES -
-                                                 static_cast<int>(autoSpinStore.size()));
-
-                    if (toAdd > autoSpinStore.free_size())
-                        autoSpinStore.expansion_size(toAdd - autoSpinStore.free_size());
-
-                    std::mt19937 rng(std::random_device{}());
-                    std::uniform_real_distribution<float> colorDist(0.0f, 1.0f);
-                    std::uniform_real_distribution<float> posDist(-1.5f,
-                                                                  1.5f); // 散开范围
-                    std::uniform_real_distribution<float> scaleDist(0.01f,
-                                                                    0.05f); // 粒子极小
-                    // 可选：随机使用不同纹理和采样器
-                    std::uniform_int_distribution<int> texDist(0, 1);
-                    std::uniform_int_distribution<int> sampDist(0, 1);
-
-                    for (int i = 0; i < toAdd; ++i)
-                    {
-                        float scale = scaleDist(rng);
-                        glm::vec3 pos(posDist(rng), posDist(rng), 0.0f);
-
-                        // 构建模型矩阵：先缩放，后平移（重要！否则位置会被缩放影响）
-                        glm::mat4 model = glm::translate(glm::mat4(1.0f), pos) *
-                                          glm::scale(glm::mat4(1.0f), glm::vec3(scale));
-                        // 若需要粒子旋转（不关心朝向，可加随机旋转）
-                        // model = model * glm::toMat4(glm::angleAxis(posDist(rng), glm::vec3(0,0,1)));
-
-                        uint32_t texIdx = texDist(rng) ? 3 : 0;   // 纹理0或3（棋盘/渐变）
-                        uint32_t sampIdx = sampDist(rng) ? 1 : 0; // 采样器0或1
-
-                        InstanceData instData{
-                            .objectId = static_cast<uint32_t>(autoSpinStore.size()),
-                            .textureIndex = texIdx,
-                            .samplerIndex = sampIdx,
-                            .objectData = object_data{model}};
-
-                        std::array<VertexAttribute, 4> attrs;
-                        for (auto &attr : attrs)
-                            attr.color =
-                                glm::vec3(colorDist(rng), colorDist(rng), colorDist(rng));
-
-                        autoSpinStore.new_entity(instData, attrs);
-                    }
-                }
-            }
-        }
+        // NOTE: 从 soaCtx 的成员找这个”autoSpinStore“的成员就好了
+        triat_inputController_for_autoSpinStore::triat_inputController(world, inputCtx,
+                                                                       soaCtx);
     };
 
     //NOTE: 下面的内联做的更好，编译期的数据更利于优化
