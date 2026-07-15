@@ -875,5 +875,9 @@ namespace mcs::vulkan::ecs
             }
             return counts;
         }
+        constexpr size_type nextEntityId() const noexcept
+        {
+            return !free_entities_.empty() ? free_entities_.back() : next_entity_id_;
+        }
     };
 }; // namespace mcs::vulkan::ecs
