@@ -2125,6 +2125,7 @@ try
     layout.print();
     std::println("layout.print [end]");
 
+#if 0
     //diff: [test_dod12] start
     static constexpr auto generate_text_instances_for_node =
         [](float w, float h, ui_data_type &uiStore, uint32_t &global_id, float nodeLeft,
@@ -2442,9 +2443,369 @@ try
                           .available_height = static_cast<float>(newHeight)});
         generateUIInstances(layout); //NOTE: 应该保持，基于layout生成实例数据
     }; //diff: [test_dod13] end
-
     // 初始调用
     generateUIInstances(layout);
+#else
+
+    // ============================================================
+    // 1. 纯几何数据结构（从 Yoga/Node 提取出来的唯一产物）
+    // ============================================================
+    struct NodeGeometry
+    {
+        float x, y, w, h;
+        float pad_left, pad_right, pad_top, pad_bottom;
+        std::string node_id;
+        uint32_t traversal_id; // 遍历顺序编号，用于颜色等
+    };
+
+    // ============================================================
+    // 2. 提取函数 —— 唯一接触 Node / Yoga 的地方
+    // ============================================================
+    static constexpr auto extract_geometries = [](const Layout &layout) {
+        constexpr auto count_nodes = [](const Node *root) noexcept {
+            size_t cnt = 0;
+            auto dfs = [&](this auto &self, const Node *node) {
+                if (!node)
+                    return;
+                ++cnt;
+                for (const auto &child : node->childrens())
+                    self(child.get());
+            };
+            dfs(root);
+            return cnt;
+        };
+
+        std::vector<NodeGeometry> geos;
+        geos.reserve(count_nodes(layout.root()));
+        uint32_t id = 0;
+        auto dfs = [&](this auto &self, const Node *node, float px, float py) {
+            if (!node)
+                return;
+            YGNodeRef yg = **node;
+            float x = px + YGNodeLayoutGetLeft(yg);
+            float y = py + YGNodeLayoutGetTop(yg);
+            float w = YGNodeLayoutGetWidth(yg);
+            float h = YGNodeLayoutGetHeight(yg);
+            if (w > 0 && h > 0)
+            {
+                NodeGeometry geo;
+                geo.x = x;
+                geo.y = y;
+                geo.w = w;
+                geo.h = h;
+                auto getPad = [&](YGEdge e) {
+                    auto v = YGNodeStyleGetPadding(yg, e);
+                    return v.unit != YGUnitUndefined ? v.value : 0.0f;
+                };
+                geo.pad_left = getPad(YGEdgeLeft);
+                geo.pad_right = getPad(YGEdgeRight);
+                geo.pad_top = getPad(YGEdgeTop);
+                geo.pad_bottom = getPad(YGEdgeBottom);
+                geo.node_id = node->id();
+                geo.traversal_id = id++;
+                geos.push_back(geo);
+            }
+            for (const auto &child : node->childrens())
+                self(child.get(), x, y);
+        };
+        dfs(layout.root(), 0.0f, 0.0f);
+        return geos;
+    };
+
+    // ============================================================
+    // 3. 文本实例生成（纯函数，只依赖 NodeGeometry + 文本数据）
+    // ============================================================
+    static constexpr auto generate_text_instances =
+        [](float w, float h, ui_data_type &uiStore, uint32_t &global_id,
+           const NodeGeometry &geo, const std::vector<uint32_t> &codepoints,
+           const auto &shape_results, const auto &break_types,
+           uint32_t modulateFlag = 1) {
+            // -------- 1. 排版参数 --------
+            float x = geo.x + geo.pad_left;
+            float y = geo.y + geo.pad_top;
+            float contentWidth = geo.w - geo.pad_left - geo.pad_right;
+            float contentHeight = geo.h - geo.pad_top - geo.pad_bottom;
+
+            const double FONT_SIZE_PX = std::min<double>(contentHeight, 12.0);
+            const double LINE_HEIGHT_PX = FONT_SIZE_PX * 1.5;
+            const double ORIGIN_X = static_cast<double>(x);
+            const double ORIGIN_Y = static_cast<double>(y) + FONT_SIZE_PX;
+            const double MAX_LINE_WIDTH = static_cast<double>(contentWidth);
+
+            // -------- 2. 收集字形与 advance --------
+            using GlyphType = std::remove_cvref_t<decltype(shape_results[0][0])>;
+            std::vector<const GlyphType *> visual_glyphs;
+            visual_glyphs.reserve([&] noexcept {
+                size_t total_glyphs = 0;
+                for (const auto &run : shape_results)
+                    total_glyphs += run.size();
+                return total_glyphs;
+            }());
+            std::vector<double> char_advance(codepoints.size(), 0.0);
+
+            for (const auto &run : shape_results)
+            {
+                for (const auto &glyph : run)
+                {
+                    visual_glyphs.push_back(&glyph);
+                    char_advance[glyph.logical_idx] += glyph.advance_x * FONT_SIZE_PX;
+                }
+            }
+
+            // -------- 3. 分行 --------
+            std::vector<int> line_of_logical(codepoints.size(), -1);
+            int current_line = 0;
+            double line_width = 0.0;
+            bool line_has_content = false;
+
+            for (size_t i = 0; i < break_types.size(); ++i)
+            {
+                if (break_types[i] == LINEBREAK_MUSTBREAK)
+                {
+                    if (line_has_content)
+                    {
+                        ++current_line;
+                        line_width = 0.0;
+                        line_has_content = false;
+                    }
+                    continue;
+                }
+                double adv = char_advance[i];
+                if (adv == 0.0)
+                    continue;
+
+                if (line_has_content && (line_width + adv) > MAX_LINE_WIDTH)
+                {
+                    ++current_line;
+                    line_width = 0.0;
+                    line_has_content = false;
+                }
+                line_of_logical[i] = current_line;
+                line_width += adv;
+                line_has_content = true;
+            }
+
+            // -------- 4. 生成字形实例 --------
+            const float ndc_scale_x = 2.0f / w;
+            const float ndc_scale_y = 2.0f / h;
+
+            double currentY = ORIGIN_Y;
+            double cursorX = ORIGIN_X;
+            int active_line = 0;
+
+            for (const auto *g : visual_glyphs)
+            {
+                int target_line = line_of_logical[g->logical_idx];
+                if (target_line < 0)
+                    continue;
+
+                if (target_line != active_line)
+                {
+                    currentY = ORIGIN_Y + LINE_HEIGHT_PX * target_line;
+                    cursorX = ORIGIN_X;
+                    active_line = target_line;
+                }
+
+                using bound_type = decltype(g->plane_bounds);
+                if (g->plane_bounds == bound_type{})
+                {
+                    cursorX += g->advance_x * FONT_SIZE_PX;
+                    continue;
+                }
+
+                double baselineY = currentY + g->offset_y * FONT_SIZE_PX;
+                float left =
+                    static_cast<float>(cursorX + g->plane_bounds.left * FONT_SIZE_PX);
+                float bottom =
+                    static_cast<float>(baselineY + g->plane_bounds.bottom * FONT_SIZE_PX);
+                float right =
+                    static_cast<float>(cursorX + g->plane_bounds.right * FONT_SIZE_PX);
+                float top =
+                    static_cast<float>(baselineY + g->plane_bounds.top * FONT_SIZE_PX);
+
+                glm::vec2 p0(left * ndc_scale_x - 1.0f, top * ndc_scale_y - 1.0f);
+                glm::vec2 p2(right * ndc_scale_x - 1.0f, bottom * ndc_scale_y - 1.0f);
+                glm::mat4 M = camera::VulkanNDCConfig::rectTransform(p0, p2, 0.0f);
+
+                UvTransform uv = UvTransform::from_target_verts(
+                    std::array<glm::vec2, 4>{{{static_cast<float>(g->uv_bounds.left),
+                                               static_cast<float>(g->uv_bounds.bottom)},
+                                              {static_cast<float>(g->uv_bounds.right),
+                                               static_cast<float>(g->uv_bounds.bottom)},
+                                              {static_cast<float>(g->uv_bounds.right),
+                                               static_cast<float>(g->uv_bounds.top)},
+                                              {static_cast<float>(g->uv_bounds.left),
+                                               static_cast<float>(g->uv_bounds.top)}}});
+
+                uint32_t cur_id = global_id++;
+                InstanceData inst{
+                    .objectId = cur_id,
+                    .textureIndex = g->font_ctx->bind.texture_index,
+                    .samplerIndex = g->font_ctx->bind.sampler_index,
+                    .objectData = object_data{glm::mat4(1.0f)},
+                    .vertexTransform = VertexTransform{M},
+                    .uvTransform = uv,
+                    .fontType = static_cast<uint32_t>(g->font_ctx->type),
+                    .pxRange = static_cast<float>(
+                        g->font_ctx->font.atlas.distanceRange.value_or(0.0)),
+                    .modulateFlag = modulateFlag};
+
+                std::array<VertexAttribute, 4> attrs = {
+                    VertexAttribute{{1.0f, 1.0f, 1.0f}},
+                    VertexAttribute{{1.0f, 0.0f, 0.0f}},
+                    VertexAttribute{{0.0f, 1.0f, 0.0f}},
+                    VertexAttribute{{0.0f, 0.0f, 1.0f}}};
+
+                uiStore.new_entity(inst, attrs);
+                cursorX += g->advance_x * FONT_SIZE_PX;
+            }
+        };
+    // ============================================================
+    // 4. 矩形实例生成（单个节点）
+    // ============================================================
+    static constexpr auto generate_rect_instance = [](float w, float h,
+                                                      ui_data_type &uiStore,
+                                                      uint32_t &global_id,
+                                                      const NodeGeometry &geo) {
+        glm::vec2 p0 = camera::VulkanNDCConfig::screenToNDC(geo.x, geo.y, w, h);
+        glm::vec2 p2 =
+            camera::VulkanNDCConfig::screenToNDC(geo.x + geo.w, geo.y + geo.h, w, h);
+        glm::mat4 M = camera::VulkanNDCConfig::rectTransform(p0, p2, 0.0f);
+
+        uint32_t cur_id = global_id++;
+
+        InstanceData inst{.objectId = cur_id,
+                          .textureIndex = UITextureIndex,
+                          .samplerIndex = 0,
+                          .objectData = object_data{glm::mat4(1.0f)},
+                          .vertexTransform = VertexTransform{M},
+                          .uvTransform = UvTransform::identity()};
+
+        // 8 组颜色表（与原始代码完全一致）
+        static const std::array<std::array<glm::vec3, 4>, 8> instanceColors = {
+            {{{{1.0f, 0.0f, 0.0f},
+               {1.0f, 0.5f, 0.0f},
+               {1.0f, 0.0f, 0.5f},
+               {1.0f, 0.5f, 0.2f}}},
+             {{{0.0f, 1.0f, 0.0f},
+               {0.5f, 1.0f, 0.0f},
+               {0.0f, 1.0f, 0.5f},
+               {0.2f, 1.0f, 0.2f}}},
+             {{{0.0f, 0.0f, 1.0f},
+               {0.0f, 0.5f, 1.0f},
+               {0.5f, 0.0f, 1.0f},
+               {0.2f, 0.5f, 1.0f}}},
+             {{{1.0f, 1.0f, 0.0f},
+               {1.0f, 0.8f, 0.0f},
+               {0.8f, 1.0f, 0.0f},
+               {1.0f, 1.0f, 0.3f}}},
+             {{{1.0f, 0.0f, 1.0f},
+               {1.0f, 0.5f, 0.5f},
+               {0.5f, 0.0f, 1.0f},
+               {0.8f, 0.2f, 0.8f}}},
+             {{{0.0f, 1.0f, 1.0f},
+               {0.0f, 0.8f, 0.8f},
+               {0.5f, 1.0f, 1.0f},
+               {0.2f, 0.8f, 0.8f}}},
+             {{{1.0f, 0.5f, 0.0f},
+               {1.0f, 0.3f, 0.0f},
+               {0.8f, 0.4f, 0.0f},
+               {1.0f, 0.6f, 0.2f}}},
+             {{{0.5f, 0.0f, 0.5f},
+               {0.6f, 0.2f, 0.6f},
+               {0.3f, 0.0f, 0.5f},
+               {0.7f, 0.3f, 0.7f}}}}};
+
+        size_t colorIdx = geo.traversal_id % 8;
+        std::array<VertexAttribute, 4> attrs{
+            {VertexAttribute{instanceColors[colorIdx][0]},
+             VertexAttribute{instanceColors[colorIdx][1]},
+             VertexAttribute{instanceColors[colorIdx][2]},
+             VertexAttribute{instanceColors[colorIdx][3]}}};
+
+        // 保留调试打印（与原始逻辑相同）
+        std::println("uiStore add id: {}", cur_id);
+        if (cur_id == 0)
+        {
+            auto printMat4 = [](const glm::mat4 &m) {
+                std::println("[{}, {}, {}, {}]", m[0][0], m[0][1], m[0][2], m[0][3]);
+                std::println("[{}, {}, {}, {}]", m[1][0], m[1][1], m[1][2], m[1][3]);
+                std::println("[{}, {}, {}, {}]", m[2][0], m[2][1], m[2][2], m[2][3]);
+                std::println("[{}, {}, {}, {}]", m[3][0], m[3][1], m[3][2], m[3][3]);
+            };
+            std::println("screen: w={}, h={}", w, h);
+            std::println(
+                "p0=({},{}), p1=({},{}), p2=({},{}), p3=({},{})", p0.x, p0.y,
+                camera::VulkanNDCConfig::screenToNDC(geo.x + geo.w, geo.y, w, h).x,
+                camera::VulkanNDCConfig::screenToNDC(geo.x + geo.w, geo.y, w, h).y, p2.x,
+                p2.y, camera::VulkanNDCConfig::screenToNDC(geo.x, geo.y + geo.h, w, h).x,
+                camera::VulkanNDCConfig::screenToNDC(geo.x, geo.y + geo.h, w, h).y);
+            std::println("matrix:");
+            printMat4(M);
+        }
+
+        uiStore.new_entity(inst, attrs);
+    };
+
+    // ============================================================
+    // 5. 重构后的 generateUIInstances
+    // ============================================================
+    auto generateUIInstances = [&swapchain, &uiStore, &fontSelect](Layout &layout) {
+        float w = static_cast<float>(swapchain.refImageExtent().width);
+        float h = static_cast<float>(swapchain.refImageExtent().height);
+
+        // 注意：原始代码只在遇到 text_display 节点时才会调用 run_text_pipeline，
+        // 但我们可以提前准备，如果不存在文本节点则不调用。为简单起见，这里保持准备，
+        // 但不会造成副作用（run_text_pipeline 可能有副作用？假设它只是计算）。
+
+        // 核心：提取纯几何数据
+        auto geos = extract_geometries(layout);
+
+        uint32_t global_id = 0;
+        for (const auto &geo : geos)
+        {
+            // 1) 每个有尺寸节点都生成矩形实例（与原始行为一致，包括文本节点）
+            generate_rect_instance(w, h, uiStore, global_id, geo);
+
+            // 2) 如果是文本节点，额外生成文本实例
+            if (geo.node_id == "text_display")
+            {
+                // 生成文本实例
+                constexpr auto rawText =
+                    u8"我你好世界你好世界你好世界🤣\nW3C (World)👪 ﷲ é \nמעביר את "
+                    u8"שירותי- ERCIM."; // NOTE: BUG
+                auto [codepoints, shape_result, break_result] =
+                    run_text_pipeline(fontSelect, rawText, "zh-CN");
+                std::println("=== text_display node detected ===");
+                std::println("  position: left={}, top={}, width={}, height={}", geo.x,
+                             geo.y, geo.w, geo.h);
+                std::println("  padding: left={}, right={}, top={}, bottom={}",
+                             geo.pad_left, geo.pad_right, geo.pad_top, geo.pad_bottom);
+
+                // 注意：原始代码中传递的是 ++global_id，这里 global_id 在 generate_rect_instance
+                // 中已经递增过一次，所以直接传入当前值即可，函数内部会继续递增。
+                generate_text_instances(w, h, uiStore, global_id, geo, codepoints,
+                                        shape_result, break_result.types);
+            }
+        }
+    };
+    auto screen_resize = [&](VkExtent2D newSize) {
+        static VkExtent2D lastSize = {0, 0};
+        if (newSize.width == lastSize.width && newSize.height == lastSize.height)
+            return;
+        lastSize = newSize;
+        uiStore.clear();
+
+        on_resize(layout, {.available_width = static_cast<float>(newSize.width),
+                           .available_height = static_cast<float>(newSize.height)});
+        layout.calculate({.available_width = static_cast<float>(newSize.width),
+                          .available_height = static_cast<float>(newSize.height)});
+        generateUIInstances(layout);
+    };
+    // 初始调用
+    generateUIInstances(layout);
+#endif
+
     // uiStore
     std::println("uiStore.size(): {}", uiStore.size());
     //diff: [test_dod10] end
