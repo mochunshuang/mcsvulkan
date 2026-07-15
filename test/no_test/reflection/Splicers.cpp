@@ -1,8 +1,9 @@
 #include <assert.h>
+#include <cstdint>
 #include <iostream>
 #include <meta>
 #include <cassert>
-#include <type_traits>
+#include <ranges>
 
 namespace meta = std::meta;
 
@@ -124,6 +125,22 @@ void print_members(const Product &p)
     std::cout << "id = " << p.[:prod_members[0]:] << '\n';
     std::cout << "price = " << p.[:prod_members[1]:] << '\n';
     std::cout << "name = " << p.[:prod_members[2]:] << '\n';
+}
+void print_members2(const Product &p, uint16_t index)
+{
+    // e:\0_github_project\mcsvulkan\test\no_test\reflection\Splicers.cpp:131:51: error: 'index' is not a constant expression
+    // 131 | std::cout << "members = " << p.[:prod_members[index]:] << '\n';
+    // std::cout << "members = " << p.[:prod_members[index]:] << '\n';
+
+    constexpr auto mems = prod_members; // 成员反射信息的编译期数组
+    template for (constexpr auto e : std::ranges::views::indices(mems.size()))
+    {
+        if (index == e)
+        {
+            std::cout << "members[" << e << "] = " << p.[:mems[e]:] << '\n';
+            // 无需 break，其他分支的 if 条件都不满足，不会执行
+        }
+    }
 }
 
 // ===== 补充：显式对象参数成员函数 → 函数指针 (§4.2.1) =====
@@ -271,6 +288,7 @@ int main()
     assert((s.*mem_fn_ptr_mult)(3) == 15);
 
     print_members(prod);
+    print_members2(prod, 1);
 
     {
         // 显式对象参数成员函数

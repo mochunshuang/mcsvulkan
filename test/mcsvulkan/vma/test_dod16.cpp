@@ -1926,9 +1926,9 @@ constexpr auto autoSpinStore_type_id = 0;
 constexpr auto interactive_type_id = 1;
 constexpr auto uiStore_type_id = 2;
 
-struct triat_inputController_for_autoSpinStore
+struct triat_for_autoSpin
 {
-    static constexpr auto triat_inputController(auto &world, auto &inputCtx, auto &soaCtx)
+    static constexpr auto inputController(auto &world, auto &inputCtx, auto &soaCtx)
     {
 
         // 每1秒添加一批实体，直到总数达到1000
@@ -1994,7 +1994,125 @@ struct triat_inputController_for_autoSpinStore
             }
         }
     }
+
+    static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
+                                   picking_result result)
+    {
+
+        uint32_t type = result.key.object_type;
+        uint32_t idx = result.key.entity_index;
+        assert(type == autoSpinStore_type_id);
+        auto &store = soaCtx.autoSpinStore;
+        if (store.alive(idx))
+        {
+            auto [inst] = store.template view_entity<"instanceData">(0, idx);
+            std::cout << "[AutoSpin] entity " << idx
+                      << " textureIndex=" << inst.textureIndex
+                      << " samplerIndex=" << inst.samplerIndex << "\n";
+        }
+        else
+        {
+            std::cout << "[AutoSpin] entity " << idx << " is dead\n";
+        }
+    }
 };
+struct triat_for_interactive
+{
+    static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
+                                   picking_result result)
+    {
+        uint32_t type = result.key.object_type;
+        uint32_t idx = result.key.entity_index;
+        assert(type == interactive_type_id);
+        auto &store = soaCtx.interactiveStore;
+        if (store.alive(idx))
+        {
+            auto [inst, state] =
+                store.template view_entity<"instanceData", "modelState">(0, idx);
+            std::cout << "[Interactive] entity " << idx << " pos=("
+                      << state.model_matrix.translation.x << ","
+                      << state.model_matrix.translation.y << ","
+                      << state.model_matrix.translation.z << ")\n";
+        }
+    }
+};
+struct triat_for_ui
+{
+    static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
+                                   picking_result result)
+    {
+        uint32_t type = result.key.object_type;
+        uint32_t idx = result.key.entity_index;
+        assert(type == uiStore_type_id);
+        auto &store = soaCtx.uiStore;
+        if (store.alive(idx))
+        {
+            auto [inst] = store.template view_entity<"instanceData">(0, idx);
+            std::cout << "[UI] entity " << idx << " fontType=" << inst.fontType << "\n";
+        }
+    }
+};
+
+using auto_spin_data_type =
+    gen_soa_struct<triat_for_autoSpin, {"instanceData", ^^InstanceData},
+                   {"vertexAttribute", ^^std::array<VertexAttribute, 4>}>;
+struct model_state
+{
+    mcs::vulkan::event::position2d_event last_pos{};
+    bool is_middle_button_pressed = false;
+    bool is_left_button_pressed = false;
+    bool is_right_button_pressed_last = false; // 新增：记录上一帧右键状态
+    mcs::vulkan::event::position2d_event last_left_pos{};
+    model_matrix model_matrix{};
+};
+using interactive_type =
+    gen_soa_struct<triat_for_interactive, {"instanceData", ^^InstanceData},
+                   {"vertexAttribute", ^^std::array<VertexAttribute, 4>},
+                   {"modelState", ^^model_state}>;
+using ui_data_type =
+    gen_soa_struct<triat_for_ui, {"instanceData", ^^InstanceData},
+                   {"vertexAttribute", ^^std::array<VertexAttribute, 4>}>;
+
+static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
+                               picking_result result)
+{
+    constexpr auto members = std::remove_cvref_t<decltype(soaCtx)>::members;
+    template for (constexpr auto e : std::ranges::views::indices(members.size()))
+    {
+        if constexpr (requires {
+                          typename std::remove_cvref_t<
+                              decltype(soaCtx.[:members[e]:])>::trait_type;
+                          std::remove_cvref_t<decltype(soaCtx.[:members[e]:])>::
+                              trait_type::template on_hover(world, inputCtx, soaCtx,
+                                                            result);
+                      })
+            if (result.key.object_type == e)
+            {
+                using trait_type =
+                    std::remove_cvref_t<decltype(soaCtx.[:members[e]:])>::trait_type;
+                trait_type::template on_hover(world, inputCtx, soaCtx, result);
+            }
+    }
+}
+static constexpr auto inputController(auto &world, auto &inputCtx, auto &soaCtx)
+{
+    constexpr auto members = std::remove_cvref_t<decltype(soaCtx)>::members;
+    template for (constexpr auto e : std::ranges::views::indices(members.size()))
+    {
+        if constexpr (requires {
+                          typename std::remove_cvref_t<
+                              decltype(soaCtx.[:members[e]:])>::trait_type;
+                          std::remove_cvref_t<decltype(soaCtx.[:members[e]:])>::
+                              trait_type::template inputController(world, inputCtx,
+                                                                   soaCtx);
+                      })
+        {
+            using trait_type =
+                std::remove_cvref_t<decltype(soaCtx.[:members[e]:])>::trait_type;
+            trait_type::template inputController(world, inputCtx, soaCtx);
+        }
+    }
+}
 
 int main()
 try
@@ -2062,39 +2180,17 @@ try
 
     // diff: [test_dod2] start 定义全部数据
 
-    struct model_state
-    {
-        mcs::vulkan::event::position2d_event last_pos{};
-        bool is_middle_button_pressed = false;
-        bool is_left_button_pressed = false;
-        bool is_right_button_pressed_last = false; // 新增：记录上一帧右键状态
-        mcs::vulkan::event::position2d_event last_left_pos{};
-        model_matrix model_matrix{};
-    };
-
     // diff: [test_dod2] end
 
     //diff: [test_dod8.cpp] start
-    using auto_spin_data_type = //NOTE: triat_inputController_for_autoSpinStore 仅仅一个trait不行，开
-        gen_soa_struct<triat_inputController_for_autoSpinStore,
-                       {"instanceData", ^^InstanceData},
-                       {"vertexAttribute", ^^std::array<VertexAttribute, 4>}>;
+
     auto_spin_data_type autoSpinStore{1};
 
-    using interactive_type =
-        gen_soa_aggregate<{"instanceData", ^^InstanceData},
-                          {"vertexAttribute", ^^std::array<VertexAttribute, 4>},
-                          {"modelState", ^^model_state}>;
     interactive_type interactiveStore{1};
-    constexpr auto interactiveStoreFuns =
-        make_aggregate<"interactiveStoreFuns", "model_update">(float{});
 
     //diff: [test_dod10] start
 
     // 新增 UI store（结构与其他 store 完全一致）
-    using ui_data_type =
-        gen_soa_aggregate<{"instanceData", ^^InstanceData},
-                          {"vertexAttribute", ^^std::array<VertexAttribute, 4>}>;
     ui_data_type uiStore{100};
 
     using namespace mcs::vulkan::yoga::literals;
@@ -3818,8 +3914,7 @@ try
         }
 
         // NOTE: 从 soaCtx 的成员找这个”autoSpinStore“的成员就好了
-        triat_inputController_for_autoSpinStore::triat_inputController(world, inputCtx,
-                                                                       soaCtx);
+        inputController(world, inputCtx, soaCtx);
     };
 
     //NOTE: 下面的内联做的更好，编译期的数据更利于优化
@@ -3856,92 +3951,37 @@ try
         },
         [] {
             return schedulable_task{
-                .task =
-                    {.name = "waitforfences_post_processing",
-                     .function = ^^decltype([](world_type &world, input_type &inputCtx,
-                                               data_type &soaCtx) {
-                         auto &globalCtx = world.globalCtx;
-                         auto &pickCtx = world.pickCtx;
+                .task = {.name = "waitforfences_post_processing",
+                         .function =
+                             ^^decltype([](world_type &world, input_type &inputCtx,
+                                           data_type &soaCtx) {
+                                 auto &globalCtx = world.globalCtx;
+                                 auto &pickCtx = world.pickCtx;
 
-                         auto &frameContext = globalCtx.frameContext;
+                                 auto &frameContext = globalCtx.frameContext;
 
-                         auto &pickMouse = pickCtx.mouse;
-                         auto &pickingFrames = pickCtx.frames;
+                                 auto &pickMouse = pickCtx.mouse;
+                                 auto &pickingFrames = pickCtx.frames;
 
-                         auto &currentFrame = frameContext.currentFrame;
+                                 auto &currentFrame = frameContext.currentFrame;
 
-                         // 等待栅栏后，正式获取图像前
-                         if (currentFrame > 0 && pickMouse.valid)
-                         {
-                             uint32_t readIdx =
-                                 (currentFrame - 1 + MAX_FRAMES_IN_FLIGHT) %
-                                 MAX_FRAMES_IN_FLIGHT;
-                             //diff: [test_dod16] start
-                             //  NOTE: 应该提取出来的
-                             auto *data = static_cast<picking_result *>(
-                                 pickingFrames[readIdx].mapPtr());
-                             if (data->key != 0xFFFFFFFF)
-                             {
-                                 uint32_t type = data->key.object_type;
-                                 uint32_t idx = data->key.entity_index;
-
-                                 // 根据类型选择 store
-                                 if (type == autoSpinStore_type_id)
+                                 // 等待栅栏后，正式获取图像前
+                                 if (currentFrame > 0 && pickMouse.valid)
                                  {
-                                     auto &store = soaCtx.autoSpinStore;
-                                     if (store.alive(idx))
+                                     uint32_t readIdx =
+                                         (currentFrame - 1 + MAX_FRAMES_IN_FLIGHT) %
+                                         MAX_FRAMES_IN_FLIGHT;
+                                     //diff: [test_dod16] start
+                                     //  NOTE: 应该提取出来的
+                                     auto *data = static_cast<picking_result *>(
+                                         pickingFrames[readIdx].mapPtr());
+                                     if (data->key != 0xFFFFFFFF)
                                      {
-                                         // 获取 instanceData 字段（field_count=0 表示非数组字段）
-                                         auto [inst] =
-                                             store.view_entity<"instanceData">(0, idx);
-                                         std::cout
-                                             << "[AutoSpin] entity " << idx
-                                             << " textureIndex=" << inst.textureIndex
-                                             << " samplerIndex=" << inst.samplerIndex
-                                             << "\n";
+                                         on_hover(world, inputCtx, soaCtx, *data);
                                      }
-                                     else
-                                     {
-                                         std::cout << "[AutoSpin] entity " << idx
-                                                   << " is dead\n";
-                                     }
+                                     //diff: [test_dod16] end
                                  }
-                                 else if (type == interactive_type_id)
-                                 {
-                                     auto &store = soaCtx.interactiveStore;
-                                     if (store.alive(idx))
-                                     {
-                                         // 可以同时获取多个字段，例如 instanceData 和 modelState
-                                         auto [inst, state] =
-                                             store.view_entity<"instanceData",
-                                                               "modelState">(0, idx);
-                                         std::cout
-                                             << "[Interactive] entity " << idx << " pos=("
-                                             << state.model_matrix.translation.x << ","
-                                             << state.model_matrix.translation.y << ","
-                                             << state.model_matrix.translation.z << ")\n";
-                                     }
-                                 }
-                                 else if (type == uiStore_type_id)
-                                 {
-                                     auto &store = soaCtx.uiStore;
-                                     if (store.alive(idx))
-                                     {
-                                         auto [inst] =
-                                             store.view_entity<"instanceData">(0, idx);
-                                         std::cout << "[UI] entity " << idx
-                                                   << " fontType=" << inst.fontType
-                                                   << "\n";
-                                     }
-                                 }
-                                 else
-                                 {
-                                     std::cout << "Unknown object_type: " << type << "\n";
-                                 }
-                             }
-                             //diff: [test_dod16] end
-                         }
-                     })},
+                             })},
                 .befores = {"after_waitForfences_start"},
                 .afters = {"after_waitForfences_end"},
             };
