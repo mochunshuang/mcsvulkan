@@ -1928,7 +1928,8 @@ constexpr auto uiStore_type_id = 2;
 
 struct triat_for_autoSpin
 {
-    static constexpr auto inputController(auto &world, auto &inputCtx, auto &soaCtx)
+    static constexpr auto inputController(auto &world, auto &inputCtx, auto &soaCtx,
+                                          uint32_t currentFrame)
     {
 
         // 每1秒添加一批实体，直到总数达到1000
@@ -1996,16 +1997,15 @@ struct triat_for_autoSpin
     }
 
     static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
-                                   picking_result result)
+                                   picking_result result, uint32_t currentFrame)
     {
-
         uint32_t type = result.key.object_type;
         uint32_t idx = result.key.entity_index;
         assert(type == autoSpinStore_type_id);
         auto &store = soaCtx.autoSpinStore;
         if (store.alive(idx))
         {
-            auto [inst] = store.template view_entity<"instanceData">(0, idx);
+            auto [inst] = store.template view_entity<"instanceData">(currentFrame, idx);
             std::cout << "[AutoSpin] entity " << idx
                       << " textureIndex=" << inst.textureIndex
                       << " samplerIndex=" << inst.samplerIndex << "\n";
@@ -2015,11 +2015,56 @@ struct triat_for_autoSpin
             std::cout << "[AutoSpin] entity " << idx << " is dead\n";
         }
     }
+    static constexpr auto update(auto &world, auto &inputCtx, auto &soaCtx,
+                                 uint32_t currentFrame) noexcept
+    {
+        auto &autoSpinStore = soaCtx.autoSpinStore;
+        float elapsed = inputCtx.clock.getElapsed(); // 直接获取当前累积时间
+        uint32_t idx{};
+        for (auto [instanceData] :
+             autoSpinStore.template view<"instanceData">(currentFrame))
+        {
+            static_assert(std::is_reference_v<decltype(instanceData)>);
+            auto &mat = instanceData.objectData.matrix;
+            if (idx == 0) [[unlikely]]
+            {
+                float phaseOffset = idx * glm::radians(137.5f);
+                float angle = elapsed * glm::radians(90.0f) + phaseOffset;
+                // 从现有矩阵提取原始平移和缩放
+                auto [trans, scale] = camera::extractTranslationScale(mat);
+                glm::quat rot = glm::angleAxis(angle, glm::vec3(0, 0, 1));
+                mat = camera::composeTRS(trans, rot, scale);
+
+                //diff: [test_dod9] start
+                // ---- 动态 UV 变换 ----
+                auto &uv = instanceData.uvTransform;
+                // 示例1：纹理随时间向右滚动（重复模式）
+                uv.offset.x = fmodf(elapsed * 0.2f, 1.0f);
+                // 示例2：纹理在 0.5 倍到 1.5 倍之间周期性缩放
+                float s = 1.0f + 0.5f * sinf(elapsed * 2.0f);
+                uv.scale = glm::vec2(s, s);
+                //diff: [test_dod9] end
+            }
+            else [[likely]]
+            {
+                // 提取现有的平移和缩放
+
+                float phaseOffset = idx * glm::radians(137.5f);
+                float angle = elapsed * glm::radians(90.0f) + phaseOffset;
+                glm::quat rot = glm::angleAxis(angle, glm::vec3(0, 0, 1));
+                auto [trans, scale] = camera::extractTranslationScale(mat);
+                // 重构：缩放 → 旋转 → 平移（与创建时的顺序保持一致）
+                mat = camera::composeTRS(trans, rot, scale);
+            }
+
+            ++idx;
+        }
+    }
 };
 struct triat_for_interactive
 {
     static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
-                                   picking_result result)
+                                   picking_result result, uint32_t currentFrame)
     {
         uint32_t type = result.key.object_type;
         uint32_t idx = result.key.entity_index;
@@ -2027,19 +2072,229 @@ struct triat_for_interactive
         auto &store = soaCtx.interactiveStore;
         if (store.alive(idx))
         {
-            auto [inst, state] =
-                store.template view_entity<"instanceData", "modelState">(0, idx);
+            auto [inst, state] = store.template view_entity<"instanceData", "modelState">(
+                currentFrame, idx);
             std::cout << "[Interactive] entity " << idx << " pos=("
                       << state.model_matrix.translation.x << ","
                       << state.model_matrix.translation.y << ","
                       << state.model_matrix.translation.z << ")\n";
         }
     }
+    static constexpr auto update(auto &world, auto &inputCtx, auto &soaCtx,
+                                 uint32_t currentFrame) noexcept
+    {
+        auto &interactiveStore = soaCtx.interactiveStore;
+        for (const auto &[instanceData, modelState] :
+             interactiveStore.template view<"instanceData", "modelState">(currentFrame))
+        {
+            //diff: [test_dod8] 构造时的偏移迁移到这里
+            auto &objectData = instanceData.objectData;
+            // modelState.model_matrix.translation.z = 0.5f; //diff: [test_dod9] 不需要补丁了。初始化的时候就填写好了
+            objectData = object_data{modelState.model_matrix()};
+        }
+    }
+    static constexpr auto model_update(auto &world, auto &inputCtx, auto &soaCtx,
+                                       uint32_t currentFrame)
+    {
+        auto &globalCtx = world.globalCtx;
+        auto &interactiveStore = soaCtx.interactiveStore;
+        auto [modelState, instanceData] =
+            *(interactiveStore.template view<"modelState", "instanceData">().begin());
+
+        const auto &input = inputCtx.input;
+        auto &camera = inputCtx.camera;
+        auto &swapchain = globalCtx.swapchain;
+
+        auto &[lastPos, isMiddleButtonPressed, isLeftButtonPressed,
+               rightButtonPressedLast, lastLeftPos, modelMatrix] = modelState;
+        using mcs::vulkan::event::MouseButtons;
+        using mcs::vulkan::event::Key;
+        using mcs::vulkan::event::scroll_event;
+        const auto cur = input.cursorPos();
+        const auto windowSize = swapchain.refImageExtent();
+
+        const bool curMiddlePressed =
+            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_MIDDLE);
+        const bool curLeftPressed =
+            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_LEFT);
+        const bool curRightPressed =
+            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_RIGHT);
+
+        // ================= 滚轮缩放 =================
+        if (scroll_event{} != input.scroll())
+        {
+            std::println("input.scroll(): {}", input.scroll());
+            bool ctrlPressed = input.isKeyPressedOrRepeat(Key::eLEFT_CONTROL) ||
+                               input.isKeyPressedOrRepeat(Key::eRIGHT_CONTROL);
+            bool altPressed = input.isKeyPressedOrRepeat(Key::eLEFT_ALT) ||
+                              input.isKeyPressedOrRepeat(Key::eRIGHT_ALT);
+            bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
+                                input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
+            float delta = input.scroll().yoffset;
+            if (delta != 0.0f)
+            {
+                const float factor = (delta > 0) ? 1.1f : (1.0f / 1.1f);
+                int modCount =
+                    (ctrlPressed ? 1 : 0) + (altPressed ? 1 : 0) + (shiftPressed ? 1 : 0);
+                if (modCount == 1)
+                {
+                    if (ctrlPressed)
+                        modelMatrix.scale.x *= factor;
+                    else if (altPressed)
+                        modelMatrix.scale.y *= factor;
+                    else if (shiftPressed)
+                        modelMatrix.scale.z *= factor;
+                }
+                else
+                {
+                    modelMatrix.scale *= factor;
+                }
+            }
+        }
+
+        // ================= 右键复位 =================
+        if (curRightPressed && !rightButtonPressedLast)
+        {
+            // modelMatrix.translation = glm::vec3(0.0f); //NOTE: 暴露平移
+            modelMatrix.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+            modelMatrix.scale = {1.0f, 1.0f, 1.0f};
+        }
+        rightButtonPressedLast = curRightPressed;
+
+        // ================= 左键旋转 =================
+        if (curLeftPressed)
+        {
+            if (!isLeftButtonPressed)
+            {
+                lastLeftPos = cur;
+                isLeftButtonPressed = true;
+            }
+            else
+            {
+                float dx = static_cast<float>(cur.xpos - lastLeftPos.xpos);
+                float dy = static_cast<float>(cur.ypos - lastLeftPos.ypos);
+                if (dx != 0.0f || dy != 0.0f)
+                {
+                    auto &viewObj = camera.refView();
+                    glm::vec3 worldRight = viewObj.getRight();
+                    glm::vec3 worldUp = viewObj.getUp();
+                    glm::vec3 worldForward = viewObj.getForward();
+
+                    const float sens = 0.01f;
+                    auto [yaw, pitch] =
+                        camera::VulkanNDCConfig::ScreenDragToYawPitch(dx, dy, sens);
+
+                    bool ctrl = input.isKeyPressedOrRepeat(Key::eLEFT_CONTROL) ||
+                                input.isKeyPressedOrRepeat(Key::eRIGHT_CONTROL);
+                    bool alt = input.isKeyPressedOrRepeat(Key::eLEFT_ALT) ||
+                               input.isKeyPressedOrRepeat(Key::eRIGHT_ALT);
+                    bool shift = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
+                                 input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
+
+                    // clang-format off
+                    // 旋转约束模式（模型旋转用）
+                    struct DefaultRotMode {};   // 绕世界 Up 和 Right 旋转
+                    struct PitchOnlyRotMode {}; // 仅绕世界 Right（俯仰）
+                    struct YawOnlyRotMode {};   // 仅绕世界 Up（偏航）
+                    struct RollRotMode {};      // 绕世界 Forward（滚转）
+                    using ModelRotMode = std::variant<DefaultRotMode, PitchOnlyRotMode,
+                                                    YawOnlyRotMode, RollRotMode>;
+                    // clang-format on
+                    // 确定旋转模式
+                    ModelRotMode rotMode = [&]() -> ModelRotMode {
+                        if (ctrl)
+                            return YawOnlyRotMode{};
+                        if (alt)
+                            return PitchOnlyRotMode{};
+                        if (shift)
+                            return RollRotMode{};
+                        return DefaultRotMode{};
+                    }();
+
+                    glm::quat delta = match(
+                        rotMode,
+                        [&](DefaultRotMode) {
+                            glm::quat rotY = glm::angleAxis(yaw, worldUp);
+                            glm::quat rotX = glm::angleAxis(pitch, worldRight);
+                            return rotY * rotX;
+                        },
+                        [&](PitchOnlyRotMode) {
+                            return glm::angleAxis(pitch, worldRight);
+                        },
+                        [&](YawOnlyRotMode) { return glm::angleAxis(yaw, worldUp); },
+                        [&](RollRotMode) { return glm::angleAxis(yaw, worldForward); });
+
+                    if (delta != glm::quat(1.0f, 0.0f, 0.0f, 0.0f))
+                        modelMatrix.rotation = delta * modelMatrix.rotation;
+                }
+                lastLeftPos = cur;
+            }
+        }
+        else
+        {
+            isLeftButtonPressed = false;
+        }
+
+        if (curMiddlePressed)
+        {
+            bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
+                                input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
+
+            auto [rayOrigin, rayDir] = camera::VulkanNDCConfig::ScreenToWorldRay(
+                glm::ivec2(cur.xpos, cur.ypos),
+                glm::ivec2(windowSize.width, windowSize.height), camera.getViewMatrix(),
+                camera.getProjMatrix());
+
+            constexpr auto topLeftLocal = quadVerts[0].pos; //diff: [test_dod14] 固有属性
+            glm::vec3 currentTopLeftWorld = camera::transformPointToWorld(
+                topLeftLocal, instanceData.objectData.matrix,
+                instanceData.vertexTransform.matrix);
+
+            // clang-format off
+            struct WorldDepthMode {};   // 保持世界空间 Z 不变
+            struct CameraDepthMode {};  // 保持相机空间深度不变
+            using DepthMode = std::variant<WorldDepthMode, CameraDepthMode>;
+            // clang-format on
+            // 选择深度模式
+            DepthMode depthMode =
+                shiftPressed ? DepthMode{WorldDepthMode{}} : DepthMode{CameraDepthMode{}};
+
+            glm::vec3 hit = match(
+                depthMode,
+                [&](WorldDepthMode) noexcept {
+                    float targetZ = currentTopLeftWorld.z;
+                    float t = (targetZ - rayOrigin.z) / rayDir.z;
+                    return (t > 0) ? (rayOrigin + t * rayDir) : currentTopLeftWorld;
+                },
+                [&](CameraDepthMode) noexcept {
+                    glm::mat4 view = camera.getViewMatrix();
+                    glm::vec4 curView = view * glm::vec4(currentTopLeftWorld, 1.0f);
+                    glm::vec3 viewOrigin = view * glm::vec4(rayOrigin, 1.0f);
+                    glm::vec3 viewDir = view * glm::vec4(rayDir, 0.0f);
+                    float t = (curView.z - viewOrigin.z) / viewDir.z;
+                    return (t > 0) ? glm::vec3(glm::inverse(view) *
+                                               glm::vec4(viewOrigin + t * viewDir, 1.0f))
+                                   : currentTopLeftWorld;
+                });
+
+            glm::vec3 offset = camera::computeAnchorOffset(
+                topLeftLocal, modelMatrix, instanceData.vertexTransform.matrix);
+            modelMatrix.translation = hit - offset;
+
+            if (!isMiddleButtonPressed)
+                isMiddleButtonPressed = true;
+            lastPos = cur;
+        }
+        else
+        {
+            isMiddleButtonPressed = false;
+        }
+    };
 };
 struct triat_for_ui
 {
     static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
-                                   picking_result result)
+                                   picking_result result, uint32_t currentFrame)
     {
         uint32_t type = result.key.object_type;
         uint32_t idx = result.key.entity_index;
@@ -2047,9 +2302,64 @@ struct triat_for_ui
         auto &store = soaCtx.uiStore;
         if (store.alive(idx))
         {
-            auto [inst] = store.template view_entity<"instanceData">(0, idx);
+            auto [inst] = store.template view_entity<"instanceData">(currentFrame, idx);
             std::cout << "[UI] entity " << idx << " fontType=" << inst.fontType << "\n";
         }
+    }
+    static constexpr auto update(auto &world, auto &inputCtx, auto &soaCtx,
+                                 uint32_t currentFrame) noexcept
+    {
+        //diff: [test_dod8] start
+        auto start = std::chrono::high_resolution_clock::now();
+        float elapsed = inputCtx.clock.getElapsed(); // 直接获取当前累积时间
+        // diff: [test_dod11] start
+        // UI 的矩阵操作. 各自UI组件的中心旋转
+        if (0)
+        {
+            auto &uiStore = soaCtx.uiStore;
+
+            int idx = 0;
+            for (auto [instanceData] :
+                 uiStore.template view<"instanceData">(currentFrame))
+            {
+                float angle = elapsed * 0.5f + idx * 0.2f;
+                float s = 1.0f + 0.3f * sinf(elapsed * 2.0f + idx);
+                glm::mat4 dynamicMat =
+                    glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0, 0, 1)) *
+                    glm::scale(glm::mat4(1.0f), glm::vec3(s, s, 1.0f));
+                instanceData.objectData.matrix = dynamicMat;
+                ++idx;
+            }
+        }
+        else if (0) // 整体 UI 组动画
+        {
+            auto &uiStore = soaCtx.uiStore;
+
+            float angle = elapsed * 0.5f;
+            float s = 1.0f + 0.3f * sinf(elapsed * 2.0f);
+            glm::mat4 dynamicTransform =
+                glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0, 0, 1)) *
+                glm::scale(glm::mat4(1.0f), glm::vec3(s, s, 1.0f));
+
+            for (auto [instanceData] :
+                 uiStore.template view<"instanceData">(currentFrame))
+            {
+                instanceData.objectData.matrix = dynamicTransform;
+            }
+        }
+        // diff: [test_dod11] end
+        // 3. 记录结束时间点
+        auto end = std::chrono::high_resolution_clock::now();
+
+        // 4. 计算时间差，并转换为毫秒
+        auto duration =
+            std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+        // 5. 打印耗时
+        // if (auto count = duration.count(); count > 0)
+        //     std::cout << "updateObjectData耗时: " << duration.count()
+        //               << " 毫秒,数据量: " << idx << std::endl;
+        //diff: [test_dod8] end
     }
 };
 
@@ -2065,7 +2375,7 @@ struct model_state
     mcs::vulkan::event::position2d_event last_left_pos{};
     model_matrix model_matrix{};
 };
-using interactive_type =
+using interactive_data_type =
     gen_soa_struct<triat_for_interactive, {"instanceData", ^^InstanceData},
                    {"vertexAttribute", ^^std::array<VertexAttribute, 4>},
                    {"modelState", ^^model_state}>;
@@ -2076,6 +2386,7 @@ using ui_data_type =
 static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
                                picking_result result)
 {
+    auto &currentFrame = world.globalCtx.frameContext.currentFrame;
     constexpr auto members = std::remove_cvref_t<decltype(soaCtx)>::members;
     template for (constexpr auto e : std::ranges::views::indices(members.size()))
     {
@@ -2084,18 +2395,20 @@ static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
                               decltype(soaCtx.[:members[e]:])>::trait_type;
                           std::remove_cvref_t<decltype(soaCtx.[:members[e]:])>::
                               trait_type::template on_hover(world, inputCtx, soaCtx,
-                                                            result);
+                                                            result, currentFrame);
                       })
             if (result.key.object_type == e)
             {
                 using trait_type =
                     std::remove_cvref_t<decltype(soaCtx.[:members[e]:])>::trait_type;
-                trait_type::template on_hover(world, inputCtx, soaCtx, result);
+                trait_type::template on_hover(world, inputCtx, soaCtx, result,
+                                              currentFrame);
             }
     }
 }
 static constexpr auto inputController(auto &world, auto &inputCtx, auto &soaCtx)
 {
+    auto &currentFrame = world.globalCtx.frameContext.currentFrame;
     constexpr auto members = std::remove_cvref_t<decltype(soaCtx)>::members;
     template for (constexpr auto e : std::ranges::views::indices(members.size()))
     {
@@ -2104,14 +2417,63 @@ static constexpr auto inputController(auto &world, auto &inputCtx, auto &soaCtx)
                               decltype(soaCtx.[:members[e]:])>::trait_type;
                           std::remove_cvref_t<decltype(soaCtx.[:members[e]:])>::
                               trait_type::template inputController(world, inputCtx,
-                                                                   soaCtx);
+                                                                   soaCtx, currentFrame);
                       })
         {
             using trait_type =
                 std::remove_cvref_t<decltype(soaCtx.[:members[e]:])>::trait_type;
-            trait_type::template inputController(world, inputCtx, soaCtx);
+            trait_type::template inputController(world, inputCtx, soaCtx, currentFrame);
         }
     }
+}
+static constexpr auto update(auto &world, auto &inputCtx, auto &soaCtx,
+                             uint32_t currentFrame) noexcept
+{
+    constexpr auto members = std::remove_cvref_t<decltype(soaCtx)>::members;
+    template for (constexpr auto e : std::ranges::views::indices(members.size()))
+    {
+        if constexpr (requires {
+                          typename std::remove_cvref_t<
+                              decltype(soaCtx.[:members[e]:])>::trait_type;
+                          std::remove_cvref_t<decltype(soaCtx.[:members[e]:])>::
+                              trait_type::template update(world, inputCtx, soaCtx,
+                                                          currentFrame);
+                      })
+        {
+            using trait_type =
+                std::remove_cvref_t<decltype(soaCtx.[:members[e]:])>::trait_type;
+            trait_type::template update(world, inputCtx, soaCtx, currentFrame);
+        }
+    }
+}
+// NOTE: 数据的分类 和 函数的个数息息相关。需要考虑好了，那些是 一份的数据，那些是多份的数据。 currentFrame 的重要性？顺序和先后？
+static constexpr auto model_update(auto &world, auto &inputCtx, auto &soaCtx) noexcept
+{
+    auto &currentFrame = world.globalCtx.frameContext.currentFrame;
+    constexpr auto members = std::remove_cvref_t<decltype(soaCtx)>::members;
+    template for (constexpr auto e : std::ranges::views::indices(members.size()))
+    {
+        if constexpr (requires {
+                          typename std::remove_cvref_t<
+                              decltype(soaCtx.[:members[e]:])>::trait_type;
+                          std::remove_cvref_t<decltype(soaCtx.[:members[e]:])>::
+                              trait_type::template model_update(world, inputCtx, soaCtx,
+                                                                currentFrame);
+                      })
+        {
+            using trait_type =
+                std::remove_cvref_t<decltype(soaCtx.[:members[e]:])>::trait_type;
+            trait_type::template model_update(world, inputCtx, soaCtx, currentFrame);
+        }
+    }
+}
+constexpr auto initSoaData()
+{
+    auto_spin_data_type autoSpinStore{1};
+    interactive_data_type interactiveStore{1};
+    ui_data_type uiStore{100};
+    return make_aggregate<"soaData", "autoSpinStore", "interactiveStore", "uiStore">(
+        std::move(autoSpinStore), std::move(interactiveStore), std::move(uiStore));
 }
 
 int main()
@@ -2184,14 +2546,7 @@ try
 
     //diff: [test_dod8.cpp] start
 
-    auto_spin_data_type autoSpinStore{1};
-
-    interactive_type interactiveStore{1};
-
-    //diff: [test_dod10] start
-
-    // 新增 UI store（结构与其他 store 完全一致）
-    ui_data_type uiStore{100};
+    auto [autoSpinStore, interactiveStore, uiStore] = initSoaData();
 
     using namespace mcs::vulkan::yoga::literals;
     using namespace mcs::vulkan::yoga;
@@ -2993,113 +3348,6 @@ try
             exec(UiReset{});
     };
 
-    static constexpr auto updateObjectData = [](world_type &world, input_type &inputCtx,
-                                                data_type &soaCtx,
-                                                uint32_t currentFrame) noexcept {
-        auto &autoSpinStore = soaCtx.autoSpinStore;
-        auto &interactiveStore = soaCtx.interactiveStore;
-
-        float elapsed = inputCtx.clock.getElapsed(); // 直接获取当前累积时间
-
-        //diff: [test_dod8] start
-        auto start = std::chrono::high_resolution_clock::now();
-        uint32_t idx = 0;
-        {
-            // Buffer is already mapped. You can access its memory.
-
-            for (auto [instanceData] : autoSpinStore.view<"instanceData">(currentFrame))
-            {
-                static_assert(std::is_reference_v<decltype(instanceData)>);
-                auto &mat = instanceData.objectData.matrix;
-                if (idx == 0) [[unlikely]]
-                {
-                    float phaseOffset = idx * glm::radians(137.5f);
-                    float angle = elapsed * glm::radians(90.0f) + phaseOffset;
-                    // 从现有矩阵提取原始平移和缩放
-                    auto [trans, scale] = camera::extractTranslationScale(mat);
-                    glm::quat rot = glm::angleAxis(angle, glm::vec3(0, 0, 1));
-                    mat = camera::composeTRS(trans, rot, scale);
-
-                    //diff: [test_dod9] start
-                    // ---- 动态 UV 变换 ----
-                    auto &uv = instanceData.uvTransform;
-                    // 示例1：纹理随时间向右滚动（重复模式）
-                    uv.offset.x = fmodf(elapsed * 0.2f, 1.0f);
-                    // 示例2：纹理在 0.5 倍到 1.5 倍之间周期性缩放
-                    float s = 1.0f + 0.5f * sinf(elapsed * 2.0f);
-                    uv.scale = glm::vec2(s, s);
-                    //diff: [test_dod9] end
-                }
-                else [[likely]]
-                {
-                    // 提取现有的平移和缩放
-
-                    float phaseOffset = idx * glm::radians(137.5f);
-                    float angle = elapsed * glm::radians(90.0f) + phaseOffset;
-                    glm::quat rot = glm::angleAxis(angle, glm::vec3(0, 0, 1));
-                    auto [trans, scale] = camera::extractTranslationScale(mat);
-                    // 重构：缩放 → 旋转 → 平移（与创建时的顺序保持一致）
-                    mat = camera::composeTRS(trans, rot, scale);
-                }
-
-                ++idx;
-            }
-            for (const auto &[instanceData, modelState] :
-                 interactiveStore.view<"instanceData", "modelState">(currentFrame))
-            {
-                //diff: [test_dod8] 构造时的偏移迁移到这里
-                auto &objectData = instanceData.objectData;
-                // modelState.model_matrix.translation.z = 0.5f; //diff: [test_dod9] 不需要补丁了。初始化的时候就填写好了
-                objectData = object_data{modelState.model_matrix()};
-            }
-        }
-        // diff: [test_dod11] start
-        // UI 的矩阵操作. 各自UI组件的中心旋转
-        if (0)
-        {
-            auto &uiStore = soaCtx.uiStore;
-
-            int idx = 0;
-            for (auto [instanceData] : uiStore.view<"instanceData">(currentFrame))
-            {
-                float angle = elapsed * 0.5f + idx * 0.2f;
-                float s = 1.0f + 0.3f * sinf(elapsed * 2.0f + idx);
-                glm::mat4 dynamicMat =
-                    glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0, 0, 1)) *
-                    glm::scale(glm::mat4(1.0f), glm::vec3(s, s, 1.0f));
-                instanceData.objectData.matrix = dynamicMat;
-                ++idx;
-            }
-        }
-        else if (0) // 整体 UI 组动画
-        {
-            auto &uiStore = soaCtx.uiStore;
-
-            float angle = elapsed * 0.5f;
-            float s = 1.0f + 0.3f * sinf(elapsed * 2.0f);
-            glm::mat4 dynamicTransform =
-                glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0, 0, 1)) *
-                glm::scale(glm::mat4(1.0f), glm::vec3(s, s, 1.0f));
-
-            for (auto [instanceData] : uiStore.view<"instanceData">(currentFrame))
-            {
-                instanceData.objectData.matrix = dynamicTransform;
-            }
-        }
-        // diff: [test_dod11] end
-        // 3. 记录结束时间点
-        auto end = std::chrono::high_resolution_clock::now();
-
-        // 4. 计算时间差，并转换为毫秒
-        auto duration =
-            std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-        // 5. 打印耗时
-        // if (auto count = duration.count(); count > 0)
-        //     std::cout << "updateObjectData耗时: " << duration.count()
-        //               << " 毫秒,数据量: " << idx << std::endl;
-        //diff: [test_dod8] end
-    };
     // diff: [test_model_matrix2] end
 
     static constexpr auto updateVertexData = [](world_type &world, input_type &inputCtx,
@@ -3109,202 +3357,6 @@ try
         auto &interactiveStore = soaCtx.interactiveStore;
     };
 
-    static constexpr auto model_update = [](world_type &world, input_type &inputCtx,
-                                            data_type &soaCtx) {
-        auto &globalCtx = world.globalCtx;
-        auto &interactiveStore = soaCtx.interactiveStore;
-        auto [modelState, instanceData] =
-            *(interactiveStore.view<"modelState", "instanceData">().begin());
-
-        const auto &input = inputCtx.input;
-        auto &camera = inputCtx.camera;
-        auto &swapchain = globalCtx.swapchain;
-
-        auto &[lastPos, isMiddleButtonPressed, isLeftButtonPressed,
-               rightButtonPressedLast, lastLeftPos, modelMatrix] = modelState;
-        using mcs::vulkan::event::MouseButtons;
-        using mcs::vulkan::event::Key;
-        using mcs::vulkan::event::scroll_event;
-        const auto cur = input.cursorPos();
-        const auto windowSize = swapchain.refImageExtent();
-
-        const bool curMiddlePressed =
-            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_MIDDLE);
-        const bool curLeftPressed =
-            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_LEFT);
-        const bool curRightPressed =
-            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_RIGHT);
-
-        // ================= 滚轮缩放 =================
-        if (scroll_event{} != input.scroll())
-        {
-            std::println("input.scroll(): {}", input.scroll());
-            bool ctrlPressed = input.isKeyPressedOrRepeat(Key::eLEFT_CONTROL) ||
-                               input.isKeyPressedOrRepeat(Key::eRIGHT_CONTROL);
-            bool altPressed = input.isKeyPressedOrRepeat(Key::eLEFT_ALT) ||
-                              input.isKeyPressedOrRepeat(Key::eRIGHT_ALT);
-            bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
-                                input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
-            float delta = input.scroll().yoffset;
-            if (delta != 0.0f)
-            {
-                const float factor = (delta > 0) ? 1.1f : (1.0f / 1.1f);
-                int modCount =
-                    (ctrlPressed ? 1 : 0) + (altPressed ? 1 : 0) + (shiftPressed ? 1 : 0);
-                if (modCount == 1)
-                {
-                    if (ctrlPressed)
-                        modelMatrix.scale.x *= factor;
-                    else if (altPressed)
-                        modelMatrix.scale.y *= factor;
-                    else if (shiftPressed)
-                        modelMatrix.scale.z *= factor;
-                }
-                else
-                {
-                    modelMatrix.scale *= factor;
-                }
-            }
-        }
-
-        // ================= 右键复位 =================
-        if (curRightPressed && !rightButtonPressedLast)
-        {
-            // modelMatrix.translation = glm::vec3(0.0f); //NOTE: 暴露平移
-            modelMatrix.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
-            modelMatrix.scale = {1.0f, 1.0f, 1.0f};
-        }
-        rightButtonPressedLast = curRightPressed;
-
-        // ================= 左键旋转 =================
-        if (curLeftPressed)
-        {
-            if (!isLeftButtonPressed)
-            {
-                lastLeftPos = cur;
-                isLeftButtonPressed = true;
-            }
-            else
-            {
-                float dx = static_cast<float>(cur.xpos - lastLeftPos.xpos);
-                float dy = static_cast<float>(cur.ypos - lastLeftPos.ypos);
-                if (dx != 0.0f || dy != 0.0f)
-                {
-                    auto &viewObj = camera.refView();
-                    glm::vec3 worldRight = viewObj.getRight();
-                    glm::vec3 worldUp = viewObj.getUp();
-                    glm::vec3 worldForward = viewObj.getForward();
-
-                    const float sens = 0.01f;
-                    auto [yaw, pitch] =
-                        camera::VulkanNDCConfig::ScreenDragToYawPitch(dx, dy, sens);
-
-                    bool ctrl = input.isKeyPressedOrRepeat(Key::eLEFT_CONTROL) ||
-                                input.isKeyPressedOrRepeat(Key::eRIGHT_CONTROL);
-                    bool alt = input.isKeyPressedOrRepeat(Key::eLEFT_ALT) ||
-                               input.isKeyPressedOrRepeat(Key::eRIGHT_ALT);
-                    bool shift = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
-                                 input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
-
-                    // clang-format off
-                    // 旋转约束模式（模型旋转用）
-                    struct DefaultRotMode {};   // 绕世界 Up 和 Right 旋转
-                    struct PitchOnlyRotMode {}; // 仅绕世界 Right（俯仰）
-                    struct YawOnlyRotMode {};   // 仅绕世界 Up（偏航）
-                    struct RollRotMode {};      // 绕世界 Forward（滚转）
-                    using ModelRotMode = std::variant<DefaultRotMode, PitchOnlyRotMode,
-                                                    YawOnlyRotMode, RollRotMode>;
-                    // clang-format on
-                    // 确定旋转模式
-                    ModelRotMode rotMode = [&]() -> ModelRotMode {
-                        if (ctrl)
-                            return YawOnlyRotMode{};
-                        if (alt)
-                            return PitchOnlyRotMode{};
-                        if (shift)
-                            return RollRotMode{};
-                        return DefaultRotMode{};
-                    }();
-
-                    glm::quat delta = match(
-                        rotMode,
-                        [&](DefaultRotMode) {
-                            glm::quat rotY = glm::angleAxis(yaw, worldUp);
-                            glm::quat rotX = glm::angleAxis(pitch, worldRight);
-                            return rotY * rotX;
-                        },
-                        [&](PitchOnlyRotMode) {
-                            return glm::angleAxis(pitch, worldRight);
-                        },
-                        [&](YawOnlyRotMode) { return glm::angleAxis(yaw, worldUp); },
-                        [&](RollRotMode) { return glm::angleAxis(yaw, worldForward); });
-
-                    if (delta != glm::quat(1.0f, 0.0f, 0.0f, 0.0f))
-                        modelMatrix.rotation = delta * modelMatrix.rotation;
-                }
-                lastLeftPos = cur;
-            }
-        }
-        else
-        {
-            isLeftButtonPressed = false;
-        }
-
-        if (curMiddlePressed)
-        {
-            bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
-                                input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
-
-            auto [rayOrigin, rayDir] = camera::VulkanNDCConfig::ScreenToWorldRay(
-                glm::ivec2(cur.xpos, cur.ypos),
-                glm::ivec2(windowSize.width, windowSize.height), camera.getViewMatrix(),
-                camera.getProjMatrix());
-
-            constexpr auto topLeftLocal = quadVerts[0].pos; //diff: [test_dod14] 固有属性
-            glm::vec3 currentTopLeftWorld = camera::transformPointToWorld(
-                topLeftLocal, instanceData.objectData.matrix,
-                instanceData.vertexTransform.matrix);
-
-            // clang-format off
-            struct WorldDepthMode {};   // 保持世界空间 Z 不变
-            struct CameraDepthMode {};  // 保持相机空间深度不变
-            using DepthMode = std::variant<WorldDepthMode, CameraDepthMode>;
-            // clang-format on
-            // 选择深度模式
-            DepthMode depthMode =
-                shiftPressed ? DepthMode{WorldDepthMode{}} : DepthMode{CameraDepthMode{}};
-
-            glm::vec3 hit = match(
-                depthMode,
-                [&](WorldDepthMode) noexcept {
-                    float targetZ = currentTopLeftWorld.z;
-                    float t = (targetZ - rayOrigin.z) / rayDir.z;
-                    return (t > 0) ? (rayOrigin + t * rayDir) : currentTopLeftWorld;
-                },
-                [&](CameraDepthMode) noexcept {
-                    glm::mat4 view = camera.getViewMatrix();
-                    glm::vec4 curView = view * glm::vec4(currentTopLeftWorld, 1.0f);
-                    glm::vec3 viewOrigin = view * glm::vec4(rayOrigin, 1.0f);
-                    glm::vec3 viewDir = view * glm::vec4(rayDir, 0.0f);
-                    float t = (curView.z - viewOrigin.z) / viewDir.z;
-                    return (t > 0) ? glm::vec3(glm::inverse(view) *
-                                               glm::vec4(viewOrigin + t * viewDir, 1.0f))
-                                   : currentTopLeftWorld;
-                });
-
-            glm::vec3 offset = camera::computeAnchorOffset(
-                topLeftLocal, modelMatrix, instanceData.vertexTransform.matrix);
-            modelMatrix.translation = hit - offset;
-
-            if (!isMiddleButtonPressed)
-                isMiddleButtonPressed = true;
-            lastPos = cur;
-        }
-        else
-        {
-            isMiddleButtonPressed = false;
-        }
-    };
     // diff: [test_indirectdraw] start prepareBatch：动态分配合批资源并填充数据 // NOLINTNEXTLINE
     static constexpr auto prepareBatch = [](world_type &world, input_type &inputCtx,
                                             data_type &soaCtx, uint32_t currentFrame) {
@@ -4003,7 +4055,7 @@ try
                                  auto &uniformBuffers = mainShaderCtx.uniformBuffers;
 
                                  //diff: [test_dod3] start
-                                 updateObjectData(world, inputCtx, soaCtx, currentFrame);
+                                 update(world, inputCtx, soaCtx, currentFrame);
                                  updateVertexData(world, inputCtx, soaCtx, currentFrame);
                                  prepareBatch(world, inputCtx, soaCtx, currentFrame);
                                  //diff: [test_dod3] end
