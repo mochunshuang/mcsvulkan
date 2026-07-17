@@ -11,10 +11,17 @@ namespace mcs::vulkan::meta
         const char *value{}; // NOLINT
 
         static_string() = default;
-        consteval explicit static_string(const char *value) noexcept : value{value} {}
+        consteval explicit static_string(std::string_view view)
+            : value{std::define_static_string(view)}
+        {
+        }
+        consteval explicit static_string(const char *value) noexcept
+            : static_string{std::string_view{value}}
+        {
+        }
         template <size_t N>
         consteval static_string(const char (&str)[N]) noexcept // NOLINT
-            : value{std::define_static_string(str)}
+            : static_string{std::string_view{str, N - 1}}
         {
         }
         [[nodiscard]] constexpr std::string_view view() const noexcept

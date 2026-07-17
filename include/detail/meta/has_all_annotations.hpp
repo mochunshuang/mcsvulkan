@@ -25,7 +25,7 @@ namespace mcs::vulkan::meta
                         break;
                     }
                 }
-                catch (std::meta::exception)
+                catch (...)
                 {
                 }
             }

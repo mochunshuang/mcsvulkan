@@ -1,5 +1,6 @@
 #include <meta>
 #include <iostream>
+#include <string_view>
 #include <type_traits>
 using namespace std::meta;
 
@@ -233,6 +234,75 @@ consteval bool test()
     return true;
 }
 static_assert(test());
+
+// ============================================================
+// 测试 7：字符串类型的 extract
+// ============================================================
+#if 0
+constexpr const char *hello = "Hello!";
+constexpr char world[] = "World!";
+
+consteval bool test_extract_string()
+{
+    // 7.1 提取 const char* 变量
+    const char *p = extract<const char *>(^^hello);
+    if (std::string_view{p} != "Hello!")
+        return false;
+
+    // 7.2 提取字符数组（引用形式，保留大小）
+    const char (&arr)[7] = extract<const char (&)[7]>(^^world);
+    if (std::string_view{arr, 6} != "World!") // 不含结尾 '\0'
+        return false;
+
+    // 7.3 提取字符数组为指针（降级）
+    const char *parr = extract<const char *>(^^world);
+    if (std::string_view{parr} != "World!")
+        return false;
+
+    // 7.4 将字符串放入 array<meta::info> 并整体提取
+    using InfoArray = std::array<std::meta::info, 2>;
+    constexpr InfoArray info_arr = {^^hello, ^^world};
+    std::meta::info packed = std::meta::reflect_constant(info_arr);
+    auto extracted_arr = extract<InfoArray>(packed);
+    // 比较内部 info 是否相同
+    if (extracted_arr != info_arr)
+        return false;
+
+    return true;
+}
+static_assert(test_extract_string());
+
+// （可选）注解字符串提取测试 —— 当前编译器可能失败，故注释保留示例
+// struct [[= "annot_str"]] Annotated {};
+// consteval bool test_extract_annotation_string()
+// {
+//     auto anns = annotations_of(^^Annotated);
+//     if (anns.empty()) return false;
+//     // 尝试 extract<const char*> 可能抛出 reflect_constant failed
+//     // 因此此测试预期在支持时启用，否则跳过
+//     return true;
+// }
+// static_assert(test_extract_annotation_string());
+#endif
+struct HelpArg
+{
+    const char *msg; // 不能是 std::string_view（非结构性类型）
+};
+
+consteval HelpArg Help(std::string_view msg)
+{
+    return HelpArg{std::define_static_string(msg)};
+}
+// 使用
+struct Args
+{
+    [[= Help("Name of the person to greet")]] std::string name;
+};
+constexpr auto ann = std::meta::annotations_of(^^Args::name)[0];
+constexpr HelpArg help = std::meta::extract<HelpArg>(ann);
+static_assert(std::string_view{help.msg} ==
+              std::string_view{"Name of the person to greet"});
+
 int main()
 {
     std::cout << "All extract tests passed.\n";

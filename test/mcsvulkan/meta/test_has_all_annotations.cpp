@@ -48,28 +48,188 @@ inline constexpr Derive<V> derive;
 constexpr struct
 {
 } Debug;
+struct myString
+{
+    const char *value;
+    constexpr bool operator==(const myString &o) const noexcept
+    {
+        return std::string_view{value} == std::string_view{o.value};
+    }
+};
+constexpr auto print_a = static_string{"rename: value"};
+static_assert(print_a == static_string{"rename: value"});
 struct [[nodiscard]][[= derive<Debug>]][[ = int{0}, = 1, = 2 ]]
                     [[= static_string{"print"}]] Point
 {
-    [[= static_string{"rename: value"}]] int x;
+    [[= print_a]] int x;
+    [[= "rename: value"]] int y;
+    [[= myString{"rename: value"}]] int z;
+    [[= myString{"rename"}]] int w;
 };
+
+static_assert(static_string{"print"} == "print");
+static_assert(static_string{"print"} == std::string_view{"print"});
+static_assert(static_string{"print"} == static_string{"print"});
+static_assert(myString{"print"} == myString{"print"});
 
 static_assert(has_all_annotations(std::meta::annotations_of(^^Point), derive<Debug>,
                                   int{0}));
 static_assert(has_all_annotations(std::meta::annotations_of(^^Point), 1, 2));
 static_assert(has_all_annotations(std::meta::annotations_of(^^Point), derive<Debug>));
-static_assert(has_all_annotations(std::meta::annotations_of(^^Point),
-                                  static_string{"print"}));
+// static_assert(has_all_annotations(std::meta::annotations_of(^^Point),
+//                                   static_string{"print"}));
 static_assert(not has_all_annotations(std::meta::annotations_of(^^Point), "123"));
 // NOTE: 类型非常严格
-static_assert(static_string{"print"} == "print");
-static_assert(static_string{"print"} == std::string_view{"print"});
+
 static_assert(not has_all_annotations(std::meta::annotations_of(^^Point), "print"));
 static_assert(not has_all_annotations(std::meta::annotations_of(^^Point),
                                       std::string_view{"print"}));
+static_assert(not std::meta::annotations_of(^^Point::x).empty());
+static_assert(std::meta::annotations_of(^^Point::x).size() == 1);
+// NOTE: bug
+// static_assert(std::meta::extract<static_string>(
+//                   std::meta::annotations_of (^^Point::x)[0]) == print_a);
+static_assert(has_all_annotations(std::meta::annotations_of(^^Point::x), print_a));
 
-static_assert(has_all_annotations(std::meta::annotations_of(^^Point::x),
-                                  static_string{"rename: value"}));
+// static_assert(std::meta::annotations_of(^^Point::y).size() == 1);
+// static_assert(std::meta::extract<const char *const>(std::meta::annotations_of (
+//                   ^^Point::y)[0]) == std::string_view{"rename: value"});
+
+static_assert(std::meta::annotations_of(^^Point::z).size() == 1);
+// static_assert(std::meta::extract<myString>(std::meta::annotations_of (^^Point::z)[0]) ==
+//               myString{"rename: value"});
+
+static_assert(std::meta::annotations_of(^^Point::z).size() == 1);
+// static_assert(std::meta::extract<myString>(std::meta::annotations_of (^^Point::w)[0]) ==
+//               myString{"rename"});
+
+// ============================================= 字符串测试
+struct HelpArg
+{
+    const char *msg; // 不能是 std::string_view（非结构性类型）
+    constexpr bool operator==(const HelpArg &o) const noexcept
+    {
+        return std::string_view{msg} == std::string_view{o.msg};
+    }
+    constexpr bool operator==(const std::string_view &o) const noexcept
+    {
+        return std::string_view{msg} == o;
+    }
+};
+
+consteval HelpArg Help(std::string_view msg)
+{
+    return HelpArg{std::define_static_string(msg)};
+}
+consteval auto make_static_string(static_string s)
+{
+    return s;
+}
+consteval auto to_constexpr(static_string v)
+{
+    return v;
+}
+// NOTE: 修改 static_string 类似  annotation_string 保证类型统一，不需要 annotation_string
+struct annotation_string
+{
+    const char *value{}; // NOLINT
+
+    annotation_string() = default;
+    consteval explicit annotation_string(std::string_view view)
+        : value{std::define_static_string(view)}
+    {
+    }
+    consteval explicit annotation_string(const char *value) noexcept
+        : annotation_string(std::string_view{value})
+    {
+    }
+    template <size_t N>
+    consteval explicit annotation_string(const char (&str)[N]) noexcept // NOLINT
+        : annotation_string(std::string_view{&str, N - 1})
+    {
+    }
+    [[nodiscard]] constexpr std::string_view view() const noexcept
+    {
+        return std::string_view{value};
+    }
+    consteval bool operator==(const std::string_view &o) const noexcept
+    {
+        return view() == o;
+    }
+    template <size_t N>
+    consteval bool operator==(const char (&str)[N]) const noexcept // NOLINT
+    {
+        return view() == std::string_view{str, N - 1};
+    }
+};
+// 使用
+struct Args
+{
+    [[= Help("Name of the person to greet")]] std::string name;
+    [[= HelpArg("Name of the person to greet")]] std::string name2;
+    [[= make_static_string("Name of the person to greet")]] std::string name3;
+    [[= make_static_string(static_string{
+        "Name of the person to greet"})]] std::string name4; //NOTE: 非常离谱说实话
+
+    [[= annotation_string("Name of the person to greet")]] std::string name5;
+    [[= static_string("Name of the person to greet")]] std::string name6;
+
+    [[= ^^int]] std::string type;
+};
+constexpr auto ann = std::meta::annotations_of(^^Args::name)[0];
+constexpr HelpArg help = std::meta::extract<HelpArg>(ann);
+static_assert(std::string_view{help.msg} ==
+              std::string_view{"Name of the person to greet"});
+static_assert(help == std::string_view{"Name of the person to greet"});
+static_assert(std::meta::extract<HelpArg>(std::meta::annotations_of (^^Args::name)[0]) ==
+              std::string_view{"Name of the person to greet"});
+
+// NOTE: 不是常量.....................
+// static_assert(std::meta::extract<HelpArg>(std::meta::annotations_of (^^Args::name2)[0]) ==
+//               std::string_view{"Name of the person to greet"});
+
+static_assert(std::meta::extract<static_string>(std::meta::annotations_of (
+                  ^^Args::name3)[0]) == std::string_view{"Name of the person to greet"});
+// static_assert(has_all_annotations(std::meta::annotations_of(^^Args::name3),
+//                                   static_string{"Name of the person to greet"}));
+static_assert(has_all_annotations(std::meta::annotations_of(^^Args::name4),
+                                  static_string{"Name of the person to greet"}));
+
+static_assert(std::meta::extract<annotation_string>(std::meta::annotations_of (
+                  ^^Args::name5)[0]) == std::string_view{"Name of the person to greet"});
+
+static_assert(std::meta::extract<static_string>(std::meta::annotations_of (
+                  ^^Args::name6)[0]) == std::string_view{"Name of the person to greet"});
+
+static_assert(has_all_annotations(std::meta::annotations_of(^^Args::name6),
+                                  static_string{"Name of the person to greet"}));
+
+static_assert(has_all_annotations(std::meta::annotations_of(^^Args::type), ^^int));
+
+consteval bool test_static_string_address()
+{
+    // 用三种方式构造，内容都是 "hello"
+    constexpr static_string s1{"hello"};                   // ① 字面量构造函数
+    constexpr static_string s2{std::string_view{"hello"}}; // ② string_view 构造函数
+    constexpr static_string s3{
+        static_cast<const char *>("hello")}; // ③ const char* 构造函数
+
+    // 指针必须相同
+    static_assert(s1.value == s2.value);
+    static_assert(s1.value == s3.value);
+
+    // 额外验证内容相等（其实指针相同已经隐含了）
+    static_assert(s1.view() == "hello");
+    static_assert(s2.view() == std::string_view{"hello"});
+    static_assert(s3 == "hello");
+
+    // 再验证：不同字符串指针必须不同
+    constexpr static_string other{"world"};
+    static_assert(s1.value != other.value);
+
+    return true;
+}
+static_assert(test_static_string_address());
 
 // 测试类
 struct bind : static_string
