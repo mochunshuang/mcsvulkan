@@ -62,6 +62,18 @@ constexpr T id(T v)
 constexpr auto id_int = &[:^^id<int>:];
 static_assert((*id_int)(42) == 42);
 
+constexpr meta::info r_identity = meta::substitute(^^id, {
+                                                             ^^int});
+constexpr auto identity_ptr = meta::extract<int (*)(int)>(r_identity);
+static_assert(identity_ptr(5) == 5);
+static_assert([:meta::substitute(^^id, {
+                                           ^^int}):](5) == 5);
+static_assert(template[:^^id:](5) == 5);
+static_assert(template[:^^id:](5.0) == 5.0);
+static_assert(template[:^^id:]("135") == "135");
+
+// 或者直接拼接调用
+static_assert([:r_identity:](5) == 5);
 // ===== §4.2 拼接作为表达式 [:r:] =====
 
 // 反射函数的正确调用方式
