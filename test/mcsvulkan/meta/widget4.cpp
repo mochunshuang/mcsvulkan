@@ -163,7 +163,7 @@ enum class WidgetKind : uint8_t
 struct ContainerStyle
 {
     std::optional<float> width, height;
-    EdgeInsets margin{}, padding{};
+    EdgeInsets margin{}, padding{}, border{};
     std::optional<Alignment> alignment = std::nullopt;
 };
 struct RowStyle
@@ -261,6 +261,13 @@ const EdgeInsets &paddingOf(const WidgetRef &ref)
     }
     }
 }
+const EdgeInsets &borderOf(const WidgetRef &ref)
+{
+    if (ref.kind == WidgetKind::Container)
+        return g_containers[ref.idx].border;
+    static EdgeInsets zero;
+    return zero;
+}
 std::optional<float> widthOf(const WidgetRef &ref)
 {
     switch (ref.kind)
@@ -312,10 +319,12 @@ std::unordered_map<WidgetKind, MeasureFunc> g_measureFuncs;
 WidgetRef makeContainer(std::optional<float> width = std::nullopt,
                         std::optional<float> height = std::nullopt,
                         EdgeInsets margin = {}, EdgeInsets padding = {},
+                        EdgeInsets border = {},
                         std::optional<Alignment> alignment = std::nullopt)
 {
     uint32_t idx = g_containers.size();
-    g_containers.push_back(ContainerStyle{width, height, margin, padding, alignment});
+    g_containers.push_back(
+        ContainerStyle{width, height, margin, padding, border, alignment});
     return {WidgetKind::Container, idx};
 }
 
@@ -415,27 +424,30 @@ static Size childFullSize(const Node &child)
     return {child.geometry.w + m.horizontal(), child.geometry.h + m.vertical()};
 }
 
-/// 根据对齐方式计算偏移量（用于 Container 的对齐）
+/// 根据对齐方式计算偏移量（用于 Container 的对齐），考虑 border、padding 和 margin
 static Offset alignmentOffset(const Alignment &align, float extraW, float extraH,
-                              const EdgeInsets &pad, const EdgeInsets &margin)
+                              const EdgeInsets &pad, const EdgeInsets &margin,
+                              const EdgeInsets &border)
 {
-    return {pad.left + margin.left + extraW * (align.x + 1.0f) / 2.0f,
-            pad.top + margin.top + extraH * (align.y + 1.0f) / 2.0f};
+    return {border.left + pad.left + margin.left + extraW * (align.x + 1.0f) / 2.0f,
+            border.top + pad.top + margin.top + extraH * (align.y + 1.0f) / 2.0f};
 }
 
 /// 将子节点按对齐方式放置在容器内容区（如果 align 为空，默认使用 topLeft）
 static void positionChildByAlignment(Node &child, const Constraints &containerConstraints,
                                      const EdgeInsets &padding,
-                                     const std::optional<Alignment> &align)
+                                     const std::optional<Alignment> &align,
+                                     const EdgeInsets &border)
 {
     const auto &childMargin = marginOf(child.ref);
     Size childFull = childFullSize(child);
-    float contentW = containerConstraints.maxW - padding.horizontal();
-    float contentH = containerConstraints.maxH - padding.vertical();
+    float contentW =
+        containerConstraints.maxW - border.horizontal() - padding.horizontal();
+    float contentH = containerConstraints.maxH - border.vertical() - padding.vertical();
     float extraW = std::max(0.0f, contentW - childFull.width);
     float extraH = std::max(0.0f, contentH - childFull.height);
     Alignment al = align.value_or(Align::topLeft);
-    Offset offset = alignmentOffset(al, extraW, extraH, padding, childMargin);
+    Offset offset = alignmentOffset(al, extraW, extraH, padding, childMargin, border);
     child.geometry.x = offset.x;
     child.geometry.y = offset.y;
 }
@@ -512,6 +524,8 @@ static Constraints makeFlexAxisConstraints(bool isRow, float minMain, float maxM
 void layoutContainer(Node &node, Constraints borderBC, const EdgeInsets &pad)
 {
     auto &ref = node.ref;
+    const auto &border = borderOf(ref);
+
     if (node.children.empty())
     {
         // 叶子 Container：宽高取固定值或 0，由约束收紧
@@ -527,7 +541,8 @@ void layoutContainer(Node &node, Constraints borderBC, const EdgeInsets &pad)
                                "' must have exactly one child.");
 
     Node &child = node.children[0];
-    Constraints innerBC = borderBC.deflate(pad); // 扣除自己的 padding
+    // 内容区约束 = 扣除 border 和 padding 后的剩余空间
+    Constraints innerBC = borderBC.deflate(border).deflate(pad);
 
     auto align = alignmentOf(ref);
     // 有 alignment => 给子节点宽松约束，让子节点自由选择尺寸
@@ -536,15 +551,17 @@ void layoutContainer(Node &node, Constraints borderBC, const EdgeInsets &pad)
     childBC = childBC.deflate(marginOf(child.ref)); // 扣除子节点 margin
     layout(child, childBC);
 
-    // Container 自身尺寸：优先取固定值，否则收缩到子节点总尺寸 + padding
+    // Container 自身尺寸：优先取固定值，否则收缩到子节点总尺寸 + padding + border
     Size childFull = childFullSize(child);
-    float containerW = widthOf(ref).value_or(childFull.width + pad.horizontal());
-    float containerH = heightOf(ref).value_or(childFull.height + pad.vertical());
+    float containerW =
+        widthOf(ref).value_or(childFull.width + pad.horizontal() + border.horizontal());
+    float containerH =
+        heightOf(ref).value_or(childFull.height + pad.vertical() + border.vertical());
     Size containerSize = borderBC.clamp({containerW, containerH});
 
-    // 定位子节点（若有 alignment 则对齐，否则默认左上）
+    // 定位子节点（若有 alignment 则对齐，否则默认左上），考虑 border
     Constraints containerAsConstraints{0, containerSize.width, 0, containerSize.height};
-    positionChildByAlignment(child, containerAsConstraints, pad, align);
+    positionChildByAlignment(child, containerAsConstraints, pad, align, border);
 
     node.geometry = BoxGeometry{0, 0, containerSize.width, containerSize.height};
 }
@@ -997,7 +1014,7 @@ bool test_parent_constraints_win_over_fixed_child()
 {
     clearPools();
     Node parent = {
-        makeContainer(100.0f, 100.0f, {}, {}, Align::topLeft), {}, {}, "parent"};
+        makeContainer(100.0f, 100.0f, {}, {}, {}, Align::topLeft), {}, {}, "parent"};
     Node child = {makeContainer(50.0f, 50.0f, {5, 5, 5, 5}), {}, {}, "child"};
     parent.children.push_back(std::move(child));
     if (!tryLayout(parent, {0, 800, 0, 600}))
@@ -1266,9 +1283,10 @@ struct ScreenGeometry
 {
     float x, y, w, h;
     float padL, padR, padT, padB;
+    float borderL, borderR, borderT, borderB;
 };
 
-/// 深度优先遍历引擎布局树，提取每个节点的几何 + padding
+/// 深度优先遍历引擎布局树，提取每个节点的几何 + padding + border
 static std::vector<ScreenGeometry> extractScreenGeometries(const Node &root)
 {
     std::vector<ScreenGeometry> geos;
@@ -1282,7 +1300,9 @@ static std::vector<ScreenGeometry> extractScreenGeometries(const Node &root)
             if (node.ref.kind == WidgetKind::Container)
             {
                 const auto &pad = paddingOf(node.ref);
-                geos.push_back({x, y, w, h, pad.left, pad.right, pad.top, pad.bottom});
+                const auto &border = borderOf(node.ref);
+                geos.push_back({x, y, w, h, pad.left, pad.right, pad.top, pad.bottom,
+                                border.left, border.right, border.top, border.bottom});
             }
             for (const auto &child : node.children)
                 dfs(child, x, y);
@@ -1290,6 +1310,7 @@ static std::vector<ScreenGeometry> extractScreenGeometries(const Node &root)
     dfs(root, 0.0f, 0.0f);
     return geos;
 }
+
 /// 测试 19：引擎布局与 Yoga 输出等价（基于您提供的 layout.print 结果）
 bool test_yoga_equivalence()
 {
@@ -1299,11 +1320,11 @@ bool test_yoga_equivalence()
     Node screen{makeContainer(800.0f, 600.0f, {}, {}), {}, {}, "screen"};
 
     // root (200x200, padding 10, alignment 使子节点保持尺寸)
-    Node root{makeContainer(200.0f, 200.0f, {}, {10, 10, 10, 10}, Align::topLeft),
+    Node root{makeContainer(200.0f, 200.0f, {}, {10, 10, 10, 10}, {}, Align::topLeft),
               {},
               {},
               "root"};
-    Node child0{makeContainer(100.0f, 100.0f, {5, 5, 5, 5}, {}, Align::topLeft),
+    Node child0{makeContainer(100.0f, 100.0f, {5, 5, 5, 5}, {}, {}, Align::topLeft),
                 {},
                 {},
                 "child0"};
@@ -1320,7 +1341,7 @@ bool test_yoga_equivalence()
     root.children.push_back(std::move(root_column));
 
     // root2 (200x200, padding 10, alignment)
-    Node root2{makeContainer(200.0f, 200.0f, {}, {10, 10, 10, 10}, Align::topLeft),
+    Node root2{makeContainer(200.0f, 200.0f, {}, {10, 10, 10, 10}, {}, Align::topLeft),
                {},
                {},
                "root2"};
@@ -1359,16 +1380,17 @@ bool test_yoga_equivalence()
         std::string name;
         float x, y, w, h;
         float padL, padR, padT, padB;
+        float borderL, borderR, borderT, borderB;
     };
     std::vector<Expected> expected = {
-        {"screen", 0, 0, 800, 600, 0, 0, 0, 0},
-        {"root", 0, 0, 200, 200, 10, 10, 10, 10},
-        {"child0", 15, 15, 100, 100, 0, 0, 0, 0},
-        {"child0-0", 20, 20, 50, 50, 0, 0, 0, 0},
-        {"1", 15, 125, 100, 20, 0, 0, 0, 0}, // root 内的 "1"
-        {"root2", 0, 200, 200, 200, 10, 10, 10, 10},
-        {"1", 15, 215, 100, 20, 0, 0, 0, 0}, // root2 内的 "1"
-        {"text_display", 0, 400, 200, 200, 10, 10, 10, 10}};
+        {"screen", 0, 0, 800, 600, 0, 0, 0, 0, 0, 0, 0, 0},
+        {"root", 0, 0, 200, 200, 10, 10, 10, 10, 0, 0, 0, 0},
+        {"child0", 15, 15, 100, 100, 0, 0, 0, 0, 0, 0, 0, 0},
+        {"child0-0", 20, 20, 50, 50, 0, 0, 0, 0, 0, 0, 0, 0},
+        {"1", 15, 125, 100, 20, 0, 0, 0, 0, 0, 0, 0, 0},
+        {"root2", 0, 200, 200, 200, 10, 10, 10, 10, 0, 0, 0, 0},
+        {"1", 15, 215, 100, 20, 0, 0, 0, 0, 0, 0, 0, 0},
+        {"text_display", 0, 400, 200, 200, 10, 10, 10, 10, 0, 0, 0, 0}};
 
     if (geos.size() != expected.size())
     {
@@ -1383,21 +1405,47 @@ bool test_yoga_equivalence()
         const auto &e = expected[i];
         if (!approx(g.x, e.x) || !approx(g.y, e.y) || !approx(g.w, e.w) ||
             !approx(g.h, e.h) || !approx(g.padL, e.padL) || !approx(g.padR, e.padR) ||
-            !approx(g.padT, e.padT) || !approx(g.padB, e.padB))
+            !approx(g.padT, e.padT) || !approx(g.padB, e.padB) ||
+            !approx(g.borderL, e.borderL) || !approx(g.borderR, e.borderR) ||
+            !approx(g.borderT, e.borderT) || !approx(g.borderB, e.borderB))
         {
             std::cerr << "FAIL: geometry mismatch at index " << i
                       << " (expected name: " << e.name << ")\n";
             std::cerr << "  expected: (" << e.x << "," << e.y << "," << e.w << "," << e.h
                       << ") pad(" << e.padL << "," << e.padR << "," << e.padT << ","
-                      << e.padB << ")\n";
+                      << e.padB << ") border(" << e.borderL << "," << e.borderR << ","
+                      << e.borderT << "," << e.borderB << ")\n";
             std::cerr << "  got:      (" << g.x << "," << g.y << "," << g.w << "," << g.h
                       << ") pad(" << g.padL << "," << g.padR << "," << g.padT << ","
-                      << g.padB << ")\n";
+                      << g.padB << ") border(" << g.borderL << "," << g.borderR << ","
+                      << g.borderT << "," << g.borderB << ")\n";
             return false;
         }
     }
     return true;
 }
+
+/// 测试20：验证 border 对 Container 尺寸和子组件位置的影响
+bool test_border()
+{
+    clearPools();
+    // Container with fixed 100x100, border 5 on all sides, padding 10, child 30x20
+    Node parent{
+        makeContainer(100.0f, 100.0f, {}, {10, 10, 10, 10}, {5, 5, 5, 5}, Align::topLeft),
+        {},
+        {},
+        "parent"};
+    Node child{makeContainer(30.0f, 20.0f), {}, {}, "child"};
+    parent.children.push_back(std::move(child));
+    if (!tryLayout(parent, {0, 200, 0, 200}))
+        return false;
+    // parent size should be exactly 100x100 (fixed), border + padding reduces content area
+    // content area = (100 - 5*2 - 10*2) = 100-10-20 = 70 width, 70 height
+    // child is 30x20, positioned at border.left+pad.left = 5+10=15, 15
+    return checkGeometry(parent, 0, 0, 100, 100, "parent with border") &&
+           checkGeometry(parent.children[0], 15, 15, 30, 20, "child inside border");
+}
+
 /// 运行所有测试，返回是否全部通过
 bool runTests()
 {
@@ -1414,7 +1462,7 @@ bool runTests()
            test_text_works_in_unbounded_width() &&
            test_expanded_in_column_distributes_vertically() &&
            test_negative_margin_overlap() && test_expanded_with_margin() &&
-           test_yoga_equivalence();
+           test_yoga_equivalence() && test_border();
 }
 
 int main()

@@ -93,6 +93,9 @@ struct Constraints
     }
 
     /// 与本约束取交集（收紧约束），对应 Flutter 的 BoxConstraints.intersect
+    /// 注意：当 min > max 时，本实现会尝试修正为合理值，而非直接返回无效约束。
+    /// 这与 Flutter 官方行为略有不同（官方会保留 min > max 让上层处理），
+    /// 但能避免大多数意外崩溃，对布局结果无实质影响。
     constexpr Constraints intersect(const Constraints &parent) const noexcept
     {
         float newMinW = std::max(parent.minW, minW);
@@ -125,6 +128,23 @@ struct Constraints
 };
 
 // ============================================================================
+// 文本方向与垂直方向（支持 RTL/Up 布局）
+// ============================================================================
+/// 文本方向，影响 Row 的主轴起始方向
+enum class TextDirection
+{
+    ltr,
+    rtl
+};
+
+/// 垂直方向，影响 Column 的主轴起始方向
+enum class VerticalDirection
+{
+    down,
+    up
+};
+
+// ============================================================================
 // 枚举与样式（对应 Flutter 的各类配置）
 // ============================================================================
 // NOTE: 用途：对齐 widget。https://docs.flutter.cn/ui/layout#aligning-widgets
@@ -143,7 +163,8 @@ enum class CrossAxisAlignment
     start,
     end,
     center,
-    stretch
+    stretch,
+    baseline // 新增：基线对齐（仅对 Row 有效）
 };
 enum class MainAxisSize
 {
@@ -163,8 +184,9 @@ enum class WidgetKind : uint8_t
 struct ContainerStyle
 {
     std::optional<float> width, height;
-    EdgeInsets margin{}, padding{};
+    EdgeInsets margin{}, padding{}, border{};
     std::optional<Alignment> alignment = std::nullopt;
+    std::optional<Constraints> constraints = std::nullopt; // 新增：Container 自身约束
 };
 struct RowStyle
 {
@@ -173,6 +195,7 @@ struct RowStyle
     MainAxisAlignment mainAlign = MainAxisAlignment::start;
     CrossAxisAlignment crossAlign = CrossAxisAlignment::start;
     MainAxisSize mainAxisSize = MainAxisSize::max;
+    TextDirection textDirection = TextDirection::ltr; // 新增：文本方向
 };
 struct ColumnStyle
 {
@@ -181,6 +204,7 @@ struct ColumnStyle
     MainAxisAlignment mainAlign = MainAxisAlignment::start;
     CrossAxisAlignment crossAlign = CrossAxisAlignment::start;
     MainAxisSize mainAxisSize = MainAxisSize::max;
+    VerticalDirection verticalDirection = VerticalDirection::down; // 新增：垂直方向
 };
 struct ExpandedStyle
 {
@@ -219,6 +243,7 @@ struct Node
     std::vector<Node> children;
     BoxGeometry geometry;
     std::string name;
+    float baseline = 0; // 基线偏移，相对于节点自身顶部（y 方向）
 };
 
 // ============================================================================
@@ -261,6 +286,13 @@ const EdgeInsets &paddingOf(const WidgetRef &ref)
     }
     }
 }
+const EdgeInsets &borderOf(const WidgetRef &ref)
+{
+    if (ref.kind == WidgetKind::Container)
+        return g_containers[ref.idx].border;
+    static EdgeInsets zero;
+    return zero;
+}
 std::optional<float> widthOf(const WidgetRef &ref)
 {
     switch (ref.kind)
@@ -299,9 +331,34 @@ std::optional<Alignment> alignmentOf(const WidgetRef &ref)
         return g_containers[ref.idx].alignment;
     return std::nullopt;
 }
+std::optional<Constraints> constraintsOf(const WidgetRef &ref)
+{
+    if (ref.kind == WidgetKind::Container)
+        return g_containers[ref.idx].constraints;
+    return std::nullopt;
+}
+TextDirection textDirectionOf(const WidgetRef &ref)
+{
+    if (ref.kind == WidgetKind::Row)
+        return g_rows[ref.idx].textDirection;
+    return TextDirection::ltr; // 非 Row 默认 ltr
+}
+VerticalDirection verticalDirectionOf(const WidgetRef &ref)
+{
+    if (ref.kind == WidgetKind::Column)
+        return g_columns[ref.idx].verticalDirection;
+    return VerticalDirection::down; // 非 Column 默认 down
+}
+
+/// 测量结果：包含自然尺寸和基线偏移（相对于顶部）
+struct MeasuredSize
+{
+    Size size;
+    float baseline = 0; // 基线偏移量（从顶部算起），若未知可设为 size.height
+};
 
 /// 测量函数类型：用于 Text 等需要自然尺寸的叶子 Widget
-using MeasureFunc = Size (*)(const WidgetRef &ref, Constraints bc);
+using MeasureFunc = MeasuredSize (*)(const WidgetRef &ref, Constraints bc);
 std::unordered_map<WidgetKind, MeasureFunc> g_measureFuncs;
 
 // ============================================================================
@@ -312,10 +369,13 @@ std::unordered_map<WidgetKind, MeasureFunc> g_measureFuncs;
 WidgetRef makeContainer(std::optional<float> width = std::nullopt,
                         std::optional<float> height = std::nullopt,
                         EdgeInsets margin = {}, EdgeInsets padding = {},
-                        std::optional<Alignment> alignment = std::nullopt)
+                        EdgeInsets border = {},
+                        std::optional<Alignment> alignment = std::nullopt,
+                        std::optional<Constraints> constraints = std::nullopt) // 新增参数
 {
     uint32_t idx = g_containers.size();
-    g_containers.push_back(ContainerStyle{width, height, margin, padding, alignment});
+    g_containers.push_back(
+        ContainerStyle{width, height, margin, padding, border, alignment, constraints});
     return {WidgetKind::Container, idx};
 }
 
@@ -324,23 +384,25 @@ WidgetRef makeRow(std::optional<float> w, std::optional<float> h,
                   MainAxisAlignment ma = MainAxisAlignment::start,
                   CrossAxisAlignment ca = CrossAxisAlignment::start,
                   MainAxisSize ms = MainAxisSize::max, EdgeInsets m = {},
-                  EdgeInsets p = {})
+                  EdgeInsets p = {}, TextDirection td = TextDirection::ltr) // 新增参数
 {
     uint32_t idx = g_rows.size();
-    g_rows.push_back(RowStyle{w, h, m, p, ma, ca, ms});
+    g_rows.push_back(RowStyle{w, h, m, p, ma, ca, ms, td});
     return {WidgetKind::Row, idx};
 }
 WidgetRef makeRow(EdgeInsets m = {}, EdgeInsets p = {})
 {
     return makeRow(std::nullopt, std::nullopt, MainAxisAlignment::start,
-                   CrossAxisAlignment::start, MainAxisSize::max, m, p);
+                   CrossAxisAlignment::start, MainAxisSize::max, m, p,
+                   TextDirection::ltr);
 }
 WidgetRef makeRow(float w, float h, MainAxisAlignment ma = MainAxisAlignment::start,
                   CrossAxisAlignment ca = CrossAxisAlignment::start,
                   MainAxisSize ms = MainAxisSize::max, EdgeInsets m = {},
-                  EdgeInsets p = {})
+                  EdgeInsets p = {}, TextDirection td = TextDirection::ltr)
 {
-    return makeRow(std::optional<float>(w), std::optional<float>(h), ma, ca, ms, m, p);
+    return makeRow(std::optional<float>(w), std::optional<float>(h), ma, ca, ms, m, p,
+                   td);
 }
 
 /// Column 工厂（与 Row 对称）
@@ -348,23 +410,26 @@ WidgetRef makeColumn(std::optional<float> w, std::optional<float> h,
                      MainAxisAlignment ma = MainAxisAlignment::start,
                      CrossAxisAlignment ca = CrossAxisAlignment::start,
                      MainAxisSize ms = MainAxisSize::max, EdgeInsets m = {},
-                     EdgeInsets p = {})
+                     EdgeInsets p = {},
+                     VerticalDirection vd = VerticalDirection::down) // 新增参数
 {
     uint32_t idx = g_columns.size();
-    g_columns.push_back(ColumnStyle{w, h, m, p, ma, ca, ms});
+    g_columns.push_back(ColumnStyle{w, h, m, p, ma, ca, ms, vd});
     return {WidgetKind::Column, idx};
 }
 WidgetRef makeColumn(EdgeInsets m = {}, EdgeInsets p = {})
 {
     return makeColumn(std::nullopt, std::nullopt, MainAxisAlignment::start,
-                      CrossAxisAlignment::start, MainAxisSize::max, m, p);
+                      CrossAxisAlignment::start, MainAxisSize::max, m, p,
+                      VerticalDirection::down);
 }
 WidgetRef makeColumn(float w, float h, MainAxisAlignment ma = MainAxisAlignment::start,
                      CrossAxisAlignment ca = CrossAxisAlignment::start,
                      MainAxisSize ms = MainAxisSize::max, EdgeInsets m = {},
-                     EdgeInsets p = {})
+                     EdgeInsets p = {}, VerticalDirection vd = VerticalDirection::down)
 {
-    return makeColumn(std::optional<float>(w), std::optional<float>(h), ma, ca, ms, m, p);
+    return makeColumn(std::optional<float>(w), std::optional<float>(h), ma, ca, ms, m, p,
+                      vd);
 }
 
 WidgetRef makeExpanded(int flex = 1)
@@ -415,32 +480,60 @@ static Size childFullSize(const Node &child)
     return {child.geometry.w + m.horizontal(), child.geometry.h + m.vertical()};
 }
 
-/// 根据对齐方式计算偏移量（用于 Container 的对齐）
+/// 根据对齐方式计算偏移量（用于 Container 的对齐），考虑 border、padding 和 margin
 static Offset alignmentOffset(const Alignment &align, float extraW, float extraH,
-                              const EdgeInsets &pad, const EdgeInsets &margin)
+                              const EdgeInsets &pad, const EdgeInsets &margin,
+                              const EdgeInsets &border)
 {
-    return {pad.left + margin.left + extraW * (align.x + 1.0f) / 2.0f,
-            pad.top + margin.top + extraH * (align.y + 1.0f) / 2.0f};
+    return {border.left + pad.left + margin.left + extraW * (align.x + 1.0f) / 2.0f,
+            border.top + pad.top + margin.top + extraH * (align.y + 1.0f) / 2.0f};
 }
 
 /// 将子节点按对齐方式放置在容器内容区（如果 align 为空，默认使用 topLeft）
 static void positionChildByAlignment(Node &child, const Constraints &containerConstraints,
                                      const EdgeInsets &padding,
-                                     const std::optional<Alignment> &align)
+                                     const std::optional<Alignment> &align,
+                                     const EdgeInsets &border)
 {
     const auto &childMargin = marginOf(child.ref);
     Size childFull = childFullSize(child);
-    float contentW = containerConstraints.maxW - padding.horizontal();
-    float contentH = containerConstraints.maxH - padding.vertical();
+    float contentW =
+        containerConstraints.maxW - border.horizontal() - padding.horizontal();
+    float contentH = containerConstraints.maxH - border.vertical() - padding.vertical();
     float extraW = std::max(0.0f, contentW - childFull.width);
     float extraH = std::max(0.0f, contentH - childFull.height);
     Alignment al = align.value_or(Align::topLeft);
-    Offset offset = alignmentOffset(al, extraW, extraH, padding, childMargin);
+    Offset offset = alignmentOffset(al, extraW, extraH, padding, childMargin, border);
     child.geometry.x = offset.x;
     child.geometry.y = offset.y;
 }
 
 // ----------------- 主轴/交叉轴工具（用于 Flex 布局） -----------------
+// 下列函数不再只依赖 isRow，而是使用 AxisDirection 来精确计算方向
+enum class AxisDirection
+{
+    right, // 左→右 (Row, ltr)
+    left,  // 右→左 (Row, rtl)
+    down,  // 上→下 (Column, down)
+    up     // 下→上 (Column, up)
+};
+
+/// 根据布局参数推导主轴方向
+static AxisDirection axisDirectionForFlex(bool isRow, TextDirection td,
+                                          VerticalDirection vd)
+{
+    if (isRow)
+        return (td == TextDirection::ltr) ? AxisDirection::right : AxisDirection::left;
+    else
+        return (vd == VerticalDirection::down) ? AxisDirection::down : AxisDirection::up;
+}
+
+/// 返回该轴方向是否在物理坐标上是正向（从左到右或从上到下）
+static bool isAxisForward(AxisDirection dir)
+{
+    return dir == AxisDirection::right || dir == AxisDirection::down;
+}
+
 static float mainAxisSizeFromConstraints(const Constraints &bc, bool isRow)
 {
     return isRow ? bc.maxW : bc.maxH;
@@ -449,21 +542,54 @@ static float crossAxisSizeFromConstraints(const Constraints &bc, bool isRow)
 {
     return isRow ? bc.maxH : bc.maxW;
 }
-static float mainAxisPaddingStart(const EdgeInsets &pad, bool isRow)
+
+/// 根据轴方向从 EdgeInsets 中提取起始边的 padding 值
+static float mainAxisPaddingStart(const EdgeInsets &pad, AxisDirection dir)
 {
-    return isRow ? pad.left : pad.top;
+    switch (dir)
+    {
+    case AxisDirection::right:
+        return pad.left;
+    case AxisDirection::left:
+        return pad.right;
+    case AxisDirection::down:
+        return pad.top;
+    case AxisDirection::up:
+        return pad.bottom;
+    }
+    return 0;
 }
-static float mainAxisPaddingEnd(const EdgeInsets &pad, bool isRow)
+static float mainAxisPaddingEnd(const EdgeInsets &pad, AxisDirection dir)
 {
-    return isRow ? pad.right : pad.bottom;
+    switch (dir)
+    {
+    case AxisDirection::right:
+        return pad.right;
+    case AxisDirection::left:
+        return pad.left;
+    case AxisDirection::down:
+        return pad.bottom;
+    case AxisDirection::up:
+        return pad.top;
+    }
+    return 0;
 }
-static float crossAxisPaddingStart(const EdgeInsets &pad, bool isRow)
+static float crossAxisPaddingStart(const EdgeInsets &pad, AxisDirection dir)
 {
-    return isRow ? pad.top : pad.left;
+    // 交叉轴始终与主轴垂直，对于 Row 交叉轴是垂直方向，对于 Column 是水平方向
+    // 交叉轴的 start 取决于垂直/水平方向的默认书写方向，这里我们沿用之前的逻辑：
+    // Row 时交叉轴 start 为 top，Column 时交叉轴 start 为 left（这与 Flutter 默认行为一致，且不受 textDirection/verticalDirection 影响）
+    if (dir == AxisDirection::right || dir == AxisDirection::left)
+        return pad.top; // Row 的交叉轴起始边是 top
+    else
+        return pad.left; // Column 的交叉轴起始边是 left
 }
-static float crossAxisPaddingEnd(const EdgeInsets &pad, bool isRow)
+static float crossAxisPaddingEnd(const EdgeInsets &pad, AxisDirection dir)
 {
-    return isRow ? pad.bottom : pad.right;
+    if (dir == AxisDirection::right || dir == AxisDirection::left)
+        return pad.bottom;
+    else
+        return pad.right;
 }
 static float childMainAxisLength(const Node &child, bool isRow)
 {
@@ -473,19 +599,41 @@ static float childCrossAxisLength(const Node &child, bool isRow)
 {
     return isRow ? child.geometry.h : child.geometry.w;
 }
-static void setChildMainAxisPosition(Node &child, bool isRow, float pos)
+
+/// 设置子节点在主轴上的物理坐标，考虑轴方向
+static void setChildMainAxisPosition(Node &child, AxisDirection dir, float pos,
+                                     float childMainLen, float parentMainSize,
+                                     float padStart, float padEnd)
 {
-    if (isRow)
-        child.geometry.x = pos;
+    // pos 是逻辑起点（从主轴的 start 边算起，不考虑方向）
+    float physical = 0;
+    if (isAxisForward(dir))
+    {
+        physical = padStart + pos;
+    }
     else
-        child.geometry.y = pos;
+    {
+        // 反向轴：坐标 = 父容器尺寸 - padEnd - pos - childMainLen
+        physical = parentMainSize - padEnd - pos - childMainLen;
+    }
+    // 根据轴方向设置对应的坐标字段
+    if (dir == AxisDirection::right || dir == AxisDirection::left)
+        child.geometry.x = physical;
+    else
+        child.geometry.y = physical;
 }
-static void setChildCrossAxisPosition(Node &child, bool isRow, float pos)
+static void setChildCrossAxisPosition(Node &child, AxisDirection dir, float pos,
+                                      float childCrossLen, float parentCrossSize,
+                                      float padCrossStart, float padCrossEnd)
 {
-    if (isRow)
-        child.geometry.y = pos;
+    // 交叉轴目前总是正向（从左到右或从上到下），暂不考虑翻转
+    (void)childCrossLen;
+    (void)parentCrossSize;
+    (void)padCrossEnd;
+    if (dir == AxisDirection::right || dir == AxisDirection::left)
+        child.geometry.y = padCrossStart + pos;
     else
-        child.geometry.x = pos;
+        child.geometry.x = padCrossStart + pos;
 }
 static bool mainAxisIsBounded(const Constraints &bc, bool isRow)
 {
@@ -508,10 +656,21 @@ static Constraints makeFlexAxisConstraints(bool isRow, float minMain, float maxM
 // Container 布局：实现 Flutter Container 的收缩/填充行为
 // ============================================================================
 
-/// 布局 Container：无 alignment 时填满父约束，有 alignment 时收缩到子节点尺寸。
+/// 布局 Container：严格遵循 Flutter Container 的尺寸决定顺序：
+/// 1. 遵守 alignment（通过收缩到子节点尺寸）
+/// 2. 贴合子节点尺寸
+/// 3. 遵守固定宽高及 constraints
 void layoutContainer(Node &node, Constraints borderBC, const EdgeInsets &pad)
 {
     auto &ref = node.ref;
+    const auto &border = borderOf(ref);
+
+    // 应用 Container 自身的约束（如果存在）
+    if (auto ownConstraints = constraintsOf(ref))
+    {
+        borderBC = borderBC.intersect(*ownConstraints);
+    }
+
     if (node.children.empty())
     {
         // 叶子 Container：宽高取固定值或 0，由约束收紧
@@ -519,6 +678,7 @@ void layoutContainer(Node &node, Constraints borderBC, const EdgeInsets &pad)
         float h = heightOf(ref).value_or(0.0f);
         Size size = borderBC.clamp({w, h});
         node.geometry = BoxGeometry{0, 0, size.width, size.height};
+        node.baseline = size.height; // 叶子容器 baseline 默认为底部
         return;
     }
 
@@ -527,7 +687,8 @@ void layoutContainer(Node &node, Constraints borderBC, const EdgeInsets &pad)
                                "' must have exactly one child.");
 
     Node &child = node.children[0];
-    Constraints innerBC = borderBC.deflate(pad); // 扣除自己的 padding
+    // 内容区约束 = 扣除 border 和 padding 后的剩余空间
+    Constraints innerBC = borderBC.deflate(border).deflate(pad);
 
     auto align = alignmentOf(ref);
     // 有 alignment => 给子节点宽松约束，让子节点自由选择尺寸
@@ -536,24 +697,31 @@ void layoutContainer(Node &node, Constraints borderBC, const EdgeInsets &pad)
     childBC = childBC.deflate(marginOf(child.ref)); // 扣除子节点 margin
     layout(child, childBC);
 
-    // Container 自身尺寸：优先取固定值，否则收缩到子节点总尺寸 + padding
+    // 先计算贴合子节点的基准尺寸（先于固定宽高）
     Size childFull = childFullSize(child);
-    float containerW = widthOf(ref).value_or(childFull.width + pad.horizontal());
-    float containerH = heightOf(ref).value_or(childFull.height + pad.vertical());
+    float baseW = childFull.width + pad.horizontal() + border.horizontal();
+    float baseH = childFull.height + pad.vertical() + border.vertical();
+
+    // 再用固定宽高覆盖（若有），否则使用贴合后的基准尺寸
+    float containerW = widthOf(ref).value_or(baseW);
+    float containerH = heightOf(ref).value_or(baseH);
     Size containerSize = borderBC.clamp({containerW, containerH});
 
-    // 定位子节点（若有 alignment 则对齐，否则默认左上）
+    // 定位子节点（若有 alignment 则对齐，否则默认左上），考虑 border
     Constraints containerAsConstraints{0, containerSize.width, 0, containerSize.height};
-    positionChildByAlignment(child, containerAsConstraints, pad, align);
+    positionChildByAlignment(child, containerAsConstraints, pad, align, border);
 
     node.geometry = BoxGeometry{0, 0, containerSize.width, containerSize.height};
+    // 有子节点时，基线为子节点基线加上子节点在容器内的 y 偏移
+    node.baseline = child.baseline + child.geometry.y;
 }
 
 // ============================================================================
-// Text 布局：使用注册的测量函数获取自然尺寸
+// Text 布局：使用注册的测量函数获取自然尺寸和基线
 // ============================================================================
 
 /// 布局 Text：必须有测量函数，尺寸由测量函数 + 固定宽高决定。
+/// 基线处理：优先使用测量函数返回的基线；若未提供，则按字体度量估算（假设基线 ≈ 0.75 * 高度）。
 void layoutText(Node &node, Constraints borderBC, const EdgeInsets &pad)
 {
     (void)pad; // 当前未使用 padding，但保留接口
@@ -565,11 +733,16 @@ void layoutText(Node &node, Constraints borderBC, const EdgeInsets &pad)
     if (it == g_measureFuncs.end())
         throw std::logic_error("No measure function registered for Text.");
 
-    Size natural = it->second(ref, borderBC);
-    float w = widthOf(ref).value_or(natural.width);
-    float h = heightOf(ref).value_or(natural.height);
+    MeasuredSize measured = it->second(ref, borderBC);
+    float w = widthOf(ref).value_or(measured.size.width);
+    float h = heightOf(ref).value_or(measured.size.height);
     Size size = borderBC.clamp({w, h});
     node.geometry = BoxGeometry{0, 0, size.width, size.height};
+
+    // 基线：若测量函数提供了有效值则使用，否则基于字体度量估算（默认 ~0.75 * 高度）
+    float baselineFromMetrics =
+        measured.baseline > 0 ? measured.baseline : size.height * 0.75f;
+    node.baseline = std::min(baselineFromMetrics, size.height);
 }
 
 // ============================================================================
@@ -617,6 +790,9 @@ static std::vector<FlexChildInfo> collectFlexChildren(Node &node, bool isRow,
 }
 
 /// 布局所有非弹性子节点，获取它们在主轴上的自然长度
+/// 关键修改：对于非弹性子节点，主轴方向不施加任何最大约束（maxMain = inf），
+/// 以完全符合 Flutter Row/Column “不对子节点施加约束”的语义。
+/// 子节点将完全根据自身内容或固定尺寸决定大小。
 static std::vector<float> layoutChildrenNaturally(const std::vector<FlexChildInfo> &infos,
                                                   bool isRow, bool isBoundedMain,
                                                   float innerMain, float innerCross,
@@ -627,8 +803,8 @@ static std::vector<float> layoutChildrenNaturally(const std::vector<FlexChildInf
     for (const auto &info : infos)
     {
         // 弹性子节点暂不布局，自然长度记为 0（由后续分配）
-        float childMainMax =
-            (info.flex > 0) ? 0.0f : (isBoundedMain ? innerMain : Constraints::inf);
+        // 非弹性子节点：主轴最大尺寸为无穷大，即不施加约束
+        float childMainMax = (info.flex > 0) ? 0.0f : Constraints::inf;
         float childCrossMax = innerCross;
         float childCrossMin =
             (crossAlign == CrossAxisAlignment::stretch) ? childCrossMax : 0.0f;
@@ -682,6 +858,7 @@ static float computeFinalMainSize(bool isBoundedMain, float totalNatural, float 
 }
 
 /// 计算主轴对齐时的间隙和起始偏移（对应 MainAxisAlignment）
+/// 此偏移是基于主轴起始边（start 边）的逻辑偏移
 static void computeMainGapAndStart(size_t childCount, float extraMain,
                                    MainAxisAlignment mainAlign, float &outMainGap,
                                    float &outMainStartOff)
@@ -724,24 +901,48 @@ static void computeMainGapAndStart(size_t childCount, float extraMain,
 
 /// 根据主轴间隙和交叉轴对齐设置每个子节点的位置
 static void positionChildrenInFlex(const std::vector<FlexChildInfo> &infos,
-                                   const std::vector<float> &naturalMain, bool isRow,
-                                   float padMainStart, float padCrossStart,
-                                   float innerCross, CrossAxisAlignment crossAlign,
-                                   float mainGap, float mainStartOff)
+                                   const std::vector<float> &naturalMain,
+                                   AxisDirection dir, bool isRow, float innerMain,
+                                   float innerCross, float padMainStart, float padMainEnd,
+                                   float padCrossStart, float padCrossEnd,
+                                   CrossAxisAlignment crossAlign, float mainGap,
+                                   float mainStartOff, float parentMainSize,
+                                   float parentCrossSize)
 {
-    float mainPos = padMainStart + mainStartOff;
+    float mainPos = mainStartOff; // 逻辑主轴位置（从 start 边算起）
+    // 基线对齐预处理
+    float maxBaseline = 0;
+    if (crossAlign == CrossAxisAlignment::baseline && isRow)
+    {
+        for (size_t i = 0; i < infos.size(); ++i)
+        {
+            float b = infos[i].node->baseline;
+            if (b > maxBaseline)
+                maxBaseline = b;
+        }
+    }
+
     for (size_t i = 0; i < infos.size(); ++i)
     {
         Node &child = *infos[i].node;
         const auto &childMargin = marginOf(child.ref);
+        float childMainLen = naturalMain[i];
         float childCrossLen = childCrossAxisLength(child, isRow);
+
+        // 设置主轴位置（考虑方向）
+        // 主轴位置逻辑偏移 = mainPos + 子节点的 leading margin
+        float leadingMargin = isRow ? childMargin.left : childMargin.top;
+        setChildMainAxisPosition(child, dir, mainPos + leadingMargin, childMainLen,
+                                 parentMainSize, padMainStart, padMainEnd);
+
+        // 设置交叉轴位置
+        float crossStart = 0;
         float crossExtra =
             std::max(0.0f, innerCross - (childCrossLen + infos[i].marginCross));
-        float crossStart = 0.0f;
         switch (crossAlign)
         {
         case CrossAxisAlignment::start:
-            crossStart = 0.0f;
+            crossStart = 0;
             break;
         case CrossAxisAlignment::end:
             crossStart = crossExtra;
@@ -750,22 +951,28 @@ static void positionChildrenInFlex(const std::vector<FlexChildInfo> &infos,
             crossStart = crossExtra / 2.0f;
             break;
         case CrossAxisAlignment::stretch:
-            crossStart = 0.0f;
+            crossStart = 0;
+            break;
+        case CrossAxisAlignment::baseline:
+            if (isRow)
+            {
+                // Row 的交叉轴是垂直方向，baseline 是 y 偏移
+                crossStart = maxBaseline - child.baseline;
+            }
+            else
+            {
+                // Column 不支持 baseline，退化为 start
+                crossStart = 0;
+            }
             break;
         }
+        // 交叉轴的 leading margin
+        float crossLeadingMargin = isRow ? childMargin.top : childMargin.left;
+        setChildCrossAxisPosition(child, dir, crossStart + crossLeadingMargin,
+                                  childCrossLen, parentCrossSize, padCrossStart,
+                                  padCrossEnd);
 
-        if (isRow)
-        {
-            setChildMainAxisPosition(child, isRow, mainPos + childMargin.left);
-            setChildCrossAxisPosition(child, isRow,
-                                      padCrossStart + crossStart + childMargin.top);
-        }
-        else
-        {
-            setChildMainAxisPosition(child, isRow, mainPos + childMargin.top);
-            setChildCrossAxisPosition(child, isRow,
-                                      padCrossStart + crossStart + childMargin.left);
-        }
+        // 更新主轴逻辑位置
         mainPos += naturalMain[i] + infos[i].marginMain + mainGap;
     }
 }
@@ -774,6 +981,10 @@ static void positionChildrenInFlex(const std::vector<FlexChildInfo> &infos,
 void layoutFlex(Node &node, Constraints borderBC, const EdgeInsets &pad, bool isRow)
 {
     auto &ref = node.ref;
+    TextDirection td = textDirectionOf(ref);
+    VerticalDirection vd = verticalDirectionOf(ref);
+    AxisDirection dir = axisDirectionForFlex(isRow, td, vd);
+
     bool isBoundedMain = mainAxisIsBounded(borderBC, isRow);
     bool isBoundedCross = crossAxisIsBounded(borderBC, isRow);
     if (!isBoundedCross)
@@ -791,10 +1002,10 @@ void layoutFlex(Node &node, Constraints borderBC, const EdgeInsets &pad, bool is
     float mainSize = mainAxisSizeFromConstraints(borderBC, isRow);
     float crossSize = crossAxisSizeFromConstraints(borderBC, isRow);
 
-    float padMainStart = mainAxisPaddingStart(pad, isRow);
-    float padMainEnd = mainAxisPaddingEnd(pad, isRow);
-    float padCrossStart = crossAxisPaddingStart(pad, isRow);
-    float padCrossEnd = crossAxisPaddingEnd(pad, isRow);
+    float padMainStart = mainAxisPaddingStart(pad, dir);
+    float padMainEnd = mainAxisPaddingEnd(pad, dir);
+    float padCrossStart = crossAxisPaddingStart(pad, dir);
+    float padCrossEnd = crossAxisPaddingEnd(pad, dir);
 
     float innerMain = mainSize - padMainStart - padMainEnd;
     if (!isBoundedMain)
@@ -839,9 +1050,10 @@ void layoutFlex(Node &node, Constraints borderBC, const EdgeInsets &pad, bool is
     float mainGap = 0.0f, mainStartOff = 0.0f;
     computeMainGapAndStart(infos.size(), extraMain, mainAlign, mainGap, mainStartOff);
 
-    // 7. 定位所有子节点
-    positionChildrenInFlex(infos, naturalMain, isRow, padMainStart, padCrossStart,
-                           innerCross, crossAlign, mainGap, mainStartOff);
+    // 7. 定位所有子节点（传入方向、父容器尺寸等）
+    positionChildrenInFlex(infos, naturalMain, dir, isRow, innerMain, innerCross,
+                           padMainStart, padMainEnd, padCrossStart, padCrossEnd,
+                           crossAlign, mainGap, mainStartOff, mainSize, crossSize);
 
     // 8. 计算 Flex 自身尺寸
     Size size;
@@ -862,6 +1074,20 @@ void layoutFlex(Node &node, Constraints borderBC, const EdgeInsets &pad, bool is
     size = borderBC.clamp(size);
 
     node.geometry = BoxGeometry{0, 0, size.width, size.height};
+    // Flex 的基线：取第一个子节点的基线 + 其在容器内的偏移（y 对于 Row，x 对于 Column）
+    if (!infos.empty())
+    {
+        Node &first = *infos[0].node;
+        if (isRow)
+            node.baseline = first.baseline + first.geometry.y;
+        else
+            node.baseline = first.baseline +
+                            first.geometry.x; // 对于 Column，基线无明确意义，但仍设置
+    }
+    else
+    {
+        node.baseline = isRow ? size.height : size.width;
+    }
 }
 
 // ============================================================================
@@ -885,17 +1111,23 @@ void layout(Node &node, Constraints constraints)
     if (auto h = heightOf(ref))
         borderBC = borderBC.applyFixedHeight(*h);
 
+    // 对于 Container，还要合并自身的 constraints
+    if (auto ownConstraints = constraintsOf(ref))
+    {
+        borderBC = borderBC.intersect(*ownConstraints);
+    }
+
     // 叶子节点且存在测量函数：使用自然尺寸作为默认宽高
     if (node.children.empty() && (!widthOf(ref) || !heightOf(ref)))
     {
         auto it = g_measureFuncs.find(ref.kind);
         if (it != g_measureFuncs.end())
         {
-            Size natural = it->second(ref, borderBC);
+            MeasuredSize natural = it->second(ref, borderBC);
             if (!widthOf(ref))
-                borderBC = borderBC.applyFixedWidth(natural.width);
+                borderBC = borderBC.applyFixedWidth(natural.size.width);
             if (!heightOf(ref))
-                borderBC = borderBC.applyFixedHeight(natural.height);
+                borderBC = borderBC.applyFixedHeight(natural.size.height);
         }
     }
 
@@ -992,12 +1224,11 @@ bool tryLayout(Node &node, Constraints c, const std::string &expectedError = "")
 // ============================================================================
 
 /// 测试1：父容器固定尺寸且显式 alignment，子容器保持固定尺寸并带 margin。
-/// 通过说明：父约束优先，但 alignment 给子节点宽松约束，子节点固定尺寸生效。
 bool test_parent_constraints_win_over_fixed_child()
 {
     clearPools();
     Node parent = {
-        makeContainer(100.0f, 100.0f, {}, {}, Align::topLeft), {}, {}, "parent"};
+        makeContainer(100.0f, 100.0f, {}, {}, {}, Align::topLeft), {}, {}, "parent"};
     Node child = {makeContainer(50.0f, 50.0f, {5, 5, 5, 5}), {}, {}, "child"};
     parent.children.push_back(std::move(child));
     if (!tryLayout(parent, {0, 800, 0, 600}))
@@ -1074,8 +1305,9 @@ bool test_main_axis_min_shrinks_column()
 bool test_text_uses_measure_func_and_margin()
 {
     clearPools();
-    g_measureFuncs[WidgetKind::Text] = [](const WidgetRef &, Constraints) -> Size {
-        return {120, 25};
+    g_measureFuncs[WidgetKind::Text] = [](const WidgetRef &,
+                                          Constraints) -> MeasuredSize {
+        return {{120, 25}, 20}; // baseline = 20
     };
     Node col = {makeColumn(300.0f, 200.0f), {}, {}, "col"};
     col.children.push_back(
@@ -1086,7 +1318,6 @@ bool test_text_uses_measure_func_and_margin()
 }
 
 /// 测试7：Container 无固定尺寸且无 alignment 时，在紧约束下填满父容器（不会收缩）。
-/// 通过说明：验证 Flutter 中无 alignment 的 Container 默认填充父约束。
 bool test_container_shrink_to_child()
 {
     clearPools();
@@ -1204,8 +1435,9 @@ bool test_parent_tighter_than_fixed_override()
 bool test_text_works_in_unbounded_width()
 {
     clearPools();
-    g_measureFuncs[WidgetKind::Text] = [](const WidgetRef &, Constraints) -> Size {
-        return {120, 25};
+    g_measureFuncs[WidgetKind::Text] = [](const WidgetRef &,
+                                          Constraints) -> MeasuredSize {
+        return {{120, 25}, 20};
     };
     Node text = {makeText(), {}, {}, "text"};
     if (!tryLayout(text, {0, Constraints::inf, 0, 100}))
@@ -1258,6 +1490,130 @@ bool test_expanded_with_margin()
 }
 
 // ============================================================================
+// 新增测试：Container.constraints
+// ============================================================================
+bool test_container_own_constraints()
+{
+    clearPools();
+    Node cont = {makeContainer(std::nullopt, std::nullopt, {}, {}, {}, std::nullopt,
+                               Constraints{80, 120, 0, Constraints::inf}),
+                 {},
+                 {},
+                 "cont"};
+    cont.children.push_back({makeContainer(50.0f, 50.0f), {}, {}, "inner"});
+    if (!tryLayout(cont, {0, 200, 0, 200}))
+        return false;
+    return checkGeometry(cont, 0, 0, 80, 50, "cont constrained to 80x50") &&
+           checkGeometry(cont.children[0], 0, 0, 80, 50, "inner fills cont");
+}
+// ============================================================================
+// 新增测试：textDirection (RTL Row)
+// ============================================================================
+bool test_row_rtl()
+{
+    clearPools();
+    Node row = {makeRow(300.0f, 100.0f, MainAxisAlignment::start,
+                        CrossAxisAlignment::start, MainAxisSize::max, {}, {},
+                        TextDirection::rtl),
+                {},
+                {},
+                "row"};
+    row.children.push_back({makeContainer(50.0f, 30.0f), {}, {}, "c1"});
+    row.children.push_back({makeContainer(70.0f, 40.0f), {}, {}, "c2"});
+    if (!tryLayout(row, {0, 300, 0, 100}))
+        return false;
+    return checkGeometry(row.children[0], 250, 0, 50, 30, "c1 right") &&
+           checkGeometry(row.children[1], 180, 0, 70, 40, "c2 left");
+}
+
+// ============================================================================
+// 新增测试：verticalDirection (Up Column)
+// ============================================================================
+bool test_column_up()
+{
+    clearPools();
+    Node col = {makeColumn(100.0f, 200.0f, MainAxisAlignment::start,
+                           CrossAxisAlignment::start, MainAxisSize::max, {}, {},
+                           VerticalDirection::up),
+                {},
+                {},
+                "col"};
+    col.children.push_back({makeContainer(50.0f, 30.0f), {}, {}, "c1"});
+    col.children.push_back({makeContainer(50.0f, 40.0f), {}, {}, "c2"});
+    if (!tryLayout(col, {0, 100, 0, 200}))
+        return false;
+    return checkGeometry(col.children[0], 0, 170, 50, 30, "c1 bottom") &&
+           checkGeometry(col.children[1], 0, 130, 50, 40, "c2 above");
+}
+
+// ============================================================================
+// 新增测试：CrossAxisAlignment.baseline (Row) – 使用真实的基线值
+// ============================================================================
+bool test_baseline_alignment()
+{
+    clearPools();
+    // 模拟不同字高的文本，基线为高度的 0.8 倍
+    g_measureFuncs[WidgetKind::Text] = [](const WidgetRef &ref,
+                                          Constraints) -> MeasuredSize {
+        float h = heightOf(ref).value_or(20.0f);
+        return {{80, h}, h * 0.8f}; // baseline = 0.8 * height
+    };
+    Node row = {
+        makeRow(300.0f, 100.0f, MainAxisAlignment::start, CrossAxisAlignment::baseline),
+        {},
+        {},
+        "row"};
+    row.children.push_back({makeText(std::nullopt, 40.0f), {}, {}, "t1"});
+    row.children.push_back({makeText(std::nullopt, 20.0f), {}, {}, "t2"});
+    row.children.push_back({makeText(std::nullopt, 60.0f), {}, {}, "t3"});
+    if (!tryLayout(row, {0, 300, 0, 100}))
+        return false;
+    // baseline: t1=32, t2=16, t3=48, maxBaseline=48
+    // t1.y = 48 - 32 = 16
+    // t2.y = 48 - 16 = 32
+    // t3.y = 48 - 48 = 0
+    return checkGeometry(row.children[0], 0, 16, 80, 40, "t1 y=16") &&
+           checkGeometry(row.children[1], 80, 32, 80, 20, "t2 y=32") &&
+           checkGeometry(row.children[2], 160, 0, 80, 60, "t3 y=0");
+}
+
+// ============================================================================
+// 新增测试：多层 Expanded 嵌套 (Row > Expanded > Column > Expanded)
+// ============================================================================
+bool test_nested_expanded()
+{
+    clearPools();
+    // Row 宽 300，高 200，包含一个固定 50x50 和一个 Expanded(flex=1) 的 Column
+    Node row = {makeRow(300.0f, 200.0f), {}, {}, "row"};
+    row.children.push_back({makeContainer(50.0f, 50.0f), {}, {}, "fixed"});
+    Node expRow = {makeExpanded(1), {}, {}, "expRow"};
+    Node col = {makeColumn(std::nullopt, std::nullopt, MainAxisAlignment::start,
+                           CrossAxisAlignment::stretch, MainAxisSize::max, {}, {}),
+                {},
+                {},
+                "col"};
+    Node expCol = {makeExpanded(1), {}, {}, "expCol"};
+    expCol.children.push_back(
+        {makeContainer(std::nullopt, std::nullopt), {}, {}, "inner"});
+    col.children.push_back({makeContainer(80.0f, 30.0f), {}, {}, "colFixed"});
+    col.children.push_back(std::move(expCol));
+    expRow.children.push_back(std::move(col));
+    row.children.push_back(std::move(expRow));
+    if (!tryLayout(row, {0, 300, 0, 200}))
+        return false;
+    // Row 高度 200，Column 交叉轴拉伸 -> 高度 = 200
+    // 固定子节点 colFixed: 80x30
+    // 剩余垂直空间 = 200 - 30 = 170，Expanded 占据全部 -> inner 高 170
+    return checkGeometry(row.children[0], 0, 0, 50, 50, "fixed") &&
+           // colFixed 相对于 col 的位置：x=0，y=0，宽度被拉伸为 250，高度 30
+           checkGeometry(row.children[1].children[0].children[0], 0, 0, 250, 30,
+                         "colFixed") &&
+           // inner 相对 col 的位置：x=0，y=30，宽度 250，高度剩余 170
+           checkGeometry(row.children[1].children[0].children[1].children[0], 0, 30, 250,
+                         170, "inner expanded");
+}
+
+// ============================================================================
 // 提取 ScreenGeometry（供 Vulkan 渲染使用）
 // ============================================================================
 
@@ -1266,9 +1622,10 @@ struct ScreenGeometry
 {
     float x, y, w, h;
     float padL, padR, padT, padB;
+    float borderL, borderR, borderT, borderB;
 };
 
-/// 深度优先遍历引擎布局树，提取每个节点的几何 + padding
+/// 深度优先遍历引擎布局树，提取每个节点的几何 + padding + border
 static std::vector<ScreenGeometry> extractScreenGeometries(const Node &root)
 {
     std::vector<ScreenGeometry> geos;
@@ -1278,11 +1635,12 @@ static std::vector<ScreenGeometry> extractScreenGeometries(const Node &root)
             float y = parentY + node.geometry.y;
             float w = node.geometry.w;
             float h = node.geometry.h;
-            // 只提取 Container 节点（用户定义的节点），跳过辅助布局节点（如 Column）
             if (node.ref.kind == WidgetKind::Container)
             {
                 const auto &pad = paddingOf(node.ref);
-                geos.push_back({x, y, w, h, pad.left, pad.right, pad.top, pad.bottom});
+                const auto &border = borderOf(node.ref);
+                geos.push_back({x, y, w, h, pad.left, pad.right, pad.top, pad.bottom,
+                                border.left, border.right, border.top, border.bottom});
             }
             for (const auto &child : node.children)
                 dfs(child, x, y);
@@ -1290,20 +1648,19 @@ static std::vector<ScreenGeometry> extractScreenGeometries(const Node &root)
     dfs(root, 0.0f, 0.0f);
     return geos;
 }
-/// 测试 19：引擎布局与 Yoga 输出等价（基于您提供的 layout.print 结果）
-bool test_yoga_equivalence()
+
+/// 测试 19：特定布局等价性验证（重命名自 test_yoga_equivalence）
+bool test_specific_layout_equivalence()
 {
     clearPools();
 
-    // 构建引擎树（与 Yoga 树结构一致）
     Node screen{makeContainer(800.0f, 600.0f, {}, {}), {}, {}, "screen"};
 
-    // root (200x200, padding 10, alignment 使子节点保持尺寸)
-    Node root{makeContainer(200.0f, 200.0f, {}, {10, 10, 10, 10}, Align::topLeft),
+    Node root{makeContainer(200.0f, 200.0f, {}, {10, 10, 10, 10}, {}, Align::topLeft),
               {},
               {},
               "root"};
-    Node child0{makeContainer(100.0f, 100.0f, {5, 5, 5, 5}, {}, Align::topLeft),
+    Node child0{makeContainer(100.0f, 100.0f, {5, 5, 5, 5}, {}, {}, Align::topLeft),
                 {},
                 {},
                 "child0"};
@@ -1319,8 +1676,7 @@ bool test_yoga_equivalence()
     root_column.children.push_back(std::move(node1_in_root));
     root.children.push_back(std::move(root_column));
 
-    // root2 (200x200, padding 10, alignment)
-    Node root2{makeContainer(200.0f, 200.0f, {}, {10, 10, 10, 10}, Align::topLeft),
+    Node root2{makeContainer(200.0f, 200.0f, {}, {10, 10, 10, 10}, {}, Align::topLeft),
                {},
                {},
                "root2"};
@@ -1333,11 +1689,9 @@ bool test_yoga_equivalence()
     root2_column.children.push_back(std::move(node1_in_root2));
     root2.children.push_back(std::move(root2_column));
 
-    // text_display (200x200, padding 10) 叶子，无子节点
     Node text_display{
         makeContainer(200.0f, 200.0f, {}, {10, 10, 10, 10}), {}, {}, "text_display"};
 
-    // screen 的 Column 排列三个顶级节点
     Node screen_column{makeColumn(std::nullopt, std::nullopt, MainAxisAlignment::start,
                                   CrossAxisAlignment::start, MainAxisSize::max, {}, {}),
                        {},
@@ -1351,24 +1705,24 @@ bool test_yoga_equivalence()
     if (!tryLayout(screen, {0, 800, 0, 600}))
         return false;
 
-    auto geos = extractScreenGeometries(screen); // 只提取 Container
+    auto geos = extractScreenGeometries(screen);
 
-    // 期望值（绝对坐标）
     struct Expected
     {
         std::string name;
         float x, y, w, h;
         float padL, padR, padT, padB;
+        float borderL, borderR, borderT, borderB;
     };
     std::vector<Expected> expected = {
-        {"screen", 0, 0, 800, 600, 0, 0, 0, 0},
-        {"root", 0, 0, 200, 200, 10, 10, 10, 10},
-        {"child0", 15, 15, 100, 100, 0, 0, 0, 0},
-        {"child0-0", 20, 20, 50, 50, 0, 0, 0, 0},
-        {"1", 15, 125, 100, 20, 0, 0, 0, 0}, // root 内的 "1"
-        {"root2", 0, 200, 200, 200, 10, 10, 10, 10},
-        {"1", 15, 215, 100, 20, 0, 0, 0, 0}, // root2 内的 "1"
-        {"text_display", 0, 400, 200, 200, 10, 10, 10, 10}};
+        {"screen", 0, 0, 800, 600, 0, 0, 0, 0, 0, 0, 0, 0},
+        {"root", 0, 0, 200, 200, 10, 10, 10, 10, 0, 0, 0, 0},
+        {"child0", 15, 15, 100, 100, 0, 0, 0, 0, 0, 0, 0, 0},
+        {"child0-0", 20, 20, 50, 50, 0, 0, 0, 0, 0, 0, 0, 0},
+        {"1", 15, 125, 100, 20, 0, 0, 0, 0, 0, 0, 0, 0},
+        {"root2", 0, 200, 200, 200, 10, 10, 10, 10, 0, 0, 0, 0},
+        {"1", 15, 215, 100, 20, 0, 0, 0, 0, 0, 0, 0, 0},
+        {"text_display", 0, 400, 200, 200, 10, 10, 10, 10, 0, 0, 0, 0}};
 
     if (geos.size() != expected.size())
     {
@@ -1383,22 +1737,44 @@ bool test_yoga_equivalence()
         const auto &e = expected[i];
         if (!approx(g.x, e.x) || !approx(g.y, e.y) || !approx(g.w, e.w) ||
             !approx(g.h, e.h) || !approx(g.padL, e.padL) || !approx(g.padR, e.padR) ||
-            !approx(g.padT, e.padT) || !approx(g.padB, e.padB))
+            !approx(g.padT, e.padT) || !approx(g.padB, e.padB) ||
+            !approx(g.borderL, e.borderL) || !approx(g.borderR, e.borderR) ||
+            !approx(g.borderT, e.borderT) || !approx(g.borderB, e.borderB))
         {
             std::cerr << "FAIL: geometry mismatch at index " << i
                       << " (expected name: " << e.name << ")\n";
             std::cerr << "  expected: (" << e.x << "," << e.y << "," << e.w << "," << e.h
                       << ") pad(" << e.padL << "," << e.padR << "," << e.padT << ","
-                      << e.padB << ")\n";
+                      << e.padB << ") border(" << e.borderL << "," << e.borderR << ","
+                      << e.borderT << "," << e.borderB << ")\n";
             std::cerr << "  got:      (" << g.x << "," << g.y << "," << g.w << "," << g.h
                       << ") pad(" << g.padL << "," << g.padR << "," << g.padT << ","
-                      << g.padB << ")\n";
+                      << g.padB << ") border(" << g.borderL << "," << g.borderR << ","
+                      << g.borderT << "," << g.borderB << ")\n";
             return false;
         }
     }
     return true;
 }
-/// 运行所有测试，返回是否全部通过
+
+/// 测试20：验证 border 对 Container 尺寸和子组件位置的影响
+bool test_border()
+{
+    clearPools();
+    Node parent{
+        makeContainer(100.0f, 100.0f, {}, {10, 10, 10, 10}, {5, 5, 5, 5}, Align::topLeft),
+        {},
+        {},
+        "parent"};
+    Node child{makeContainer(30.0f, 20.0f), {}, {}, "child"};
+    parent.children.push_back(std::move(child));
+    if (!tryLayout(parent, {0, 200, 0, 200}))
+        return false;
+    return checkGeometry(parent, 0, 0, 100, 100, "parent with border") &&
+           checkGeometry(parent.children[0], 15, 15, 30, 20, "child inside border");
+}
+
+/// 运行所有测试
 bool runTests()
 {
     return test_parent_constraints_win_over_fixed_child() &&
@@ -1414,7 +1790,9 @@ bool runTests()
            test_text_works_in_unbounded_width() &&
            test_expanded_in_column_distributes_vertically() &&
            test_negative_margin_overlap() && test_expanded_with_margin() &&
-           test_yoga_equivalence();
+           test_specific_layout_equivalence() && test_border() &&
+           test_container_own_constraints() && test_row_rtl() && test_column_up() &&
+           test_baseline_alignment() && test_nested_expanded();
 }
 
 int main()
