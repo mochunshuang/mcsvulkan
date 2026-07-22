@@ -13,6 +13,175 @@
 #include <unordered_map>
 #include <vector>
 
+/*
+ * ============================================================================
+ * FLUTTER 布局引擎 - 术语表与常用函数速查（C++ 注释版）
+ * 对应关系与官方 Flutter 保持一致，方便理解约束传递与布局逻辑
+ * ============================================================================
+ */
+
+/* ============================================================================
+ * 一、基础几何数据（积木块）
+ * ============================================================================
+ *   Size          -> 对应 Flutter Size          : 仅存宽高 (width, height)
+ *   Offset        -> 对应 Flutter Offset        : 二维偏移量 (x, y)
+ *   EdgeInsets    -> 对应 Flutter EdgeInsets    : 上下左右空白 (left, top, right, bottom)
+ *                   - horizontal() : 快捷返回 left + right
+ *                   - vertical()   : 快捷返回 top + bottom
+ *   Alignment     -> 对应 Flutter Alignment     : 归一化坐标 (-1..1)
+ *                   - Align::topLeft   : (-1,-1)
+ *                   - Align::center    : ( 0, 0)
+ *                   - Align::bottomRight: ( 1, 1)
+ * ============================================================================ */
+
+/* ============================================================================
+ * 二、约束核心（Constraints）—— 父级传给子级的“规矩”
+ * ============================================================================
+ *   Constraints  -> 对应 Flutter BoxConstraints
+ *                   字段: float minW, maxW, minH, maxH
+ *
+ *   核心成员函数（意图说明）：
+ *     - hasBoundedWidth()     : 宽度是否有上限 (maxW 不是 inf)
+ *     - hasUnboundedHeight()  : 高度是否无限 (maxH 是 inf)
+ *     - deflate(EdgeInsets)   : 扣减空白。例如 0~200 减去左右各 10 => 0~180
+ *     - intersect(Constraints): 取交集收紧。例如 0~100 与 50~200 => 50~100
+ *     - clamp(Size)           : 夹紧尺寸。将待定 Size 硬约束到 [min, max] 范围内
+ *     - applyFixedWidth(w)    : 固定宽度。将宽度收紧为 w~w 并与当前约束取交集
+ *     - applyFixedHeight(h)   : 固定高度（同上）
+ * ============================================================================ */
+
+/* ============================================================================
+ * 三、方向与布局轴（往哪走）
+ * ============================================================================
+ *   AxisDirection  -> 对应 Flutter AxisDirection
+ *                     枚举: right(左→右), left(右→左), down(上→下), up(下→上)
+ *   TextDirection  -> 对应 Flutter TextDirection
+ *                     枚举: ltr(左到右), rtl(右到左) —— 仅影响 Row 的主轴起始边
+ *   VerticalDirection -> 对应 Flutter VerticalDirection
+ *                     枚举: down(上到下), up(下到上) —— 仅影响 Column 的主轴起始边
+ *
+ *   配套工具函数：
+ *     - axisDirectionForFlex(isRow, td, vd) : 推导最终的 AxisDirection
+ *     - isAxisForward(dir)                 : 判断是否为正向（right 或 down）
+ * ============================================================================ */
+
+/* ============================================================================
+ * 四、对齐与排列规则（摆在哪）
+ * ============================================================================
+ *   MainAxisAlignment   -> 对应 Flutter MainAxisAlignment
+ *                         枚举: start, end, center,
+ *                               spaceBetween, spaceAround, spaceEvenly
+ *                         作用：决定 Flex（Row/Column）子项在主轴方向的分布
+ *
+ *   CrossAxisAlignment -> 对应 Flutter CrossAxisAlignment
+ *                         枚举: start, end, center, stretch, baseline
+ *                         作用：决定子项在交叉轴方向的位置
+ *                               stretch 会强制拉伸填满该轴
+ *
+ *   MainAxisSize       -> 对应 Flutter MainAxisSize
+ *                         枚举: max（尽量撑满父约束）, min（收缩到子项总大小）
+ *                         作用：决定 Flex 自身在主轴上的尺寸策略
+ * ============================================================================ */
+
+/* ============================================================================
+ * 五、核心公共工具函数（动作指令）
+ * 说明：以下函数与 Flutter RenderObject 层级的工具方法一一对应
+ * ============================================================================
+ *
+ *   1. makeLooseConstraints(Constraints c)
+ *      -> 对应 Flutter BoxConstraints.loose
+ *      -> 意图：生成宽松约束，min 置 0，仅保留 max。
+ *      -> 典型场景：Container 有 alignment 时传给子节点，允许子节点自由选择尺寸。
+ *
+ *   2. childFullSize(const Node& child)
+ *      -> 对应 Flutter 中手动计算 size + margins
+ *      -> 意图：计算子节点总占用 = 几何尺寸 + margin。
+ *      -> 典型场景：Flex 计算所有子项占用的总主轴长度。
+ *
+ *   3. alignmentOffset(Alignment, float, float, EdgeInsets, EdgeInsets, EdgeInsets)
+ *      -> 对应 Flutter Alignment.inscribe
+ *      -> 意图：根据 Alignment 和额外空间，算出具体的左上角偏移量。
+ *      -> 典型场景：Container 根据对齐方式计算子节点位置。
+ *
+ *   4. positionChildByAlignment(Node&, Constraints, EdgeInsets, optional<Alignment>, EdgeInsets)
+ *      -> 对应 Flutter RenderPositionedBox
+ *      -> 意图：按对齐方式安置子节点（内部调用 alignmentOffset 并设置 child.geometry）。
+ *      -> 典型场景：Container 布局的最后一步。
+ *
+ *   5. mainAxisSizeFromConstraints(const Constraints&, bool isRow)
+ *      -> 意图：提取主轴尺寸（Row 取 maxW，Column 取 maxH）。
+ *
+ *   6. crossAxisSizeFromConstraints(const Constraints&, bool isRow)
+ *      -> 意图：提取交叉轴尺寸（Row 取 maxH，Column 取 maxW）。
+ *
+ *   7. setChildMainAxisPosition(Node&, AxisDirection, float, float, float, float, float)
+ *      -> 意图：设置子节点在主轴的物理坐标。
+ *      -> 关键：自动处理 RTL 和 Up 反向轴时的坐标翻转。
+ *
+ *   8. setChildCrossAxisPosition(Node&, AxisDirection, float, float, float, float, float)
+ *      -> 意图：设置子节点在交叉轴的物理坐标（目前仅支持正向）。
+ *
+ *   9. collectFlexChildren(Node&, bool, float&)
+ *      -> 意图：收集 Flex 的所有子项，展开 Expanded，提取真实子节点并累加总 flex。
+ *      -> 典型场景：Row/Column 布局的第一步。
+ *
+ *   10. distributeFlexSpace(infos, naturalMain, isRow, freeMain, totalFlex, innerCross, crossAlign)
+ *       -> 意图：按 flex 比例将剩余主轴空间分配给 Expanded 子节点。
+ *       -> 典型场景：Row/Column 布局的第二步。
+ *
+ *   11. computeMainGapAndStart(size_t, float, MainAxisAlignment, float&, float&)
+ *       -> 意图：根据 MainAxisAlignment 计算起始偏移和子项间隙。
+ *       -> 典型场景：Row/Column 的对齐计算。
+ *
+ *   12. extractScreenGeometries(const Node& root)
+ *       -> 意图：深度优先遍历布局树，提取每个 Container 的 x,y,w,h,padding,border。
+ *       -> 典型场景：将布局结果送给渲染引擎（如 Vulkan）进行绘制。
+ * ============================================================================ */
+
+/* ============================================================================
+ * 六、布局调度与生命周期（总指挥）
+ * ============================================================================
+ *   layout(Node&, Constraints)  -> 对应 Flutter RenderObject.layout
+ *     意图：总入口。父传约束进来，内部分发到具体布局函数（Container/Flex/Text）。
+ *           执行完成后，node.geometry 被填好。
+ *
+ *   layoutContainer(...)        -> 对应 Flutter RenderConstrainedBox / RenderPadding
+ *     意图：Container 专属逻辑。处理 alignment、padding、border、自身 constraints。
+ *
+ *   layoutFlex(...)            -> 对应 Flutter RenderFlex
+ *     意图：Row/Column 专属逻辑。处理主轴/交叉轴、Expanded、各种对齐方式。
+ *
+ *   layoutText(...)            -> 对应 Flutter RenderParagraph
+ *     意图：Text 专属逻辑。调用注册的测量函数获取自然尺寸，然后应用固定宽高。
+ *
+ *   MeasureFunc                -> 对应 Flutter TextPainter 或 computeDryLayout
+ *     意图：叶子节点“自报尺寸”的回调函数类型。外部注册后供 layoutText 调用。
+ *
+ *   Node                       -> 对应 Flutter RenderObject 树节点
+ *     意图：布局树节点，包含 WidgetRef、子节点列表、最终几何信息 (geometry) 和基线。
+ *
+ *   BoxGeometry                -> 存储 x, y, w, h 的简单几何结构体。
+ * ============================================================================ */
+
+/* ============================================================================
+ * 七、紧约束 vs 宽松约束（快速记忆口诀）
+ * ============================================================================
+ *   【宽松约束 (Loose)】
+ *     定义：min = 0, max = 某个限制值。子节点可以在 0 ~ max 之间自由选择任意尺寸。
+ *     代码体现：makeLooseConstraints() 函数。
+ *     典型场景：Container 有 alignment（对齐方式）时，父级不强迫子节点填满。
+ *
+ *   【紧约束 (Tight)】
+ *     定义：min == max（即宽度或高度被锁定为同一个值）。子节点没有任何选择余地。
+ *     代码体现：Constraints{w, w, h, h}，或调用 applyFixedWidth/Height 后产生。
+ *     典型场景：设置了固定宽高，或 Container 没有 alignment 时被迫填满父容器。
+ *
+ *   【夹紧 (Clamp / Tighten)】 —— 这是一个“动作”，不是一种状态
+ *     定义：把一个候选的尺寸值，强行裁剪或拉伸到目标约束的 [min, max] 范围内。
+ *     代码体现：borderBC.clamp(size) 或 Constraints.intersect()。
+ *     典型场景：子节点报上来的自然尺寸超出父约束范围时，父级用 clamp 把它拉回来。
+ * ============================================================================ */
+
 // NOLINTBEGIN
 // ============================================================================
 // 基础几何与布局类型
@@ -151,19 +320,19 @@ enum class VerticalDirection
 // NOTE: 对于一行来说，主轴水平延伸，交叉轴垂直延伸。对于一列来说，主轴垂直延伸，交叉轴水平延伸。
 enum class MainAxisAlignment
 {
-    start,
-    end,
-    center,
-    spaceBetween,
-    spaceAround,
+    start,        //子项从主轴的起始边开始排列
+    end,          //从主轴的末尾边开始排列。
+    center,       //子项在主轴上居中排列。
+    spaceBetween, //第一个子项靠起始边，最后一个靠末尾边，其余子项之间的间距均匀相等
+    spaceAround, //每个子项两侧的间距相等，但首尾两侧的间距是子项之间间距的一半（因为两端各只有一半）
     spaceEvenly // 因此设置主轴对齐方式为 spaceEvenly 会将空余空间在每个图像之间、之前和之后均匀地划分
 };
 enum class CrossAxisAlignment
 {
-    start,
-    end,
-    center,
-    stretch,
+    start,   //对齐到交叉轴的起始边（Row 的顶部，Column 的左侧，不受 TextDirection 影响）
+    end,     //对齐到交叉轴的末尾边（Row 的底部，Column 的右侧）。
+    center,  //在交叉轴上居中。
+    stretch, //子项在交叉轴方向上拉伸以填满整个容器（例如 Row 中的子项高度会被拉伸到与 Row 高度一致，除非子项本身有固定高度约束）
     baseline // 新增：基线对齐（仅对 Row 有效）
 };
 enum class MainAxisSize
@@ -534,16 +703,20 @@ static bool isAxisForward(AxisDirection dir)
     return dir == AxisDirection::right || dir == AxisDirection::down;
 }
 
+/// 从约束中提取主轴尺寸（Row 取宽度，Column 取高度）
 static float mainAxisSizeFromConstraints(const Constraints &bc, bool isRow)
 {
     return isRow ? bc.maxW : bc.maxH;
 }
+
+/// 从约束中提取交叉轴尺寸（Row 取高度，Column 取宽度）
 static float crossAxisSizeFromConstraints(const Constraints &bc, bool isRow)
 {
     return isRow ? bc.maxH : bc.maxW;
 }
 
-/// 根据轴方向从 EdgeInsets 中提取起始边的 padding 值
+/// 根据轴方向从 EdgeInsets 中提取主轴起始边的 padding 值
+/// 例如：右向轴（Row ltr）取 left，左向轴（Row rtl）取 right，下向轴取 top，上向轴取 bottom
 static float mainAxisPaddingStart(const EdgeInsets &pad, AxisDirection dir)
 {
     switch (dir)
@@ -559,6 +732,8 @@ static float mainAxisPaddingStart(const EdgeInsets &pad, AxisDirection dir)
     }
     return 0;
 }
+
+/// 根据轴方向从 EdgeInsets 中提取主轴末尾边的 padding 值（与 start 相对）
 static float mainAxisPaddingEnd(const EdgeInsets &pad, AxisDirection dir)
 {
     switch (dir)
@@ -574,16 +749,18 @@ static float mainAxisPaddingEnd(const EdgeInsets &pad, AxisDirection dir)
     }
     return 0;
 }
+
+/// 根据轴方向从 EdgeInsets 中提取交叉轴起始边的 padding 值
+/// 对于 Row（水平主轴），交叉轴是垂直方向，起始边为 top；对于 Column，交叉轴是水平方向，起始边为 left
 static float crossAxisPaddingStart(const EdgeInsets &pad, AxisDirection dir)
 {
-    // 交叉轴始终与主轴垂直，对于 Row 交叉轴是垂直方向，对于 Column 是水平方向
-    // 交叉轴的 start 取决于垂直/水平方向的默认书写方向，这里我们沿用之前的逻辑：
-    // Row 时交叉轴 start 为 top，Column 时交叉轴 start 为 left（这与 Flutter 默认行为一致，且不受 textDirection/verticalDirection 影响）
     if (dir == AxisDirection::right || dir == AxisDirection::left)
         return pad.top; // Row 的交叉轴起始边是 top
     else
         return pad.left; // Column 的交叉轴起始边是 left
 }
+
+/// 根据轴方向从 EdgeInsets 中提取交叉轴末尾边的 padding 值（与 start 相对）
 static float crossAxisPaddingEnd(const EdgeInsets &pad, AxisDirection dir)
 {
     if (dir == AxisDirection::right || dir == AxisDirection::left)
@@ -591,16 +768,21 @@ static float crossAxisPaddingEnd(const EdgeInsets &pad, AxisDirection dir)
     else
         return pad.right;
 }
+
+/// 获取子节点在主轴方向上的长度（Row 取宽度，Column 取高度）
 static float childMainAxisLength(const Node &child, bool isRow)
 {
     return isRow ? child.geometry.w : child.geometry.h;
 }
+
+/// 获取子节点在交叉轴方向上的长度（Row 取高度，Column 取宽度）
 static float childCrossAxisLength(const Node &child, bool isRow)
 {
     return isRow ? child.geometry.h : child.geometry.w;
 }
 
-/// 设置子节点在主轴上的物理坐标，考虑轴方向
+/// 设置子节点在主轴上的物理坐标，考虑轴方向（正向或反向）
+/// pos 是逻辑起点（从主轴的 start 边算起），函数会根据轴方向计算出最终物理坐标
 static void setChildMainAxisPosition(Node &child, AxisDirection dir, float pos,
                                      float childMainLen, float parentMainSize,
                                      float padStart, float padEnd)
@@ -609,11 +791,12 @@ static void setChildMainAxisPosition(Node &child, AxisDirection dir, float pos,
     float physical = 0;
     if (isAxisForward(dir))
     {
+        // 正向轴：物理坐标 = padding_start + 逻辑位置
         physical = padStart + pos;
     }
     else
     {
-        // 反向轴：坐标 = 父容器尺寸 - padEnd - pos - childMainLen
+        // 反向轴：物理坐标 = 父容器尺寸 - padding_end - 逻辑位置 - 子元素长度
         physical = parentMainSize - padEnd - pos - childMainLen;
     }
     // 根据轴方向设置对应的坐标字段
@@ -622,11 +805,13 @@ static void setChildMainAxisPosition(Node &child, AxisDirection dir, float pos,
     else
         child.geometry.y = physical;
 }
+
+/// 设置子节点在交叉轴上的物理坐标（目前仅支持正向，即从左到右或从上到下）
 static void setChildCrossAxisPosition(Node &child, AxisDirection dir, float pos,
                                       float childCrossLen, float parentCrossSize,
                                       float padCrossStart, float padCrossEnd)
 {
-    // 交叉轴目前总是正向（从左到右或从上到下），暂不考虑翻转
+    // 交叉轴目前总是正向，暂不考虑翻转
     (void)childCrossLen;
     (void)parentCrossSize;
     (void)padCrossEnd;
@@ -635,14 +820,20 @@ static void setChildCrossAxisPosition(Node &child, AxisDirection dir, float pos,
     else
         child.geometry.x = padCrossStart + pos;
 }
+
+/// 判断约束在主轴方向是否有界（不是无限）
 static bool mainAxisIsBounded(const Constraints &bc, bool isRow)
 {
     return isRow ? bc.hasBoundedWidth() : bc.hasBoundedHeight();
 }
+
+/// 判断约束在交叉轴方向是否有界（不是无限）
 static bool crossAxisIsBounded(const Constraints &bc, bool isRow)
 {
     return isRow ? bc.hasBoundedHeight() : bc.hasBoundedWidth();
 }
+
+/// 根据 Row/Column 生成主轴/交叉轴对应的约束（辅助函数）
 static Constraints makeFlexAxisConstraints(bool isRow, float minMain, float maxMain,
                                            float minCross, float maxCross)
 {
@@ -978,6 +1169,17 @@ static void positionChildrenInFlex(const std::vector<FlexChildInfo> &infos,
 }
 
 /// 布局 Flex（Row/Column）的主函数
+/// 步骤概览：
+/// 1. 准备轴方向、约束边界，检查合法性
+/// 2. 收集子节点信息（展开 Expanded）
+/// 3. 布局非弹性子节点，获得自然主轴尺寸
+/// 4. 计算所有子节点占用的总主轴长度
+/// 5. 根据 MainAxisSize 决定最终内容区主轴尺寸，计算剩余空间
+/// 6. 将剩余空间按 flex 分配给弹性子节点
+/// 7. 重新计算实际占用主轴长度
+/// 8. 计算主轴对齐的间隙和起始偏移
+/// 9. 定位所有子节点
+/// 10. 计算 Flex 自身尺寸
 void layoutFlex(Node &node, Constraints borderBC, const EdgeInsets &pad, bool isRow)
 {
     auto &ref = node.ref;
@@ -1093,7 +1295,19 @@ void layoutFlex(Node &node, Constraints borderBC, const EdgeInsets &pad, bool is
 // ============================================================================
 // 顶层布局入口：约束向下传递，最终调用具体布局函数
 // ============================================================================
+/*
+所有布局都从 layout 函数开始。它的工作：
 
+1. 先根据 Widget 自身的 width/height 收紧约束（applyFixedWidth/Height）。
+2. 如果是 Container，还要合并它自己的 constraints 字段。
+3. 如果节点是叶子且注册了测量函数（比如 Text），就用测量函数获得自然尺寸，并收紧约束。
+4. 然后根据 ref.kind 分发到具体的布局函数：
+    layoutContainer（Container）
+    layoutFlex（Row / Column，通过 isRow 区分）
+    layoutText（Text）
+
+最终，每个节点的 geometry（x,y,w,h）和 baseline 被填好。layout 还会检测是否溢出父约束，并打印警告。
+*/
 /// 布局入口：接收父约束，处理固定宽高，分发到具体 Widget 布局函数。
 /// 完全符合 Flutter "约束向下，尺寸向上" 的原则。
 void layout(Node &node, Constraints constraints)
