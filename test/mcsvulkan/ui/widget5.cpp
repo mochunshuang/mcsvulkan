@@ -1629,19 +1629,298 @@ bool test_container_single_child_constraint()
     return caught;
 }
 
+// ====================== 通用声明式 UIBuilder（新增） ======================
+template <typename SoaCtx>
+class UIBuilder
+{
+    SoaCtx &soaCtx_;
+    FlatLayoutTree &tree_;
+    int currentParent_ = -1;
+    std::vector<int> parentStack_;
+
+    void pushParent(int idx)
+    {
+        parentStack_.push_back(currentParent_);
+        currentParent_ = idx;
+    }
+    void popParent()
+    {
+        currentParent_ = parentStack_.back();
+        parentStack_.pop_back();
+    }
+
+    int addNode(const std::string &name, Entity entity)
+    {
+        if (currentParent_ != -1)
+            pre_single_child_check(soaCtx_, tree_.getNode(currentParent_));
+        return tree_.addNode(name, std::move(entity), currentParent_);
+    }
+
+  public:
+    UIBuilder(SoaCtx &ctx, FlatLayoutTree &tree) : soaCtx_{ctx}, tree_{tree} {}
+
+    // 获取最后添加的节点索引（辅助）
+    int lastNodeIdx() const noexcept
+    {
+        return static_cast<int>(tree_.nodes.size() - 1);
+    }
+
+    // ========== 叶子版本（无子节点） ==========
+    // 约束：没有额外参数，或者第一个参数不可调用（即不是 BuildFn）
+    template <typename TraitType, typename... Args>
+        requires(
+            sizeof...(Args) == 0 ||
+            !std::invocable<std::decay_t<std::tuple_element_t<0, std::tuple<Args...>>>,
+                            UIBuilder &>)
+    UIBuilder &Add(const std::string &name, Args &&...args)
+    {
+        auto entity = TraitType::make(soaCtx_, std::forward<Args>(args)...);
+        addNode(name, std::move(entity));
+        return *this;
+    }
+
+    // ========== 容器版本（有子节点） ==========
+    // 约束：第一个额外参数必须可调用（以 UIBuilder& 为参数）
+    template <typename TraitType, typename BuildFn, typename... Args>
+        requires std::invocable<std::decay_t<BuildFn>, UIBuilder &>
+    UIBuilder &Add(const std::string &name, BuildFn &&buildFn, Args &&...args)
+    {
+        // 先创建节点（使用叶子版本，传入 args...）
+        int idx = Add<TraitType>(name, std::forward<Args>(args)...).lastNodeIdx();
+        pushParent(idx);
+        std::invoke(std::forward<BuildFn>(buildFn), *this);
+        popParent();
+        return *this;
+    }
+
+    // ========== Root 入口（保持不变） ==========
+    template <typename TraitType = ContainerStyleTrait, typename BuildFn,
+              typename... Args>
+    void Root(const std::string &name, BuildFn &&buildFn, Args &&...args)
+    {
+        currentParent_ = -1;
+        int idx = Add<TraitType>(name, std::forward<Args>(args)...).lastNodeIdx();
+        pushParent(idx);
+        std::invoke(std::forward<BuildFn>(buildFn), *this);
+        popParent();
+    }
+
+    // ========== If 条件分支 ==========
+    UIBuilder &If(bool condition, std::function<void(UIBuilder &)> build)
+    {
+        if (condition)
+            build(*this);
+        return *this;
+    }
+};
+
+// ====================== 新版通用 Builder 测试 ======================
+
+bool test_generic_builder_simple()
+{
+    auto soaCtx = initSoaData();
+    FlatLayoutTree tree;
+    UIBuilder b(soaCtx, tree);
+
+    b.Root<RowStyleTrait>(
+        "mainRow",
+        [](auto &b) {
+            b.template Add<ContainerStyleTrait>("c1", 50, 30);
+            b.template Add<ContainerStyleTrait>("c2", 70, 40);
+        },
+        300, 100);
+
+    soaCtx.layout(soaCtx, tree, 0, {0, 500, 0, 200});
+
+    return checkGeometry(tree.nodes[0], 0, 0, 300, 100, "row") &&
+           checkGeometry(tree.nodes[1], 0, 0, 50, 30, "c1") &&
+           checkGeometry(tree.nodes[2], 50, 0, 70, 40, "c2");
+}
+
+bool test_generic_builder_lambda()
+{
+    auto soaCtx = initSoaData();
+    FlatLayoutTree tree;
+    UIBuilder b(soaCtx, tree);
+
+    b.Root<ContainerStyleTrait>(
+        "app",
+        [](auto &b) {
+            b.template Add<ColumnStyleTrait>(
+                "mainCol",
+                [](auto &b) {
+                    b.template Add<RowStyleTrait>(
+                        "header",
+                        [](auto &b) {
+                            b.template Add<TextStyleTrait>("title", std::nullopt, 30);
+                        },
+                        400, 50);
+                    b.template Add<TextStyleTrait>("count_label", std::nullopt, 40);
+                },
+                std::nullopt, std::nullopt);
+        },
+        400, 300);
+
+    soaCtx.layout(soaCtx, tree, 0, {0, 400, 0, 300});
+
+    // 简单结构验证：节点数量、父子链
+    bool ok = (tree.nodes.size() == 5);
+    auto find = [&](const std::string &name) -> const FlatNode * {
+        for (auto &n : tree.nodes)
+            if (n.name == name)
+                return &n;
+        return nullptr;
+    };
+    ok &= (find("title") != nullptr && find("count_label") != nullptr);
+    // 验证 header 的第二个兄弟是 count_label
+    const FlatNode *header = find("header");
+    ok &= (header != nullptr && header->nextSibling == 4);
+    return ok;
+}
+
+bool test_generic_builder_nested_expanded()
+{
+    auto soaCtx = initSoaData();
+    FlatLayoutTree tree;
+    UIBuilder b(soaCtx, tree);
+
+    b.Root<RowStyleTrait>(
+        "row",
+        [](auto &b) {
+            b.template Add<ContainerStyleTrait>("fixed", 50, 50);
+            b.template Add<ExpandedStyleTrait>(
+                "expRow",
+                [](auto &b) {
+                    b.template Add<ColumnStyleTrait>(
+                        "col",
+                        [](auto &b) {
+                            b.template Add<ContainerStyleTrait>("colFixed", 80, 30);
+                            b.template Add<ExpandedStyleTrait>(
+                                "expCol",
+                                [](auto &b) {
+                                    b.template Add<ContainerStyleTrait>(
+                                        "inner", std::nullopt, std::nullopt);
+                                },
+                                1);
+                        },
+                        std::nullopt, std::nullopt, // width, height
+                        EdgeInsets{}, EdgeInsets{}, // margin, padding   ← 新增这两行
+                        MainAxisAlignment::start, CrossAxisAlignment::stretch);
+                },
+                1);
+        },
+        300, 200);
+
+    soaCtx.layout(soaCtx, tree, 0, {0, 300, 0, 200});
+
+    auto findNode = [&](const std::string &name) -> const FlatNode * {
+        for (auto &n : tree.nodes)
+            if (n.name == name)
+                return &n;
+        return nullptr;
+    };
+    const FlatNode *colFixed = findNode("colFixed");
+    const FlatNode *inner = findNode("inner");
+    bool ok = true;
+    ok &= (colFixed != nullptr && inner != nullptr);
+    if (colFixed)
+        ok &= checkGeometry(*colFixed, 0, 0, 250, 30, "colFixed");
+    if (inner)
+        ok &= checkGeometry(*inner, 0, 30, 250, 170, "inner expanded");
+    return ok;
+}
+
+bool test_generic_builder_single_child_constraint()
+{
+    auto soaCtx = initSoaData();
+    FlatLayoutTree tree;
+    UIBuilder b(soaCtx, tree);
+
+    b.Add<ContainerStyleTrait>("root", 200, 200);
+    b.Add<TextStyleTrait>("first", 30, 30);
+    bool caught = false;
+    try
+    {
+        b.Add<TextStyleTrait>("second", 30, 30);
+    }
+    catch (const std::logic_error &e)
+    {
+        caught = true;
+    }
+    return caught;
+}
+
+bool test_generic_builder_reactive()
+{
+    auto soaCtx = initSoaData();
+    auto build = [&](bool showExtra) {
+        FlatLayoutTree tree;
+        UIBuilder b(soaCtx, tree);
+        b.Root<ContainerStyleTrait>(
+            "app",
+            [&](auto &b) {
+                b.template Add<ColumnStyleTrait>(
+                    "mainCol",
+                    [&](auto &b) {
+                        b.template Add<RowStyleTrait>(
+                            "header",
+                            [&](auto &b) {
+                                b.template Add<TextStyleTrait>("title", std::nullopt, 30);
+                                b.If(showExtra, [](auto &b) {
+                                    b.template Add<TextStyleTrait>("extra", std::nullopt,
+                                                                   20);
+                                });
+                            },
+                            400, 50);
+                        b.template Add<TextStyleTrait>("count_label", std::nullopt, 40);
+                    },
+                    std::nullopt, std::nullopt);
+            },
+            400, 300);
+
+        soaCtx.layout(soaCtx, tree, 0, {0, 400, 0, 300});
+        return tree;
+    };
+
+    {
+        auto t = build(false);
+        bool hasExtra = false;
+        for (auto &n : t.nodes)
+            if (n.name == "extra")
+                hasExtra = true;
+        if (hasExtra)
+            return false;
+    }
+    {
+        auto t = build(true);
+        bool hasExtra = false;
+        for (auto &n : t.nodes)
+            if (n.name == "extra")
+                hasExtra = true;
+        if (!hasExtra)
+            return false;
+    }
+    return true;
+}
+
 // ====================== 运行所有测试 ======================
 bool runTests()
 {
+    bool genericTests = test_generic_builder_simple() && test_generic_builder_lambda() &&
+                        test_generic_builder_nested_expanded() &&
+                        test_generic_builder_single_child_constraint() &&
+                        test_generic_builder_reactive();
+
     bool newTests = test_dsl_simple_layout() && test_reactive_update() &&
                     test_dynamic_add_remove() && test_resource_cleanup() &&
                     test_dsl_nested_expanded() &&
                     test_container_single_child_constraint();
 
-    return newTests && test_basic_container_fixed() && test_row_fixed_children() &&
-           test_expanded_in_row() && test_stretch_overrides_height() &&
-           test_column_min_shrink() && test_rtl_row() && test_up_column() &&
-           test_baseline_alignment() && test_expanded_outside_flex_throws() &&
-           test_nested_expanded();
+    return genericTests && newTests && test_basic_container_fixed() &&
+           test_row_fixed_children() && test_expanded_in_row() &&
+           test_stretch_overrides_height() && test_column_min_shrink() &&
+           test_rtl_row() && test_up_column() && test_baseline_alignment() &&
+           test_expanded_outside_flex_throws() && test_nested_expanded();
 }
 
 int main()
