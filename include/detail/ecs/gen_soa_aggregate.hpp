@@ -704,6 +704,15 @@ namespace mcs::vulkan::ecs
             }
             return ~0;
         }
+        static constexpr bool has_member(static_string name) noexcept
+        {
+            template for (constexpr auto I : std::views::indices(members.size()))
+            {
+                if (name.view() == info...[I].field_name())
+                    return true;
+            }
+            return false;
+        }
 
         template <size_type I, typename Self>
         static constexpr auto get_field_span(Self &&self, size_type field_count) noexcept

@@ -91,6 +91,16 @@ namespace mcs::vulkan::meta
         static constexpr auto class_name = Name...[0];                // NOLINT
         static constexpr auto members = static_nsdms_of(^^base_type); // NOLINT
 
+        static consteval int find_name(static_string name) // NOLINT
+        {
+            template for (constexpr auto I : std::ranges::views::indices(sizeof...(Ts)))
+            {
+                if (Name...[I + 1] == name)
+                    return I;
+            }
+            return -1;
+        }
+
         template <size_t I>
         consteval static auto get_member_name() // NOLINT
         {

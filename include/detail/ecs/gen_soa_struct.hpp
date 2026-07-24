@@ -10,6 +10,7 @@ namespace mcs::vulkan::ecs
     {
         using base_type = gen_soa_aggregate<info...>;
         using base_type::base_type;
+        using base_type::find_name;
         using trait_type = T;
     };
 }; // namespace mcs::vulkan::ecs
