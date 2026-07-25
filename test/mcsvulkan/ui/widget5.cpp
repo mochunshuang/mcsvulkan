@@ -3,6 +3,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 #include <type_traits>
 #include <typeindex>
 #include <utility>
@@ -23,7 +24,6 @@ using mcs::vulkan::meta::static_string;
 #include <vector>
 
 // ====================== 全局基础类型：Entity 与 RefAny ======================
-// 注意：这些类型必须在 ui 命名空间之前定义，否则 ui 内部无法使用
 struct Entity
 {
     using release_type = std::move_only_function<void(uint32_t) noexcept>;
@@ -295,6 +295,13 @@ namespace ui
         min
     };
 
+    // [NEW] FlexFit 枚举，对应 Flutter 的 FlexFit
+    enum class FlexFit
+    {
+        tight, // 强制填满分配空间（Expanded 默认行为）
+        loose  // 允许子组件小于分配空间（Flexible 行为）
+    };
+
     struct BoxGeometry
     {
         float x = 0, y = 0, w = 0, h = 0;
@@ -531,15 +538,25 @@ namespace ui
         child.geometry.y = offset.y;
     }
 
-    // Flex 布局支持结构
+    // ====================== FlexChildInfo ======================
     struct FlexChildInfo
     {
         int nodeIdx = -1;
         float flex = 0;
-        float marginMain = 0;
-        float marginCross = 0;
+        FlexFit flexFit = FlexFit::tight; // [NEW] 默认为 tight
+        EdgeInsets margin;
+
+        float marginMain(bool isRow) const
+        {
+            return isRow ? margin.horizontal() : margin.vertical();
+        }
+        float marginCross(bool isRow) const
+        {
+            return isRow ? margin.vertical() : margin.horizontal();
+        }
     };
 
+    // ====================== collectFlexChildren ======================
     inline std::vector<FlexChildInfo> collectFlexChildren(auto &soaCtx,
                                                           FlatLayoutTree &tree,
                                                           int parentIdx, bool isRow,
@@ -558,29 +575,27 @@ namespace ui
             if (size_t(child.ref.type_id) == expandedTypeId)
             {
                 if (child.firstChild == -1)
-                    throw std::logic_error("Expanded widget has no child.");
+                    throw std::logic_error("Expanded/Flexible widget has no child.");
                 int realIdx = child.firstChild;
-                auto [flexVal] =
-                    soaCtx.expandeds.template view_entity<"flex">(0, child.ref.entity_id);
+                auto [flexVal, flexFitVal] = // [FIX] 读取 flexFit
+                    soaCtx.expandeds.template view_entity<"flex", "flexFit">(
+                        0, child.ref.entity_id);
                 EdgeInsets m = do_get_member<"margin">(soaCtx, tree.nodes[realIdx].ref)
                                    .miss_return(EdgeInsets{});
-                float mM = isRow ? m.horizontal() : m.vertical();
-                float mC = isRow ? m.vertical() : m.horizontal();
-                infos.push_back({realIdx, (float)flexVal, mM, mC});
+                infos.push_back({realIdx, (float)flexVal, flexFitVal, m});
                 outTotalFlex += flexVal;
             }
             else
             {
                 EdgeInsets m =
                     do_get_member<"margin">(soaCtx, child.ref).miss_return(EdgeInsets{});
-                float mM = isRow ? m.horizontal() : m.vertical();
-                float mC = isRow ? m.vertical() : m.horizontal();
-                infos.push_back({c, 0.0f, mM, mC});
+                infos.push_back({c, 0.0f, FlexFit::tight, m});
             }
         }
         return infos;
     }
 
+    // ====================== layoutChildrenNaturally ======================
     inline std::vector<float> layoutChildrenNaturally(
         auto &soaCtx, FlatLayoutTree &tree, const std::vector<FlexChildInfo> &infos,
         bool isRow, bool /*isBoundedMain*/, float /*innerMain*/, float innerCross,
@@ -590,20 +605,23 @@ namespace ui
         naturalMain.reserve(infos.size());
         for (const auto &info : infos)
         {
+            // 弹性子组件用 0 主轴最大约束（为了测量交叉轴）
             float childMainMax = (info.flex > 0) ? 0.0f : Constraints::inf;
             float childCrossMax = innerCross;
             float childCrossMin =
                 (crossAlign == CrossAxisAlignment::stretch) ? childCrossMax : 0.0f;
             Constraints childBC = makeFlexAxisConstraints(isRow, 0.0f, childMainMax,
                                                           childCrossMin, childCrossMax);
+            // 非弹性子组件才 deflate margin（弹性子组件后续布局会处理）
             if (info.flex == 0)
-                childBC = childBC.deflate({info.marginMain, info.marginCross, 0, 0});
+                childBC = childBC.deflate(info.margin);
             soaCtx.layout(soaCtx, tree, info.nodeIdx, childBC);
             naturalMain.push_back(childMainAxisLength(tree.nodes[info.nodeIdx], isRow));
         }
         return naturalMain;
     }
 
+    // ====================== distributeFlexSpace ======================
     inline void distributeFlexSpace(auto &soaCtx, FlatLayoutTree &tree,
                                     const std::vector<FlexChildInfo> &infos,
                                     std::vector<float> &naturalMain, bool isRow,
@@ -621,14 +639,22 @@ namespace ui
                 float childCrossMax = innerCross;
                 float childCrossMin =
                     (crossAlign == CrossAxisAlignment::stretch) ? childCrossMax : 0.0f;
-                Constraints tightBC = makeFlexAxisConstraints(
-                    isRow, allocated, allocated, childCrossMin, childCrossMax);
-                soaCtx.layout(soaCtx, tree, infos[i].nodeIdx, tightBC);
+
+                // [FIX] 根据 flexFit 选择约束类型
+                float minMain = (infos[i].flexFit == FlexFit::loose) ? 0.0f : allocated;
+                float maxMain = allocated;
+
+                Constraints flexBC = makeFlexAxisConstraints(
+                    isRow, minMain, maxMain, childCrossMin, childCrossMax);
+                // 扣除 margin
+                flexBC = flexBC.deflate(infos[i].margin);
+                soaCtx.layout(soaCtx, tree, infos[i].nodeIdx, flexBC);
                 naturalMain[i] = childMainAxisLength(tree.nodes[infos[i].nodeIdx], isRow);
             }
         }
     }
 
+    // computeFinalMainSize 不变
     inline float computeFinalMainSize(bool isBoundedMain, float totalNatural,
                                       float innerMain, MainAxisSize axisSize)
     {
@@ -639,6 +665,7 @@ namespace ui
         return innerMain;
     }
 
+    // computeMainGapAndStart 不变
     inline void computeMainGapAndStart(size_t childCount, float extraMain,
                                        MainAxisAlignment mainAlign, float &outMainGap,
                                        float &outMainStartOff)
@@ -679,6 +706,7 @@ namespace ui
         }
     }
 
+    // ====================== positionChildrenInFlex ======================
     inline void positionChildrenInFlex(
         auto &soaCtx, FlatLayoutTree &tree, const std::vector<FlexChildInfo> &infos,
         const std::vector<float> &naturalMain, AxisDirection dir, bool isRow,
@@ -697,18 +725,20 @@ namespace ui
         for (size_t i = 0; i < infos.size(); ++i)
         {
             FlatNode &child = tree.nodes[infos[i].nodeIdx];
-            EdgeInsets childMargin =
-                do_get_member<"margin">(soaCtx, child.ref).miss_return(EdgeInsets{});
+            const EdgeInsets &childMargin = infos[i].margin;
             float childMainLen = naturalMain[i];
             float childCrossLen = childCrossAxisLength(child, isRow);
 
             float leadingMargin = isRow ? childMargin.left : childMargin.top;
+            float crossLeadingMargin = isRow ? childMargin.top : childMargin.left;
+
+            // 主轴位置 = 分配位置 + leading margin
             setChildMainAxisPosition(child, dir, mainPos + leadingMargin, childMainLen,
                                      parentMainSize, padMainStart, padMainEnd);
 
             float crossStart = 0;
-            float crossExtra =
-                std::max(0.0f, innerCross - (childCrossLen + infos[i].marginCross));
+            float crossExtra = std::max(
+                0.0f, innerCross - (childCrossLen + infos[i].marginCross(isRow)));
             switch (crossAlign)
             {
             case CrossAxisAlignment::start:
@@ -727,14 +757,16 @@ namespace ui
                 crossStart = isRow ? maxBaseline - child.baseline : 0;
                 break;
             }
-            float crossLeadingMargin = isRow ? childMargin.top : childMargin.left;
+            // 交叉轴位置 = 对齐位置 + cross leading margin
             setChildCrossAxisPosition(child, dir, crossStart + crossLeadingMargin,
                                       childCrossLen, parentCrossSize, padCrossStart,
                                       padCrossEnd);
-            mainPos += naturalMain[i] + infos[i].marginMain + mainGap;
+
+            mainPos += naturalMain[i] + infos[i].marginMain(isRow) + mainGap;
         }
     }
 
+    // ====================== layoutFlexImpl (关键修正) ======================
     template <bool isRow>
     void layoutFlexImpl(auto &soaCtx, FlatLayoutTree &tree, int nodeIdx,
                         Constraints borderBC, const EdgeInsets &pad, AxisDirection dir,
@@ -745,9 +777,12 @@ namespace ui
         FlatNode &node = tree.nodes[nodeIdx];
         bool isBoundedMain = mainAxisIsBounded(borderBC, isRow);
         bool isBoundedCross = crossAxisIsBounded(borderBC, isRow);
+
+        // [FIX] 根据 Flutter 规范：交叉轴必须始终有界，否则直接报错
         if (!isBoundedCross)
             throw std::logic_error("Row/Column '" + node.name +
-                                   "' has unbounded cross axis.");
+                                   "' has unbounded cross axis. Cross axis must be "
+                                   "bounded in Flutter flex layout.");
 
         if (!isBoundedMain)
         {
@@ -757,7 +792,7 @@ namespace ui
                         "expandeds"))
                     throw std::logic_error(
                         "Row/Column '" + node.name +
-                        "' has unbounded main axis and Expanded child.");
+                        "' has unbounded main axis and Expanded/Flexible child.");
         }
 
         float mainSize = mainAxisSizeFromConstraints(borderBC, isRow);
@@ -778,7 +813,10 @@ namespace ui
 
         float totalNatural = 0.0f;
         for (size_t i = 0; i < infos.size(); ++i)
-            totalNatural += naturalMain[i] + infos[i].marginMain;
+        {
+            if (infos[i].flex == 0)
+                totalNatural += naturalMain[i] + infos[i].marginMain(isRow);
+        }
 
         float finalInnerMain =
             computeFinalMainSize(isBoundedMain, totalNatural, innerMain, axisSize);
@@ -788,7 +826,7 @@ namespace ui
 
         float totalMainUsed = 0.0f;
         for (size_t i = 0; i < infos.size(); ++i)
-            totalMainUsed += naturalMain[i] + infos[i].marginMain;
+            totalMainUsed += naturalMain[i] + infos[i].marginMain(isRow);
 
         float extraMain = std::max(0.0f, finalInnerMain - totalMainUsed);
         float mainGap = 0.0f, mainStartOff = 0.0f;
@@ -817,6 +855,7 @@ namespace ui
         size = borderBC.clamp(size);
 
         node.geometry = {0, 0, size.width, size.height};
+
         if (!infos.empty())
         {
             FlatNode &first = tree.nodes[infos[0].nodeIdx];
@@ -831,10 +870,9 @@ namespace ui
 
 } // namespace ui
 
-// 引入 ui 命名空间，方便后续代码直接使用布局组件
 using namespace ui;
 
-// ====================== Container Trait ======================
+// ====================== Container Trait（重写以符合 Flutter 规范）======================
 struct ContainerStyleTrait : TraitBase<"containers">
 {
     static constexpr bool has_single_child = true;
@@ -851,54 +889,104 @@ struct ContainerStyleTrait : TraitBase<"containers">
         return {type_id(soaCtx), idx, release(soaCtx)};
     }
 
+    // [FIX] 完全按照 Flutter Container 布局算法重写
     static void layout(auto &soaCtx, auto &selfSoa, FlatLayoutTree &tree, int nodeIdx,
                        Constraints borderBC, const EdgeInsets &pad)
     {
         FlatNode &node = tree.nodes[nodeIdx];
-        auto [border, ownConstraints, width, height, align] =
+        auto [border, ownConstraints, width, height, alignment] =
             selfSoa.template view_entity<"border", "constraints", "width", "height",
                                          "alignment">(0, node.ref.entity_id);
 
         if (ownConstraints)
             borderBC = borderBC.intersect(*ownConstraints);
 
+        // 1. 无子组件：尽可能大（或显式尺寸）
         if (node.firstChild == -1)
         {
-            float w = width.value_or(0.0f);
-            float h = height.value_or(0.0f);
+            float w = width.has_value()
+                          ? *width
+                          : (borderBC.hasBoundedWidth() ? borderBC.maxW : 0.0f);
+            float h = height.has_value()
+                          ? *height
+                          : (borderBC.hasBoundedHeight() ? borderBC.maxH : 0.0f);
             Size size = borderBC.clamp({w, h});
             node.geometry = {0, 0, size.width, size.height};
             node.baseline = size.height;
             return;
         }
 
+        // 2. 有子组件：必须唯一
         int childIdx = node.firstChild;
         if (tree.nodes[childIdx].nextSibling != -1)
             throw std::logic_error("Container '" + node.name +
                                    "' must have exactly one child.");
 
         FlatNode &child = tree.nodes[childIdx];
+        EdgeInsets childMargin =
+            do_get_member<"margin">(soaCtx, child.ref).miss_return(EdgeInsets{});
+
+        // 计算内部约束（去除 border 和 container 自己的 padding）
         Constraints innerBC = borderBC.deflate(border).deflate(pad);
-        Constraints childBC = align.has_value() ? makeLooseConstraints(innerBC) : innerBC;
-        childBC = childBC.deflate(
-            do_get_member<"margin">(soaCtx, child.ref).miss_return(EdgeInsets{}));
 
-        soaCtx.layout(soaCtx, tree, childIdx, childBC);
+        if (alignment.has_value())
+        {
+            // --- 有 alignment：容器尺寸优先看显式宽高，否则尝试填满父约束（有界时），最后被子组件撑开 ---
 
-        Size childFull = childFullSize(soaCtx, child);
-        float baseW = childFull.width + pad.horizontal() + border.horizontal();
-        float baseH = childFull.height + pad.vertical() + border.vertical();
-        float containerW = width.value_or(baseW);
-        float containerH = height.value_or(baseH);
-        Size containerSize = borderBC.clamp({containerW, containerH});
+            // 1. 先布局子组件，使用 loose 约束（内部扣除 margin）
+            Constraints childBC = makeLooseConstraints(innerBC);
+            childBC = childBC.deflate(childMargin);
+            soaCtx.layout(soaCtx, tree, childIdx, childBC);
 
-        Constraints containerAsConstraints{0, containerSize.width, 0,
-                                           containerSize.height};
-        positionChildByAlignment(soaCtx, child, containerAsConstraints, pad, align,
-                                 border);
+            Size childFull = childFullSize(soaCtx, child);
 
-        node.geometry = {0, 0, containerSize.width, containerSize.height};
-        node.baseline = child.baseline + child.geometry.y;
+            // 2. 确定容器最终尺寸
+            // 使用 innerBC（已扣除 padding 和 border），而非 borderBC
+            float containerW =
+                width.has_value()
+                    ? *width
+                    : (innerBC.hasBoundedWidth()
+                           ? innerBC.maxW
+                           : childFull.width + border.horizontal() + pad.horizontal());
+            float containerH =
+                height.has_value()
+                    ? *height
+                    : (innerBC.hasBoundedHeight()
+                           ? innerBC.maxH
+                           : childFull.height + border.vertical() + pad.vertical());
+
+            Size containerSize = borderBC.clamp({containerW, containerH});
+
+            // 3. 根据 alignment 定位子组件（使用容器的实际尺寸作为对齐参考空间）
+            Constraints containerAsConstraints{0, containerSize.width, 0,
+                                               containerSize.height};
+            positionChildByAlignment(soaCtx, child, containerAsConstraints, pad,
+                                     alignment, border);
+
+            // 4. 设置当前节点几何
+            node.geometry = {0, 0, containerSize.width, containerSize.height};
+            node.baseline = child.baseline + child.geometry.y;
+        }
+        else
+        {
+            // --- 无 alignment：容器尺寸由子组件决定，子组件接收 loose 约束 ---
+            Constraints childBC = makeLooseConstraints(innerBC).deflate(childMargin);
+            soaCtx.layout(soaCtx, tree, childIdx, childBC);
+
+            Size childFull = childFullSize(soaCtx, child);
+            float containerW =
+                width.value_or(childFull.width + border.horizontal() + pad.horizontal());
+            float containerH =
+                height.value_or(childFull.height + border.vertical() + pad.vertical());
+            Size containerSize = borderBC.clamp({containerW, containerH});
+
+            // 子组件定位到左上角（默认无 alignment 行为）
+            child.geometry.x = border.left + pad.left + childMargin.left;
+            child.geometry.y = border.top + pad.top + childMargin.top;
+
+            node.geometry = {0, 0, containerSize.width, containerSize.height};
+            node.baseline = child.baseline + child.geometry.y;
+        }
     }
 };
 using ContainerStyleObject =
@@ -979,15 +1067,21 @@ using ColumnStyleObject =
                    {"crossAlign", ^^CrossAxisAlignment}, {"mainAxisSize", ^^MainAxisSize},
                    {"verticalDirection", ^^VerticalDirection}>;
 
+// [FIX] Expanded 扩展为支持 FlexFit（可表达 Expanded 和 Flexible）
 struct ExpandedStyleTrait : TraitBase<"expandeds">
 {
-    static Entity make(auto &soaCtx, int flex = 1)
+    static constexpr bool has_single_child = true; // 强制单子节点
+
+    static Entity make(auto &soaCtx, int flex = 1,
+                       FlexFit fit = FlexFit::tight) // [NEW] 增加 flexFit 参数
     {
-        uint32_t idx = soaCtx.expandeds.new_entity(flex);
+        uint32_t idx = soaCtx.expandeds.new_entity(flex, fit);
         return {type_id(soaCtx), idx, release(soaCtx)};
     }
 };
-using ExpandedStyleObject = gen_soa_struct<ExpandedStyleTrait, {"flex", ^^int}>;
+using ExpandedStyleObject =
+    gen_soa_struct<ExpandedStyleTrait, {"flex", ^^int},
+                   {"flexFit", ^^FlexFit}>; // [NEW] 添加 flexFit 字段
 
 struct TextStyleTrait : TraitBase<"texts">
 {
@@ -1013,7 +1107,7 @@ struct TextStyleTrait : TraitBase<"texts">
         float h = height.value_or(40.0f);
         Size size = borderBC.clamp({w, h});
         node.geometry = {0, 0, size.width, size.height};
-        node.baseline = size.height * 0.8f;
+        node.baseline = size.height * 0.8f; // 测试用，实际需真实字体度量
     }
 };
 using TextStyleObject =
@@ -1059,8 +1153,8 @@ constexpr auto initSoaData()
         FlatNode &node = tree.nodes[nodeIdx];
         const auto &ref = node.ref;
         if (ref.type_id == ExpandedStyleTrait::type_id(soaCtx))
-            throw std::logic_error(
-                "Expanded widget must be placed directly inside Row/Column/Flex.");
+            throw std::logic_error("Expanded/Flexible widget must be placed directly "
+                                   "inside Row/Column/Flex.");
 
         Constraints borderBC = constraints;
         if (auto w = do_get_member<"width">(soaCtx, ref).value_or(std::optional<float>{}))
@@ -1173,7 +1267,7 @@ bool tryLayout(auto &soaCtx, FlatLayoutTree &tree, int rootIdx, Constraints c,
     }
 }
 
-// ====================== 测试用例（全局）======================
+// ====================== 测试用例（适配新行为）======================
 bool test_basic_container_fixed()
 {
     auto soaCtx = initSoaData();
@@ -1320,7 +1414,7 @@ bool test_expanded_outside_flex_throws()
     int cont = tree.addNode("cont", ContainerStyleTrait::make(soaCtx, 200, 200), -1);
     int exp = tree.addNode("exp", ExpandedStyleTrait::make(soaCtx), cont);
     tree.addNode("inner", ContainerStyleTrait::make(soaCtx, 50, 50), exp);
-    return tryLayout(soaCtx, tree, cont, {0, 200, 0, 200}, "Expanded widget");
+    return tryLayout(soaCtx, tree, cont, {0, 200, 0, 200}, "Expanded");
 }
 
 bool test_nested_expanded()
@@ -1369,50 +1463,62 @@ constexpr void pre_single_child_check(auto &soaCtx, const FlatNode &node)
         }
     }
 }
-
+// dsl_container 增加 border 和 constraints 参数
 inline int dsl_container(auto &soaCtx, FlatLayoutTree &tree, int parentIdx,
                          const std::string &name, std::optional<float> w = {},
                          std::optional<float> h = {}, EdgeInsets margin = {},
-                         EdgeInsets padding = {}, std::optional<Alignment> align = {})
+                         EdgeInsets padding = {}, EdgeInsets border = {},
+                         std::optional<Alignment> align = {},
+                         std::optional<Constraints> constraints = {})
 {
     if (parentIdx != -1)
         pre_single_child_check(soaCtx, tree.getNode(parentIdx));
-    auto entity = ContainerStyleTrait::make(soaCtx, w, h, margin, padding, {}, align);
+    auto entity = ContainerStyleTrait::make(soaCtx, w, h, margin, padding, border, align,
+                                            constraints);
     return tree.addNode(name, std::move(entity), parentIdx);
 }
 
+// dsl_row 增加 axisSize 和 textDir 参数
 inline int dsl_row(auto &soaCtx, FlatLayoutTree &tree, int parentIdx,
                    const std::string &name, std::optional<float> w = {},
                    std::optional<float> h = {},
                    MainAxisAlignment ma = MainAxisAlignment::start,
                    CrossAxisAlignment ca = CrossAxisAlignment::start,
-                   EdgeInsets margin = {}, EdgeInsets padding = {})
+                   EdgeInsets margin = {}, EdgeInsets padding = {},
+                   MainAxisSize axisSize = MainAxisSize::max,
+                   TextDirection textDir = TextDirection::ltr)
 {
     if (parentIdx != -1)
         pre_single_child_check(soaCtx, tree.getNode(parentIdx));
-    auto entity = RowStyleTrait::make(soaCtx, w, h, margin, padding, ma, ca);
+    auto entity =
+        RowStyleTrait::make(soaCtx, w, h, margin, padding, ma, ca, axisSize, textDir);
     return tree.addNode(name, std::move(entity), parentIdx);
 }
 
+// dsl_column 增加 axisSize 和 vertDir 参数
 inline int dsl_column(auto &soaCtx, FlatLayoutTree &tree, int parentIdx,
                       const std::string &name, std::optional<float> w = {},
                       std::optional<float> h = {},
                       MainAxisAlignment ma = MainAxisAlignment::start,
                       CrossAxisAlignment ca = CrossAxisAlignment::start,
-                      EdgeInsets margin = {}, EdgeInsets padding = {})
+                      EdgeInsets margin = {}, EdgeInsets padding = {},
+                      MainAxisSize axisSize = MainAxisSize::max,
+                      VerticalDirection vertDir = VerticalDirection::down)
 {
     if (parentIdx != -1)
         pre_single_child_check(soaCtx, tree.getNode(parentIdx));
-    auto entity = ColumnStyleTrait::make(soaCtx, w, h, margin, padding, ma, ca);
+    auto entity =
+        ColumnStyleTrait::make(soaCtx, w, h, margin, padding, ma, ca, axisSize, vertDir);
     return tree.addNode(name, std::move(entity), parentIdx);
 }
 
 inline int dsl_expanded(auto &soaCtx, FlatLayoutTree &tree, int parentIdx,
-                        const std::string &name, int flex = 1)
+                        const std::string &name, int flex = 1,
+                        FlexFit fit = FlexFit::tight)
 {
     if (parentIdx != -1)
         pre_single_child_check(soaCtx, tree.getNode(parentIdx));
-    auto entity = ExpandedStyleTrait::make(soaCtx, flex);
+    auto entity = ExpandedStyleTrait::make(soaCtx, flex, fit);
     return tree.addNode(name, std::move(entity), parentIdx);
 }
 
@@ -1659,14 +1765,12 @@ class UIBuilder
   public:
     UIBuilder(SoaCtx &ctx, FlatLayoutTree &tree) : soaCtx_{ctx}, tree_{tree} {}
 
-    // 获取最后添加的节点索引（辅助）
     int lastNodeIdx() const noexcept
     {
         return static_cast<int>(tree_.nodes.size() - 1);
     }
 
-    // ========== 叶子版本（无子节点） ==========
-    // 约束：没有额外参数，或者第一个参数不可调用（即不是 BuildFn）
+    // 叶子版本（无子节点）
     template <typename TraitType, typename... Args>
         requires(
             sizeof...(Args) == 0 ||
@@ -1679,13 +1783,11 @@ class UIBuilder
         return *this;
     }
 
-    // ========== 容器版本（有子节点） ==========
-    // 约束：第一个额外参数必须可调用（以 UIBuilder& 为参数）
+    // 容器版本（有子节点）
     template <typename TraitType, typename BuildFn, typename... Args>
         requires std::invocable<std::decay_t<BuildFn>, UIBuilder &>
     UIBuilder &Add(const std::string &name, BuildFn &&buildFn, Args &&...args)
     {
-        // 先创建节点（使用叶子版本，传入 args...）
         int idx = Add<TraitType>(name, std::forward<Args>(args)...).lastNodeIdx();
         pushParent(idx);
         std::invoke(std::forward<BuildFn>(buildFn), *this);
@@ -1693,7 +1795,6 @@ class UIBuilder
         return *this;
     }
 
-    // ========== Root 入口（保持不变） ==========
     template <typename TraitType = ContainerStyleTrait, typename BuildFn,
               typename... Args>
     void Root(const std::string &name, BuildFn &&buildFn, Args &&...args)
@@ -1705,7 +1806,6 @@ class UIBuilder
         popParent();
     }
 
-    // ========== If 条件分支 ==========
     UIBuilder &If(bool condition, std::function<void(UIBuilder &)> build)
     {
         if (condition)
@@ -1763,7 +1863,6 @@ bool test_generic_builder_lambda()
 
     soaCtx.layout(soaCtx, tree, 0, {0, 400, 0, 300});
 
-    // 简单结构验证：节点数量、父子链
     bool ok = (tree.nodes.size() == 5);
     auto find = [&](const std::string &name) -> const FlatNode * {
         for (auto &n : tree.nodes)
@@ -1772,7 +1871,6 @@ bool test_generic_builder_lambda()
         return nullptr;
     };
     ok &= (find("title") != nullptr && find("count_label") != nullptr);
-    // 验证 header 的第二个兄弟是 count_label
     const FlatNode *header = find("header");
     ok &= (header != nullptr && header->nextSibling == 4);
     return ok;
@@ -1803,8 +1901,7 @@ bool test_generic_builder_nested_expanded()
                                 },
                                 1);
                         },
-                        std::nullopt, std::nullopt, // width, height
-                        EdgeInsets{}, EdgeInsets{}, // margin, padding   ← 新增这两行
+                        std::nullopt, std::nullopt, EdgeInsets{}, EdgeInsets{},
                         MainAxisAlignment::start, CrossAxisAlignment::stretch);
                 },
                 1);
@@ -1836,12 +1933,16 @@ bool test_generic_builder_single_child_constraint()
     FlatLayoutTree tree;
     UIBuilder b(soaCtx, tree);
 
-    b.Add<ContainerStyleTrait>("root", 200, 200);
-    b.Add<TextStyleTrait>("first", 30, 30);
     bool caught = false;
     try
     {
-        b.Add<TextStyleTrait>("second", 30, 30);
+        b.Root<ContainerStyleTrait>(
+            "root",
+            [](auto &b) {
+                b.template Add<TextStyleTrait>("first", 30, 30);
+                b.template Add<TextStyleTrait>("second", 30, 30); // 应抛出异常
+            },
+            200, 200);
     }
     catch (const std::logic_error &e)
     {
@@ -1903,41 +2004,550 @@ bool test_generic_builder_reactive()
     return true;
 }
 
-// ====================== 运行所有测试 ======================
-bool runTests()
+/// 屏幕几何信息
+struct ScreenGeometry
 {
-    bool genericTests = test_generic_builder_simple() && test_generic_builder_lambda() &&
-                        test_generic_builder_nested_expanded() &&
-                        test_generic_builder_single_child_constraint() &&
-                        test_generic_builder_reactive();
+    float x, y, w, h;
+    float padL, padR, padT, padB;
+    float borderL, borderR, borderT, borderB;
+};
 
-    bool newTests = test_dsl_simple_layout() && test_reactive_update() &&
-                    test_dynamic_add_remove() && test_resource_cleanup() &&
-                    test_dsl_nested_expanded() &&
-                    test_container_single_child_constraint();
+static std::vector<ScreenGeometry> extractScreenGeometries(auto &soaCtx,
+                                                           const FlatLayoutTree &tree,
+                                                           int rootIdx)
+{
+    std::vector<ScreenGeometry> geos;
+    auto dfs = [&](this auto &self, int nodeIdx, float accX, float accY) -> void {
+        const FlatNode &node = tree.nodes[nodeIdx];
+        float x = accX + node.geometry.x;
+        float y = accY + node.geometry.y;
+        float w = node.geometry.w;
+        float h = node.geometry.h;
 
-    return genericTests && newTests && test_basic_container_fixed() &&
-           test_row_fixed_children() && test_expanded_in_row() &&
-           test_stretch_overrides_height() && test_column_min_shrink() &&
-           test_rtl_row() && test_up_column() && test_baseline_alignment() &&
-           test_expanded_outside_flex_throws() && test_nested_expanded();
+        // 直接使用 Trait 的 type_id，与 make 时一致
+        if (node.ref.type_id == ContainerStyleTrait::type_id(soaCtx))
+        {
+            // 注意：view_entity 第一个参数是 field_count（单字段为 0）
+            auto [pad, border] =
+                soaCtx.containers.template view_entity<"padding", "border">(
+                    0, node.ref.entity_id);
+            geos.push_back({x, y, w, h, pad.left, pad.right, pad.top, pad.bottom,
+                            border.left, border.right, border.top, border.bottom});
+        }
+
+        for (int c = node.firstChild; c != -1; c = tree.nodes[c].nextSibling)
+            self(c, x, y);
+    };
+    dfs(rootIdx, 0.0f, 0.0f);
+    return geos;
+}
+bool test_extract_screen_geometries()
+{
+    auto soaCtx = initSoaData();
+    FlatLayoutTree tree2;
+    tree2.reserve(10);
+    int root2 = tree2.addNode(
+        "root", ContainerStyleTrait::make(soaCtx, 100, 100, {}, {}, {}, std::nullopt),
+        -1);
+    int child2 = tree2.addNode(
+        "child",
+        ContainerStyleTrait::make(soaCtx, 30, 30, {}, EdgeInsets{5, 5, 5, 5},
+                                  EdgeInsets{2, 2, 2, 2}, std::nullopt),
+        root2);
+
+    Constraints screen{0, 500, 0, 500};
+    tryLayout(soaCtx, tree2, root2, screen);
+
+    auto geos = extractScreenGeometries(soaCtx, tree2, root2);
+    if (geos.size() != 2)
+    {
+        std::cerr << "FAIL: expected 2 geometries, got " << geos.size() << "\n";
+        return false;
+    }
+
+    const auto &rootGeo = geos[0];
+    if (!approx(rootGeo.x, 0) || !approx(rootGeo.y, 0) || !approx(rootGeo.w, 100) ||
+        !approx(rootGeo.h, 100))
+    {
+        std::cerr << "FAIL: root geometry mismatch\n";
+        return false;
+    }
+
+    const auto &childGeo = geos[1];
+    if (!approx(childGeo.x, 0) || !approx(childGeo.y, 0) || !approx(childGeo.w, 30) ||
+        !approx(childGeo.h, 30))
+        return false;
+
+    if (!approx(childGeo.padL, 5) || !approx(childGeo.padR, 5) ||
+        !approx(childGeo.padT, 5) || !approx(childGeo.padB, 5) ||
+        !approx(childGeo.borderL, 2) || !approx(childGeo.borderR, 2) ||
+        !approx(childGeo.borderT, 2) || !approx(childGeo.borderB, 2))
+        return false;
+
+    return true;
+}
+
+// ====================== 新增修复验证测试 ======================
+
+bool test_flex_margin_no_double_offset()
+{
+    auto soaCtx = initSoaData();
+    FlatLayoutTree tree;
+    tree.reserve(10);
+
+    int row = tree.addNode("row", RowStyleTrait::make(soaCtx, 300, 100), -1);
+    int c1 =
+        tree.addNode("c1", ContainerStyleTrait::make(soaCtx, 50, 30, {10, 5, 0, 0}), row);
+    int c2 =
+        tree.addNode("c2", ContainerStyleTrait::make(soaCtx, 70, 40, {0, 8, 0, 0}), row);
+
+    if (!tryLayout(soaCtx, tree, row, {0, 300, 0, 100}))
+        return false;
+
+    return checkGeometry(tree.nodes[c1], 10, 5, 50, 30, "c1 with margin") &&
+           checkGeometry(tree.nodes[c2], 60, 8, 70, 40, "c2 with margin");
+}
+
+bool test_expanded_with_margin()
+{
+    auto soaCtx = initSoaData();
+    FlatLayoutTree tree;
+    tree.reserve(10);
+
+    int row = tree.addNode("row", RowStyleTrait::make(soaCtx, 300, 100), -1);
+    int c1 =
+        tree.addNode("c1", ContainerStyleTrait::make(soaCtx, 50, 30, {5, 0, 0, 0}), row);
+    int exp = tree.addNode("exp", ExpandedStyleTrait::make(soaCtx, 1), row);
+    int c2 = tree.addNode(
+        "c2", ContainerStyleTrait::make(soaCtx, std::nullopt, 40, {3, 0, 0, 0}), exp);
+
+    if (!tryLayout(soaCtx, tree, row, {0, 300, 0, 100}))
+        return false;
+
+    return checkGeometry(tree.nodes[c1], 5, 0, 50, 30, "c1") &&
+           checkGeometry(tree.nodes[c2], 58, 0, 242, 40, "c2 expanded with margin");
+}
+
+bool test_baseline_with_margin()
+{
+    auto soaCtx = initSoaData();
+    FlatLayoutTree tree;
+    tree.reserve(10);
+
+    int row = tree.addNode("row",
+                           RowStyleTrait::make(soaCtx, 300, 100, {}, {},
+                                               MainAxisAlignment::start,
+                                               CrossAxisAlignment::baseline),
+                           -1);
+    int t1 = tree.addNode(
+        "t1", TextStyleTrait::make(soaCtx, std::nullopt, 40, {0, 5, 0, 0}), row);
+    int t2 = tree.addNode("t2", TextStyleTrait::make(soaCtx, std::nullopt, 20), row);
+    if (!tryLayout(soaCtx, tree, row, {0, 300, 0, 100}))
+        return false;
+
+    return checkGeometry(tree.nodes[t1], 0, 5, 80, 40, "t1 baseline + margin") &&
+           checkGeometry(tree.nodes[t2], 80, 16, 80, 20, "t2 baseline");
+}
+
+bool test_container_baseline_with_margin()
+{
+    auto soaCtx = initSoaData();
+    FlatLayoutTree tree;
+    tree.reserve(10);
+
+    int root = tree.addNode("root", ContainerStyleTrait::make(soaCtx, 200, 200), -1);
+    int child = tree.addNode(
+        "child", TextStyleTrait::make(soaCtx, std::nullopt, 40, {0, 10, 0, 0}), root);
+
+    std::cerr << "[TEST] Before layout:\n";
+    std::cerr << "  child.ref.type_id=" << tree.nodes[child].ref.type_id
+              << " entity_id=" << tree.nodes[child].ref.entity_id << "\n";
+
+    if (!tryLayout(soaCtx, tree, root, {0, 200, 0, 200}))
+        return false;
+
+    const FlatNode &rootNode = tree.nodes[root];
+    const FlatNode &childNode = tree.nodes[child];
+
+    // 重新读取 child 的 margin 和 baseline，验证布局后的状态
+    auto marginRef = do_get_member<"margin">(soaCtx, childNode.ref);
+    EdgeInsets childMargin = marginRef.miss_return(EdgeInsets{});
+    std::cerr << "[TEST] After layout:\n";
+    std::cerr << "  child.geometry = (" << childNode.geometry.x << ","
+              << childNode.geometry.y << "," << childNode.geometry.w << ","
+              << childNode.geometry.h << ")\n";
+    std::cerr << "  child.baseline = " << childNode.baseline << "\n";
+    std::cerr << "  child margin (from SOA) = {l=" << childMargin.left
+              << ", t=" << childMargin.top << ", r=" << childMargin.right
+              << ", b=" << childMargin.bottom << "}\n";
+    std::cerr << "  root.baseline = " << rootNode.baseline << "\n";
+    std::cerr << "  expected root.baseline = child.baseline + child.geometry.y = "
+              << (childNode.baseline + childNode.geometry.y) << "\n";
+
+    // 如果 child.geometry.y 不是 10，则可能 Container 布局中读取 margin 失败
+    if (!approx(childNode.geometry.y, 10.0f))
+    {
+        std::cerr << "  => child.geometry.y is wrong! Should be 10 (top margin).\n";
+    }
+    if (!approx(childNode.baseline, 32.0f))
+    {
+        std::cerr << "  => child.baseline is wrong! Should be 32 (40 * 0.8).\n";
+    }
+
+    return approx(rootNode.baseline, 42.0f);
+}
+// [NEW] 测试 Container 有 alignment 时填满父约束
+bool test_container_alignment_fills_parent()
+{
+    auto soaCtx = initSoaData();
+    FlatLayoutTree tree;
+    tree.reserve(10);
+
+    // Container 无尺寸，有 alignment，父约束有界 => 应填满父约束
+    int root = tree.addNode("root",
+                            ContainerStyleTrait::make(soaCtx, std::nullopt, std::nullopt,
+                                                      {}, {}, {}, Align::center),
+                            -1);
+    int child = tree.addNode("child", ContainerStyleTrait::make(soaCtx, 50, 30), root);
+
+    Constraints parentC = {0, 200, 0, 200};
+    if (!tryLayout(soaCtx, tree, root, parentC))
+        return false;
+
+    return checkGeometry(tree.nodes[root], 0, 0, 200, 200, "root fills parent") &&
+           checkGeometry(tree.nodes[child], 75, 85, 50, 30, "child centered");
+}
+
+// [NEW] 测试 Flexible (loose) 行为
+bool test_flexible_loose()
+{
+    auto soaCtx = initSoaData();
+    FlatLayoutTree tree;
+    tree.reserve(10);
+
+    int row = tree.addNode("row", RowStyleTrait::make(soaCtx, 300, 100), -1);
+    // 固定宽度子组件
+    tree.addNode("c1", ContainerStyleTrait::make(soaCtx, 50, 30), row);
+    // Flexible (loose) 子组件，内部 Container 宽度 50，不应填满剩余空间
+    int flexible =
+        tree.addNode("flex", ExpandedStyleTrait::make(soaCtx, 1, FlexFit::loose), row);
+    tree.addNode("c2", ContainerStyleTrait::make(soaCtx, 50, 20), flexible);
+    // 另一个固定子组件
+    tree.addNode("c3", ContainerStyleTrait::make(soaCtx, 70, 40), row);
+
+    if (!tryLayout(soaCtx, tree, row, {0, 300, 0, 100}))
+        return false;
+
+    // c2 应该保持 50 宽度，而不是填满弹性空间
+    return checkGeometry(tree.nodes[1], 0, 0, 50, 30, "c1") &&
+           checkGeometry(tree.nodes[3], 50, 0, 50, 20, "c2 flexible loose") &&
+           checkGeometry(tree.nodes[4], 100, 0, 70, 40, "c3");
+}
+
+// [NEW] 测试交叉轴无界时 Flex 抛出异常
+bool test_flex_unbounded_cross_throws()
+{
+    auto soaCtx = initSoaData();
+    FlatLayoutTree tree;
+    tree.reserve(10);
+
+    // Row 未指定高度，父约束高度无界 => 交叉轴无界，应抛出
+    int row = tree.addNode("row", RowStyleTrait::make(soaCtx, 300, std::nullopt), -1);
+    tree.addNode("c1", ContainerStyleTrait::make(soaCtx, 50, 30), row);
+
+    return tryLayout(soaCtx, tree, row, {0, 300, 0, Constraints::inf},
+                     "unbounded cross axis");
+}
+bool test_complex_nested_flex()
+{
+    auto soaCtx = initSoaData();
+    FlatLayoutTree tree;
+    tree.reserve(20);
+
+    int root = dsl_container(soaCtx, tree, -1, "root");
+    int col = dsl_column(soaCtx, tree, root, "col", std::nullopt, std::nullopt,
+                         MainAxisAlignment::start, CrossAxisAlignment::stretch, {}, {},
+                         MainAxisSize::min);
+    int row =
+        dsl_row(soaCtx, tree, col, "row", std::nullopt, 60, MainAxisAlignment::start,
+                CrossAxisAlignment::start, EdgeInsets{}, EdgeInsets{5, 10, 5, 10});
+    dsl_container(soaCtx, tree, row, "fixed", 50, 30);
+    int exp = dsl_expanded(soaCtx, tree, row, "exp", 1);
+    int innerCont = dsl_container(soaCtx, tree, exp, "innerCont", std::nullopt,
+                                  std::nullopt, {}, {}, {}, Align::center);
+    dsl_text(soaCtx, tree, innerCont, "innerText", std::nullopt, 24);
+    dsl_text(soaCtx, tree, col, "bottomText", std::nullopt, 30, {0, 15, 0, 0});
+
+    Constraints screen{0, 500, 0, 500};
+    dsl_layout(soaCtx, tree, screen);
+
+    auto find = [&](const std::string &name) -> const FlatNode & {
+        for (auto &n : tree.nodes)
+            if (n.name == name)
+                return n;
+        throw std::runtime_error("node not found");
+    };
+
+    bool ok = true;
+    ok &= checkGeometry(tree.nodes[root], 0, 0, 500, 105, "root");
+    ok &= checkGeometry(tree.nodes[col], 0, 0, 500, 105, "col");
+    ok &= checkGeometry(find("row"), 0, 0, 500, 60, "row");
+    ok &= checkGeometry(find("fixed"), 5, 10, 50, 30, "fixed");
+    // innerCont 在 flex 空间内，且 alignment center 使其垂直居中
+    ok &= checkGeometry(find("innerCont"), 55, 10, 440, 40, "innerCont");
+    ok &= checkGeometry(find("innerText"), 180, 8, 80, 24, "innerText centered");
+    ok &= checkGeometry(find("bottomText"), 0, 75, 500, 30, "bottomText");
+    return ok;
+}
+
+bool test_container_complex_decoration()
+{
+    auto soaCtx = initSoaData();
+    FlatLayoutTree tree;
+    tree.reserve(10);
+    int root = dsl_container(soaCtx, tree, -1, "root", 300, 300, {},
+                             EdgeInsets{10, 10, 10, 10}, // 四边均匀 padding
+                             EdgeInsets{2, 2, 2, 2},     // 四边均匀 border
+                             Align::bottomRight);
+    int child = dsl_container(soaCtx, tree, root, "child", 50, 40);
+    Constraints c{0, 500, 0, 500};
+    dsl_layout(soaCtx, tree, c);
+    return checkGeometry(tree.nodes[root], 0, 0, 300, 300, "root") &&
+           checkGeometry(tree.nodes[child], 238, 248, 50, 40, "child");
+}
+
+bool test_complex_baseline_in_column()
+{
+    auto soaCtx = initSoaData();
+    FlatLayoutTree tree;
+    tree.reserve(20);
+    int root = dsl_container(soaCtx, tree, -1, "root", 400, 400);
+    int col = dsl_column(soaCtx, tree, root, "col", std::nullopt, std::nullopt,
+                         MainAxisAlignment::start, CrossAxisAlignment::stretch);
+    int row = dsl_row(soaCtx, tree, col, "row", std::nullopt, 50,
+                      MainAxisAlignment::start, CrossAxisAlignment::baseline);
+    dsl_text(soaCtx, tree, row, "t1", std::nullopt, 30);
+    dsl_text(soaCtx, tree, row, "t2", std::nullopt, 50);
+    int exp = dsl_expanded(soaCtx, tree, col, "exp", 1);
+    int innerCol = dsl_column(soaCtx, tree, exp, "innerCol", std::nullopt, std::nullopt,
+                              MainAxisAlignment::start, CrossAxisAlignment::start, {}, {},
+                              MainAxisSize::min);
+    dsl_text(soaCtx, tree, innerCol, "innerText", std::nullopt, 40);
+
+    Constraints screen{0, 400, 0, 400};
+    dsl_layout(soaCtx, tree, screen);
+
+    auto find = [&](const std::string &name) -> const FlatNode & {
+        for (auto &n : tree.nodes)
+            if (n.name == name)
+                return n;
+        throw std::runtime_error("node not found");
+    };
+    return checkGeometry(find("t1"), 0, 16, 80, 30, "t1") &&
+           checkGeometry(find("t2"), 80, 0, 80, 50, "t2") &&
+           checkGeometry(find("row"), 0, 0, 400, 50, "row") &&
+           checkGeometry(find("innerCol"), 0, 50, 400, 350, "innerCol") &&
+           checkGeometry(find("innerText"), 0, 0, 80, 40, "innerText");
+}
+// 测试主轴 spaceEvenly 的间隙
+bool test_row_space_evenly()
+{
+    auto soaCtx = initSoaData();
+    FlatLayoutTree tree;
+    tree.reserve(10);
+    int row = tree.addNode("row",
+                           RowStyleTrait::make(soaCtx, 300, 100, {}, {},
+                                               MainAxisAlignment::spaceEvenly,
+                                               CrossAxisAlignment::start),
+                           -1);
+    tree.addNode("c1", ContainerStyleTrait::make(soaCtx, 50, 30), row);
+    tree.addNode("c2", ContainerStyleTrait::make(soaCtx, 50, 30), row);
+    tree.addNode("c3", ContainerStyleTrait::make(soaCtx, 50, 30), row);
+
+    tryLayout(soaCtx, tree, row, {0, 300, 0, 100});
+
+    // spaceEvenly: 间隙 = (300 - 150) / 4 = 37.5
+    // 子组件 x 分别为 37.5, 125, 212.5
+    return checkGeometry(tree.nodes[1], 37.5, 0, 50, 30, "c1") &&
+           checkGeometry(tree.nodes[2], 125, 0, 50, 30, "c2") &&
+           checkGeometry(tree.nodes[3], 212.5, 0, 50, 30, "c3");
+}
+
+// 测试 Column 交叉轴 end 对齐
+bool test_column_cross_end()
+{
+    auto soaCtx = initSoaData();
+    FlatLayoutTree tree;
+    tree.reserve(10);
+    int col = tree.addNode("col",
+                           ColumnStyleTrait::make(soaCtx, 200, 200, {}, {},
+                                                  MainAxisAlignment::start,
+                                                  CrossAxisAlignment::end),
+                           -1);
+    tree.addNode("c1", ContainerStyleTrait::make(soaCtx, 50, 50), col);
+    tree.addNode("c2", ContainerStyleTrait::make(soaCtx, 80, 40), col);
+
+    tryLayout(soaCtx, tree, col, {0, 200, 0, 200});
+
+    // 交叉轴宽度 200，子组件靠右（end），x 分别为 150 和 120
+    return checkGeometry(tree.nodes[1], 150, 0, 50, 50, "c1") &&
+           checkGeometry(tree.nodes[2], 120, 50, 80, 40, "c2");
+}
+// ====================== 测试执行辅助 ======================
+struct TestCase
+{
+    const char *name;
+    bool (*func)();
+};
+
+// 所有测试用例注册表
+static const TestCase allTests[] = {
+    {"test_basic_container_fixed", test_basic_container_fixed},
+    {"test_row_fixed_children", test_row_fixed_children},
+    {"test_expanded_in_row", test_expanded_in_row},
+    {"test_stretch_overrides_height", test_stretch_overrides_height},
+    {"test_column_min_shrink", test_column_min_shrink},
+    {"test_rtl_row", test_rtl_row},
+    {"test_up_column", test_up_column},
+    {"test_baseline_alignment", test_baseline_alignment},
+    {"test_expanded_outside_flex_throws", test_expanded_outside_flex_throws},
+    {"test_nested_expanded", test_nested_expanded},
+    {"test_dsl_simple_layout", test_dsl_simple_layout},
+    {"test_reactive_update", test_reactive_update},
+    {"test_dynamic_add_remove", test_dynamic_add_remove},
+    {"test_resource_cleanup", test_resource_cleanup},
+    {"test_dsl_nested_expanded", test_dsl_nested_expanded},
+    {"test_container_single_child_constraint", test_container_single_child_constraint},
+    {"test_generic_builder_simple", test_generic_builder_simple},
+    {"test_generic_builder_lambda", test_generic_builder_lambda},
+    {"test_generic_builder_nested_expanded", test_generic_builder_nested_expanded},
+    {"test_generic_builder_single_child_constraint",
+     test_generic_builder_single_child_constraint},
+    {"test_generic_builder_reactive", test_generic_builder_reactive},
+    {"test_extract_screen_geometries", test_extract_screen_geometries},
+    {"test_flex_margin_no_double_offset", test_flex_margin_no_double_offset},
+    {"test_expanded_with_margin", test_expanded_with_margin},
+    {"test_baseline_with_margin", test_baseline_with_margin},
+    {"test_container_baseline_with_margin", test_container_baseline_with_margin},
+    {"test_container_alignment_fills_parent", test_container_alignment_fills_parent},
+    {"test_flexible_loose", test_flexible_loose},
+    {"test_flex_unbounded_cross_throws", test_flex_unbounded_cross_throws},
+    {"test_complex_nested_flex", test_complex_nested_flex},
+    {"test_container_complex_decoration", test_container_complex_decoration},
+    {"test_complex_baseline_in_column", test_complex_baseline_in_column},
+    {"test_row_space_evenly", test_row_space_evenly},
+    {"test_column_cross_end", test_column_cross_end},
+};
+
+// ====================== 独立 API 反射测试 ======================
+bool test_api_margin_on_text()
+{
+    auto soaCtx = initSoaData();
+    // 创建一个带 margin 的 Text 实体
+    EdgeInsets margin{0, 10, 0, 0}; // top=10
+    Entity textEntity = TextStyleTrait::make(soaCtx, std::nullopt, 40, margin, {});
+
+    // 用 do_get_member 读取 margin
+    RefAny anyMargin = do_get_member<"margin">(soaCtx, textEntity);
+    std::cerr << "[API TEST] do_get_member<\"margin\"> on Text: has_value="
+              << anyMargin.has_value() << std::endl;
+    if (!anyMargin.has_value())
+    {
+        std::cerr << "FAIL: margin not found via do_get_member\n";
+        return false;
+    }
+    EdgeInsets m = anyMargin.miss_return(EdgeInsets{});
+    std::cerr << "  margin = {l=" << m.left << ", t=" << m.top << ", r=" << m.right
+              << ", b=" << m.bottom << "}\n";
+    if (!approx(m.top, 10.0f) || !approx(m.left, 0.0f))
+    {
+        std::cerr << "FAIL: margin value mismatch\n";
+        return false;
+    }
+
+    // 再用 view_entity 直接读 (验证另一种访问路径)
+    auto [w, h] =
+        soaCtx.texts.template view_entity<"width", "height">(0, textEntity.entity_id);
+    // 注意：view_entity 可能需要 (col_idx, entity_id) 或仅 entity_id，按你现有代码的调用方式
+    // 你现有的 Text layout 里是 view_entity<"width","height">(0, entity_id)，我们也保持一致
+    std::cerr << "  view_entity width=" << (w.has_value() ? *w : 0.0f)
+              << " height=" << (h.has_value() ? *h : 0.0f) << std::endl;
+    return true;
+}
+
+bool test_api_padding_border_on_container()
+{
+    auto soaCtx = initSoaData();
+    EdgeInsets padding{5, 5, 5, 5};
+    EdgeInsets border{2, 2, 2, 2};
+    Entity contEntity =
+        ContainerStyleTrait::make(soaCtx, 30, 30, {}, padding, border, std::nullopt);
+
+    // 用 view_entity 读取 padding/border
+    auto [pad, bd] = soaCtx.containers.template view_entity<"padding", "border">(
+        0, contEntity.entity_id); // 注意这里用0，与你 layout 中一致
+    std::cerr << "[API TEST] container padding = {l=" << pad.left << ", t=" << pad.top
+              << ", r=" << pad.right << ", b=" << pad.bottom << "}\n";
+    std::cerr << "  border = {l=" << bd.left << ", t=" << bd.top << ", r=" << bd.right
+              << ", b=" << bd.bottom << "}\n";
+    if (!approx(pad.left, 5) || !approx(pad.top, 5) || !approx(bd.left, 2) ||
+        !approx(bd.top, 2))
+    {
+        std::cerr << "FAIL: padding/border mismatch\n";
+        return false;
+    }
+    return true;
 }
 
 int main()
 {
-    try
+    std::cout << "Running API tests...\n";
+    bool api1 = test_api_margin_on_text();
+    bool api2 = test_api_padding_border_on_container();
+    if (!api1 || !api2)
     {
-        if (runTests())
+        std::cerr << "API test(s) failed, abort.\n";
+        return 1;
+    }
+
+    int passed = 0;
+    int failed = 0;
+    constexpr int total = sizeof(allTests) / sizeof(allTests[0]);
+
+    std::cout << "Running " << total << " tests...\n";
+    std::cout << "----------------------------------------\n";
+
+    for (const auto &test : allTests)
+    {
+        std::cout << "Test: " << test.name << " ... ";
+        try
         {
-            std::cout << "All tests passed!\n";
-            return 0;
+            if (test.func())
+            {
+                std::cout << "PASSED\n";
+                passed++;
+            }
+            else
+            {
+                std::cout << "FAILED (returned false)\n";
+                failed++;
+            }
         }
-        std::cout << "no passed!\n";
-        return 1;
+        catch (const std::exception &e)
+        {
+            std::cout << "EXCEPTION: " << e.what() << "\n";
+            failed++;
+        }
+        catch (...)
+        {
+            std::cout << "UNKNOWN EXCEPTION\n";
+            failed++;
+        }
     }
-    catch (const std::exception &e)
-    {
-        std::cerr << "Unhandled exception: " << e.what() << "\n";
-        return 1;
-    }
+
+    std::cout << "----------------------------------------\n";
+    std::cout << "Results: " << passed << " passed, " << failed << " failed out of "
+              << total << "\n";
+
+    return (failed == 0) ? 0 : 1;
 }

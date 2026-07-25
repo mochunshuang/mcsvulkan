@@ -164,5 +164,8 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_dod16 test_dod14.vert test_dod12.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
+add_std_glsl_target(test_dod17 test_dod14.vert test_dod12.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
 # end
 std_glsl_env_destroy()
