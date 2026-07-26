@@ -759,6 +759,61 @@ namespace ui
       public:
         std::vector<FlatNode> nodes;
 
+        static constexpr auto printLayoutTree = [](this auto &&self, auto &soaCtx,
+                                                   const auto &tree, int nodeIdx = 0,
+                                                   int depth = 0, float parentAbsX = 0.0f,
+                                                   float parentAbsY = 0.0f) {
+            if (nodeIdx < 0 || nodeIdx >= static_cast<int>(tree.nodes.size()))
+                return;
+
+            const FlatNode &node = tree.nodes[nodeIdx];
+            std::string indent(depth * 2, ' ');
+
+            // 计算绝对坐标（累积父节点偏移）
+            float absX = parentAbsX + node.geometry.x;
+            float absY = parentAbsY + node.geometry.y;
+            float absRight = absX + node.geometry.w;
+            float absBottom = absY + node.geometry.h;
+
+            // 从 SOA 上下文中提取样式（若不存在则返回默认值）
+            EdgeInsets pad =
+                do_get_member<"padding">(soaCtx, node.ref).miss_return(EdgeInsets{});
+            EdgeInsets margin =
+                do_get_member<"margin">(soaCtx, node.ref).miss_return(EdgeInsets{});
+            EdgeInsets border =
+                do_get_member<"border">(soaCtx, node.ref).miss_return(EdgeInsets{});
+
+            // 打印节点基本信息
+            std::println("{}Node Layout [{}]:", indent, node.name);
+            // 相对坐标（相对于父节点）
+            std::println("{}  position (relative): left={}, top={}, right={}, bottom={}",
+                         indent, node.geometry.x, node.geometry.y,
+                         node.geometry.x + node.geometry.w,
+                         node.geometry.y + node.geometry.h);
+            // 绝对坐标（相对于根节点）
+            std::println("{}  position (absolute): left={}, top={}, right={}, bottom={}",
+                         indent, absX, absY, absRight, absBottom);
+            std::println("{}  size: width={}, height={}", indent, node.geometry.w,
+                         node.geometry.h);
+
+            // 样式信息
+            std::println("{}  padding: top={}, left={}, bottom={}, right={}", indent,
+                         pad.top, pad.left, pad.bottom, pad.right);
+            std::println("{}  margin: top={}, left={}, bottom={}, right={}", indent,
+                         margin.top, margin.left, margin.bottom, margin.right);
+            std::println("{}  border: top={}, left={}, bottom={}, right={}", indent,
+                         border.top, border.left, border.bottom, border.right);
+
+            // 额外信息：如果有文本节点可打印基线（可选）
+            std::println("{}  baseline: {}", indent, node.baseline);
+
+            // 递归打印子节点（传入当前绝对坐标作为父绝对坐标）
+            for (int c = node.firstChild; c != -1; c = tree.nodes[c].nextSibling)
+            {
+                self(soaCtx, tree, c, depth + 1, absX, absY);
+            }
+        };
+
         void reserve(size_t n)
         {
             nodes.reserve(n);
@@ -790,7 +845,8 @@ namespace ui
 
         // 将 childIdx 从其当前父节点移动到 newParentIdx 下，并插入到 beforeSibling 之前。
         // 若 beforeSibling == -1，则追加到末尾。
-        void moveNode(int childIdx, int newParentIdx, int beforeSibling = -1)
+        constexpr void moveNode(int childIdx, int newParentIdx,
+                                int beforeSibling = -1) noexcept
         {
             if (childIdx == -1 || newParentIdx == -1 || childIdx == newParentIdx)
                 return;
@@ -857,17 +913,43 @@ namespace ui
                 }
             }
         }
+        // 在 FlatLayoutTree 类内部添加
+        constexpr std::optional<int> findNodeByName(
+            const std::string &name) const noexcept
+        {
+            for (int i = 0; i < static_cast<int>(nodes.size()); ++i)
+                if (nodes[i].name == name)
+                    return i;
+            return std::nullopt;
+        }
 
-        void clear()
+        // 便捷移动封装
+        constexpr void moveNodeByName(const std::string &childName,
+                                      const std::string &newParentName) noexcept
+        {
+            auto c = findNodeByName(childName);
+            auto p = findNodeByName(newParentName);
+            if (c && p)
+                moveNode(*c, *p);
+        }
+
+        constexpr void clear()
         {
             nodes.clear();
         }
 
         template <typename F>
-        void forEachChild(int idx, F &&f) const
+            requires(requires(F &f) { f(0); })
+        constexpr void forEachChild(int idx, F &&f) const noexcept(noexcept(f(0)))
         {
             for (int c = nodes[idx].firstChild; c != -1; c = nodes[c].nextSibling)
                 f(c);
+        }
+
+        constexpr void printLayout(auto &soaCtx, int nodeIdx = 0, int depth = 0,
+                                   float parentAbsX = 0.0f, float parentAbsY = 0.0f) const
+        {
+            printLayoutTree(soaCtx, *this, nodeIdx, depth, parentAbsX, parentAbsY);
         }
     };
 
@@ -4075,63 +4157,7 @@ try
                                       static_cast<float>(HEIGHT)};
     layout_(uiLayoutCtx, uiTree, 0, screenConstraints);
 
-    static constexpr auto printLayoutTree =
-        [](this auto &&self, auto &soaCtx, const FlatLayoutTree &tree, int nodeIdx = 0,
-           int depth = 0, float parentAbsX = 0.0f, float parentAbsY = 0.0f) {
-            if (nodeIdx < 0 || nodeIdx >= static_cast<int>(tree.nodes.size()))
-                return;
-
-            const FlatNode &node = tree.nodes[nodeIdx];
-            std::string indent(depth * 2, ' ');
-
-            // 计算绝对坐标（累积父节点偏移）
-            float absX = parentAbsX + node.geometry.x;
-            float absY = parentAbsY + node.geometry.y;
-            float absRight = absX + node.geometry.w;
-            float absBottom = absY + node.geometry.h;
-
-            // 从 SOA 上下文中提取样式（若不存在则返回默认值）
-            EdgeInsets pad =
-                do_get_member<"padding">(soaCtx, node.ref).miss_return(EdgeInsets{});
-            EdgeInsets margin =
-                do_get_member<"margin">(soaCtx, node.ref).miss_return(EdgeInsets{});
-            EdgeInsets border =
-                do_get_member<"border">(soaCtx, node.ref).miss_return(EdgeInsets{});
-
-            // 打印节点基本信息
-            std::println("{}Node Layout [{}]:", indent, node.name);
-            // 相对坐标（相对于父节点）
-            std::println("{}  position (relative): left={}, top={}, right={}, bottom={}",
-                         indent, node.geometry.x, node.geometry.y,
-                         node.geometry.x + node.geometry.w,
-                         node.geometry.y + node.geometry.h);
-            // 绝对坐标（相对于根节点）
-            std::println("{}  position (absolute): left={}, top={}, right={}, bottom={}",
-                         indent, absX, absY, absRight, absBottom);
-            std::println("{}  size: width={}, height={}", indent, node.geometry.w,
-                         node.geometry.h);
-
-            // 样式信息
-            std::println("{}  padding: top={}, left={}, bottom={}, right={}", indent,
-                         pad.top, pad.left, pad.bottom, pad.right);
-            std::println("{}  margin: top={}, left={}, bottom={}, right={}", indent,
-                         margin.top, margin.left, margin.bottom, margin.right);
-            std::println("{}  border: top={}, left={}, bottom={}, right={}", indent,
-                         border.top, border.left, border.bottom, border.right);
-
-            // 额外信息：如果有文本节点可打印基线（可选）
-            if (node.ref.type_id == TextStyleTrait::type_id(soaCtx))
-            {
-                std::println("{}  baseline: {}", indent, node.baseline);
-            }
-
-            // 递归打印子节点（传入当前绝对坐标作为父绝对坐标）
-            for (int c = node.firstChild; c != -1; c = tree.nodes[c].nextSibling)
-            {
-                self(soaCtx, tree, c, depth + 1, absX, absY);
-            }
-        };
-    printLayoutTree(uiLayoutCtx, uiTree, 0); // 从根节点开始打印
+    uiTree.printLayout(uiLayoutCtx, 0); // 从根节点开始打印
 
     // 4. 几何提取（Flutter 专用，填充 NodeGeometry）
     auto extractGeometries = [&](const ui::FlatLayoutTree &tree) {
@@ -4196,7 +4222,7 @@ try
     // 6. Resize 回调（窗口大小改变时重建 UI）
     auto screen_resize = [uiLayoutCtx = std::move(uiLayoutCtx), layout_ = layout_,
                           &uiStore, &fontSelect, &swapchain,
-                          buildUITree](VkExtent2D newSize) mutable {
+                          &uiTree](VkExtent2D newSize) mutable {
         static VkExtent2D lastSize{0, 0};
         if (newSize.width == lastSize.width && newSize.height == lastSize.height)
             return;
@@ -4205,12 +4231,25 @@ try
         uiStore.clear();
 
         // 重建 UI 树
-        ui::FlatLayoutTree tree;
-        tree.reserve(20);
-        UIBuilder<std::remove_cvref_t<decltype(uiLayoutCtx)>> b(uiLayoutCtx, tree);
-        b.Root<ColumnStyleTrait>("screen", buildUITree, static_cast<float>(newSize.width),
-                                 static_cast<float>(newSize.height), EdgeInsets{},
-                                 EdgeInsets{});
+        auto &tree = uiTree;
+        // ===== DOM 操作：只移动节点，不重建 =====
+        int rootIdx = tree.findNodeByName("root").value_or(-1);
+        int root2Idx = tree.findNodeByName("root2").value_or(-1);
+        int child0Idx = tree.findNodeByName("child0").value_or(-1);
+
+        // 判断 child0 当前在哪个父节点下
+        if (tree.nodes[child0Idx].parent == rootIdx)
+        {
+            // child0 在 root 下 → 移到 root2 头部
+            tree.moveNode(
+                child0Idx, root2Idx,
+                tree.nodes[root2Idx].firstChild); // beforeSibling = root2 的第一个子节点
+        }
+        else
+        {
+            // child0 在 root2 下 → 移回 root 头部
+            tree.moveNode(child0Idx, rootIdx, tree.nodes[rootIdx].firstChild);
+        }
 
         // 重新布局
         ui::Constraints c{0.0f, static_cast<float>(newSize.width), 0.0f,

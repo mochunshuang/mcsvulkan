@@ -360,9 +360,15 @@ namespace ui
         }
 
         template <typename F>
-        void forEachChild(int idx, F &&f) const
+        void forEachChild(FlatNode &parentNode, F &&f)
         {
-            for (int c = nodes[idx].firstChild; c != -1; c = nodes[c].nextSibling)
+            for (int c = parentNode.firstChild; c != -1; c = nodes[c].nextSibling)
+                f(nodes[c]);
+        }
+        template <typename F>
+        void forEachChild(int parentIdx, F &&f)
+        {
+            for (int c = nodes[parentIdx].firstChild; c != -1; c = nodes[c].nextSibling)
                 f(c);
         }
     };
@@ -568,10 +574,8 @@ namespace ui
             std::decay_t<decltype(soaCtx)>::find_name("expandeds");
         static_assert(expandedTypeId != ~0u);
 
-        for (int c = tree.nodes[parentIdx].firstChild; c != -1;
-             c = tree.nodes[c].nextSibling)
-        {
-            FlatNode &child = tree.nodes[c];
+        tree.forEachChild(parentIdx, [&](int c) {
+            auto &child = tree.nodes[c];
             if (size_t(child.ref.type_id) == expandedTypeId)
             {
                 if (child.firstChild == -1)
@@ -591,7 +595,7 @@ namespace ui
                     do_get_member<"margin">(soaCtx, child.ref).miss_return(EdgeInsets{});
                 infos.push_back({c, 0.0f, FlexFit::tight, m});
             }
-        }
+        });
         return infos;
     }
 
@@ -786,13 +790,14 @@ namespace ui
 
         if (!isBoundedMain)
         {
-            for (int c = node.firstChild; c != -1; c = tree.nodes[c].nextSibling)
-                if (tree.nodes[c].ref.type_id ==
+            tree.forEachChild(node, [&](FlatNode &child) {
+                if (child.ref.type_id ==
                     (uint32_t)std::remove_cvref_t<decltype(soaCtx)>::find_name(
                         "expandeds"))
                     throw std::logic_error(
-                        "Row/Column '" + node.name +
+                        "Row/Column '" + child.name +
                         "' has unbounded main axis and Expanded/Flexible child.");
+            });
         }
 
         float mainSize = mainAxisSizeFromConstraints(borderBC, isRow);
