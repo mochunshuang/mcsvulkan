@@ -4157,7 +4157,8 @@ try
     uiTree.printLayout(uiLayoutCtx, 0); // 从根节点开始打印
 
     // 4. 几何提取（Flutter 专用，填充 NodeGeometry）
-    auto extractGeometries = [](auto &uiLayoutCtx, const ui::FlatLayoutTree &tree) {
+    static constexpr auto extractGeometries = [](auto &uiLayoutCtx,
+                                                 const ui::FlatLayoutTree &tree) {
         std::vector<NodeGeometry> geos;
         uint32_t id = 0;
         auto dfs = [&](this auto &self, int nodeIdx, float px, float py) -> void {
@@ -4265,46 +4266,7 @@ try
                           static_cast<float>(newSize.height)};
         layout_(uiLayoutCtx, tree, 0, c);
 
-        // 提取几何并生成实例（局部版本，捕获了 uiLayoutCtx）
-        auto extractLocal = [&](const ui::FlatLayoutTree &t) {
-            std::vector<NodeGeometry> geos;
-            uint32_t id = 0;
-            auto dfs = [&](this auto &self, int idx, float px, float py) -> void {
-                const ui::FlatNode &nd = t.nodes[idx];
-                float x = px + nd.geometry.x, y = py + nd.geometry.y;
-                float w = nd.geometry.w, h = nd.geometry.h;
-                if (w > 0 && h > 0)
-                {
-                    NodeGeometry g;
-                    g.x = x;
-                    g.y = y;
-                    g.w = w;
-                    g.h = h;
-                    auto padOpt = do_get_member<"padding">(uiLayoutCtx, nd.ref);
-                    if (padOpt.has_value())
-                    {
-                        auto &p = any_cast<ui::EdgeInsets>(padOpt);
-                        g.pad_left = p.left;
-                        g.pad_right = p.right;
-                        g.pad_top = p.top;
-                        g.pad_bottom = p.bottom;
-                    }
-                    else
-                    {
-                        g.pad_left = g.pad_right = g.pad_top = g.pad_bottom = 0;
-                    }
-                    g.node_id = nd.name;
-                    g.traversal_id = id++;
-                    geos.push_back(g);
-                }
-                for (int c = nd.firstChild; c != -1; c = t.nodes[c].nextSibling)
-                    self(c, x, y);
-            };
-            dfs(0, 0.0f, 0.0f);
-            return geos;
-        };
-
-        auto geos = extractLocal(tree);
+        auto geos = extractGeometries(uiLayoutCtx, tree);
         float w = static_cast<float>(newSize.width);
         float h = static_cast<float>(newSize.height);
         for (const auto &geo : geos)
