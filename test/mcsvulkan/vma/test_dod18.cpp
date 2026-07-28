@@ -6,8 +6,6 @@
 #include <cstdint>
 #include <exception>
 #include <flat_map>
-#include <glm/ext/matrix_transform.hpp>
-#include <glm/fwd.hpp>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -24,6 +22,9 @@
 #include <vector>
 
 #include "../head.hpp"
+#include <glm/ext/matrix_transform.hpp>
+#include <glm/gtx/string_cast.hpp>
+#include <glm/fwd.hpp>
 
 using mcs::vulkan::Instance;
 using mcs::vulkan::tool::create_instance;
@@ -252,11 +253,6 @@ void generateGradientTexture(uint8_t *pixels, int width, int height, uint8_t top
 }
 
 // diff: [camera_perspective] end
-
-// diff: [camera_model] start
-
-// diff: [camera_model] end
-
 //diff: [test_dod8] start
 struct object_data
 {
@@ -2606,26 +2602,11 @@ constexpr auto inputInit(auto &swapchain)
             glm::vec3(0.0f, 0.0f, 0.0f), // 位置为原点
             glm::identity<glm::quat>()   // 无旋转
         };
-        // 投影：正交范围 [-1,1] 且 near=0, far=1 → 投影矩阵 = I
-        auto uiProj =
-            camera::VulkanUIOrthographicProjection{-1.0f, 1.0f, -1.0f, 1.0f, 0.0f, 1.0f};
+        // 投影：正交范围 [-1,1] 且 near=0, far=1 → 投影矩阵 = I //NOTE: -10.0f, 10.0f 避免绕 Y X 被裁剪
+        auto uiProj = camera::VulkanUIOrthographicProjection{-1.0f, 1.0f,   -1.0f,
+                                                             1.0f,  -10.0f, 10.0f};
         return camera::GenCamera(uiView, uiProj);
     }();
-    {
-        auto v = uiCamera.getViewMatrix();
-        auto p = uiCamera.getProjMatrix();
-
-        std::println("=== UI Camera matrices ===");
-        for (int i = 0; i < 4; ++i)
-            std::println("V[{}]: {:8.6f} {:8.6f} {:8.6f} {:8.6f}", i, v[i][0], v[i][1],
-                         v[i][2], v[i][3]);
-        std::println("");
-        for (int i = 0; i < 4; ++i)
-            std::println("P[{}]: {:8.6f} {:8.6f} {:8.6f} {:8.6f}", i, p[i][0], p[i][1],
-                         p[i][2], p[i][3]);
-    }
-    assert(uiCamera.getViewMatrix() == glm::mat4(1) &&
-           uiCamera.getProjMatrix() == glm::mat4(1));
     auto input = std::make_unique<glfw_input>();
     return make_aggregate<"inputDataCtx", "input", "camera", "uiCamera", "clock">(
         std::move(input), std::move(camera), std::move(uiCamera), FrameClock{});
@@ -4389,7 +4370,7 @@ try
     // diff: [test_dod2] end
 
     static constexpr auto views_matrix_update = [](world_type &world,
-                                                   input_type &inputCtx,
+                                                   const input_type &inputCtx,
                                                    data_type &soaCtx) {
         const auto &input = inputCtx.input;
         auto &camera = inputCtx.camera; // 类型现在是 GenCamera<...>
@@ -4506,7 +4487,7 @@ try
     };
 
     static constexpr auto views_perspective_update =
-        [](world_type &world, input_type &inputCtx, data_type &soaCtx) {
+        [](world_type &world, const input_type &inputCtx, data_type &soaCtx) {
             const auto &input = inputCtx.input;
             auto &camera = inputCtx.camera;
             using mcs::vulkan::event::Key;
@@ -4551,7 +4532,7 @@ try
     // diff: [test_model_matrix3] 小小调整
 
     static constexpr auto views_ui_camera_update = [](world_type &world,
-                                                      input_type &inputCtx,
+                                                      const input_type &inputCtx,
                                                       data_type &soaCtx) noexcept {
         const auto &input = inputCtx.input;
         auto &uiCam = inputCtx.uiCamera;
@@ -4571,12 +4552,12 @@ try
             return;
 
         // clang-format off
-            struct UiTranslateKey { float dx, dy; };
-            struct UiDrag { float ndcDx, ndcDy; };
-            struct UiZoom { float factor; };
-            struct UiRotate { float angle; };
-            struct UiReset {};
-            using UiAction = std::variant<UiTranslateKey, UiDrag, UiZoom, UiRotate, UiReset>;
+        struct UiTranslateKey { float dx, dy; };
+        struct UiDrag { float ndcDx, ndcDy; };
+        struct UiZoom { float factor; };
+        struct UiRotate { float angle; glm::vec3 axis; };
+        struct UiReset {};
+        using UiAction = std::variant<UiTranslateKey, UiDrag, UiZoom, UiRotate, UiReset>;
         // clang-format on
 
         // 统一的执行器（每次直接 match）
@@ -4596,7 +4577,7 @@ try
                 },
                 [&](const UiRotate &r) noexcept {
                     uiCam.refView().rotateWorld(
-                        glm::angleAxis(r.angle, glm::vec3(0, 0, 1)));
+                        glm::angleAxis(r.angle, glm::normalize(r.axis)));
                 },
                 [&](const UiReset &) noexcept {
                     uiCam.refView().setPosition(glm::vec3(0.0f));
@@ -4623,12 +4604,22 @@ try
         if (input.isKeyPressedOrRepeat(Key::eQ))
             exec(UiZoom{zoomFactor}); // 缩小
 
-        // ---------- 旋转（Alt + R/F） ----------
-        constexpr float rotAngle = glm::radians(2.0f);
+        // ---------- 旋转 ----------
+        // 旋转（Alt + R/F 绕 Z，Alt + T/G 绕 Y，Alt + Y/H 绕 X）
+        constexpr float rotAngle = glm::radians(10.0f);
         if (input.isKeyPressedOrRepeat(Key::eR))
-            exec(UiRotate{rotAngle}); // 顺时针
+            exec(UiRotate{rotAngle, glm::vec3(0, 0, 1)});
         if (input.isKeyPressedOrRepeat(Key::eF))
-            exec(UiRotate{-rotAngle}); // 逆时针
+            exec(UiRotate{-rotAngle, glm::vec3(0, 0, 1)});
+
+        if (input.isKeyPressedOrRepeat(Key::eT))
+            exec(UiRotate{rotAngle, glm::vec3(0, 1, 0)});
+        if (input.isKeyPressedOrRepeat(Key::eG))
+            exec(UiRotate{-rotAngle, glm::vec3(0, 1, 0)});
+        if (input.isKeyPressedOrRepeat(Key::eY))
+            exec(UiRotate{rotAngle, glm::vec3(1, 0, 0)});
+        if (input.isKeyPressedOrRepeat(Key::eH))
+            exec(UiRotate{-rotAngle, glm::vec3(1, 0, 0)});
 
         // ---------- 拖拽平移（Alt + 左键） ----------
         {
@@ -5311,7 +5302,6 @@ try
                                  InputController(world, inputCtx, soaCtx);
                                  views_matrix_update(world, inputCtx, soaCtx);
                                  views_perspective_update(world, inputCtx, soaCtx);
-                                 // diff: [test_dod14] 新增：UI 相机更新（Alt + 按键）
                                  views_ui_camera_update(world, inputCtx, soaCtx);
                                  model_update(world, inputCtx, soaCtx);
                                  FrameRateMonitor(world, inputCtx,

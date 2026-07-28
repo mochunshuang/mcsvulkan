@@ -250,7 +250,7 @@ namespace mcs::vulkan::camera
         {
             assert(left < right);
             assert(bottom < top);
-            assert(zNear >= 0.0F); //NOTE: ==0 为了能生产 单位矩阵
+            // assert(zNear >= 0.0F); //NOTE: ==0 为了能生产 单位矩阵 // 允许负 near
             assert(zFar > zNear);
             (void)left;
             (void)right;
