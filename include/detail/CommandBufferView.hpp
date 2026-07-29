@@ -378,6 +378,11 @@ namespace mcs::vulkan
             pool_->device()->cmdDrawIndexedIndirect(value_, buffer, offset, drawCount,
                                                     stride);
         }
+        constexpr void setPrimitiveTopology(
+            VkPrimitiveTopology primitiveTopology) const noexcept
+        {
+            pool_->device()->cmdSetPrimitiveTopology(value_, primitiveTopology);
+        }
     };
 
 }; // namespace mcs::vulkan

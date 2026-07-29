@@ -746,5 +746,13 @@ namespace mcs::vulkan
             MCS_ASSERT(table_.vkGetDeviceBufferMemoryRequirements != nullptr);
             table_.vkGetDeviceBufferMemoryRequirements(value_, requirements, out);
         }
+
+        constexpr void cmdSetPrimitiveTopology(
+            VkCommandBuffer commandBuffer,
+            VkPrimitiveTopology primitiveTopology) const noexcept
+        {
+            MCS_ASSERT(table_.vkCmdSetPrimitiveTopology != nullptr);
+            table_.vkCmdSetPrimitiveTopology(commandBuffer, primitiveTopology);
+        }
     };
 }; // namespace mcs::vulkan
