@@ -2727,8 +2727,10 @@ struct FrameResources
     // 新增：命令常量缓冲区
     BufferResourceWithAddress commandConstantsBuffer{};
 
-    uint32_t drawCount3D = 0;
-    uint32_t drawCountUI = 0;
+    uint32_t drawCountOpaque3D = 0;
+    uint32_t drawCountTransparent3D = 0;
+    uint32_t drawCountOpaqueUI = 0;
+    uint32_t drawCountTransparentUI = 0;
 };
 
 constexpr uint32_t MAX_INSTANCE_COUNT = 1000;
@@ -3018,8 +3020,16 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
         VK_FORMAT_R32G32_UINT            // location 1 (picking)
     };
 
-    auto graphicsPipeline =
-        create_graphics_pipeline{}
+    /*
+    管线名	                深度测试	    深度写入	混合(att0)	        典型用途
+    pipelineOpaque3D	    ON (LESS)	    ON	        OFF	            不透明3D物体
+    pipelineTransparent3D	ON (LESS)	    OFF	        ON	            半透明3D物体
+    pipelineOpaqueUI	    OFF	            OFF	        OFF	            不透明UI（矩形、文字）
+    pipelineTransparentUI	OFF	            OFF	        ON	            半透明UI（毛玻璃、淡入淡出）
+    */
+    auto makePipeline = [&](const VkBool32 depthTest, const VkBool32 depthWrite,
+                            VkBool32 blendEnable) {
+        return create_graphics_pipeline{}
             .setCreateInfo(
                 {.pNext = make_pNext(structure_chain<VkPipelineRenderingCreateInfo>{
                      {//diff: [test_indirectdraw_no_pick] start
@@ -3057,8 +3067,9 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
                          .alphaToCoverageEnable = VK_FALSE,
                          .alphaToOneEnable = VK_FALSE,
                      },
-                 .depthStencilState = {.depthTestEnable = VK_TRUE,
-                                       .depthWriteEnable = VK_TRUE,
+                 // 深度/模板状态: 片段着色器之后的固定操作. 控制丢弃片元
+                 .depthStencilState = {.depthTestEnable = depthTest,
+                                       .depthWriteEnable = depthWrite,
                                        .depthCompareOp = VK_COMPARE_OP_LESS,
                                        .depthBoundsTestEnable = VK_FALSE,
                                        .stencilTestEnable = VK_FALSE,
@@ -3066,14 +3077,16 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
                                        .back = {},
                                        .minDepthBounds = 0.0F,
                                        .maxDepthBounds = 1.0F},
+                 // 颜色混合: 片段着色器之后的固定操作,控制画面颜色
                  .colorBlendState =
                      {.logicOpEnable = VK_FALSE,
                       .logicOp = VkLogicOp::VK_LOGIC_OP_COPY,
                       .attachments =
                           {
+                              //附件0
                               {
                                   //diff: [test_dod12] start: 附件 0 – 开启混合，支持 MSDF 与普通纹理混合
-                                  .blendEnable = VK_TRUE,
+                                  .blendEnable = blendEnable,
                                   .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
                                   .dstColorBlendFactor =
                                       VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
@@ -3097,22 +3110,30 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
                               },
                               //diff: [test_indirectdraw_no_pick] end
                           }},
-                 .dynamicState =
-                     {.dynamicStates =
-                          {
-                              VK_DYNAMIC_STATE_VIEWPORT,
-                              VK_DYNAMIC_STATE_SCISSOR,
-                              // diff: [test_dod10] start: UI的 z 是一样的哦。 所以前面的会被丢弃。我们不能让UI的z相同就丢弃
-                              VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
-                              VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
-                              // diff: [test_dod10] end
-                          }},
+                 .dynamicState = {.dynamicStates =
+                                      {
+                                          VK_DYNAMIC_STATE_VIEWPORT,
+                                          VK_DYNAMIC_STATE_SCISSOR,
+                                          //NOTE: 多管线替代下面的动态状态了
+                                          //   VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
+                                          //   VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+                                      }},
                  .layout = *pipelineLayout})
             .build(device);
-    return make_aggregate<"mainPipelineCtx", "pipelineLayout", "graphicsPipeline",
-                          "swapchainAttachments", "pickingAttachments">(
-        std::move(pipelineLayout), std::move(graphicsPipeline),
-        std::move(swapchainAttachments), std::move(pickingAttachments));
+    };
+    // 创建4个管线
+    auto pipelineOpaque3D = makePipeline(VK_TRUE, VK_TRUE, VK_FALSE);
+    auto pipelineTransparent3D = makePipeline(VK_TRUE, VK_FALSE, VK_TRUE);
+    auto pipelineOpaqueUI = makePipeline(VK_FALSE, VK_FALSE, VK_FALSE);
+    auto pipelineTransparentUI = makePipeline(VK_FALSE, VK_FALSE, VK_TRUE);
+    return make_aggregate<"mainPipelineCtx", "pipelineLayout", "pipelineOpaque3D",
+                          "pipelineTransparent3D", "pipelineOpaqueUI",
+                          "pipelineTransparentUI", "swapchainAttachments",
+                          "pickingAttachments">(
+        std::move(pipelineLayout), std::move(pipelineOpaque3D),
+        std::move(pipelineTransparent3D), std::move(pipelineOpaqueUI),
+        std::move(pipelineTransparentUI), std::move(swapchainAttachments),
+        std::move(pickingAttachments));
 }
 
 constexpr auto autoSpinStore_type_id = 0;
@@ -3818,7 +3839,8 @@ try
     auto frameResources = initFrameResources(device, meshManager);
 
     auto mainPipelineCtx = initPipeline(hardwareCtx, descriptorCtx);
-    auto &[pipelineLayout, graphicsPipeline, swapchainAttachments, pickingAttachments] =
+    auto &[pipelineLayout, pipelineOpaque3D, pipelineTransparent3D, pipelineOpaqueUI,
+           pipelineTransparentUI, swapchainAttachments, pickingAttachments] =
         mainPipelineCtx;
     auto &[depthResourcesBuild, depthResource, msaaResourcesBuild, msaaResource] =
         swapchainAttachments;
@@ -4297,9 +4319,12 @@ try
             commandBuffers, GRAPHICS_AND_PRESENT, meshMap);
 
     auto mainCtx =
-        make_aggregate_ref<"mainCtx", "pipeline", "pipelineLayout", "depthResourcesBuild",
-                           "depthResource", "msaaResourcesBuild", "msaaResource">(
-            graphicsPipeline, pipelineLayout, depthResourcesBuild, depthResource,
+        make_aggregate_ref<"mainCtx", "pipelineOpaque3D", "pipelineTransparent3D",
+                           "pipelineOpaqueUI", "pipelineTransparentUI", "pipelineLayout",
+                           "depthResourcesBuild", "depthResource", "msaaResourcesBuild",
+                           "msaaResource">(
+            pipelineOpaque3D, pipelineTransparent3D, pipelineOpaqueUI,
+            pipelineTransparentUI, pipelineLayout, depthResourcesBuild, depthResource,
             msaaResourcesBuild, msaaResource);
 
     auto mainShaderCtx = make_aggregate_ref<"mainShaderCtx", "indirectDrawBatches",
@@ -4697,8 +4722,8 @@ try
             // 用于写入 buffer 的偏移
             VkDeviceSize instanceOffset = 0;
             VkDeviceSize attributeOffset = 0;
-            batch.drawCount3D = 0;
-            batch.drawCountUI = 0;
+            batch.drawCountOpaque3D = 0;
+            batch.drawCountOpaqueUI = 0;
 
             // 处理一个 store（它绑定到一个 mesh，mesh 提供顶点数）
             auto processStore = [&](auto &store, const mesh_data &mesh, uint32_t frame) {
@@ -4740,8 +4765,8 @@ try
                 processStore(autoSpinStore, quadMesh, currentFrame);
                 processStore(interactiveStore, quadMesh, currentFrame);
             }
-            uint32_t drawCount3D = static_cast<uint32_t>(cmds.size());
-            batch.drawCount3D = drawCount3D;
+            uint32_t drawCountOpaque3D = static_cast<uint32_t>(cmds.size());
+            batch.drawCountOpaque3D = drawCountOpaque3D;
 
             // UI
             if (1)
@@ -4767,7 +4792,8 @@ try
                     processStore(uiStore, quadMesh, currentFrame);
                 }
             }
-            batch.drawCountUI = cmds.size() - drawCount3D;
+            // NOTE: todo 应该区分好. 这样确实没问题. 但是细节没做好.
+            batch.drawCountTransparentUI = cmds.size() - drawCountOpaque3D;
 
             // 上传命令和常量
             // 所有命令（3D+UI）一次性拷贝
@@ -4959,15 +4985,18 @@ try
             const auto &[currentFrame, imageIndex] = recordCtx.info;
             const auto &commandBuffer = commandBuffers[currentFrame];
 
-            auto &graphicsPipeline = mainCtx.pipeline;
             auto imageExtent = swapchain.imageExtent();
             auto &pipelineLayout = mainCtx.pipelineLayout;
+
+            auto &frameResources = mainShaderCtx.indirectDrawBatches;
+            auto &batch = frameResources[currentFrame];
 
             auto &descriptorSets = mainShaderCtx.descriptorSets;
             auto descriptorSet = descriptorSets[currentFrame];
 
-            commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                       *graphicsPipeline);
+            auto &uniformBuffers = mainShaderCtx.uniformBuffers;
+
+            // 公共动态状态
             commandBuffer.setViewport(
                 0, std::array<VkViewport, 1>{
                        VkViewport{.x = 0.0F,
@@ -4980,33 +5009,13 @@ try
             commandBuffer.setScissor(
                 0, std::array<VkRect2D, 1>{
                        VkRect2D{.offset = {.x = 0, .y = 0}, .extent = imageExtent}});
+
+            // 绑定公共资源：索引缓冲、描述符集、推送常量公共部分（如缓冲地址）
             commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                              *pipelineLayout, 0, 1, &(descriptorSet), 0,
                                              nullptr);
-        }>{},
-        std::constant_wrapper<[](world_type &world, input_type &inputCtx,
-                                 data_type &soaCtx) {
-            auto &mainShaderCtx = world.mainShaderCtx;
-            auto &recordCtx = world.recordCtx;
-            auto &globalCtx = world.globalCtx;
-            auto &mainCtx = world.mainCtx;
-
-            auto &commandBuffers = globalCtx.commandBuffers;
-            auto &pipelineLayout = mainCtx.pipelineLayout;
-
-            auto &uniformBuffers = mainShaderCtx.uniformBuffers;
-
-            const auto &[currentFrame, imageIndex] = recordCtx.info;
-            const auto &commandBuffer = commandBuffers[currentFrame];
-
-            auto &frameResources = mainShaderCtx.indirectDrawBatches;
-
-            // diff: [test_dod8] start 使用合并索引缓冲和间接绘制
-            auto &batch = frameResources[currentFrame];
             commandBuffer.bindIndexBuffer(batch.globalIndexBuffer.buffer.buffer(), 0,
                                           VK_INDEX_TYPE_UINT32);
-
-            // diff: [test_dod11] start
 
             auto uploadUniformBuffers = [&]() {
                 UniformBufferObject ubo;
@@ -5020,43 +5029,66 @@ try
                 memcpy(uniformBuffers[currentFrame].mapPtr(), &ubo, sizeof(ubo));
             };
             uploadUniformBuffers();
+        }>{},
+        std::constant_wrapper<[](world_type &world, input_type &inputCtx,
+                                 data_type &soaCtx) {
+            auto &mainShaderCtx = world.mainShaderCtx;
+            auto &recordCtx = world.recordCtx;
+            auto &globalCtx = world.globalCtx;
+            auto &mainCtx = world.mainCtx;
 
-            if (batch.drawCount3D > 0)
+            auto &commandBuffers = globalCtx.commandBuffers;
+            auto &pipelineLayout = mainCtx.pipelineLayout;
+
+            const auto &[currentFrame, imageIndex] = recordCtx.info;
+            const auto &commandBuffer = commandBuffers[currentFrame];
+
+            auto &frameResources = mainShaderCtx.indirectDrawBatches;
+            auto &batch = frameResources[currentFrame];
+
+            // diff: [test_dod18] start 使用合并索引缓冲和间接绘制
+            // 按顺序绘制四个段，每个段绑定对应管线，并发送间接命令
+            struct DrawSegment
             {
+                VkPipeline pipeline;
+                uint32_t drawCount;
+                VkDeviceSize indirectOffset;
+                uint32_t cameraIndex;
+            };
+
+            DrawSegment segments[] = {
+                {*mainCtx.pipelineOpaque3D, batch.drawCountOpaque3D, 0, 0},
+                {*mainCtx.pipelineTransparent3D, batch.drawCountTransparent3D,
+                 batch.drawCountOpaque3D * sizeof(VkDrawIndexedIndirectCommand), 0},
+                {*mainCtx.pipelineOpaqueUI, batch.drawCountOpaqueUI,
+                 (batch.drawCountOpaque3D + batch.drawCountTransparent3D) *
+                     sizeof(VkDrawIndexedIndirectCommand),
+                 1},
+                {*mainCtx.pipelineTransparentUI, batch.drawCountTransparentUI,
+                 (batch.drawCountOpaque3D + batch.drawCountTransparent3D +
+                  batch.drawCountOpaqueUI) *
+                     sizeof(VkDrawIndexedIndirectCommand),
+                 1}};
+
+            for (const auto &seg : segments)
+            {
+                if (seg.drawCount == 0)
+                    continue;
                 PushData push = {.vertexAddress = batch.globalVertexBuffer.address,
                                  .attributeAddress = batch.globalAttributeBuffer.address,
                                  .instanceAddress = batch.globalInstanceBuffer.address,
                                  .commandConstantsAddress =
                                      batch.commandConstantsBuffer.address,
-                                 .cameraIndex = 0};
+                                 .cameraIndex = seg.cameraIndex};
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, seg.pipeline);
                 commandBuffer.pushConstants(*pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
                                             0, sizeof(PushData), &push);
-                commandBuffer.setDepthWriteEnable(true);
-                commandBuffer.setDepthTestEnable(true);
                 commandBuffer.drawIndexedIndirect(
-                    batch.indirectDrawBuffer.buffer.buffer(), 0, batch.drawCount3D,
-                    sizeof(VkDrawIndexedIndirectCommand));
+                    batch.indirectDrawBuffer.buffer.buffer(), seg.indirectOffset,
+                    seg.drawCount, sizeof(VkDrawIndexedIndirectCommand));
             }
-            if (batch.drawCountUI)
-            {
-                PushData push = {.vertexAddress = batch.globalVertexBuffer.address,
-                                 .attributeAddress = batch.globalAttributeBuffer.address,
-                                 .instanceAddress = batch.globalInstanceBuffer.address,
-                                 .commandConstantsAddress =
-                                     batch.commandConstantsBuffer.address,
-                                 .cameraIndex = 1};
-                commandBuffer.pushConstants(*pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
-                                            0, sizeof(PushData), &push);
-                commandBuffer.setDepthWriteEnable(false);
-                commandBuffer.setDepthTestEnable(false);
-                VkDeviceSize offset =
-                    batch.drawCount3D * sizeof(VkDrawIndexedIndirectCommand);
-                commandBuffer.drawIndexedIndirect(
-                    batch.indirectDrawBuffer.buffer.buffer(), offset, batch.drawCountUI,
-                    sizeof(VkDrawIndexedIndirectCommand));
-            }
-            // diff: [test_dod11] end
-            // diff: [test_dod8] start
+
+            // diff: [test_dod18] end
         }>{},
         std::constant_wrapper<[](world_type &world, input_type &inputCtx,
                                  data_type &soaCtx) {
