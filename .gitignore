@@ -6,3 +6,4 @@ build
 # 必须 /开头，否则所有的 tool目录都不被添加到 git 的范围中
 /tool/
 /msdf/
+.glsld/

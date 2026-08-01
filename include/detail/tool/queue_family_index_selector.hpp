@@ -10,7 +10,7 @@
 
 namespace mcs::vulkan::tool
 {
-    struct [[deprecated("use queue_family_index_selector instead.")]]
+    struct [[deprecated("use create_queue_family_index_selector instead.")]]
     queue_family_index_selector
     {
         using check_VkQueueFamilyProperties = std::function<bool(
