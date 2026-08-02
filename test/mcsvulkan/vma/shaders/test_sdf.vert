@@ -114,6 +114,30 @@ layout(buffer_reference, scalar) readonly buffer ColoredTriBuffer
     ColoredTri insts[];
 };
 
+// ============================================================
+// type_id == 2：字形实例（纹理采样，MSDF/SDF/Bitmap，与 cpp / frag 对齐）。
+// 字形几何 = 公共 quad × model（平移+缩放）；UV 由 uvTransform 从图集映射；
+// 颜色/纹理/采样器/字体类型全部来自实例对象。
+// struct Glyph 共 120 字节（scalar 布局，C++/GLSL 精确一致）。
+// ============================================================
+#define GLYPH_SIZE 120
+struct Glyph
+{
+    uint entity_index;         // 拾取实体索引（outPicking.y）
+    uint textureIndex;         // 纹理数组下标（bindless）
+    uint samplerIndex;         // 采样器数组下标（bindless）
+    uint fontType;             // 字体类型（与 FontType 枚举一致）
+    float pxRange;             // MSDF 距离场范围
+    uint modulateFlag;         // 1 = 用顶点色调制
+    vec4 color;                // 顶点色（默认白）
+    mat4 model;                // 平移 + 缩放：[-0.5,0.5] quad -> NDC 字形矩形
+    UvTransform uvTransform;   // 图集 UV 变换
+};
+layout(buffer_reference, scalar) readonly buffer GlyphBuffer
+{
+    Glyph glyphs[];
+};
+
 
 layout(location = 0) out vec4 fragColor;     // 插值后的颜色
 layout(location = 1) out vec2 fragTexCoord;
@@ -179,6 +203,16 @@ void main()
         ColoredTri inst = ColoredTriBuffer(instancePtr).insts[0];
         model = inst.model;
         fragColor = inst.colors[localVertexIndex]; // 顶点颜色来自实例（最细粒度）
+        pos = v.pos;
+    }
+    break;
+    case 2: {
+        instancePtr = heapBaseStart + gl_InstanceIndex * GLYPH_SIZE;
+        Glyph inst = GlyphBuffer(instancePtr).glyphs[0]; // 直接读取实例
+        model = inst.model;                    // 平移 + 缩放（字形矩形）
+        fragColor = inst.color;                // 顶点色，供 modulate 使用
+        fragTexCoord = inst.uvTransform.offset + v.texCoord * inst.uvTransform.scale;
+        localPos = v.pos.xy;
         pos = v.pos;
     }
     break;

@@ -1141,6 +1141,40 @@ constexpr auto initFont(auto &hardwareCtx, auto &descriptorCtx)
         std::move(loaderPtr), std::move(font_factoryPtr), std::move(fontSelect));
 }
 
+//diff: [test_sdf_text] start: 移植自 test_dod18.cpp 的文字管线
+constexpr auto run_text_pipeline(auto &fontSelect, const char8_t *rawText,
+                                 std::string_view langBcp47, bool ltr = true)
+{
+    constexpr auto ltr_value = 0; // NOLINT
+    constexpr auto rtl_value = 1; // NOLINT
+    namespace font_ns = mcs::vulkan::font;
+
+    auto norm = font_ns::utf8proc::normalize(rawText);
+    const std::vector<uint32_t> &codepoints = norm.codepoints;
+    font_ns::utf8proc::print_normalized(norm, rawText);
+
+    auto analyze_result = font_ns::bidi::analyze(codepoints, ltr ? ltr_value : rtl_value);
+    font_ns::bidi::print_bidi_result(codepoints, analyze_result);
+
+    auto test_text_runs = font_ns::assign_fonts(analyze_result, fontSelect);
+    font_ns::print_text_runs(test_text_runs);
+
+    auto test_shape_result = font_ns::harfbuzz::shape(
+        analyze_result.mirrored_codepoints, test_text_runs, fontSelect.notdefFont());
+    font_ns::harfbuzz::print_shape_result(analyze_result.mirrored_codepoints,
+                                          test_shape_result);
+
+    auto break_result = font_ns::libunibreak::analyze_line_breaks(
+        analyze_result.mirrored_codepoints, langBcp47);
+    font_ns::libunibreak::print_break_result(break_result,
+                                             analyze_result.mirrored_codepoints);
+    return make_aggregate<"text_pipeline_result", "codepoints", "shape_result",
+                          "break_result">(std::move(analyze_result.mirrored_codepoints),
+                                          std::move(test_shape_result),
+                                          std::move(break_result));
+}
+//diff: [test_sdf_text] end
+
 struct BufferResource
 {
     mcs::vulkan::memory::auto_map_buffer buffer{};
@@ -2073,6 +2107,95 @@ try
             static_assert(sizeof(ColoredTri) == 116); // 与 shader COLORED_TRI_SIZE 一致
 
             // 三角形实例：红/绿/蓝三色（颜色 = 实例数据）
+            // ---------- 3.5 字形实例（type 2：纹理 + MSDF/SDF/Bitmap）----------
+            // 复用 dod18 的文字管线：harfbuzz shaping 产出字形，这里用 NDC 直接排版，
+            // 每个字形一个 Glyph 实例，随矩形/三角形一起上传到实例堆。
+            struct Glyph
+            {
+                uint32_t entity_index;   // 4B 拾取实体索引（outPicking.y）
+                uint32_t textureIndex;   // 4B 纹理数组下标（bindless）
+                uint32_t samplerIndex;   // 4B 采样器数组下标（bindless）
+                uint32_t fontType;       // 4B 字体类型（FontType 枚举）
+                float pxRange;           // 4B MSDF 距离场范围
+                uint32_t modulateFlag;   // 4B 1 = 用顶点色调制
+                glm::vec4 color;         // 16B 顶点色（默认白）
+                glm::mat4 model;         // 64B 平移+缩放：[-0.5,0.5] quad -> NDC 字形矩形
+                UvTransform uvTransform; // 16B 图集 UV 变换
+            };
+            static_assert(sizeof(Glyph) == 120); // 与 shader GLYPH_SIZE 一致
+
+            // 生成一段文字：中文 + 英文 + 数字，覆盖 MSDF 与位图字体路径
+            constexpr auto rawText = u8"Hello SDF 你好世界 0123";
+            auto [codepoints, shape_result, break_result] =
+                run_text_pipeline(fontSelect, rawText, "zh-CN");
+            (void)codepoints;
+            (void)break_result;
+
+            std::vector<Glyph> glyphs;
+            {
+                constexpr float FONT_SIZE = 0.09f;          // 1em 对应的 NDC 高度
+                constexpr glm::vec2 ORIGIN{-0.95f, -0.86f}; // 文字块左上角（NDC，y 向下）
+                const float baselineY = ORIGIN.y + FONT_SIZE;
+                float cursorX = ORIGIN.x;
+
+                auto addGlyph = [&](Glyph t) {
+                    t.entity_index = static_cast<uint32_t>(glyphs.size());
+                    glyphs.push_back(t);
+                };
+
+                for (const auto &run : shape_result)
+                {
+                    for (const auto &g : run)
+                    {
+                        using bound_type = decltype(g.plane_bounds);
+                        if (g.plane_bounds == bound_type{}) // 空格等无字形字符
+                        {
+                            cursorX += static_cast<float>(g.advance_x) * FONT_SIZE;
+                            continue;
+                        }
+                        // 字形矩形（NDC，y 向下）：顶边在上（数值更小）
+                        float left =
+                            cursorX + static_cast<float>(g.plane_bounds.left) * FONT_SIZE;
+                        float bottom =
+                            baselineY +
+                            static_cast<float>(g.plane_bounds.bottom) * FONT_SIZE;
+                        float right = cursorX + static_cast<float>(g.plane_bounds.right) *
+                                                    FONT_SIZE;
+                        float top = baselineY +
+                                    static_cast<float>(g.plane_bounds.top) * FONT_SIZE;
+
+                        glm::vec2 p0{left, top};
+                        glm::vec2 p2{right, bottom};
+                        glm::vec2 center = (p0 + p2) * 0.5f;
+                        glm::vec2 full = p2 - p0;
+
+                        // NOTE: 图集 UV 为 y 向下（bottom > top），
+                        // 必须 offset=top、scale=bottom-top，否则字形上下颠倒。
+                        UvTransform uv;
+                        uv.scale = {
+                            static_cast<float>(g.uv_bounds.right - g.uv_bounds.left),
+                            static_cast<float>(g.uv_bounds.bottom - g.uv_bounds.top)};
+                        uv.offset = {static_cast<float>(g.uv_bounds.left),
+                                     static_cast<float>(g.uv_bounds.top)};
+
+                        Glyph tg{};
+                        tg.textureIndex = g.font_ctx->bind.texture_index;
+                        tg.samplerIndex = g.font_ctx->bind.sampler_index;
+                        tg.fontType = static_cast<uint32_t>(g.font_ctx->type);
+                        tg.pxRange = static_cast<float>(
+                            g.font_ctx->font.atlas.distanceRange.value_or(0.0));
+                        tg.modulateFlag = 1;
+                        tg.color = glm::vec4(0.0f); // 默认黑色，背景是白色
+                        tg.model =
+                            glm::translate(glm::mat4(1.0f), glm::vec3(center, 0.0f)) *
+                            glm::scale(glm::mat4(1.0f), glm::vec3(full, 1.0f));
+                        tg.uvTransform = uv;
+                        addGlyph(tg);
+                        cursorX += static_cast<float>(g.advance_x) * FONT_SIZE;
+                    }
+                }
+            }
+
             std::vector<ColoredTri> coloredTris;
             // entity_index 自动 = 当前实例数（vector size）
             auto addTri = [&](ColoredTri t) {
@@ -2093,6 +2216,10 @@ try
             VkDeviceSize offsetTri = sizeRect;
             VkDeviceSize sizeTri = coloredTris.size() * sizeof(ColoredTri);
             batch.globalInstanceBuffer.write(offsetTri, coloredTris.data(), sizeTri);
+            VkDeviceSize offsetText = sizeRect + sizeTri;
+            VkDeviceSize sizeText = glyphs.size() * sizeof(Glyph);
+            if (sizeText > 0)
+                batch.globalInstanceBuffer.write(offsetText, glyphs.data(), sizeText);
 
             // ---------- 2. 构建间接绘制命令数组（每个 mesh 一条命令）----------
             std::vector<VkDrawIndexedIndirectCommand> drawCommands;
@@ -2111,6 +2238,16 @@ try
                  .firstIndex = meshTri.indexOffset,
                  .vertexOffset = static_cast<int32_t>(meshTri.vertexOffset),
                  .firstInstance = 0});
+            // 命令 2：字形（quad 网格，type 2：纹理 + MSDF/SDF/Bitmap）
+            if (!glyphs.empty())
+            {
+                drawCommands.push_back(
+                    {.indexCount = mesh.indexCount,
+                     .instanceCount = static_cast<uint32_t>(glyphs.size()),
+                     .firstIndex = mesh.indexOffset,
+                     .vertexOffset = static_cast<int32_t>(mesh.vertexOffset),
+                     .firstInstance = 0});
+            }
             // 写入间接绘制缓冲区
             VkDeviceSize cmdOffset = 0;
             VkDeviceSize cmdSize =
@@ -2125,6 +2262,9 @@ try
             // 类型 1：ColoredTri（三角形，3 顶点颜色）
             cmdConsts.push_back(
                 {.type_id = 1, .adddress_offset = static_cast<uint32_t>(offsetTri)});
+            // 类型 2：Glyph（字形）
+            cmdConsts.push_back(
+                {.type_id = 2, .adddress_offset = static_cast<uint32_t>(offsetText)});
             batch.commandConstantsBuffer.write(
                 0, cmdConsts.data(), cmdConsts.size() * sizeof(CommandConstant));
 
