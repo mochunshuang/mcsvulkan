@@ -1421,7 +1421,8 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
     std::array<mcs::vulkan::memory::auto_map_buffer, MAX_FRAMES_IN_FLIGHT> pickingFrames;
     for (auto &pf : pickingFrames)
     {
-        constexpr auto BUFFER_SIZE = 4 * sizeof(uint32_t); // R32G32B32A32_UINT 一个像素 = 16B
+        constexpr auto BUFFER_SIZE =
+            4 * sizeof(uint32_t); // R32G32B32A32_UINT 一个像素 = 16B
         pf = mcs::vulkan::memory::auto_map_buffer(
             mcs::vulkan::memory::create_simple_buffer(
                 device,
@@ -1549,10 +1550,9 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
                              {
                                  // location 1 (R32G32B32A32_UINT，不能混合)
                                  .blendEnable = VK_FALSE,
-                                 .colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
-                                                   VK_COLOR_COMPONENT_G_BIT |
-                                                   VK_COLOR_COMPONENT_B_BIT |
-                                                   VK_COLOR_COMPONENT_A_BIT,
+                                 .colorWriteMask =
+                                     VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                     VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
                              },
                              //diff: [test_indirectdraw_no_pick] end
                          }},
@@ -1894,8 +1894,8 @@ try
             };
             struct Rectangle
             {
-                uint32_t entity_index;    // 4B 拾取实体索引（outPicking.y）
-                uint32_t effects;         // 4B 特效标志（见 FX_*，0=按值自动推断）
+                uint32_t entity_index; // 4B 拾取实体索引（outPicking.y）
+                uint32_t effects;      // 4B 特效标志（见 FX_*，0=按值自动推断）
                 // 颜色 = 实例数据：四顶点颜色（quad 网格固定 N=4；
                 // 单色矩形 = 四顶点同色，彩色矩形 = 四顶点各色，圆角/阴影同样生效）
                 std::array<glm::vec4, 4> colors; // 64B 每顶点颜色（最细粒度，含 alpha）
@@ -1966,61 +1966,55 @@ try
             // [1] 整屏背景：白色 + 标准黑色阴影（HTML 页面效果）。
             //     说明：不透明填充会盖住自身阴影，这里的阴影主要作为参数演示，
             //     标准黑色阴影的视觉效果请看 [2][5][6]。
-            addRect(
-                makeRect({0.0f, 0.0f}, {2.0f, 2.0f},
-                         {.fillColor = WHITE,
-                          .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.5f),
-                          .shadowOffset = {0.0f, 0.015f},
-                          .radius = 0.0f,
-                          .shadowBlur = 0.015f}));
+            addRect(makeRect({0.0f, 0.0f}, {2.0f, 2.0f},
+                             {.fillColor = WHITE,
+                              .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.5f),
+                              .shadowOffset = {0.0f, 0.015f},
+                              .radius = 0.0f,
+                              .shadowBlur = 0.015f}));
 
             // [2] 经典 HTML 卡片：白色圆角 + 黑色投影（目标效果：白底黑影）
-            addRect(
-                makeRect({0.0f, 0.1f}, {0.5f, 0.3f},
-                         {.fillColor = WHITE,
-                          .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.45f),
-                          .shadowOffset = {0.0f, 0.05f},
-                          .radius = 0.08f,
-                          .shadowBlur = 0.08f}));
+            addRect(makeRect({0.0f, 0.1f}, {0.5f, 0.3f},
+                             {.fillColor = WHITE,
+                              .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.45f),
+                              .shadowOffset = {0.0f, 0.05f},
+                              .radius = 0.08f,
+                              .shadowBlur = 0.08f}));
 
             // [3] 蓝色半透明圆角卡片：阴影透过卡片可见（HTML 透明效果）
-            addRect(
-                makeRect({-0.33f, -0.28f}, {0.4f, 0.24f},
-                         {.fillColor = glm::vec4(0.15f, 0.35f, 0.9f, 0.6f),
-                          .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.4f),
-                          .shadowOffset = {0.0f, 0.05f},
-                          .radius = 0.1f,
-                          .shadowBlur = 0.08f}));
+            addRect(makeRect({-0.33f, -0.28f}, {0.4f, 0.24f},
+                             {.fillColor = glm::vec4(0.15f, 0.35f, 0.9f, 0.6f),
+                              .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.4f),
+                              .shadowOffset = {0.0f, 0.05f},
+                              .radius = 0.1f,
+                              .shadowBlur = 0.08f}));
 
             // [4] 深色卡片 + 白色阴影（白色描边/发光效果）；
             //     同时演示 effects 标志位显式指定特效
-            addRect(
-                makeRect({0.33f, -0.22f}, {0.32f, 0.22f},
-                         {.fillColor = glm::vec4(0.12f, 0.14f, 0.2f, 1.0f),
-                          .shadowColor = glm::vec4(1.0f, 1.0f, 1.0f, 0.85f),
-                          .shadowOffset = {0.0f, 0.03f},
-                          .radius = 0.12f,
-                          .shadowBlur = 0.09f,
-                          .effects = FX_ROUNDED | FX_SHADOW | FX_FILL}));
+            addRect(makeRect({0.33f, -0.22f}, {0.32f, 0.22f},
+                             {.fillColor = glm::vec4(0.12f, 0.14f, 0.2f, 1.0f),
+                              .shadowColor = glm::vec4(1.0f, 1.0f, 1.0f, 0.85f),
+                              .shadowOffset = {0.0f, 0.03f},
+                              .radius = 0.12f,
+                              .shadowBlur = 0.09f,
+                              .effects = FX_ROUNDED | FX_SHADOW | FX_FILL}));
 
             // [5] 纯阴影（无填充）：一个柔和的黑色阴影块（a=0 → 无卡片）
-            addRect(
-                makeRect({-0.35f, 0.35f}, {0.28f, 0.16f},
-                         {.fillColor = glm::vec4(0.0f),
-                          .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.5f),
-                          .shadowOffset = {0.0f, 0.0f},
-                          .radius = 0.25f,
-                          .shadowBlur = 0.12f,
-                          .shadowSpread = 1.15f}));
+            addRect(makeRect({-0.35f, 0.35f}, {0.28f, 0.16f},
+                             {.fillColor = glm::vec4(0.0f),
+                              .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.5f),
+                              .shadowOffset = {0.0f, 0.0f},
+                              .radius = 0.25f,
+                              .shadowBlur = 0.12f,
+                              .shadowSpread = 1.15f}));
 
             // [6] 直角 + 阴影（只要阴影不要圆角：radius=0）
-            addRect(
-                makeRect({0.32f, 0.36f}, {0.28f, 0.15f},
-                         {.fillColor = glm::vec4(0.9f, 0.5f, 0.1f, 1.0f),
-                          .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.45f),
-                          .shadowOffset = {0.03f, 0.05f},
-                          .radius = 0.0f,
-                          .shadowBlur = 0.06f}));
+            addRect(makeRect({0.32f, 0.36f}, {0.28f, 0.15f},
+                             {.fillColor = glm::vec4(0.9f, 0.5f, 0.1f, 1.0f),
+                              .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.45f),
+                              .shadowOffset = {0.03f, 0.05f},
+                              .radius = 0.0f,
+                              .shadowBlur = 0.06f}));
 
             // [7] 最基础矩形：无圆角、无阴影
             addRect(makeRect(
@@ -2028,13 +2022,12 @@ try
                 {.fillColor = glm::vec4(0.2f, 0.75f, 0.4f, 1.0f), .radius = 0.0f}));
 
             // [8] 旋转卡片 + 阴影（阴影随卡片旋转，几何自动外扩）
-            addRect(
-                makeRect({0.0f, -0.62f}, {0.42f, 0.2f},
-                         {.fillColor = WHITE,
-                          .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.4f),
-                          .shadowOffset = {0.0f, 0.05f},
-                          .radius = 0.08f,
-                          .rotation = 12.0f}));
+            addRect(makeRect({0.0f, -0.62f}, {0.42f, 0.2f},
+                             {.fillColor = WHITE,
+                              .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.4f),
+                              .shadowOffset = {0.0f, 0.05f},
+                              .radius = 0.08f,
+                              .rotation = 12.0f}));
 
             // [9][10][11] 三层重叠半透明卡片（透明度测试，右上角）。
             //     绘制顺序 = 层次顺序：红(最底) → 绿 → 蓝(最顶)，
@@ -2044,13 +2037,12 @@ try
             addRect(makeRect(
                 {0.62f, 0.15f}, {0.34f, 0.24f},
                 {.fillColor = glm::vec4(0.9f, 0.15f, 0.15f, 0.45f), .radius = 0.08f}));
-            addRect(
-                makeRect({0.72f, 0.24f}, {0.28f, 0.20f},
-                         {.fillColor = glm::vec4(0.15f, 0.85f, 0.25f, 0.5f),
-                          .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.35f),
-                          .shadowOffset = {0.0f, 0.05f},
-                          .radius = 0.08f,
-                          .shadowBlur = 0.08f}));
+            addRect(makeRect({0.72f, 0.24f}, {0.28f, 0.20f},
+                             {.fillColor = glm::vec4(0.15f, 0.85f, 0.25f, 0.5f),
+                              .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.35f),
+                              .shadowOffset = {0.0f, 0.05f},
+                              .radius = 0.08f,
+                              .shadowBlur = 0.08f}));
             addRect(makeRect(
                 {0.82f, 0.33f}, {0.22f, 0.16f},
                 {.fillColor = glm::vec4(0.2f, 0.4f, 0.95f, 0.6f), .radius = 0.08f}));
