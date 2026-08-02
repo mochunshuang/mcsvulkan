@@ -441,9 +441,11 @@ struct Vertex // NOLINT
     glm::vec3 pos;
     glm::vec2 texCoord; // diff: [texture] 添加纹理坐标
 };
+// NOTE: 颜色不是网格数据，是实例数据（std::array<color,N> 由实例上传）。
+//       公共顶点池只存固定几何（pos/texCoord），所有 mesh 共用一个池。
 struct mesh_manager
 {
-    std::vector<Vertex> allVertices;
+    std::vector<Vertex> allVertices; // 公共顶点池（20B/顶点）
     std::vector<uint32_t> allIndices;
     std::unordered_map<std::string, mesh_data> meshMap;
 
@@ -466,15 +468,23 @@ constexpr auto initMeshManager()
 {
     // NOTE: 考虑放到一个命名空间或等区域统一处理
     constexpr std::array<Vertex, 4> quadVerts = {
-        Vertex{{-1.0f, -1.0f, 0.0f}, {0.0f, 0.0f}}, // 左上
-        Vertex{{1.0f, -1.0f, 0.0f}, {1.0f, 0.0f}},  // 右上
-        Vertex{{1.0f, 1.0f, 0.0f}, {1.0f, 1.0f}},   // 右下
-        Vertex{{-1.0f, 1.0f, 0.0f}, {0.0f, 1.0f}}   // 左下
+        Vertex{{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f}}, // 左上
+        Vertex{{0.5f, -0.5f, 0.0f}, {1.0f, 0.0f}},  // 右上
+        Vertex{{0.5f, 0.5f, 0.0f}, {1.0f, 1.0f}},   // 右下
+        Vertex{{-0.5f, 0.5f, 0.0f}, {0.0f, 1.0f}}   // 左下
     };
     constexpr auto quadIdx = std::array<uint32_t, 6>{0, 1, 2, 0, 2, 3};
 
+    // 三角形网格：固定 3 个顶点（颜色由实例上传，不占网格数据）
+    constexpr std::array<Vertex, 3> triVerts = {
+        Vertex{{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f}},
+        Vertex{{0.5f, -0.5f, 0.0f}, {0.0f, 0.0f}},
+        Vertex{{0.0f, 0.5f, 0.0f}, {0.0f, 0.0f}}};
+    constexpr auto triIdx = std::array<uint32_t, 3>{0, 1, 2};
+
     mesh_manager m;
     m.addMesh("quad", std::span{quadVerts}, std::span{quadIdx});
+    m.addMesh("triangle", std::span{triVerts}, std::span{triIdx});
     return m;
 }
 
@@ -1353,7 +1363,9 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
     // ========== 拾取资源 =========
     auto pickResourcesBuild = mcs::vulkan::memory::build_simple_resource(
         {.imageType = VK_IMAGE_TYPE_2D,
-         .format = VK_FORMAT_R32G32_UINT,
+         // R32G32B32_UINT 三分量不被 GPU 支持为颜色附件（VUID-02251），
+         // 用 R32G32B32A32_UINT；片元输出 uvec4 与之严格对齐
+         .format = VK_FORMAT_R32G32B32A32_UINT,
          .extent = {.width = WIDTH, .height = HEIGHT, .depth = 1},
          .mipLevels = 1,
          .arrayLayers = 1,
@@ -1409,7 +1421,7 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
     std::array<mcs::vulkan::memory::auto_map_buffer, MAX_FRAMES_IN_FLIGHT> pickingFrames;
     for (auto &pf : pickingFrames)
     {
-        constexpr auto BUFFER_SIZE = 8;
+        constexpr auto BUFFER_SIZE = 4 * sizeof(uint32_t); // R32G32B32A32_UINT 一个像素 = 16B
         pf = mcs::vulkan::memory::auto_map_buffer(
             mcs::vulkan::memory::create_simple_buffer(
                 device,
@@ -1448,7 +1460,7 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
     // 定义两个颜色附件格式
     std::array<VkFormat, 2> mainColorFormats = {
         swapchainBuild.refImageFormat(), // location 0 (swapchain)
-        VK_FORMAT_R32G32_UINT            // location 1 (picking)
+        VK_FORMAT_R32G32B32A32_UINT      // location 1 (picking)
     };
 
     auto makeUIPipeline = [&](VkPipelineCreateFlagBits flags,
@@ -1535,10 +1547,12 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
                              },
                              //diff: [test_indirectdraw_no_pick] start
                              {
-                                 // location 1 (R32G32_UINT，不能混合)
+                                 // location 1 (R32G32B32A32_UINT，不能混合)
                                  .blendEnable = VK_FALSE,
-                                 .colorWriteMask =
-                                     VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT,
+                                 .colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
+                                                   VK_COLOR_COMPONENT_G_BIT |
+                                                   VK_COLOR_COMPONENT_B_BIT |
+                                                   VK_COLOR_COMPONENT_A_BIT,
                              },
                              //diff: [test_indirectdraw_no_pick] end
                          }},
@@ -1864,7 +1878,11 @@ try
             uploadUniformBuffers();
         },
         [&] {
-            // TODO(mcs): 真的命令绘制
+            // ============================================================
+            // 前端 API：上传的 Rectangle 实例数据。
+            // shader(test_sdf.vert/frag) 是后端，按这里的参数绘制；
+            // 字段布局必须与 test_sdf.vert/frag 中的 struct Rectangle 完全一致。
+            // ============================================================
             struct VertexTransform
             {
                 glm::mat4 matrix;
@@ -1876,12 +1894,25 @@ try
             };
             struct Rectangle
             {
-                glm::vec4 color;
-                glm::mat4 model;
-                VertexTransform vertexTransform;
-                UvTransform uvTransform;
+                uint32_t entity_index;    // 4B 拾取实体索引（outPicking.y）
+                uint32_t effects;         // 4B 特效标志（见 FX_*，0=按值自动推断）
+                // 颜色 = 实例数据：四顶点颜色（quad 网格固定 N=4；
+                // 单色矩形 = 四顶点同色，彩色矩形 = 四顶点各色，圆角/阴影同样生效）
+                std::array<glm::vec4, 4> colors; // 64B 每顶点颜色（最细粒度，含 alpha）
+                glm::mat4 model;                 // 64B 平移 + 旋转
+                VertexTransform vertexTransform; // 64B 顶点缩放（尺寸映射到公共顶点）
+                UvTransform uvTransform;         // 16B UV 变换
+                glm::vec2 size;                  // 8B 卡片完整宽/高（NDC，SDF 用）
+                glm::vec2 shadowOffset;   // 8B 阴影偏移（相对卡片宽/高；x右 y下为正）
+                glm::vec4 radiusSoftness; // 16B x=圆角 y=柔化 z=模糊 w=扩散
+                glm::vec4 shadowColor;    // 16B 阴影色 RGBA（a=0 → 无阴影）
             };
-            static_assert(sizeof(Rectangle) == 160);
+            static_assert(sizeof(Rectangle) == 264); // 与 shader RECTANGLE_SIZE 一致
+
+            // 特效标志（与 test_sdf.vert/frag 中的 FX_* 常量一致；追加式）
+            constexpr uint32_t FX_ROUNDED = 1u; // 圆角
+            constexpr uint32_t FX_SHADOW = 2u;  // 阴影
+            constexpr uint32_t FX_FILL = 4u;    // 填充
 
             // 写入类型+命令
             const auto &[currentFrame, imageIndex] = recordCtx.info;
@@ -1889,49 +1920,219 @@ try
             auto &batch = mainShaderCtx.indirectDrawBatches[currentFrame];
             const auto &mesh = meshMap.at("quad"); // 使用 quad 网格
 
-            // ---------- 1. 准备实例数据 (RoundRect) ----------
-            std::vector<Rectangle> rectangles = {
-                // 蓝色矩形：0.4×0.3，右下，旋转15°
-                {.color = glm::vec4(0.0f, 0.0f, 1.0f, 1.0f),
-                 .model = glm::rotate(
-                     glm::translate(glm::mat4(1.0f), glm::vec3(0.2f, 0.1f, 0.0f)),
-                     glm::radians(15.0f), glm::vec3(0.0f, 0.0f, 1.0f)),
-                 .vertexTransform = VertexTransform{glm::scale(
-                     glm::mat4(1.0f), glm::vec3(0.4f, 0.3f, 1.0f))},
-                 .uvTransform = UvTransform{glm::vec2(1.0f), glm::vec2(0.0f)}},
+            // ---------- 1. 矩形构建器（前端 API，带标准默认参数）----------
+            struct RectStyle
+            {
+                glm::vec4 fillColor{1.0f, 1.0f, 1.0f, 1.0f};   // 默认白色不透明
+                glm::vec4 shadowColor{0.0f, 0.0f, 0.0f, 0.0f}; // 默认无阴影
+                glm::vec2 shadowOffset{0.0f, 0.04f};           // 默认向下偏移 4% 卡片高
+                float radius = 0.08f;        // 默认圆角（相对卡片短边比例）
+                float edgeSoftness = 0.006f; // 默认边缘柔化（相对卡片宽比例）
+                float shadowBlur = 0.08f;    // 默认阴影模糊（相对卡片宽比例）
+                float shadowSpread = 1.0f;   // 默认阴影与卡片同大
+                float rotation = 0.0f;       // 默认不旋转（度）
+                uint32_t effects = 0u;       // 0=按 alpha/半径自动推断
+            };
+            auto makeRect = [&](glm::vec2 center, glm::vec2 size, RectStyle s) {
+                Rectangle r{};
+                r.colors = {s.fillColor, s.fillColor, s.fillColor, s.fillColor};
+                r.model =
+                    glm::rotate(glm::translate(glm::mat4(1.0f), glm::vec3(center, 0.0f)),
+                                glm::radians(s.rotation), glm::vec3(0.0f, 0.0f, 1.0f));
+                // 顶点缩放 = 卡片尺寸（quad 公共顶点是 [-0.5,0.5] 单位矩形）
+                r.vertexTransform.matrix =
+                    glm::scale(glm::mat4(1.0f), glm::vec3(size, 1.0f));
+                r.uvTransform = UvTransform{glm::vec2(1.0f), glm::vec2(0.0f)};
+                r.size = size;
+                r.shadowOffset = s.shadowOffset;
+                r.radiusSoftness =
+                    glm::vec4(s.radius, s.edgeSoftness, s.shadowBlur, s.shadowSpread);
+                r.shadowColor = s.shadowColor;
+                r.effects = s.effects;
+                return r;
+            };
 
-                // 绿色矩形（半透明）：0.3×0.25，左下，与蓝色重叠
-                {.color = glm::vec4(0.0f, 1.0f, 0.0f, 0.8f),
-                 .model = glm::translate(glm::mat4(1.0f), glm::vec3(-0.1f, -0.1f, 0.0f)),
-                 .vertexTransform = VertexTransform{glm::scale(
-                     glm::mat4(1.0f), glm::vec3(0.3f, 0.25f, 1.0f))},
-                 .uvTransform = UvTransform{glm::vec2(1.0f), glm::vec2(0.0f)}}};
+            // ---------- 2. 准备实例数据（多实例、异构特效，全部参数化）----------
+            std::vector<Rectangle> rectangles;
+            const glm::vec4 WHITE{1.0f, 1.0f, 1.0f, 1.0f};
+
+            // 追加矩形实例：entity_index 自动 = 当前实例数（vector size），
+            // 与实例数据同步生成，无需手工维护
+            auto addRect = [&](Rectangle r) {
+                r.entity_index = static_cast<uint32_t>(rectangles.size());
+                rectangles.push_back(r);
+            };
+
+            // [1] 整屏背景：白色 + 标准黑色阴影（HTML 页面效果）。
+            //     说明：不透明填充会盖住自身阴影，这里的阴影主要作为参数演示，
+            //     标准黑色阴影的视觉效果请看 [2][5][6]。
+            addRect(
+                makeRect({0.0f, 0.0f}, {2.0f, 2.0f},
+                         {.fillColor = WHITE,
+                          .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.5f),
+                          .shadowOffset = {0.0f, 0.015f},
+                          .radius = 0.0f,
+                          .shadowBlur = 0.015f}));
+
+            // [2] 经典 HTML 卡片：白色圆角 + 黑色投影（目标效果：白底黑影）
+            addRect(
+                makeRect({0.0f, 0.1f}, {0.5f, 0.3f},
+                         {.fillColor = WHITE,
+                          .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.45f),
+                          .shadowOffset = {0.0f, 0.05f},
+                          .radius = 0.08f,
+                          .shadowBlur = 0.08f}));
+
+            // [3] 蓝色半透明圆角卡片：阴影透过卡片可见（HTML 透明效果）
+            addRect(
+                makeRect({-0.33f, -0.28f}, {0.4f, 0.24f},
+                         {.fillColor = glm::vec4(0.15f, 0.35f, 0.9f, 0.6f),
+                          .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.4f),
+                          .shadowOffset = {0.0f, 0.05f},
+                          .radius = 0.1f,
+                          .shadowBlur = 0.08f}));
+
+            // [4] 深色卡片 + 白色阴影（白色描边/发光效果）；
+            //     同时演示 effects 标志位显式指定特效
+            addRect(
+                makeRect({0.33f, -0.22f}, {0.32f, 0.22f},
+                         {.fillColor = glm::vec4(0.12f, 0.14f, 0.2f, 1.0f),
+                          .shadowColor = glm::vec4(1.0f, 1.0f, 1.0f, 0.85f),
+                          .shadowOffset = {0.0f, 0.03f},
+                          .radius = 0.12f,
+                          .shadowBlur = 0.09f,
+                          .effects = FX_ROUNDED | FX_SHADOW | FX_FILL}));
+
+            // [5] 纯阴影（无填充）：一个柔和的黑色阴影块（a=0 → 无卡片）
+            addRect(
+                makeRect({-0.35f, 0.35f}, {0.28f, 0.16f},
+                         {.fillColor = glm::vec4(0.0f),
+                          .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.5f),
+                          .shadowOffset = {0.0f, 0.0f},
+                          .radius = 0.25f,
+                          .shadowBlur = 0.12f,
+                          .shadowSpread = 1.15f}));
+
+            // [6] 直角 + 阴影（只要阴影不要圆角：radius=0）
+            addRect(
+                makeRect({0.32f, 0.36f}, {0.28f, 0.15f},
+                         {.fillColor = glm::vec4(0.9f, 0.5f, 0.1f, 1.0f),
+                          .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.45f),
+                          .shadowOffset = {0.03f, 0.05f},
+                          .radius = 0.0f,
+                          .shadowBlur = 0.06f}));
+
+            // [7] 最基础矩形：无圆角、无阴影
+            addRect(makeRect(
+                {0.0f, 0.62f}, {0.46f, 0.1f},
+                {.fillColor = glm::vec4(0.2f, 0.75f, 0.4f, 1.0f), .radius = 0.0f}));
+
+            // [8] 旋转卡片 + 阴影（阴影随卡片旋转，几何自动外扩）
+            addRect(
+                makeRect({0.0f, -0.62f}, {0.42f, 0.2f},
+                         {.fillColor = WHITE,
+                          .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.4f),
+                          .shadowOffset = {0.0f, 0.05f},
+                          .radius = 0.08f,
+                          .rotation = 12.0f}));
+
+            // [9][10][11] 三层重叠半透明卡片（透明度测试，右上角）。
+            //     绘制顺序 = 层次顺序：红(最底) → 绿 → 蓝(最顶)，
+            //     每层都是半透明填充，重叠区域能看到 premultiplied alpha
+            //     的透色混合；中间绿层带黑色阴影，同时验证“阴影透过
+            //     半透明卡片可见”（HTML 风格）。
+            addRect(makeRect(
+                {0.62f, 0.15f}, {0.34f, 0.24f},
+                {.fillColor = glm::vec4(0.9f, 0.15f, 0.15f, 0.45f), .radius = 0.08f}));
+            addRect(
+                makeRect({0.72f, 0.24f}, {0.28f, 0.20f},
+                         {.fillColor = glm::vec4(0.15f, 0.85f, 0.25f, 0.5f),
+                          .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.35f),
+                          .shadowOffset = {0.0f, 0.05f},
+                          .radius = 0.08f,
+                          .shadowBlur = 0.08f}));
+            addRect(makeRect(
+                {0.82f, 0.33f}, {0.22f, 0.16f},
+                {.fillColor = glm::vec4(0.2f, 0.4f, 0.95f, 0.6f), .radius = 0.08f}));
+
+            // [12] 彩色渐变矩形：四顶点四色（红/绿/蓝/黄）+ 圆角 + 黑色阴影。
+            //      颜色 = Rectangle.colors[4]（与 ColoredQuad 合并后，特效同样生效）
+            auto gradientRect =
+                makeRect({-0.78f, -0.52f}, {0.36f, 0.36f},
+                         {.fillColor = WHITE,
+                          .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.45f),
+                          .shadowOffset = {0.0f, 0.05f},
+                          .radius = 0.1f,
+                          .shadowBlur = 0.08f});
+            gradientRect.colors = {
+                glm::vec4(1.0f, 0.0f, 0.0f, 1.0f), glm::vec4(0.0f, 1.0f, 0.0f, 1.0f),
+                glm::vec4(0.0f, 0.0f, 1.0f, 1.0f), glm::vec4(1.0f, 1.0f, 0.0f, 1.0f)};
+            addRect(gradientRect);
+
+            // ---------- 3. 顶点颜色实例（type 1：颜色 = 实例数据，完全参数化）----------
+            // 三角形 mesh（N=3）对应 ColoredTri；quad 的彩色版本已合并进
+            // Rectangle（colors[4]），圆角/阴影同样生效。
+            struct ColoredTri
+            {
+                uint32_t entity_index;           // 拾取实体索引（4B）
+                glm::mat4 model;                 // 平移+旋转+缩放（64B）
+                std::array<glm::vec4, 3> colors; // 三个顶点颜色（48B）
+            };
+            static_assert(sizeof(ColoredTri) == 116); // 与 shader COLORED_TRI_SIZE 一致
+
+            // 三角形实例：红/绿/蓝三色（颜色 = 实例数据）
+            std::vector<ColoredTri> coloredTris;
+            // entity_index 自动 = 当前实例数（vector size）
+            auto addTri = [&](ColoredTri t) {
+                t.entity_index = static_cast<uint32_t>(coloredTris.size());
+                coloredTris.push_back(t);
+            };
+            addTri(ColoredTri{
+                .model = glm::scale(
+                    glm::translate(glm::mat4(1.0f), glm::vec3(-0.55f, 0.05f, 0.0f)),
+                    glm::vec3(0.35f)),
+                .colors = {glm::vec4(1.0f, 0.0f, 0.0f, 1.0f),
+                           glm::vec4(0.0f, 1.0f, 0.0f, 1.0f),
+                           glm::vec4(0.0f, 0.0f, 1.0f, 1.0f)}});
 
             VkDeviceSize offsetRect = 0;
             VkDeviceSize sizeRect = rectangles.size() * sizeof(Rectangle);
             batch.globalInstanceBuffer.write(offsetRect, rectangles.data(), sizeRect);
+            VkDeviceSize offsetTri = sizeRect;
+            VkDeviceSize sizeTri = coloredTris.size() * sizeof(ColoredTri);
+            batch.globalInstanceBuffer.write(offsetTri, coloredTris.data(), sizeTri);
 
-            // ---------- 2. 构建间接绘制命令数组 ----------
+            // ---------- 2. 构建间接绘制命令数组（每个 mesh 一条命令）----------
             std::vector<VkDrawIndexedIndirectCommand> drawCommands;
+            // 命令 0：矩形（quad 网格，多实例）
             drawCommands.push_back(
                 {.indexCount = mesh.indexCount,
                  .instanceCount = static_cast<uint32_t>(rectangles.size()),
                  .firstIndex = mesh.indexOffset,
                  .vertexOffset = static_cast<int32_t>(mesh.vertexOffset),
                  .firstInstance = 0});
-
+            // 命令 1：三角形（triangle 网格，type 1：实例上传 3 顶点颜色）
+            const auto &meshTri = meshMap.at("triangle");
+            drawCommands.push_back(
+                {.indexCount = meshTri.indexCount,
+                 .instanceCount = static_cast<uint32_t>(coloredTris.size()),
+                 .firstIndex = meshTri.indexOffset,
+                 .vertexOffset = static_cast<int32_t>(meshTri.vertexOffset),
+                 .firstInstance = 0});
             // 写入间接绘制缓冲区
             VkDeviceSize cmdOffset = 0;
             VkDeviceSize cmdSize =
                 drawCommands.size() * sizeof(VkDrawIndexedIndirectCommand);
             batch.indirectDrawBuffer.write(cmdOffset, drawCommands.data(), cmdSize);
 
-            // ---------- 3. 命令常量 (type_id + 偏移) ----------
+            // ---------- 3. 命令常量 (type_id + 实例偏移) ----------
             std::vector<CommandConstant> cmdConsts;
             // 类型 0：Rectangle
             cmdConsts.push_back(
                 {.type_id = 0, .adddress_offset = static_cast<uint32_t>(offsetRect)});
-
+            // 类型 1：ColoredTri（三角形，3 顶点颜色）
+            cmdConsts.push_back(
+                {.type_id = 1, .adddress_offset = static_cast<uint32_t>(offsetTri)});
             batch.commandConstantsBuffer.write(
                 0, cmdConsts.data(), cmdConsts.size() * sizeof(CommandConstant));
 
@@ -2046,35 +2247,17 @@ try
 
     struct object_key
     {
-        uint32_t object_type : 8;   // 假设高 8 位
-        uint32_t entity_index : 24; // 低 24 位
-
-        static consteval uint32_t max_type_value(int bit_with) noexcept
-        {
-            return (1u << bit_with) - 1; // 255
-        }
-
-        constexpr object_key(uint32_t type, uint32_t index) noexcept
-            : object_type{type}, entity_index{index}
-        {
-            assert(type <= max_type_value(8));
-            assert(type <= max_type_value(24));
-        }
-        constexpr object_key() : object_key(0, 0) {}
-
-        // 显式组合位，不依赖内存布局
-        constexpr operator uint32_t() const noexcept
-        {
-            return (static_cast<uint32_t>(object_type) << 24) |
-                   (entity_index & 0xFFFFFFu);
-        }
+        uint32_t object_type;  // 对象类型
+        uint32_t entity_index; // 实体索引
     };
-    static_assert(sizeof(object_key) == sizeof(uint32_t));
     struct picking_result
     {
-        object_key key;
-        uint32_t primitive_id;
+        object_key key;        // 对应 outPicking.xy
+        uint32_t primitive_id; // 对应 outPicking.z
+        uint32_t reserved;     // 对应 outPicking.w（附件第 4 分量，恒 0）
     };
+    // picking_result 直接映射着色器输出的 uvec4(object_type, entity_index, primitive_id, 0)
+    static_assert(sizeof(picking_result) == 4 * sizeof(uint32_t));
     auto drawFrame = [&] {
         auto &inFlightFences = frameContext.inFlightFences;
         auto &currentFrame = frameContext.currentFrame;
@@ -2099,12 +2282,13 @@ try
                 //  NOTE: 应该提取出来的
                 auto *data =
                     static_cast<picking_result *>(pickingFrames[readIdx].mapPtr());
-                if (data->key != 0xFFFFFFFF)
+                if (data->key.object_type != 0xFFFFFFFF)
                 {
                     uint32_t type = data->key.object_type;
                     uint32_t idx = data->key.entity_index;
+                    uint32_t prim = data->primitive_id;
                     std::cout << "object_type: " << type << " , entity_index: " << idx
-                              << '\n';
+                              << " , primitive_id: " << prim << '\n';
                 }
                 //diff: [test_dod16] end
             }
