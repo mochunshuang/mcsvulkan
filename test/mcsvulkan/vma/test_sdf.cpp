@@ -2213,13 +2213,14 @@ try
             VkDeviceSize offsetRect = 0;
             VkDeviceSize sizeRect = rectangles.size() * sizeof(Rectangle);
             batch.globalInstanceBuffer.write(offsetRect, rectangles.data(), sizeRect);
+
             VkDeviceSize offsetTri = sizeRect;
             VkDeviceSize sizeTri = coloredTris.size() * sizeof(ColoredTri);
             batch.globalInstanceBuffer.write(offsetTri, coloredTris.data(), sizeTri);
+
             VkDeviceSize offsetText = sizeRect + sizeTri;
             VkDeviceSize sizeText = glyphs.size() * sizeof(Glyph);
-            if (sizeText > 0)
-                batch.globalInstanceBuffer.write(offsetText, glyphs.data(), sizeText);
+            batch.globalInstanceBuffer.write(offsetText, glyphs.data(), sizeText);
 
             // ---------- 2. 构建间接绘制命令数组（每个 mesh 一条命令）----------
             std::vector<VkDrawIndexedIndirectCommand> drawCommands;

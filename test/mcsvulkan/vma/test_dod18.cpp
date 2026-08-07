@@ -1,4 +1,5 @@
 
+#include <any>
 #include <array>
 #include <cassert>
 #include <concepts>
@@ -14,10 +15,12 @@
 #include <random>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 #include <stdint.h>
 #include <thread>
 #include <type_traits>
 #include <typeindex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -737,7 +740,29 @@ namespace ui
         float x = 0, y = 0, w = 0, h = 0;
     };
 
-    // 扁平树节点（使用全局 Entity）
+    // 统一事件：任意负载（点击/渲染上下文等），name-function 分发的载体
+    struct UiEvent
+    {
+        std::any payload;
+
+        template <typename T>
+        UiEvent(T value) : payload(std::move(value))
+        {
+        }
+
+        template <typename T>
+        T &get()
+        {
+            return std::any_cast<T &>(payload);
+        }
+        template <typename T>
+        const T &get() const
+        {
+            return std::any_cast<const T &>(payload);
+        }
+    };
+
+    // 扁平树节点（使用全局 Entity）：每个节点自己的状态 + 自己的函数
     struct FlatNode
     {
         Entity ref; // 全局 Entity，ui 内可直接访问
@@ -747,6 +772,31 @@ namespace ui
         BoxGeometry geometry;
         std::string name;
         float baseline = 0;
+        int first_instance = -1; // 渲染时登记的 uiStore 实例起点（targeted 更新用）
+
+        // 每个节点自己的状态：任意 struct（有状态，归节点所有）
+        std::any status;
+        // 每个节点自己的函数：name -> function（无状态，分发时 self 传入）
+        std::unordered_map<std::string,
+                           std::move_only_function<void(FlatNode &, const UiEvent &)>>
+            fns;
+
+        template <typename T>
+        T &state()
+        {
+            return std::any_cast<T &>(status);
+        }
+
+        void on(std::string name,
+                std::move_only_function<void(FlatNode &, const UiEvent &)> fn)
+        {
+            fns.emplace(std::move(name), std::move(fn));
+        }
+        void emit(const std::string &name, const UiEvent &e)
+        {
+            if (auto it = fns.find(name); it != fns.end())
+                it->second(*this, e);
+        }
     };
 
     // 树管理器
@@ -927,6 +977,36 @@ namespace ui
             auto p = findNodeByName(newParentName);
             if (c && p)
                 moveNode(*c, *p);
+        }
+
+        // 从树中摘除节点（不释放向量槽位，索引稳定；修复父/兄弟链）
+        constexpr void removeNode(int idx) noexcept
+        {
+            if (idx < 0 || idx >= static_cast<int>(nodes.size()))
+                return;
+            FlatNode &child = nodes[idx];
+            int oldParent = child.parent;
+            if (oldParent != -1)
+            {
+                FlatNode &oldP = nodes[oldParent];
+                if (oldP.firstChild == idx)
+                {
+                    oldP.firstChild = child.nextSibling;
+                }
+                else
+                {
+                    int prev = oldP.firstChild;
+                    while (prev != -1 && nodes[prev].nextSibling != idx)
+                        prev = nodes[prev].nextSibling;
+                    if (prev != -1)
+                        nodes[prev].nextSibling = child.nextSibling;
+                }
+            }
+            child.parent = -1;
+            child.nextSibling = -1;
+            child.firstChild = -1;
+            child.fns.clear();   // 摘除即失效：释放闭包
+            child.status.reset(); // 释放节点状态
         }
 
         constexpr void clear()
@@ -1751,6 +1831,26 @@ class UIBuilder
     int lastNodeIdx() const noexcept
     {
         return static_cast<int>(tree_.nodes.size() - 1);
+    }
+
+    // ========== 链式注册：status / on，绑定到"当前节点" ==========
+    FlatNode &node() noexcept
+    {
+        return tree_.nodes[lastNodeIdx()];
+    }
+
+    template <typename T>
+    UIBuilder &status(T value)
+    {
+        node().status = std::move(value);
+        return *this;
+    }
+
+    UIBuilder &on(std::string name,
+                  std::move_only_function<void(FlatNode &, const UiEvent &)> fn)
+    {
+        node().on(std::move(name), std::move(fn));
+        return *this;
     }
 
     // ========== 叶子版本（无子节点） ==========
@@ -3514,11 +3614,27 @@ struct triat_for_ui
         uint32_t idx = result.key.entity_index;
         assert(type == uiStore_type_id);
         auto &store = soaCtx.uiStore;
-        if (store.alive(idx))
+        if (!store.alive(idx))
+            return;
+        if (idx >= soaCtx.instanceToNode.size())
+            return;
+        int node_idx = soaCtx.instanceToNode[idx];
+        if (node_idx < 0 || node_idx >= static_cast<int>(soaCtx.uiTree.nodes.size()))
+            return;
+
+        // 薄转发：把输入源指针交给节点自己的 "hover"，不读设备、不解释
+        auto &input = inputCtx.input;
+        auto &node = soaCtx.uiTree.nodes[node_idx];
+        if (soaCtx.uiHoverNode != node_idx)
         {
-            auto [inst] = store.template view_entity<"instanceData">(currentFrame, idx);
-            std::cout << "[UI] entity " << idx << " fontType=" << inst.fontType << "\n";
+            // 悬停转移：先通知旧节点离开（修复跨节点误 click）
+            int old = soaCtx.uiHoverNode;
+            if (old >= 0 && old < static_cast<int>(soaCtx.uiTree.nodes.size()))
+                soaCtx.uiTree.nodes[old].emit(
+                    "hover", ui::UiEvent{static_cast<glfw_input *>(nullptr)});
+            soaCtx.uiHoverNode = node_idx;
         }
+        node.emit("hover", ui::UiEvent{&input});
     }
     static constexpr auto update(auto &world, auto &inputCtx, auto &soaCtx,
                                  uint32_t currentFrame) noexcept
@@ -3620,6 +3736,15 @@ static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
             }
     }
 }
+// 悬停离开：把 nullptr 输入指针发给当前悬停节点，节点自行复位（系统只做路由）
+static constexpr auto ui_hover_leave = [](auto &world, auto &inputCtx, auto &soaCtx) {
+    int node_idx = soaCtx.uiHoverNode;
+    if (node_idx < 0 || node_idx >= static_cast<int>(soaCtx.uiTree.nodes.size()))
+        return;
+    soaCtx.uiHoverNode = -1;
+    auto &node = soaCtx.uiTree.nodes[node_idx];
+    node.emit("hover", ui::UiEvent{static_cast<glfw_input *>(nullptr)});
+};
 static constexpr auto inputController(auto &world, auto &inputCtx, auto &soaCtx)
 {
     auto &currentFrame = world.globalCtx.frameContext.currentFrame;
@@ -3866,6 +3991,7 @@ try
         float pad_left, pad_right, pad_top, pad_bottom;
         std::string node_id;
         uint32_t traversal_id; // 遍历顺序编号，用于颜色等
+        int node_idx = -1;     // 节点在树中的索引：重命名/重名免疫
     };
     // ============================================================
     // 3. 文本实例生成（纯函数，只依赖 NodeGeometry + 文本数据）
@@ -4097,6 +4223,25 @@ try
                      geo.node_id, geo.x, geo.y, geo.w, geo.h);
         uiStore.new_entity(inst, attrs);
     };
+
+    // ============================================================
+    // 4.5 节点状态与渲染绑定：TextState / RenderContext / RenderEvent
+    // ============================================================
+    struct TextState
+    {
+        std::u8string text;
+    };
+    struct RenderContext
+    {
+        float w = 0, h = 0;
+        ui_data_type *uiStore = nullptr;
+        std::remove_reference_t<decltype(fontSelect)> *font = nullptr;
+    };
+    struct RenderEvent
+    {
+        RenderContext rc;
+        NodeGeometry geo;
+    };
     //-----------------------------------下面是新增的代码
     // 1. 构建 UI 布局上下文
     auto uiLayoutCtx =
@@ -4107,19 +4252,130 @@ try
                            TextStyleObject::trait_type::name, "get_member", "layout">(
             containers_, rows_, columns_, expandeds_, texts_, get_member_, layout_);
 
+    // resize 事件负载：只带"发生了什么"，不带"该怎么做"
+    struct ResizeEvent
+    {
+        float w = 0, h = 0;
+        ui::FlatLayoutTree *tree = nullptr;
+        std::remove_reference_t<decltype(uiLayoutCtx)> *layoutCtx = nullptr;
+    };
+
+    // 测试按钮：状态照 model_state 的写法；颜色边沿触发，直接写实例属性
+    struct ButtonState
+    {
+        bool is_left_button_pressed = false;
+        bool hovered = false;
+        glm::vec4 hover_color{0.4f, 0.9f, 0.5f, 1.0f};
+        glm::vec4 press_color{0.9f, 0.4f, 0.2f, 1.0f};
+    };
+    // UI 只在初始化/resize 重建，prepareBatch 每帧全量上传：
+    // 直接写当前帧的实例属性，下帧上传自然生效，不需要脏标志
+    auto on_button_hover = [&uiStore, &frameContext](ui::FlatNode &n,
+                                                     const ui::UiEvent &e) {
+        auto *input = e.get<glfw_input *>(); // 系统只转发这个指针；nullptr = 离开
+        auto &st = n.state<ButtonState>();
+
+        if (!input) // 离开节点：中断手势（修复"按下拖出再进入"的误 click）
+        {
+            st.hovered = false;
+            st.is_left_button_pressed = false;
+            return;
+        }
+        bool left = input->isMouseButtonPressed(
+            mcs::vulkan::event::MouseButtons::eMOUSE_BUTTON_LEFT);
+
+        auto set_color = [&](glm::vec4 c) {
+            if (n.first_instance < 0)
+                return;
+            auto [attrs] = uiStore.template view_entity<"vertexAttribute">(
+                frameContext.currentFrame, static_cast<uint32_t>(n.first_instance));
+            for (auto &a : attrs)
+                a.color = c;
+        };
+
+        if (!st.hovered) // 进入：亮色（边沿）
+        {
+            st.hovered = true;
+            st.is_left_button_pressed = false; // 离开过：上次手势作废
+            if (left)
+                return; // 带着按下进入：按下不属于本节点
+            set_color(st.hover_color);
+            return;
+        }
+        if (left)
+        {
+            if (!st.is_left_button_pressed) // 按下边沿：按压色
+            {
+                st.is_left_button_pressed = true;
+                set_color(st.press_color);
+            }
+        }
+        else
+        {
+            if (st.is_left_button_pressed) // 抬起：点击/双击 + 恢复悬停色
+            {
+                set_color(st.hover_color);
+                n.emit("click", e); // 生成事件，转发给节点自身的其他函数
+            }
+            st.is_left_button_pressed = false;
+        }
+    };
+
+    // 布局刷新入口：render_all / extractGeometries 定义后赋值；
+    // resize、删除、移动等布局类变化统一走它
+    std::function<void()> ui_refresh;
+
     // 2. 构建 UI 树（对应 Yoga 中的 screen / root / root2 / text_display）
     ui::FlatLayoutTree uiTree;
     uiTree.reserve(20);
     UIBuilder<std::remove_cvref_t<decltype(uiLayoutCtx)>> builder(uiLayoutCtx, uiTree);
 
+    // 删除测试：点 child0 → 删除 child0-0（布局变更走 ui_refresh）
+    auto on_delete_child0_0 = [&](ui::FlatNode &, const ui::UiEvent &) {
+        if (auto t = uiTree.findNodeByName("child0-0"))
+        {
+            uiTree.removeNode(*t);
+            // 释放 layout store 实体（Entity 析构时自动 release）
+            uiTree.nodes[*t].ref =
+                Entity(Entity::invalid, Entity::invalid, [](uint32_t) noexcept {});
+        }
+        ui_refresh();
+    };
     // 辅助 Lambda：构建子树（避免 resize 时重复写）
-    auto buildUITree = [](auto &b) {
+    auto buildUITree = [&](auto &b) {
+        // screen（Root 节点）自己的 resize 行为——此刻 lastNodeIdx() == screen
+        b.on("resize", [](ui::FlatNode &n, const ui::UiEvent &e) {
+            auto &ev = e.get<ResizeEvent>();
+            auto &ref = n.ref;
+            auto [w, h] =
+                ev.layoutCtx->columns.view_entity<"width", "height">(0, ref.entity_id);
+            w = ev.w;
+            h = ev.h;
+        });
         b.template Add<ColumnStyleTrait>(
             "root",
-            [](auto &b) {
+            [&](auto &b) {
                 b.template Add<ContainerStyleTrait>(
                     "child0",
-                    [](auto &b) {
+                    [&](auto &b) {
+                        // child0 自己的 resize 行为——此刻 lastNodeIdx() == child0
+                        b.on("resize", [](ui::FlatNode &n, const ui::UiEvent &e) {
+                            auto &ev = e.get<ResizeEvent>();
+                            auto &tree = *ev.tree;
+                            int self = tree.findNodeByName(n.name).value_or(-1);
+                            int root = tree.findNodeByName("root").value_or(-1);
+                            int root2 = tree.findNodeByName("root2").value_or(-1);
+                            if (self == -1 || root == -1 || root2 == -1)
+                                return;
+                            if (tree.nodes[self].parent == root)
+                                tree.moveNode(self, root2, tree.nodes[root2].firstChild);
+                            else
+                                tree.moveNode(self, root, tree.nodes[root].firstChild);
+                        });
+                        // 链式：状态 + hover 事件一起挂（此刻 lastNodeIdx() == child0）
+                        b.status(ButtonState{})
+                            .on("hover", on_button_hover)
+                            .on("click", on_delete_child0_0);
                         // child0-0 固定尺寸 50x50，margin 四边 5，padding 为 0
                         b.template Add<ContainerStyleTrait>(
                             "child0-0", 50.0f, 50.0f,
@@ -4144,20 +4400,60 @@ try
                     EdgeInsets{});
             },
             200.0f, 200.0f, EdgeInsets{}, EdgeInsets{10, 10, 10, 10}); // padding 四边 10
+        // 链式注册：status = 节点自己的状态，on("render") = 节点自己的渲染函数
         b.template Add<TextStyleTrait>("text_display", 200.0f, 200.0f, EdgeInsets{},
-                                       EdgeInsets{10, 10, 10, 10}); // padding 四边 10
+                                       EdgeInsets{10, 10, 10, 10}) // padding 四边 10
+            .status(TextState{
+                u8"我你好世界你好世界你好世界🤣\nW3C (World)👪 ﷲ e\u0301 \nמעביר את "
+                u8"שירותי- ERCIM."})
+            .on("render", [](ui::FlatNode &n, const ui::UiEvent &e) {
+                auto &ev = e.get<RenderEvent>();
+                // 与原逻辑等价：文本节点先画自己的背景矩形，再叠加字形
+                // generate_* 是 main 里的 static lambda，无捕获直接调用
+                generate_rect_instance(ev.rc.w, ev.rc.h, *ev.rc.uiStore, ev.geo);
+                auto &st = n.state<TextState>();
+                auto [codepoints, shape_result, break_result] =
+                    run_text_pipeline(*ev.rc.font, st.text.c_str(), "zh-CN");
+                generate_text_instances(ev.rc.w, ev.rc.h, *ev.rc.uiStore, ev.geo,
+                                        codepoints, shape_result, break_result.types);
+            });
     };
 
     builder.Root<ColumnStyleTrait>("screen", buildUITree, static_cast<float>(WIDTH),
                                    static_cast<float>(HEIGHT), EdgeInsets{},
                                    EdgeInsets{});
 
-    // 3. 初次布局
-    ui::Constraints screenConstraints{0.0f, static_cast<float>(WIDTH), 0.0f,
-                                      static_cast<float>(HEIGHT)};
-    layout_(uiLayoutCtx, uiTree, 0, screenConstraints);
+    // 2.5 默认渲染绑定：每个节点都有 "render"，文本节点已在声明处覆盖
+    auto default_rect_render = [](ui::FlatNode &n, const ui::UiEvent &e) {
+        auto &ev = e.get<RenderEvent>();
+        generate_rect_instance(ev.rc.w, ev.rc.h, *ev.rc.uiStore, ev.geo);
+    };
+    for (auto &n : uiTree.nodes)
+        if (!n.fns.contains("render"))
+            n.on("render", default_rect_render);
 
-    uiTree.printLayout(uiLayoutCtx, 0); // 从根节点开始打印
+    // 2.6 统一渲染循环：初始化与 resize 共用，算法已绑定到节点
+    // 实例 → 节点 映射：GPU 拾取回读后，由 instance index 反查 FlatNode
+    std::vector<int> instanceToNode;
+    auto render_all = [&](const std::vector<NodeGeometry> &geos, float w, float h) {
+        RenderContext rc{w, h, &uiStore, &fontSelect};
+        instanceToNode.clear();
+        for (const auto &geo : geos)
+        {
+            // NodeGeometry 直接携带节点索引：重命名/重名都免疫
+            if (geo.node_idx < 0 || geo.node_idx >= static_cast<int>(uiTree.nodes.size()))
+                continue;
+            auto &n = uiTree.nodes[geo.node_idx];
+            if (auto itf = n.fns.find("render"); itf != n.fns.end())
+            {
+                size_t before = uiStore.size();
+                n.first_instance = static_cast<int>(before);
+                itf->second(n, ui::UiEvent{RenderEvent{rc, geo}});
+                for (size_t i = before; i < uiStore.size(); ++i)
+                    instanceToNode.push_back(geo.node_idx);
+            }
+        }
+    };
 
     // 4. 几何提取（Flutter 专用，填充 NodeGeometry）
     static constexpr auto extractGeometries = [](auto &uiLayoutCtx,
@@ -4191,6 +4487,7 @@ try
                     geo.pad_left = geo.pad_right = geo.pad_top = geo.pad_bottom = 0;
                 }
                 geo.node_id = node.name;
+                geo.node_idx = nodeIdx;
                 geo.traversal_id = id++;
                 geos.push_back(geo);
             }
@@ -4201,91 +4498,37 @@ try
         return geos;
     };
 
-    // 5. 初始生成所有 UI 实例
-    float w = static_cast<float>(swapchain.refImageExtent().width);
-    float h = static_cast<float>(swapchain.refImageExtent().height);
-    auto geos = extractGeometries(uiLayoutCtx, uiTree);
-    for (const auto &geo : geos)
-    {
-        generate_rect_instance(w, h, uiStore, geo);
-        if (geo.node_id == "text_display")
-        {
-            constexpr auto rawText =
-                u8"我你好世界你好世界你好世界🤣\nW3C (World)👪 ﷲ é \nמעביר את "
-                u8"שירותי- ERCIM.";
-            auto [codepoints, shape_result, break_result] =
-                run_text_pipeline(fontSelect, rawText, "zh-CN");
-            generate_text_instances(w, h, uiStore, geo, codepoints, shape_result,
-                                    break_result.types);
-        }
-    }
+    // 共享刷新：resize / 删除 / 移动 统一走这里（树已变更后调用）
+    ui_refresh = [&]() {
+        auto ext = swapchain.refImageExtent();
+        float w = static_cast<float>(ext.width);
+        float h = static_cast<float>(ext.height);
+        uiStore.clear();
+        ui::Constraints c{0.0f, w, 0.0f, h};
+        layout_(uiLayoutCtx, uiTree, 0, c);
+        auto geos = extractGeometries(uiLayoutCtx, uiTree);
+        render_all(geos, w, h);
+    };
+
+    // 5. 初始生成所有 UI 实例（与 resize/删除/移动共用同一条刷新链路）
+    ui_refresh();
+    uiTree.printLayout(uiLayoutCtx, 0); // 布局结果打印（与首次刷新共用）
 
     // 6. Resize 回调（窗口大小改变时重建 UI）
-    auto screen_resize = [uiLayoutCtx = std::move(uiLayoutCtx), layout_ = layout_,
-                          &uiStore, &fontSelect, &swapchain,
-                          &uiTree](VkExtent2D newSize) mutable {
+    auto screen_resize = [&](VkExtent2D newSize) {
         static VkExtent2D lastSize{0, 0};
         if (newSize.width == lastSize.width && newSize.height == lastSize.height)
             return;
         lastSize = newSize;
 
-        uiStore.clear();
+        // 事件分发：screen 更新尺寸、child0 决定是否搬家——行为归节点自己
+        ui::UiEvent ev{ResizeEvent{static_cast<float>(newSize.width),
+                                   static_cast<float>(newSize.height), &uiTree,
+                                   &uiLayoutCtx}};
+        for (auto &n : uiTree.nodes)
+            n.emit("resize", ev);
 
-        // 获取根节点（假设索引 0 为根）
-
-        {
-            auto &rootNode = uiTree.nodes[0];
-            auto &ref = rootNode.ref;
-            // 更新根节点的 width 和 height 字段
-            auto [w, h] =
-                uiLayoutCtx.columns.view_entity<"width", "height">(0, ref.entity_id);
-            w = static_cast<float>(newSize.width);
-            h = static_cast<float>(newSize.height);
-        }
-
-        // 重建 UI 树
-        auto &tree = uiTree;
-        // ===== DOM 操作：只移动节点，不重建 =====
-        int rootIdx = tree.findNodeByName("root").value_or(-1);
-        int root2Idx = tree.findNodeByName("root2").value_or(-1);
-        int child0Idx = tree.findNodeByName("child0").value_or(-1);
-
-        // 判断 child0 当前在哪个父节点下
-        if (tree.nodes[child0Idx].parent == rootIdx)
-        {
-            // child0 在 root 下 → 移到 root2 头部
-            tree.moveNode(
-                child0Idx, root2Idx,
-                tree.nodes[root2Idx].firstChild); // beforeSibling = root2 的第一个子节点
-        }
-        else
-        {
-            // child0 在 root2 下 → 移回 root 头部
-            tree.moveNode(child0Idx, rootIdx, tree.nodes[rootIdx].firstChild);
-        }
-
-        // 重新布局
-        ui::Constraints c{0.0f, static_cast<float>(newSize.width), 0.0f,
-                          static_cast<float>(newSize.height)};
-        layout_(uiLayoutCtx, tree, 0, c);
-
-        auto geos = extractGeometries(uiLayoutCtx, tree);
-        float w = static_cast<float>(newSize.width);
-        float h = static_cast<float>(newSize.height);
-        for (const auto &geo : geos)
-        {
-            generate_rect_instance(w, h, uiStore, geo);
-            if (geo.node_id == "text_display")
-            {
-                constexpr auto rawText =
-                    u8"我你好世界你好世界你好世界🤣\nW3C (World)👪 ﷲ é \nמעביר את "
-                    u8"שירותי- ERCIM.";
-                auto [codepoints, shape_result, break_result] =
-                    run_text_pipeline(fontSelect, rawText, "zh-CN");
-                generate_text_instances(w, h, uiStore, geo, codepoints, shape_result,
-                                        break_result.types);
-            }
-        }
+        ui_refresh(); // 与删除/移动共用
     };
     //diff: [test_dod17] end
 
@@ -4294,9 +4537,13 @@ try
     //diff: [test_dod10] end
 
     //diff: [test_dod14] 不再需要  topLeftLocal 字段，因为我们使用的公共的顶点我们是知道的
-    auto soaCtx = make_aggregate_ref<"soaCtx", "autoSpinStore", "interactiveStore",
-                                     "uiStore", "screen_resize">(
-        autoSpinStore, interactiveStore, uiStore, screen_resize);
+    // 系统路由状态：当前悬停的 UI 节点（仅路由，不解释手势）
+    int uiHoverNode = -1;
+    auto soaCtx =
+        make_aggregate_ref<"soaCtx", "autoSpinStore", "interactiveStore", "uiStore",
+                           "screen_resize", "uiTree", "instanceToNode", "uiHoverNode">(
+            autoSpinStore, interactiveStore, uiStore, screen_resize, uiTree,
+            instanceToNode, uiHoverNode);
 
     //diff: [test_dod8.cpp] end
 
@@ -5360,20 +5607,34 @@ try
                                  auto &currentFrame = frameContext.currentFrame;
 
                                  // 等待栅栏后，正式获取图像前
-                                 if (currentFrame > 0 && pickMouse.valid)
+                                 // currentFrame == 0 时拾取回读未就绪，不当作"离开"
+                                 if (currentFrame > 0)
                                  {
-                                     uint32_t readIdx =
-                                         (currentFrame - 1 + MAX_FRAMES_IN_FLIGHT) %
-                                         MAX_FRAMES_IN_FLIGHT;
-                                     //diff: [test_dod16] start
-                                     //  NOTE: 应该提取出来的
-                                     auto *data = static_cast<picking_result *>(
-                                         pickingFrames[readIdx].mapPtr());
-                                     if (data->key != 0xFFFFFFFF)
+                                     if (pickMouse.valid)
                                      {
-                                         on_hover(world, inputCtx, soaCtx, *data);
+                                         uint32_t readIdx =
+                                             (currentFrame - 1 + MAX_FRAMES_IN_FLIGHT) %
+                                             MAX_FRAMES_IN_FLIGHT;
+                                         //diff: [test_dod16] start
+                                         //  NOTE: 应该提取出来的
+                                         auto *data = static_cast<picking_result *>(
+                                             pickingFrames[readIdx].mapPtr());
+                                         if (data->key != 0xFFFFFFFF)
+                                         {
+                                             on_hover(world, inputCtx, soaCtx, *data);
+                                             if (data->key.object_type != uiStore_type_id)
+                                                 ui_hover_leave(world, inputCtx, soaCtx);
+                                         }
+                                         else
+                                         {
+                                             ui_hover_leave(world, inputCtx, soaCtx);
+                                         }
+                                         //diff: [test_dod16] end
                                      }
-                                     //diff: [test_dod16] end
+                                     else
+                                     {
+                                         ui_hover_leave(world, inputCtx, soaCtx);
+                                     }
                                  }
                              })},
                 .befores = {"after_waitForfences_start"},
