@@ -52,6 +52,8 @@ struct CommandConstant
 {
     uint type_id;
     uint adddress_offset; // 实例数据区偏移（heap）
+    uint perInstanceAttributeCount; // type 7：每实例属性数
+    uint attributeOffset;           // type 7：属性池偏移（上传命令常量时解析）
 };
 layout(buffer_reference, scalar) readonly buffer CommandConstBuffer
 {
@@ -63,6 +65,7 @@ layout(push_constant) uniform PushConsts
     uint64_t vertexAddress;
     uint64_t dataAddress;
     uint64_t commandConstantsAddress;
+    uint64_t attributeAddress; // 逐顶点属性池（type 7 用）
     uint cameraIndex;
 }
 pc;
@@ -197,6 +200,46 @@ layout(buffer_reference, scalar) readonly buffer UiPolygonBuffer
     UiPolygon insts[];
 };
 
+// ============================================================
+// type_id == 6：任意路径网格（CPU 三角化，顶点/索引由前端上传到全局池）
+// ============================================================
+#define UI_MESH_SIZE 84
+struct UiMesh
+{
+    uint entity_index;
+    mat4 model;       // 平移 + 旋转 + 缩放
+    vec4 color;       // 单色填充
+};
+layout(buffer_reference, scalar) readonly buffer UiMeshBuffer
+{
+    UiMesh insts[];
+};
+
+// ============================================================
+// type_id == 7：逐顶点颜色网格（独立结构，实例不带颜色）
+// 颜色只来自属性池（VertexAttribute），实例只有 entity + model
+// ============================================================
+#define UI_MESH_VC_SIZE 68
+struct UiMeshVc
+{
+    uint entity_index;
+    mat4 model;       // 平移 + 旋转 + 缩放
+};
+layout(buffer_reference, scalar) readonly buffer UiMeshVcBuffer
+{
+    UiMeshVc insts[];
+};
+
+// type 7 逐顶点属性（独立属性池，只在用到时读取，同 test_dod18）
+struct VertexAttribute
+{
+    vec3 color;
+};
+layout(buffer_reference, scalar) readonly buffer AttributePool
+{
+    VertexAttribute attributes[];
+};
+
 
 layout(location = 0) out vec4 fragColor;     // 插值后的颜色
 layout(location = 1) out vec2 fragTexCoord;
@@ -315,6 +358,27 @@ void main()
                      vec4(inst.center, 0.0, 1.0));
         fragColor = inst.color;
         localPos = v.pos.xy;
+        pos = v.pos;
+    }
+    break;
+    case 6: {
+        instancePtr = heapBaseStart + gl_InstanceIndex * UI_MESH_SIZE;
+        UiMesh inst = UiMeshBuffer(instancePtr).insts[0];
+        model = inst.model;
+        fragColor = inst.color; // 实色填充
+        pos = v.pos; // 几何由 CPU 三角化上传，这里直接使用
+    }
+    break;
+    case 7: {
+        instancePtr = heapBaseStart + gl_InstanceIndex * UI_MESH_VC_SIZE;
+        UiMeshVc inst = UiMeshVcBuffer(instancePtr).insts[0];
+        // 属性池基址来自推常量，属性偏移在命令常量上传时解析
+        AttributePool attrPool = AttributePool(pc.attributeAddress);
+        uint attrIdx = gl_InstanceIndex * cc.perInstanceAttributeCount + localVertexIndex +
+                       cc.attributeOffset;
+        VertexAttribute attr = attrPool.attributes[attrIdx];
+        fragColor = vec4(attr.color, 1.0); // 颜色只来自属性池
+        model = inst.model;
         pos = v.pos;
     }
     break;

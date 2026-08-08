@@ -141,6 +141,29 @@ layout(buffer_reference, scalar) readonly buffer UiPolygonBuffer
     UiPolygon insts[];
 };
 
+#define UI_MESH_SIZE 84
+struct UiMesh
+{
+    uint entity_index;
+    mat4 model;       // 平移 + 旋转 + 缩放
+    vec4 color;       // 单色填充
+};
+layout(buffer_reference, scalar) readonly buffer UiMeshBuffer
+{
+    UiMesh insts[];
+};
+
+#define UI_MESH_VC_SIZE 68
+struct UiMeshVc
+{
+    uint entity_index;
+    mat4 model;
+};
+layout(buffer_reference, scalar) readonly buffer UiMeshVcBuffer
+{
+    UiMeshVc insts[];
+};
+
 // ===== 从 ShaderToy 复制过来的 SDF 函数 =====
 float roundedBoxSDF(vec2 CenterPosition, vec2 HalfSize, float Radius)
 {
@@ -374,6 +397,18 @@ void main()
         float d = length(uv) - edgeR;
         float alpha = 1.0 - smoothstep(0.0, max(inst.softness, 0.0005), d);
         outColor = vec4(fragColor.rgb * fragColor.a * alpha, fragColor.a * alpha);
+        outPicking = uvec4(type_id, inst.entity_index, gl_PrimitiveID, 0);
+    }
+    break;
+    case 6: {
+        UiMesh inst = UiMeshBuffer(instancePtr).insts[0];
+        outColor = vec4(fragColor.rgb * fragColor.a, fragColor.a); // CPU 三角化，直出
+        outPicking = uvec4(type_id, inst.entity_index, gl_PrimitiveID, 0);
+    }
+    break;
+    case 7: {
+        UiMeshVc inst = UiMeshVcBuffer(instancePtr).insts[0];
+        outColor = vec4(fragColor.rgb * fragColor.a, fragColor.a); // 逐顶点色渐变，直出
         outPicking = uvec4(type_id, inst.entity_index, gl_PrimitiveID, 0);
     }
     break;

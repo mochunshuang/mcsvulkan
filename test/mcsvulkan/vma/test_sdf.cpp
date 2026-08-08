@@ -75,6 +75,12 @@ using mcs::vulkan::MCS_ASSERT;
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
 constexpr auto TITLE = "test_my_triangle";
+// ============================================================
+// 测试开关
+//   TEST_SDF_DEMO_MODE = 0 → 只测 type 6 UIMesh（CPU 路径细分，无第三方库）
+//   TEST_SDF_DEMO_MODE = 1 → 完整演示（矩形/三角形/字形/SDF 点线多边形/管线切换）
+// ============================================================
+#define TEST_SDF_DEMO_MODE 0
 static constexpr auto MAX_FRAMES_IN_FLIGHT = 2;
 
 namespace camera
@@ -445,8 +451,11 @@ struct Vertex // NOLINT
     glm::vec3 pos;
     glm::vec2 texCoord; // diff: [texture] 添加纹理坐标
 };
-// NOTE: 颜色不是网格数据，是实例数据（std::array<color,N> 由实例上传）。
-//       公共顶点池只存固定几何（pos/texCoord），所有 mesh 共用一个池。
+// 逐顶点属性（type 7 用，独立属性池，同 test_dod18；其它类型无开销）
+struct VertexAttribute // NOLINT
+{
+    glm::vec3 color;
+};
 struct mesh_manager
 {
     std::vector<Vertex> allVertices; // 公共顶点池（20B/顶点）
@@ -497,6 +506,237 @@ constexpr auto initMeshManager()
     m.addMesh("triangle", std::span{triVerts}, std::span{triIdx});
     m.addMesh("triLoop", std::span{triLoopVerts}, std::span{triLoopIdx});
     return m;
+}
+
+// ============================================================
+// CPU 路径细分器（type 6 UIMesh，无第三方库）
+//   - 贝塞尔：de Casteljau 均匀采样（quad→8 段，cubic→16 段）
+//   - 三角化：耳切（ear clipping，支持凹多边形，单轮廓无孔）
+// ============================================================
+struct PathTessellator
+{
+    std::vector<glm::vec2> pts;
+    bool started = false;
+
+    void begin()
+    {
+        pts.clear();
+        started = false;
+    }
+    void moveTo(glm::vec2 p)
+    {
+        pts.clear();
+        pts.push_back(p);
+        started = true;
+    }
+    void lineTo(glm::vec2 p)
+    {
+        if (!started)
+        {
+            moveTo(p);
+            return;
+        }
+        pts.push_back(p);
+    }
+    void quadTo(glm::vec2 c, glm::vec2 p)
+    {
+        constexpr int N = 8;
+        const glm::vec2 a = pts.back();
+        for (int i = 1; i <= N; i++)
+        {
+            const float t = float(i) / float(N);
+            const float u = 1.0f - t;
+            lineTo(u * u * a + 2.0f * u * t * c + t * t * p);
+        }
+    }
+    void cubicTo(glm::vec2 c1, glm::vec2 c2, glm::vec2 p)
+    {
+        constexpr int N = 16;
+        const glm::vec2 a = pts.back();
+        for (int i = 1; i <= N; i++)
+        {
+            const float t = float(i) / float(N);
+            const float u = 1.0f - t;
+            lineTo(u * u * u * a + 3.0f * u * u * t * c1 + 3.0f * u * t * t * c2 +
+                   t * t * t * p);
+        }
+    }
+    // 闭合轮廓：去掉首尾重复点
+    std::vector<glm::vec2> close()
+    {
+        std::vector<glm::vec2> poly = std::move(pts);
+        if (poly.size() > 1 && glm::length(poly.front() - poly.back()) < 1e-5f)
+        {
+            poly.pop_back();
+        }
+        pts.clear();
+        started = false;
+        return poly;
+    }
+};
+
+// 点在三角形内（含边界）
+static bool pointInTriangle(glm::vec2 p, glm::vec2 a, glm::vec2 b, glm::vec2 c)
+{
+    auto cross = [](glm::vec2 o, glm::vec2 x, glm::vec2 y) {
+        return (x.x - o.x) * (y.y - o.y) - (x.y - o.y) * (y.x - o.x);
+    };
+    const float d1 = cross(a, b, p);
+    const float d2 = cross(b, c, p);
+    const float d3 = cross(c, a, p);
+    const bool neg = d1 < 0.0f || d2 < 0.0f || d3 < 0.0f;
+    const bool pos = d1 > 0.0f || d2 > 0.0f || d3 > 0.0f;
+    return !(neg && pos);
+}
+
+// 耳切三角化：任意方向单轮廓（凸/凹均可，无孔）
+static void earClipPolygon(const std::vector<glm::vec2> &poly, std::vector<uint32_t> &out)
+{
+    const size_t n = poly.size();
+    if (n < 3)
+        return;
+    double area2 = 0.0;
+    for (size_t i = 0; i < n; i++)
+    {
+        const auto &a = poly[i];
+        const auto &b = poly[(i + 1) % n];
+        area2 += double(a.x) * b.y - double(b.x) * a.y;
+    }
+    const bool ccw = area2 > 0.0;
+    std::vector<uint32_t> idx(n);
+    for (size_t i = 0; i < n; i++)
+        idx[i] = static_cast<uint32_t>(i);
+    const auto cross = [&](size_t i0, size_t i1, size_t i2) {
+        const auto &a = poly[idx[i0]];
+        const auto &b = poly[idx[i1]];
+        const auto &c = poly[idx[i2]];
+        return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    };
+    while (idx.size() > 3)
+    {
+        const size_t m = idx.size();
+        bool clipped = false;
+        for (size_t i = 0; i < m; i++)
+        {
+            const size_t i0 = (i + m - 1) % m;
+            const size_t i1 = i;
+            const size_t i2 = (i + 1) % m;
+            const float cr = cross(i0, i1, i2);
+            const bool convex = ccw ? cr > 0.0f : cr < 0.0f;
+            if (!convex)
+                continue;
+            bool hasInside = false;
+            for (size_t j = 0; j < m; j++)
+            {
+                if (j == i0 || j == i1 || j == i2)
+                    continue;
+                if (pointInTriangle(poly[idx[j]], poly[idx[i0]], poly[idx[i1]],
+                                    poly[idx[i2]]))
+                {
+                    hasInside = true;
+                    break;
+                }
+            }
+            if (!hasInside)
+            {
+                out.push_back(idx[i0]);
+                out.push_back(idx[i1]);
+                out.push_back(idx[i2]);
+                idx.erase(idx.begin() + static_cast<std::ptrdiff_t>(i1));
+                clipped = true;
+                break;
+            }
+        }
+        if (!clipped)
+            break; // 数值退化保护
+    }
+    if (idx.size() == 3)
+    {
+        out.push_back(idx[0]);
+        out.push_back(idx[1]);
+        out.push_back(idx[2]);
+    }
+}
+
+// 圆（凸）
+static void buildCirclePoly(std::vector<glm::vec2> &poly, glm::vec2 c, float r,
+                            int seg = 48)
+{
+    poly.clear();
+    for (int i = 0; i < seg; i++)
+    {
+        const float a = 6.2831853f * float(i) / float(seg);
+        poly.push_back(c + glm::vec2(std::cos(a), std::sin(a)) * r);
+    }
+}
+
+// 圆角矩形（凸）
+static void buildRoundedRectPoly(std::vector<glm::vec2> &poly, glm::vec2 c,
+                                 glm::vec2 half, float radius, int segPerArc = 10)
+{
+    poly.clear();
+    const float r = std::min(std::max(radius, 0.0f), std::min(half.x, half.y));
+    constexpr float PI = 3.14159265f;
+    const std::array<glm::vec2, 4> corners = {
+        glm::vec2(-half.x + r, -half.y + r), // 左上（y 向下：小 y 在上）
+        glm::vec2(half.x - r, -half.y + r),  // 右上
+        glm::vec2(half.x - r, half.y - r),   // 右下
+        glm::vec2(-half.x + r, half.y - r),  // 左下
+    };
+    const std::array<float, 4> startAngles = {PI, PI * 1.5f, 0.0f, PI * 0.5f};
+    for (int k = 0; k < 4; k++)
+    {
+        for (int i = 0; i < segPerArc; i++)
+        {
+            const float a = startAngles[k] + PI * 0.5f * float(i) / float(segPerArc);
+            poly.push_back(corners[k] + glm::vec2(std::cos(a), std::sin(a)) * r);
+        }
+    }
+}
+
+// 星形（凹 → 耳切）
+static void buildStarPoly(std::vector<glm::vec2> &poly, glm::vec2 c, float outer,
+                          float inner, int spikes = 5)
+{
+    poly.clear();
+    const float start = -1.5707963f; // 尖朝上（y 向下坐标）
+    for (int k = 0; k < spikes * 2; k++)
+    {
+        const float a = start + 3.14159265f * float(k) / float(spikes);
+        const float r = (k % 2 == 0) ? outer : inner;
+        poly.push_back(c + glm::vec2(std::cos(a), std::sin(a)) * r);
+    }
+}
+
+// 心形（三次贝塞尔 → 凹 → 耳切）
+static void buildHeartPoly(std::vector<glm::vec2> &poly)
+{
+    PathTessellator t;
+    t.begin();
+    t.moveTo({0.0f, 0.35f});                                     // 底部尖端
+    t.cubicTo({0.45f, 0.10f}, {0.40f, -0.30f}, {0.0f, -0.10f});  // 右瓣
+    t.cubicTo({-0.40f, -0.30f}, {-0.45f, 0.10f}, {0.0f, 0.35f}); // 左瓣
+    poly = t.close();
+}
+
+// 单瓣花瓣（2 段三次曲线，绕中心旋转 angle 后返回）
+static void buildPetalPoly(std::vector<glm::vec2> &poly, float angle)
+{
+    PathTessellator t;
+    t.begin();
+    t.moveTo({0.0f, 0.0f});                                    // 中心
+    t.cubicTo({0.35f, 0.15f}, {0.70f, 0.25f}, {1.0f, 0.0f});   // 上边 → 花瓣尖
+    t.cubicTo({0.70f, -0.25f}, {0.35f, -0.15f}, {0.0f, 0.0f}); // 下边 → 回中心
+    poly = t.close();
+    const float c = std::cos(angle);
+    const float s = std::sin(angle);
+    for (auto &p : poly)
+    {
+        const float x = p.x;
+        const float y = p.y;
+        p.x = x * c - y * s;
+        p.y = x * s + y * c;
+    }
 }
 
 using mcs::vulkan::tool::resource_manager;
@@ -1242,6 +1482,8 @@ struct FrameResources
 
     BufferResourceWithAddress globalInstanceBuffer{};
 
+    BufferResourceWithAddress globalAttributeBuffer{}; // type 7 逐顶点属性池
+
     BufferResource indirectDrawBuffer{};
     BufferResourceWithAddress commandConstantsBuffer{};
 
@@ -1251,9 +1493,13 @@ struct CommandConstant
 {
     uint32_t type_id;
     uint32_t adddress_offset;
+    uint32_t perInstanceAttributeCount; // type 7：每实例属性数
+    uint32_t attributeOffset;           // type 7：属性池偏移（上传命令常量时解析）
 };
 constexpr uint32_t MAX_INSTANCE_COUNT = 1000;
-constexpr uint32_t MAX_DRAW_CALLS = 10;
+constexpr uint32_t MAX_DRAW_CALLS = 32;
+constexpr VkDeviceSize PATH_VERTEX_CAPACITY = 16 * 1024; // type 6 动态顶点（个）
+constexpr VkDeviceSize PATH_INDEX_CAPACITY = 32 * 1024;  // type 6 动态索引（个）
 constexpr auto initFrameResources(const LogicalDevice &device, const mesh_manager &m)
 {
     auto &[allVertices, allIndices, meshMap] = m;
@@ -1262,7 +1508,8 @@ constexpr auto initFrameResources(const LogicalDevice &device, const mesh_manage
     {
         auto &batche = frameResources[i];
         {
-            auto capacity = allVertices.size() * sizeof(Vertex);
+            auto capacity = allVertices.size() * sizeof(Vertex) +
+                            PATH_VERTEX_CAPACITY * sizeof(Vertex);
             batche.globalVertexBuffer =
                 BufferResourceWithAddress{device, capacity,
                                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
@@ -1270,16 +1517,19 @@ constexpr auto initFrameResources(const LogicalDevice &device, const mesh_manage
                                           VK_SHARING_MODE_EXCLUSIVE,
                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
-            batche.globalVertexBuffer.write(0, allVertices.data(), capacity);
+            batche.globalVertexBuffer.write(0, allVertices.data(),
+                                            allVertices.size() * sizeof(Vertex));
         }
         {
-            auto capacity = allIndices.size() * sizeof(uint32_t);
+            auto capacity = allIndices.size() * sizeof(uint32_t) +
+                            PATH_INDEX_CAPACITY * sizeof(uint32_t);
             batche.globalIndexBuffer =
                 BufferResource{device, capacity, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
                                VK_SHARING_MODE_EXCLUSIVE,
                                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
-            batche.globalIndexBuffer.write(0, allIndices.data(), capacity);
+            batche.globalIndexBuffer.write(0, allIndices.data(),
+                                           allIndices.size() * sizeof(uint32_t));
         }
         {
             constexpr VkDeviceSize MAX_INSTANCE_DATA_SIZE =
@@ -1304,6 +1554,18 @@ constexpr auto initFrameResources(const LogicalDevice &device, const mesh_manage
                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
         }
         {
+            // type 7 逐顶点属性池（与动态顶点等量）
+            constexpr VkDeviceSize capacity =
+                PATH_VERTEX_CAPACITY * sizeof(VertexAttribute);
+            batche.globalAttributeBuffer =
+                BufferResourceWithAddress{device, capacity,
+                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                          VK_SHARING_MODE_EXCLUSIVE,
+                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+        {
             // 新增 command constants buffer
             constexpr VkDeviceSize MAX_CMD_CONST_SIZE =
                 MAX_DRAW_CALLS * sizeof(CommandConstant);
@@ -1324,6 +1586,7 @@ struct UIPushConstant
     uint64_t vertexAddress;
     uint64_t dataAddress;
     uint64_t commandConstantsAddress;
+    uint64_t attributeAddress; // type 7 逐顶点属性池
     uint32_t cameraIndex;
 };
 constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
@@ -2018,6 +2281,7 @@ try
                               .radius = 0.0f,
                               .shadowBlur = 0.015f}));
 
+#if TEST_SDF_DEMO_MODE
             // [1.5] 右侧演示面板：补充 SDF（点/线/多边形）的浅色背景
             addRect(makeRect({0.5f, 0.0f}, {1.0f, 1.8f},
                              {.fillColor = glm::vec4(0.93f, 0.94f, 0.96f, 1.0f),
@@ -2112,6 +2376,7 @@ try
                 glm::vec4(1.0f, 0.0f, 0.0f, 1.0f), glm::vec4(0.0f, 1.0f, 0.0f, 1.0f),
                 glm::vec4(0.0f, 0.0f, 1.0f, 1.0f), glm::vec4(1.0f, 1.0f, 0.0f, 1.0f)};
             addRect(gradientRect);
+#endif
 
             // ---------- 3. 顶点颜色实例（type 1：颜色 = 实例数据，完全参数化）----------
             // 三角形 mesh（N=3）对应 ColoredTri；quad 的彩色版本已合并进
@@ -2142,6 +2407,7 @@ try
             };
             static_assert(sizeof(Glyph) == 120); // 与 shader GLYPH_SIZE 一致
 
+#if TEST_SDF_DEMO_MODE
             // 生成一段文字：中文 + 英文 + 数字，覆盖 MSDF 与位图字体路径
             constexpr auto rawText = u8"Hello SDF 你好世界 0123";
             auto [codepoints, shape_result, break_result] =
@@ -2149,7 +2415,10 @@ try
             (void)codepoints;
             (void)break_result;
 
+#endif
+
             std::vector<Glyph> glyphs;
+#if TEST_SDF_DEMO_MODE
             {
                 constexpr float FONT_SIZE = 0.045f; // 1em 对应的 NDC 高度
                 constexpr glm::vec2 ORIGIN{-0.975f,
@@ -2214,6 +2483,7 @@ try
                     }
                 }
             }
+#endif
 
             std::vector<ColoredTri> coloredTris;
             // entity_index 自动 = 当前实例数（vector size）
@@ -2221,6 +2491,7 @@ try
                 t.entity_index = static_cast<uint32_t>(coloredTris.size());
                 coloredTris.push_back(t);
             };
+#if TEST_SDF_DEMO_MODE
             addTri(ColoredTri{
                 .model = glm::scale(
                     glm::translate(glm::mat4(1.0f), glm::vec3(-0.775f, 0.025f, 0.0f)),
@@ -2228,6 +2499,7 @@ try
                 .colors = {glm::vec4(1.0f, 0.0f, 0.0f, 1.0f),
                            glm::vec4(0.0f, 1.0f, 0.0f, 1.0f),
                            glm::vec4(0.0f, 0.0f, 1.0f, 1.0f)}});
+#endif
 
             // ---------- 3.6 补充 SDF 实例：通用点 / 通用线 / 正多边形 ----------
             // 与 shader 端 UiPoint / UiLine / UiPolygon 尺寸严格一致
@@ -2286,6 +2558,7 @@ try
                 uiPolygons.push_back(p);
             };
 
+#if TEST_SDF_DEMO_MODE
             constexpr std::array<glm::vec4, 6> pointColors = {
                 glm::vec4(0.95f, 0.35f, 0.35f, 1.0f),
                 glm::vec4(0.35f, 0.65f, 0.95f, 1.0f),
@@ -2352,30 +2625,158 @@ try
                                      .rotation = 0.0f,
                                      .softness = 0.010f});
             }
+#endif
+
+#if !TEST_SDF_DEMO_MODE
+            // ---------- 3.7 type 7：UIMesh 逐顶点色（CPU 细分 + 属性池，无第三方库）----------
+            struct UiMeshVc
+            {
+                uint32_t entity_index; // 4B
+                glm::mat4 model;       // 64B
+            };
+            static_assert(sizeof(UiMeshVc) == 68); // 与 shader UI_MESH_VC_SIZE 一致
+
+            struct PathMeshRange
+            {
+                uint32_t firstVertex; // 相对动态顶点区
+                uint32_t vertexCount;
+                uint32_t firstIndex; // 相对动态索引区
+                uint32_t indexCount;
+            };
+
+            std::vector<Vertex> pathVerts;          // 动态顶点（与全局池同构）
+            std::vector<uint32_t> pathIdx;          // 动态索引（相对值）
+            std::vector<VertexAttribute> pathAttrs; // 逐顶点属性（与 pathVerts 平行）
+            std::vector<PathMeshRange> pathRanges;
+            std::vector<UiMeshVc> uiMeshVcs;
+
+            // 每个形状：耳切 → 顶点/索引进动态区，实例只记 model；
+            // colorFn(局部坐标) 生成逐顶点颜色（渐变/实色均可）
+            auto addPathMesh = [&](glm::vec2 center, glm::vec2 scale,
+                                   const std::vector<glm::vec2> &poly, auto &&colorFn) {
+                std::vector<uint32_t> tris;
+                earClipPolygon(poly, tris);
+                const uint32_t firstVertex = static_cast<uint32_t>(pathVerts.size());
+                const uint32_t firstIndex = static_cast<uint32_t>(pathIdx.size());
+                for (const auto &p : poly)
+                {
+                    pathVerts.push_back(Vertex{glm::vec3(p, 0.0f), {0.0f, 0.0f}});
+                    pathAttrs.push_back(VertexAttribute{glm::vec3(colorFn(p))});
+                }
+                pathIdx.insert(pathIdx.end(), tris.begin(), tris.end());
+                pathRanges.push_back(
+                    PathMeshRange{firstVertex, static_cast<uint32_t>(poly.size()),
+                                  firstIndex, static_cast<uint32_t>(tris.size())});
+                UiMeshVc m{};
+                m.model = glm::translate(glm::mat4(1.0f), glm::vec3(center, 0.0f)) *
+                          glm::scale(glm::mat4(1.0f), glm::vec3(scale, 1.0f));
+                uiMeshVcs.push_back(m);
+            };
+
+            // 演示形状：上排 多边形（圆/圆角矩形/五角星），下排 贝塞尔（心形/四瓣花）
+            std::vector<glm::vec2> circlePoly, rrPoly, starPoly, heartPoly;
+            buildCirclePoly(circlePoly, {0.0f, 0.0f}, 1.0f);
+            buildRoundedRectPoly(rrPoly, {0.0f, 0.0f}, {0.5f, 0.32f}, 0.16f);
+            buildStarPoly(starPoly, {0.0f, 0.0f}, 1.0f, 0.45f, 5);
+            buildHeartPoly(heartPoly);
+
+            // 3 列 × 2 行布局（下排中间留空，避免与上排圆重复）
+            // 圆：径向渐变（中心亮 → 边缘深）
+            addPathMesh({-0.5f, -0.45f}, {0.18f, 0.18f}, circlePoly, [](glm::vec2 p) {
+                const float t = glm::length(p); // 0..1
+                return glm::mix(glm::vec4(0.55f, 0.85f, 1.0f, 1.0f),
+                                glm::vec4(0.05f, 0.20f, 0.55f, 1.0f), t);
+            });
+            // 圆角矩形：水平渐变（左蓝 → 右紫）
+            addPathMesh({0.0f, -0.45f}, {0.18f, 0.18f}, rrPoly, [](glm::vec2 p) {
+                const float t = (p.x + 0.5f) / 1.0f;
+                return glm::mix(glm::vec4(0.20f, 0.45f, 0.90f, 1.0f),
+                                glm::vec4(0.65f, 0.30f, 0.85f, 1.0f), t);
+            });
+            // 五角星：径向渐变（外亮金 → 内深橙）
+            addPathMesh({0.5f, -0.45f}, {0.18f, 0.18f}, starPoly, [](glm::vec2 p) {
+                const float t = glm::length(p);
+                return glm::mix(glm::vec4(0.98f, 0.88f, 0.40f, 1.0f),
+                                glm::vec4(0.75f, 0.25f, 0.10f, 1.0f), t);
+            });
+            // 心形：垂直渐变（上浅红 → 下深红）
+            addPathMesh({-0.45f, 0.40f}, {0.18f, 0.18f}, heartPoly, [](glm::vec2 p) {
+                const float t = (p.y + 0.30f) / 0.65f;
+                return glm::mix(glm::vec4(1.00f, 0.55f, 0.55f, 1.0f),
+                                glm::vec4(0.75f, 0.05f, 0.10f, 1.0f), t);
+            });
+            // 四瓣花：4 片贝塞尔花瓣（每片单独一条 path mesh，花瓣内中心→尖端渐变）
+            const std::array<glm::vec4, 4> petalColors = {
+                glm::vec4(0.90f, 0.25f, 0.30f, 1.0f), // 红
+                glm::vec4(0.95f, 0.60f, 0.15f, 1.0f), // 橙
+                glm::vec4(0.35f, 0.70f, 0.40f, 1.0f), // 绿
+                glm::vec4(0.40f, 0.50f, 0.90f, 1.0f), // 蓝
+            };
+            for (int k = 0; k < 4; k++)
+            {
+                std::vector<glm::vec2> petal;
+                buildPetalPoly(petal, 6.2831853f * float(k) / 4.0f);
+                addPathMesh({0.45f, 0.40f}, {0.15f, 0.15f}, petal,
+                            [c = petalColors[k]](glm::vec2 p) {
+                                const float t = glm::length(p);
+                                return glm::mix(glm::vec4(glm::vec3(c) * 0.45f, 1.0f), c,
+                                                t);
+                            });
+            }
+#endif
 
             VkDeviceSize offsetRect = 0;
             VkDeviceSize sizeRect = rectangles.size() * sizeof(Rectangle);
-            batch.globalInstanceBuffer.write(offsetRect, rectangles.data(), sizeRect);
+            if (sizeRect > 0)
+                batch.globalInstanceBuffer.write(offsetRect, rectangles.data(), sizeRect);
 
             VkDeviceSize offsetTri = sizeRect;
             VkDeviceSize sizeTri = coloredTris.size() * sizeof(ColoredTri);
-            batch.globalInstanceBuffer.write(offsetTri, coloredTris.data(), sizeTri);
+            if (sizeTri > 0)
+                batch.globalInstanceBuffer.write(offsetTri, coloredTris.data(), sizeTri);
 
             VkDeviceSize offsetText = sizeRect + sizeTri;
             VkDeviceSize sizeText = glyphs.size() * sizeof(Glyph);
-            batch.globalInstanceBuffer.write(offsetText, glyphs.data(), sizeText);
+            if (sizeText > 0)
+                batch.globalInstanceBuffer.write(offsetText, glyphs.data(), sizeText);
 
             VkDeviceSize offsetPoint = offsetText + sizeText;
             VkDeviceSize sizePoint = uiPoints.size() * sizeof(UiPoint);
-            batch.globalInstanceBuffer.write(offsetPoint, uiPoints.data(), sizePoint);
+            if (sizePoint > 0)
+                batch.globalInstanceBuffer.write(offsetPoint, uiPoints.data(), sizePoint);
 
             VkDeviceSize offsetLine = offsetPoint + sizePoint;
             VkDeviceSize sizeLine = uiLines.size() * sizeof(UiLine);
-            batch.globalInstanceBuffer.write(offsetLine, uiLines.data(), sizeLine);
+            if (sizeLine > 0)
+                batch.globalInstanceBuffer.write(offsetLine, uiLines.data(), sizeLine);
 
             VkDeviceSize offsetPoly = offsetLine + sizeLine;
             VkDeviceSize sizePoly = uiPolygons.size() * sizeof(UiPolygon);
-            batch.globalInstanceBuffer.write(offsetPoly, uiPolygons.data(), sizePoly);
+            if (sizePoly > 0)
+                batch.globalInstanceBuffer.write(offsetPoly, uiPolygons.data(), sizePoly);
+
+#if !TEST_SDF_DEMO_MODE
+            VkDeviceSize offsetUiMesh = offsetPoly + sizePoly;
+            VkDeviceSize sizeUiMesh = uiMeshVcs.size() * sizeof(UiMeshVc);
+            if (sizeUiMesh > 0)
+                batch.globalInstanceBuffer.write(offsetUiMesh, uiMeshVcs.data(),
+                                                 sizeUiMesh);
+
+            // 动态路径顶点/索引追加到全局池尾部（静态网格之后）
+            const uint32_t staticVertexCount = static_cast<uint32_t>(allVertices.size());
+            const uint32_t staticIndexCount = static_cast<uint32_t>(allIndices.size());
+            if (!pathVerts.empty())
+            {
+                batch.globalVertexBuffer.write(staticVertexCount * sizeof(Vertex),
+                                               pathVerts.data(),
+                                               pathVerts.size() * sizeof(Vertex));
+                batch.globalIndexBuffer.write(staticIndexCount * sizeof(uint32_t),
+                                              pathIdx.data(),
+                                              pathIdx.size() * sizeof(uint32_t));
+                batch.globalAttributeBuffer.write(
+                    0, pathAttrs.data(), pathAttrs.size() * sizeof(VertexAttribute));
+            }
+#endif
 
             // ---------- 2. 构建间接绘制命令数组（每个 mesh 一条命令）----------
             std::vector<VkDrawIndexedIndirectCommand> drawCommands;
@@ -2443,6 +2844,19 @@ try
                  .firstIndex = meshTriLoop.indexOffset,
                  .vertexOffset = static_cast<int32_t>(meshTriLoop.vertexOffset),
                  .firstInstance = 0});
+#if !TEST_SDF_DEMO_MODE
+            // 命令 7+：UIMesh 任意路径（type 6，每条 path mesh 一条命令）
+            for (size_t i = 0; i < pathRanges.size(); i++)
+            {
+                const auto &r = pathRanges[i];
+                drawCommands.push_back({.indexCount = r.indexCount,
+                                        .instanceCount = 1,
+                                        .firstIndex = staticIndexCount + r.firstIndex,
+                                        .vertexOffset = static_cast<int32_t>(
+                                            staticVertexCount + r.firstVertex),
+                                        .firstInstance = 0});
+            }
+#endif
             // 写入间接绘制缓冲区
             VkDeviceSize cmdOffset = 0;
             VkDeviceSize cmdSize =
@@ -2458,20 +2872,37 @@ try
             cmdConsts.push_back(
                 {.type_id = 1, .adddress_offset = static_cast<uint32_t>(offsetTri)});
             // 类型 2：Glyph（字形）
-            cmdConsts.push_back(
-                {.type_id = 2, .adddress_offset = static_cast<uint32_t>(offsetText)});
+            if (!glyphs.empty())
+                cmdConsts.push_back(
+                    {.type_id = 2, .adddress_offset = static_cast<uint32_t>(offsetText)});
             // 类型 3：UiPoint（通用点）
-            cmdConsts.push_back(
-                {.type_id = 3, .adddress_offset = static_cast<uint32_t>(offsetPoint)});
+            if (!uiPoints.empty())
+                cmdConsts.push_back(
+                    {.type_id = 3,
+                     .adddress_offset = static_cast<uint32_t>(offsetPoint)});
             // 类型 4：UiLine（通用线）
-            cmdConsts.push_back(
-                {.type_id = 4, .adddress_offset = static_cast<uint32_t>(offsetLine)});
+            if (!uiLines.empty())
+                cmdConsts.push_back(
+                    {.type_id = 4, .adddress_offset = static_cast<uint32_t>(offsetLine)});
             // 类型 5：UiPolygon（正多边形）
-            cmdConsts.push_back(
-                {.type_id = 5, .adddress_offset = static_cast<uint32_t>(offsetPoly)});
+            if (!uiPolygons.empty())
+                cmdConsts.push_back(
+                    {.type_id = 5, .adddress_offset = static_cast<uint32_t>(offsetPoly)});
             // 类型 6：切换演示（type 1 三角形数据，供 UIPoint/UILine/UITriangle 复用）
             cmdConsts.push_back(
                 {.type_id = 1, .adddress_offset = static_cast<uint32_t>(offsetTri)});
+#if !TEST_SDF_DEMO_MODE
+            // 类型 7+：UIMesh 逐顶点色（实例偏移 + 属性区间在命令常量上传时解析）
+            for (size_t i = 0; i < uiMeshVcs.size(); i++)
+            {
+                const auto &r = pathRanges[i];
+                cmdConsts.push_back({.type_id = 7,
+                                     .adddress_offset = static_cast<uint32_t>(
+                                         offsetUiMesh + i * sizeof(UiMeshVc)),
+                                     .perInstanceAttributeCount = r.vertexCount,
+                                     .attributeOffset = r.firstVertex});
+            }
+#endif
             batch.commandConstantsBuffer.write(
                 0, cmdConsts.data(), cmdConsts.size() * sizeof(CommandConstant));
 
@@ -2483,6 +2914,7 @@ try
                               .dataAddress = batch.globalInstanceBuffer.address,
                               .commandConstantsAddress =
                                   batch.commandConstantsBuffer.address,
+                              .attributeAddress = batch.globalAttributeBuffer.address,
                               .cameraIndex = 1}; // UI 相机
 
             // ---------- 5. 管线切换演示：UIPoint / UILine / UITriangle 来回绑定 ----------
@@ -2497,6 +2929,7 @@ try
                                               batch.drawCount,
                                               sizeof(VkDrawIndexedIndirectCommand));
 
+#if TEST_SDF_DEMO_MODE
             // 切换演示：命令常量基址指向演示区（cmdConsts[6] = type 1 + offsetTri），
             // 三条管线共用同一份 ColoredTri 实例，只是拓扑解释不同。
             constexpr VkDeviceSize DEMO_CMD_STRIDE = sizeof(VkDrawIndexedIndirectCommand);
@@ -2546,6 +2979,7 @@ try
             commandBuffer.setPrimitiveTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
             commandBuffer.drawIndexedIndirect(batch.indirectDrawBuffer.buffer.buffer(),
                                               1 * DEMO_CMD_STRIDE, 1, DEMO_CMD_STRIDE);
+#endif
         },
         [&] {
             const auto &[currentFrame, imageIndex] = recordCtx.info;
