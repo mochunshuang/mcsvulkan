@@ -214,6 +214,8 @@ constexpr auto init()
                  {
                      .independentBlend = VK_TRUE,  // NOTE: 两个frag 附件
                      .multiDrawIndirect = VK_TRUE, // 多实例绘制
+                     .wideLines = VK_TRUE,         // 管线切换演示：setLineWidth > 1
+                     .largePoints = VK_TRUE,       // 管线切换演示：gl_PointSize > 1
                      .samplerAnisotropy = VK_TRUE, //各向异性过滤
                      .shaderInt64 = VK_TRUE,       // uint64支持
                  }},
@@ -271,6 +273,8 @@ constexpr auto init()
                 return features2.features.samplerAnisotropy &&
                        features2.features.shaderInt64 &&
                        features2.features.multiDrawIndirect && //diff: [test_indirectdraw]
+                       features2.features.largePoints &&       // 管线切换演示需要
+                       features2.features.wideLines &&         // 管线切换演示需要
                        features2.features
                            .independentBlend && //diff: [test_indirectdraw_no_pick]
                        query_vulkan13_features.dynamicRendering &&
@@ -481,10 +485,17 @@ constexpr auto initMeshManager()
         Vertex{{0.5f, -0.5f, 0.0f}, {0.0f, 0.0f}},
         Vertex{{0.0f, 0.5f, 0.0f}, {0.0f, 0.0f}}};
     constexpr auto triIdx = std::array<uint32_t, 3>{0, 1, 2};
+    // 线框循环网格：与三角形同顶点，LINE_LIST 用 6 索引画三条边（TRIANGLE_LIST 下是退化三角形）
+    constexpr std::array<Vertex, 3> triLoopVerts = {
+        Vertex{{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f}},
+        Vertex{{0.5f, -0.5f, 0.0f}, {0.0f, 0.0f}},
+        Vertex{{0.0f, 0.5f, 0.0f}, {0.0f, 0.0f}}};
+    constexpr auto triLoopIdx = std::array<uint32_t, 6>{0, 1, 1, 2, 2, 0};
 
     mesh_manager m;
     m.addMesh("quad", std::span{quadVerts}, std::span{quadIdx});
     m.addMesh("triangle", std::span{triVerts}, std::span{triIdx});
+    m.addMesh("triLoop", std::span{triLoopVerts}, std::span{triLoopIdx});
     return m;
 }
 
@@ -2007,8 +2018,15 @@ try
                               .radius = 0.0f,
                               .shadowBlur = 0.015f}));
 
+            // [1.5] 右侧演示面板：补充 SDF（点/线/多边形）的浅色背景
+            addRect(makeRect({0.5f, 0.0f}, {1.0f, 1.8f},
+                             {.fillColor = glm::vec4(0.93f, 0.94f, 0.96f, 1.0f),
+                              .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.25f),
+                              .shadowOffset = {0.0f, 0.03f},
+                              .radius = 0.03f,
+                              .shadowBlur = 0.06f}));
             // [2] 经典 HTML 卡片：白色圆角 + 黑色投影（目标效果：白底黑影）
-            addRect(makeRect({0.0f, 0.1f}, {0.5f, 0.3f},
+            addRect(makeRect({-0.5f, 0.05f}, {0.25f, 0.15f},
                              {.fillColor = WHITE,
                               .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.45f),
                               .shadowOffset = {0.0f, 0.05f},
@@ -2016,7 +2034,7 @@ try
                               .shadowBlur = 0.08f}));
 
             // [3] 蓝色半透明圆角卡片：阴影透过卡片可见（HTML 透明效果）
-            addRect(makeRect({-0.33f, -0.28f}, {0.4f, 0.24f},
+            addRect(makeRect({-0.665f, -0.14f}, {0.2f, 0.12f},
                              {.fillColor = glm::vec4(0.15f, 0.35f, 0.9f, 0.6f),
                               .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.4f),
                               .shadowOffset = {0.0f, 0.05f},
@@ -2025,7 +2043,7 @@ try
 
             // [4] 深色卡片 + 白色阴影（白色描边/发光效果）；
             //     同时演示 effects 标志位显式指定特效
-            addRect(makeRect({0.33f, -0.22f}, {0.32f, 0.22f},
+            addRect(makeRect({-0.335f, -0.11f}, {0.16f, 0.11f},
                              {.fillColor = glm::vec4(0.12f, 0.14f, 0.2f, 1.0f),
                               .shadowColor = glm::vec4(1.0f, 1.0f, 1.0f, 0.85f),
                               .shadowOffset = {0.0f, 0.03f},
@@ -2034,7 +2052,7 @@ try
                               .effects = FX_ROUNDED | FX_SHADOW | FX_FILL}));
 
             // [5] 纯阴影（无填充）：一个柔和的黑色阴影块（a=0 → 无卡片）
-            addRect(makeRect({-0.35f, 0.35f}, {0.28f, 0.16f},
+            addRect(makeRect({-0.675f, 0.175f}, {0.14f, 0.08f},
                              {.fillColor = glm::vec4(0.0f),
                               .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.5f),
                               .shadowOffset = {0.0f, 0.0f},
@@ -2043,7 +2061,7 @@ try
                               .shadowSpread = 1.15f}));
 
             // [6] 直角 + 阴影（只要阴影不要圆角：radius=0）
-            addRect(makeRect({0.32f, 0.36f}, {0.28f, 0.15f},
+            addRect(makeRect({-0.34f, 0.18f}, {0.14f, 0.075f},
                              {.fillColor = glm::vec4(0.9f, 0.5f, 0.1f, 1.0f),
                               .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.45f),
                               .shadowOffset = {0.03f, 0.05f},
@@ -2052,39 +2070,39 @@ try
 
             // [7] 最基础矩形：无圆角、无阴影
             addRect(makeRect(
-                {0.0f, 0.62f}, {0.46f, 0.1f},
+                {-0.5f, 0.31f}, {0.23f, 0.05f},
                 {.fillColor = glm::vec4(0.2f, 0.75f, 0.4f, 1.0f), .radius = 0.0f}));
 
             // [8] 旋转卡片 + 阴影（阴影随卡片旋转，几何自动外扩）
-            addRect(makeRect({0.0f, -0.62f}, {0.42f, 0.2f},
+            addRect(makeRect({-0.5f, -0.31f}, {0.21f, 0.1f},
                              {.fillColor = WHITE,
                               .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.4f),
                               .shadowOffset = {0.0f, 0.05f},
                               .radius = 0.08f,
                               .rotation = 12.0f}));
 
-            // [9][10][11] 三层重叠半透明卡片（透明度测试，右上角）。
+            // [9][10][11] 三层重叠半透明卡片（透明度测试）。
             //     绘制顺序 = 层次顺序：红(最底) → 绿 → 蓝(最顶)，
             //     每层都是半透明填充，重叠区域能看到 premultiplied alpha
             //     的透色混合；中间绿层带黑色阴影，同时验证“阴影透过
             //     半透明卡片可见”（HTML 风格）。
             addRect(makeRect(
-                {0.62f, 0.15f}, {0.34f, 0.24f},
+                {-0.19f, 0.075f}, {0.17f, 0.12f},
                 {.fillColor = glm::vec4(0.9f, 0.15f, 0.15f, 0.45f), .radius = 0.08f}));
-            addRect(makeRect({0.72f, 0.24f}, {0.28f, 0.20f},
+            addRect(makeRect({-0.14f, 0.12f}, {0.14f, 0.10f},
                              {.fillColor = glm::vec4(0.15f, 0.85f, 0.25f, 0.5f),
                               .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.35f),
                               .shadowOffset = {0.0f, 0.05f},
                               .radius = 0.08f,
                               .shadowBlur = 0.08f}));
             addRect(makeRect(
-                {0.82f, 0.33f}, {0.22f, 0.16f},
+                {-0.09f, 0.165f}, {0.11f, 0.08f},
                 {.fillColor = glm::vec4(0.2f, 0.4f, 0.95f, 0.6f), .radius = 0.08f}));
 
             // [12] 彩色渐变矩形：四顶点四色（红/绿/蓝/黄）+ 圆角 + 黑色阴影。
             //      颜色 = Rectangle.colors[4]（与 ColoredQuad 合并后，特效同样生效）
             auto gradientRect =
-                makeRect({-0.78f, -0.52f}, {0.36f, 0.36f},
+                makeRect({-0.89f, -0.26f}, {0.18f, 0.18f},
                          {.fillColor = WHITE,
                           .shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.45f),
                           .shadowOffset = {0.0f, 0.05f},
@@ -2133,8 +2151,9 @@ try
 
             std::vector<Glyph> glyphs;
             {
-                constexpr float FONT_SIZE = 0.09f;          // 1em 对应的 NDC 高度
-                constexpr glm::vec2 ORIGIN{-0.95f, -0.86f}; // 文字块左上角（NDC，y 向下）
+                constexpr float FONT_SIZE = 0.045f; // 1em 对应的 NDC 高度
+                constexpr glm::vec2 ORIGIN{-0.975f,
+                                           -0.43f}; // 文字块左上角（NDC，y 向下）
                 const float baselineY = ORIGIN.y + FONT_SIZE;
                 float cursorX = ORIGIN.x;
 
@@ -2204,11 +2223,135 @@ try
             };
             addTri(ColoredTri{
                 .model = glm::scale(
-                    glm::translate(glm::mat4(1.0f), glm::vec3(-0.55f, 0.05f, 0.0f)),
-                    glm::vec3(0.35f)),
+                    glm::translate(glm::mat4(1.0f), glm::vec3(-0.775f, 0.025f, 0.0f)),
+                    glm::vec3(0.175f)),
                 .colors = {glm::vec4(1.0f, 0.0f, 0.0f, 1.0f),
                            glm::vec4(0.0f, 1.0f, 0.0f, 1.0f),
                            glm::vec4(0.0f, 0.0f, 1.0f, 1.0f)}});
+
+            // ---------- 3.6 补充 SDF 实例：通用点 / 通用线 / 正多边形 ----------
+            // 与 shader 端 UiPoint / UiLine / UiPolygon 尺寸严格一致
+            struct UiPoint
+            {
+                uint32_t entity_index; // 4B
+                uint32_t style;        // 4B 0=圆盘 1=圆环 2=方块 3=菱形 4=十字 5=星形
+                glm::vec4 color;       // 16B
+                glm::vec2 center;      // 8B NDC
+                glm::vec2 size;        // 8B NDC 直径
+                float softness;        // 4B
+                float param;           // 4B 圆环内径比例 / 星形瓣数
+            };
+            static_assert(sizeof(UiPoint) == 48); // 与 shader UI_POINT_SIZE 一致
+
+            struct UiLine
+            {
+                uint32_t entity_index;           // 4B
+                uint32_t style;                  // 4B 0=实线 1=虚线 2=箭头 3=渐变
+                std::array<glm::vec4, 2> colors; // 32B 端点颜色
+                glm::vec2 posA;                  // 8B NDC
+                glm::vec2 posB;                  // 8B NDC
+                float width;                     // 4B
+                float softness;                  // 4B
+                float param;                     // 4B 虚线周期 / 箭头长度
+            };
+            static_assert(sizeof(UiLine) == 68); // 与 shader UI_LINE_SIZE 一致
+
+            struct UiPolygon
+            {
+                uint32_t entity_index; // 4B
+                uint32_t sides;        // 4B 3..64
+                glm::vec4 color;       // 16B
+                glm::vec2 center;      // 8B NDC
+                float radius;          // 4B NDC 外接圆半径
+                float rotation;        // 4B 弧度
+                float softness;        // 4B
+            };
+            static_assert(sizeof(UiPolygon) == 44); // 与 shader UI_POLYGON_SIZE 一致
+
+            // 右侧面板内的例子：点（两排 12 个，6 种 style）、线（5 条，4 种 style+渐变）、
+            // 多边形（三角/五边/六边/圆）
+            std::vector<UiPoint> uiPoints;
+            auto addPoint = [&](UiPoint p) {
+                p.entity_index = static_cast<uint32_t>(uiPoints.size());
+                uiPoints.push_back(p);
+            };
+            std::vector<UiLine> uiLines;
+            auto addLine = [&](UiLine l) {
+                l.entity_index = static_cast<uint32_t>(uiLines.size());
+                uiLines.push_back(l);
+            };
+            std::vector<UiPolygon> uiPolygons;
+            auto addPolygon = [&](UiPolygon p) {
+                p.entity_index = static_cast<uint32_t>(uiPolygons.size());
+                uiPolygons.push_back(p);
+            };
+
+            constexpr std::array<glm::vec4, 6> pointColors = {
+                glm::vec4(0.95f, 0.35f, 0.35f, 1.0f),
+                glm::vec4(0.35f, 0.65f, 0.95f, 1.0f),
+                glm::vec4(0.30f, 0.80f, 0.45f, 1.0f),
+                glm::vec4(0.95f, 0.70f, 0.20f, 1.0f),
+                glm::vec4(0.70f, 0.45f, 0.95f, 1.0f),
+                glm::vec4(0.15f, 0.75f, 0.80f, 1.0f)};
+            for (uint32_t row = 0; row < 2; row++)
+            {
+                for (uint32_t i = 0; i < 6; i++)
+                {
+                    const float x = 0.15f + static_cast<float>(i) * 0.15f;
+                    const float y = -0.50f - static_cast<float>(row) * 0.20f;
+                    const uint32_t style = row == 0 ? i : (i + 3) % 6;
+                    addPoint(UiPoint{.style = style,
+                                     .color = pointColors[i],
+                                     .center = {x, y},
+                                     .size = {0.14f, 0.14f},
+                                     .softness = 0.010f,
+                                     .param = style == 1u ? 0.45f
+                                                          : (style == 5u ? 5.0f : 0.0f)});
+                }
+            }
+
+            constexpr std::array<glm::vec4, 4> lineColors = {
+                glm::vec4(0.20f, 0.45f, 0.85f, 1.0f),
+                glm::vec4(0.65f, 0.35f, 0.90f, 1.0f),
+                glm::vec4(0.90f, 0.55f, 0.15f, 1.0f),
+                glm::vec4(0.85f, 0.30f, 0.35f, 1.0f)};
+            for (uint32_t i = 0; i < 4; i++)
+            {
+                const float y = 0.12f + static_cast<float>(i) * 0.18f;
+                addLine(UiLine{.style = i,
+                               .colors = {lineColors[i], lineColors[i]},
+                               .posA = {0.14f, y},
+                               .posB = {0.86f, y},
+                               .width = 0.045f,
+                               .softness = 0.008f,
+                               .param = i == 1u ? 0.08f : (i == 2u ? 0.16f : 0.0f)});
+            }
+            // 渐变线：两端不同颜色
+            addLine(UiLine{.style = 3,
+                           .colors = {glm::vec4(0.95f, 0.30f, 0.30f, 1.0f),
+                                      glm::vec4(0.20f, 0.40f, 0.95f, 1.0f)},
+                           .posA = {0.14f, 0.84f},
+                           .posB = {0.86f, 0.84f},
+                           .width = 0.045f,
+                           .softness = 0.008f,
+                           .param = 0.0f});
+
+            constexpr std::array<uint32_t, 4> polySides = {3, 5, 6, 24};
+            constexpr std::array<glm::vec4, 4> polyColors = {
+                glm::vec4(0.90f, 0.40f, 0.35f, 1.0f),
+                glm::vec4(0.35f, 0.70f, 0.40f, 1.0f),
+                glm::vec4(0.35f, 0.55f, 0.90f, 1.0f),
+                glm::vec4(0.85f, 0.65f, 0.20f, 1.0f)};
+            for (uint32_t i = 0; i < 4; i++)
+            {
+                const float x = 0.28f + static_cast<float>(i) * 0.20f;
+                addPolygon(UiPolygon{.sides = polySides[i],
+                                     .color = polyColors[i],
+                                     .center = {x, -0.16f},
+                                     .radius = 0.11f,
+                                     .rotation = 0.0f,
+                                     .softness = 0.010f});
+            }
 
             VkDeviceSize offsetRect = 0;
             VkDeviceSize sizeRect = rectangles.size() * sizeof(Rectangle);
@@ -2221,6 +2364,18 @@ try
             VkDeviceSize offsetText = sizeRect + sizeTri;
             VkDeviceSize sizeText = glyphs.size() * sizeof(Glyph);
             batch.globalInstanceBuffer.write(offsetText, glyphs.data(), sizeText);
+
+            VkDeviceSize offsetPoint = offsetText + sizeText;
+            VkDeviceSize sizePoint = uiPoints.size() * sizeof(UiPoint);
+            batch.globalInstanceBuffer.write(offsetPoint, uiPoints.data(), sizePoint);
+
+            VkDeviceSize offsetLine = offsetPoint + sizePoint;
+            VkDeviceSize sizeLine = uiLines.size() * sizeof(UiLine);
+            batch.globalInstanceBuffer.write(offsetLine, uiLines.data(), sizeLine);
+
+            VkDeviceSize offsetPoly = offsetLine + sizeLine;
+            VkDeviceSize sizePoly = uiPolygons.size() * sizeof(UiPolygon);
+            batch.globalInstanceBuffer.write(offsetPoly, uiPolygons.data(), sizePoly);
 
             // ---------- 2. 构建间接绘制命令数组（每个 mesh 一条命令）----------
             std::vector<VkDrawIndexedIndirectCommand> drawCommands;
@@ -2249,6 +2404,45 @@ try
                      .vertexOffset = static_cast<int32_t>(mesh.vertexOffset),
                      .firstInstance = 0});
             }
+            // 命令 3：通用点（quad 网格，type 3：disc/ring/square/diamond/cross/star）
+            if (!uiPoints.empty())
+            {
+                drawCommands.push_back(
+                    {.indexCount = mesh.indexCount,
+                     .instanceCount = static_cast<uint32_t>(uiPoints.size()),
+                     .firstIndex = mesh.indexOffset,
+                     .vertexOffset = static_cast<int32_t>(mesh.vertexOffset),
+                     .firstInstance = 0});
+            }
+            // 命令 4：通用线（quad 网格，type 4：capsule/dash/arrow/gradient）
+            if (!uiLines.empty())
+            {
+                drawCommands.push_back(
+                    {.indexCount = mesh.indexCount,
+                     .instanceCount = static_cast<uint32_t>(uiLines.size()),
+                     .firstIndex = mesh.indexOffset,
+                     .vertexOffset = static_cast<int32_t>(mesh.vertexOffset),
+                     .firstInstance = 0});
+            }
+            // 命令 5：正多边形（quad 网格，type 5：sides=3..64）
+            if (!uiPolygons.empty())
+            {
+                drawCommands.push_back(
+                    {.indexCount = mesh.indexCount,
+                     .instanceCount = static_cast<uint32_t>(uiPolygons.size()),
+                     .firstIndex = mesh.indexOffset,
+                     .vertexOffset = static_cast<int32_t>(mesh.vertexOffset),
+                     .firstInstance = 0});
+            }
+            // 命令 6：三角形线框网格（triLoop，LINE_LIST 画三条边；
+            // 主场景 TRIANGLE_LIST 下是退化三角形，不可见）
+            const auto &meshTriLoop = meshMap.at("triLoop");
+            drawCommands.push_back(
+                {.indexCount = meshTriLoop.indexCount,
+                 .instanceCount = static_cast<uint32_t>(coloredTris.size()),
+                 .firstIndex = meshTriLoop.indexOffset,
+                 .vertexOffset = static_cast<int32_t>(meshTriLoop.vertexOffset),
+                 .firstInstance = 0});
             // 写入间接绘制缓冲区
             VkDeviceSize cmdOffset = 0;
             VkDeviceSize cmdSize =
@@ -2266,6 +2460,18 @@ try
             // 类型 2：Glyph（字形）
             cmdConsts.push_back(
                 {.type_id = 2, .adddress_offset = static_cast<uint32_t>(offsetText)});
+            // 类型 3：UiPoint（通用点）
+            cmdConsts.push_back(
+                {.type_id = 3, .adddress_offset = static_cast<uint32_t>(offsetPoint)});
+            // 类型 4：UiLine（通用线）
+            cmdConsts.push_back(
+                {.type_id = 4, .adddress_offset = static_cast<uint32_t>(offsetLine)});
+            // 类型 5：UiPolygon（正多边形）
+            cmdConsts.push_back(
+                {.type_id = 5, .adddress_offset = static_cast<uint32_t>(offsetPoly)});
+            // 类型 6：切换演示（type 1 三角形数据，供 UIPoint/UILine/UITriangle 复用）
+            cmdConsts.push_back(
+                {.type_id = 1, .adddress_offset = static_cast<uint32_t>(offsetTri)});
             batch.commandConstantsBuffer.write(
                 0, cmdConsts.data(), cmdConsts.size() * sizeof(CommandConstant));
 
@@ -2279,7 +2485,8 @@ try
                                   batch.commandConstantsBuffer.address,
                               .cameraIndex = 1}; // UI 相机
 
-            // ---------- 5. 绑定管线并绘制 ----------
+            // ---------- 5. 管线切换演示：UIPoint / UILine / UITriangle 来回绑定 ----------
+            // 主场景（全部三角化类型 0..6）走 pipelineUITriangle，一次间接绘制
             commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                        *mainCtx.pipelineUITriangle);
             commandBuffer.setPrimitiveTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
@@ -2289,6 +2496,56 @@ try
             commandBuffer.drawIndexedIndirect(batch.indirectDrawBuffer.buffer.buffer(), 0,
                                               batch.drawCount,
                                               sizeof(VkDrawIndexedIndirectCommand));
+
+            // 切换演示：命令常量基址指向演示区（cmdConsts[6] = type 1 + offsetTri），
+            // 三条管线共用同一份 ColoredTri 实例，只是拓扑解释不同。
+            constexpr VkDeviceSize DEMO_CMD_STRIDE = sizeof(VkDrawIndexedIndirectCommand);
+            UIPushConstant pcDemo = pc;
+            pcDemo.commandConstantsAddress =
+                batch.commandConstantsBuffer.address + 6 * sizeof(CommandConstant);
+            commandBuffer.pushConstants(*mainCtx.pipelineLayout,
+                                        VK_SHADER_STAGE_VERTEX_BIT, 0,
+                                        sizeof(UIPushConstant), &pcDemo);
+
+            // 第 1 轮：点 → 线 → 三角形
+            commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                       *mainCtx.pipelineUIPoint);
+            commandBuffer.setPrimitiveTopology(VK_PRIMITIVE_TOPOLOGY_POINT_LIST);
+            commandBuffer.drawIndexedIndirect(batch.indirectDrawBuffer.buffer.buffer(),
+                                              1 * DEMO_CMD_STRIDE, 1, DEMO_CMD_STRIDE);
+
+            commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                       *mainCtx.pipelineUILine);
+            commandBuffer.setPrimitiveTopology(VK_PRIMITIVE_TOPOLOGY_LINE_LIST);
+            commandBuffer.setLineWidth(2.0f);
+            commandBuffer.drawIndexedIndirect(batch.indirectDrawBuffer.buffer.buffer(),
+                                              6 * DEMO_CMD_STRIDE, 1, DEMO_CMD_STRIDE);
+
+            commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                       *mainCtx.pipelineUITriangle);
+            commandBuffer.setPrimitiveTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+            commandBuffer.drawIndexedIndirect(batch.indirectDrawBuffer.buffer.buffer(),
+                                              1 * DEMO_CMD_STRIDE, 1, DEMO_CMD_STRIDE);
+
+            // 第 2 轮：再来一遍（来回切换）
+            commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                       *mainCtx.pipelineUIPoint);
+            commandBuffer.setPrimitiveTopology(VK_PRIMITIVE_TOPOLOGY_POINT_LIST);
+            commandBuffer.drawIndexedIndirect(batch.indirectDrawBuffer.buffer.buffer(),
+                                              1 * DEMO_CMD_STRIDE, 1, DEMO_CMD_STRIDE);
+
+            commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                       *mainCtx.pipelineUILine);
+            commandBuffer.setPrimitiveTopology(VK_PRIMITIVE_TOPOLOGY_LINE_LIST);
+            commandBuffer.setLineWidth(2.0f);
+            commandBuffer.drawIndexedIndirect(batch.indirectDrawBuffer.buffer.buffer(),
+                                              6 * DEMO_CMD_STRIDE, 1, DEMO_CMD_STRIDE);
+
+            commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                       *mainCtx.pipelineUITriangle);
+            commandBuffer.setPrimitiveTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
+            commandBuffer.drawIndexedIndirect(batch.indirectDrawBuffer.buffer.buffer(),
+                                              1 * DEMO_CMD_STRIDE, 1, DEMO_CMD_STRIDE);
         },
         [&] {
             const auto &[currentFrame, imageIndex] = recordCtx.info;

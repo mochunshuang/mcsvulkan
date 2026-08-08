@@ -383,6 +383,10 @@ namespace mcs::vulkan
         {
             pool_->device()->cmdSetPrimitiveTopology(value_, primitiveTopology);
         }
+        constexpr void setLineWidth(float lineWidth) const noexcept
+        {
+            pool_->device()->cmdSetLineWidth(value_, lineWidth);
+        }
     };
 
 }; // namespace mcs::vulkan

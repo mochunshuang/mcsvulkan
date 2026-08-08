@@ -138,6 +138,65 @@ layout(buffer_reference, scalar) readonly buffer GlyphBuffer
     Glyph glyphs[];
 };
 
+// ============================================================
+// type_id == 3：通用点（quad + disc/ring/square/diamond/cross/star SDF）
+// 与 test_sdf.frag / test_sdf.cpp 对齐
+// ============================================================
+#define UI_POINT_SIZE 48
+struct UiPoint
+{
+    uint entity_index;
+    uint style;       // 0=圆盘 1=圆环 2=方块 3=菱形 4=十字 5=星形
+    vec4 color;
+    vec2 center;      // NDC
+    vec2 size;        // NDC 直径
+    float softness;
+    float param;      // 圆环内径比例 / 星形瓣数
+};
+layout(buffer_reference, scalar) readonly buffer UiPointBuffer
+{
+    UiPoint insts[];
+};
+
+// ============================================================
+// type_id == 4：通用粗线段（quad + capsule/dash/arrow SDF，圆头、端点渐变）
+// ============================================================
+#define UI_LINE_SIZE 68
+struct UiLine
+{
+    uint entity_index;
+    uint style;       // 0=实线胶囊 1=虚线 2=箭头 3=渐变（颜色端点插值）
+    vec4 colors[2];   // 端点颜色
+    vec2 posA;        // NDC
+    vec2 posB;        // NDC
+    float width;
+    float softness;
+    float param;      // 虚线周期 / 箭头长度
+};
+layout(buffer_reference, scalar) readonly buffer UiLineBuffer
+{
+    UiLine insts[];
+};
+
+// ============================================================
+// type_id == 5：正多边形（quad + 极坐标 SDF，sides=3..64）
+// ============================================================
+#define UI_POLYGON_SIZE 44
+struct UiPolygon
+{
+    uint entity_index;
+    uint sides;
+    vec4 color;
+    vec2 center;
+    float radius;     // NDC 外接圆半径
+    float rotation;   // 弧度
+    float softness;
+};
+layout(buffer_reference, scalar) readonly buffer UiPolygonBuffer
+{
+    UiPolygon insts[];
+};
+
 
 layout(location = 0) out vec4 fragColor;     // 插值后的颜色
 layout(location = 1) out vec2 fragTexCoord;
@@ -156,7 +215,7 @@ void main()
     vec3 pos = vec3(0.0);
     localPos = vec2(0.0);
 
-    gl_PointSize = 1.;
+    gl_PointSize = 8.; // 管线切换演示：POINT_LIST 时用大点，三角形/线框绘制时被忽略
 
     // NOTE: 多实例间接绘制（每条 draw 命令由 gl_DrawIDARB 对应一条命令常量）
     CommandConstBuffer cmdConsts = CommandConstBuffer(pc.commandConstantsAddress);
@@ -212,6 +271,49 @@ void main()
         model = inst.model;                    // 平移 + 缩放（字形矩形）
         fragColor = inst.color;                // 顶点色，供 modulate 使用
         fragTexCoord = inst.uvTransform.offset + v.texCoord * inst.uvTransform.scale;
+        localPos = v.pos.xy;
+        pos = v.pos;
+    }
+    break;
+    case 3: {
+        instancePtr = heapBaseStart + gl_InstanceIndex * UI_POINT_SIZE;
+        UiPoint inst = UiPointBuffer(instancePtr).insts[0];
+        // 平移 + 缩放：quad [-0.5,0.5] -> NDC [center-size/2, center+size/2]
+        model = mat4(vec4(inst.size.x, 0.0, 0.0, 0.0),
+                     vec4(0.0, inst.size.y, 0.0, 0.0),
+                     vec4(0.0, 0.0, 1.0, 0.0),
+                     vec4(inst.center, 0.0, 1.0));
+        fragColor = inst.color;
+        localPos = v.pos.xy;
+        pos = v.pos;
+    }
+    break;
+    case 4: {
+        instancePtr = heapBaseStart + gl_InstanceIndex * UI_LINE_SIZE;
+        UiLine inst = UiLineBuffer(instancePtr).insts[0];
+        vec2 a = inst.posA;
+        vec2 b = inst.posB;
+        vec2 dir = normalize(b - a);
+        float len = length(b - a);
+        vec2 nrm = vec2(-dir.y, dir.x);
+        float w = max(inst.width, 1e-4);
+        vec2 halfSize = vec2(len * 0.5 + w * 0.5, w * 0.5); // 圆头外扩
+        vec2 p = v.pos.xy * 2.0 * halfSize;                 // 线段局部坐标（NDC）
+        vec2 center = (a + b) * 0.5;
+        pos.xy = center + dir * p.x + nrm * p.y;
+        localPos = p;
+        fragColor = inst.colors[uint(v.pos.x > 0.0)];       // 端点渐变
+    }
+    break;
+    case 5: {
+        instancePtr = heapBaseStart + gl_InstanceIndex * UI_POLYGON_SIZE;
+        UiPolygon inst = UiPolygonBuffer(instancePtr).insts[0];
+        // quad 覆盖外接圆 bbox：直径 = 2*radius
+        model = mat4(vec4(2.0 * inst.radius, 0.0, 0.0, 0.0),
+                     vec4(0.0, 2.0 * inst.radius, 0.0, 0.0),
+                     vec4(0.0, 0.0, 1.0, 0.0),
+                     vec4(inst.center, 0.0, 1.0));
+        fragColor = inst.color;
         localPos = v.pos.xy;
         pos = v.pos;
     }

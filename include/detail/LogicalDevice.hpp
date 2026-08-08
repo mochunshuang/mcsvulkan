@@ -754,5 +754,11 @@ namespace mcs::vulkan
             MCS_ASSERT(table_.vkCmdSetPrimitiveTopology != nullptr);
             table_.vkCmdSetPrimitiveTopology(commandBuffer, primitiveTopology);
         }
+        constexpr void cmdSetLineWidth(VkCommandBuffer commandBuffer,
+                                       float lineWidth) const noexcept
+        {
+            MCS_ASSERT(table_.vkCmdSetLineWidth != nullptr);
+            table_.vkCmdSetLineWidth(commandBuffer, lineWidth);
+        }
     };
 }; // namespace mcs::vulkan
