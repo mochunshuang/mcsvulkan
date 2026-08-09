@@ -762,6 +762,13 @@ namespace ui
         }
     };
 
+    // hover 事件负载：input 指针（薄转发）+ 命中的 UI 实例实体 id（GPU pick 回传，~0u=无）
+    struct HoverEvent
+    {
+        glfw_input *input = nullptr;
+        uint32_t instanceId = ~0u;
+    };
+
     // 扁平树节点（使用全局 Entity）：每个节点自己的状态 + 自己的函数
     struct FlatNode
     {
@@ -772,7 +779,6 @@ namespace ui
         BoxGeometry geometry;
         std::string name;
         float baseline = 0;
-        int first_instance = -1; // 渲染时登记的 uiStore 实例起点（targeted 更新用）
 
         // 每个节点自己的状态：任意 struct（有状态，归节点所有）
         std::any status;
@@ -3614,15 +3620,22 @@ struct triat_for_ui
         uint32_t idx = result.key.entity_index;
         assert(type == uiStore_type_id);
         auto &store = soaCtx.uiStore;
-        if (!store.alive(idx))
+        // 几何路由：光标落在哪个节点的 geometry 矩形内（后遍历者 = 后绘制/最上层优先）
+        const auto cur = inputCtx.input.cursorPos();
+        int node_idx = -1;
+        for (size_t i = 0; i < soaCtx.uiTree.nodes.size(); i++)
+        {
+            const auto &g = soaCtx.uiTree.nodes[i].geometry;
+            if (cur.xpos >= g.x && cur.xpos <= g.x + g.w && cur.ypos >= g.y &&
+                cur.ypos <= g.y + g.h)
+                node_idx = static_cast<int>(i);
+        }
+        if (node_idx < 0)
             return;
-        if (idx >= soaCtx.instanceToNode.size())
-            return;
-        int node_idx = soaCtx.instanceToNode[idx];
-        if (node_idx < 0 || node_idx >= static_cast<int>(soaCtx.uiTree.nodes.size()))
-            return;
+        // 命中实例：GPU pick 回传（~0u = 无/旧构建），随事件交给节点做 targeted 更新
+        const uint32_t instanceId = store.alive(idx) ? idx : ~0u;
 
-        // 薄转发：把输入源指针交给节点自己的 "hover"，不读设备、不解释
+        // 薄转发：input + 命中实例 id 交给节点自己的 "hover"，不读设备、不解释
         auto &input = inputCtx.input;
         auto &node = soaCtx.uiTree.nodes[node_idx];
         if (soaCtx.uiHoverNode != node_idx)
@@ -3630,11 +3643,10 @@ struct triat_for_ui
             // 悬停转移：先通知旧节点离开（修复跨节点误 click）
             int old = soaCtx.uiHoverNode;
             if (old >= 0 && old < static_cast<int>(soaCtx.uiTree.nodes.size()))
-                soaCtx.uiTree.nodes[old].emit(
-                    "hover", ui::UiEvent{static_cast<glfw_input *>(nullptr)});
+                soaCtx.uiTree.nodes[old].emit("hover", ui::UiEvent{ui::HoverEvent{}});
             soaCtx.uiHoverNode = node_idx;
         }
-        node.emit("hover", ui::UiEvent{&input});
+        node.emit("hover", ui::UiEvent{ui::HoverEvent{&input, instanceId}});
     }
     static constexpr auto update(auto &world, auto &inputCtx, auto &soaCtx,
                                  uint32_t currentFrame) noexcept
@@ -3743,7 +3755,7 @@ static constexpr auto ui_hover_leave = [](auto &world, auto &inputCtx, auto &soa
         return;
     soaCtx.uiHoverNode = -1;
     auto &node = soaCtx.uiTree.nodes[node_idx];
-    node.emit("hover", ui::UiEvent{static_cast<glfw_input *>(nullptr)});
+    node.emit("hover", ui::UiEvent{ui::HoverEvent{}});
 };
 static constexpr auto inputController(auto &world, auto &inputCtx, auto &soaCtx)
 {
@@ -4272,7 +4284,8 @@ try
     // 直接写当前帧的实例属性，下帧上传自然生效，不需要脏标志
     auto on_button_hover = [&uiStore, &frameContext](ui::FlatNode &n,
                                                      const ui::UiEvent &e) {
-        auto *input = e.get<glfw_input *>(); // 系统只转发这个指针；nullptr = 离开
+        auto &hv = e.get<ui::HoverEvent>(); // 只转发 input + 命中实例 id；input=nullptr 表示离开
+        auto *input = hv.input;
         auto &st = n.state<ButtonState>();
 
         if (!input) // 离开节点：中断手势（修复"按下拖出再进入"的误 click）
@@ -4285,10 +4298,11 @@ try
             mcs::vulkan::event::MouseButtons::eMOUSE_BUTTON_LEFT);
 
         auto set_color = [&](glm::vec4 c) {
-            if (n.first_instance < 0)
+            // 直接改被命中实例的属性（GPU pick 回传的实体 id，随 hover 事件携带）
+            if (hv.instanceId == ~0u)
                 return;
             auto [attrs] = uiStore.template view_entity<"vertexAttribute">(
-                frameContext.currentFrame, static_cast<uint32_t>(n.first_instance));
+                frameContext.currentFrame, hv.instanceId);
             for (auto &a : attrs)
                 a.color = c;
         };
@@ -4433,11 +4447,9 @@ try
             n.on("render", default_rect_render);
 
     // 2.6 统一渲染循环：初始化与 resize 共用，算法已绑定到节点
-    // 实例 → 节点 映射：GPU 拾取回读后，由 instance index 反查 FlatNode
-    std::vector<int> instanceToNode;
+    // 命中/交互 = layout 几何路由（光标 vs 节点矩形）+ GPU pick 携带的实例 id。
     auto render_all = [&](const std::vector<NodeGeometry> &geos, float w, float h) {
         RenderContext rc{w, h, &uiStore, &fontSelect};
-        instanceToNode.clear();
         for (const auto &geo : geos)
         {
             // NodeGeometry 直接携带节点索引：重命名/重名都免疫
@@ -4445,13 +4457,7 @@ try
                 continue;
             auto &n = uiTree.nodes[geo.node_idx];
             if (auto itf = n.fns.find("render"); itf != n.fns.end())
-            {
-                size_t before = uiStore.size();
-                n.first_instance = static_cast<int>(before);
                 itf->second(n, ui::UiEvent{RenderEvent{rc, geo}});
-                for (size_t i = before; i < uiStore.size(); ++i)
-                    instanceToNode.push_back(geo.node_idx);
-            }
         }
     };
 
@@ -4541,9 +4547,9 @@ try
     int uiHoverNode = -1;
     auto soaCtx =
         make_aggregate_ref<"soaCtx", "autoSpinStore", "interactiveStore", "uiStore",
-                           "screen_resize", "uiTree", "instanceToNode", "uiHoverNode">(
+                           "screen_resize", "uiTree", "uiHoverNode">(
             autoSpinStore, interactiveStore, uiStore, screen_resize, uiTree,
-            instanceToNode, uiHoverNode);
+            uiHoverNode);
 
     //diff: [test_dod8.cpp] end
 
