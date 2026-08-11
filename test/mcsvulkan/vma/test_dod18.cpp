@@ -3620,20 +3620,12 @@ struct triat_for_ui
         uint32_t idx = result.key.entity_index;
         assert(type == uiStore_type_id);
         auto &store = soaCtx.uiStore;
-        // 几何路由：光标落在哪个节点的 geometry 矩形内（后遍历者 = 后绘制/最上层优先）
-        const auto cur = inputCtx.input.cursorPos();
-        int node_idx = -1;
-        for (size_t i = 0; i < soaCtx.uiTree.nodes.size(); i++)
-        {
-            const auto &g = soaCtx.uiTree.nodes[i].geometry;
-            if (cur.xpos >= g.x && cur.xpos <= g.x + g.w && cur.ypos >= g.y &&
-                cur.ypos <= g.y + g.h)
-                node_idx = static_cast<int>(i);
-        }
-        if (node_idx < 0)
+        // 路由：GPU pick 命中的实例 id -> 实体上记录的 nodeIndex -> 节点（O(1)，无需再遍历节点矩形）
+        // 注意：visit_entity 已保证实体 alive
+        auto [nodeIndex] = store.template view_entity<"nodeIndex">(currentFrame, idx);
+        int node_idx = static_cast<int>(nodeIndex);
+        if (node_idx < 0 || node_idx >= static_cast<int>(soaCtx.uiTree.nodes.size()))
             return;
-        // 命中实例：GPU pick 回传（~0u = 无/旧构建），随事件交给节点做 targeted 更新
-        const uint32_t instanceId = store.alive(idx) ? idx : ~0u;
 
         // 薄转发：input + 命中实例 id 交给节点自己的 "hover"，不读设备、不解释
         auto &input = inputCtx.input;
@@ -3646,7 +3638,7 @@ struct triat_for_ui
                 soaCtx.uiTree.nodes[old].emit("hover", ui::UiEvent{ui::HoverEvent{}});
             soaCtx.uiHoverNode = node_idx;
         }
-        node.emit("hover", ui::UiEvent{ui::HoverEvent{&input, instanceId}});
+        node.emit("hover", ui::UiEvent{ui::HoverEvent{&input, idx}});
     }
     static constexpr auto update(auto &world, auto &inputCtx, auto &soaCtx,
                                  uint32_t currentFrame) noexcept
@@ -3723,31 +3715,36 @@ using interactive_data_type =
                    {"modelState", ^^model_state}>;
 using ui_data_type =
     gen_soa_struct<triat_for_ui, {"instanceData", ^^InstanceData},
-                   {"vertexAttribute", ^^std::array<VertexAttribute, 4>}>;
+                   {"vertexAttribute", ^^std::array<VertexAttribute, 4>},
+                   {"nodeIndex", ^^uint32_t}>;
 
-static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
-                               picking_result result)
+// ================= id -> 对象：统一实体访问 =================
+// 按 type_id 找到 store，把具体 store 类型交给 visitor（一次实现，取代各处成员遍历分派）
+static constexpr auto visit_store(auto &soaCtx, uint32_t type_id, auto &&visitor)
 {
-    auto &currentFrame = world.globalCtx.frameContext.currentFrame;
     constexpr auto members = std::remove_cvref_t<decltype(soaCtx)>::members;
-    template for (constexpr auto e : std::ranges::views::indices(members.size()))
+    template for (constexpr auto I : std::ranges::views::indices(members.size()))
     {
-        if constexpr (requires {
-                          typename std::remove_cvref_t<
-                              decltype(soaCtx.[:members[e]:])>::trait_type;
-                          std::remove_cvref_t<decltype(soaCtx.[:members[e]:])>::
-                              trait_type::template on_hover(world, inputCtx, soaCtx,
-                                                            result, currentFrame);
-                      })
-            if (result.key.object_type == e)
-            {
-                using trait_type =
-                    std::remove_cvref_t<decltype(soaCtx.[:members[e]:])>::trait_type;
-                trait_type::template on_hover(world, inputCtx, soaCtx, result,
-                                              currentFrame);
-            }
+        using MemberType = std::remove_cvref_t<decltype(soaCtx.[:members[I]:])>;
+        if constexpr (requires { typename MemberType::trait_type; })
+            if (I == type_id)
+                return std::forward<decltype(visitor)>(visitor)(soaCtx.[:members[I]:]);
     }
+    throw std::out_of_range{"visit_store: bad type_id"};
 }
+
+// 实体级：type_id + entity_id -> 类型化引用（统一 alive 检查），返回是否命中
+static constexpr auto visit_entity(auto &soaCtx, object_key key, uint32_t frame,
+                                   auto &&visitor) -> bool
+{
+    return visit_store(soaCtx, key.object_type, [&](auto &store) {
+        if (!store.alive(key.entity_index))
+            return false;
+        visitor(store, key.entity_index, frame);
+        return true;
+    });
+}
+
 // 悬停离开：把 nullptr 输入指针发给当前悬停节点，节点自行复位（系统只做路由）
 static constexpr auto ui_hover_leave = [](auto &world, auto &inputCtx, auto &soaCtx) {
     int node_idx = soaCtx.uiHoverNode;
@@ -3757,6 +3754,24 @@ static constexpr auto ui_hover_leave = [](auto &world, auto &inputCtx, auto &soa
     auto &node = soaCtx.uiTree.nodes[node_idx];
     node.emit("hover", ui::UiEvent{ui::HoverEvent{}});
 };
+
+static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
+                               picking_result result)
+{
+    auto &currentFrame = world.globalCtx.frameContext.currentFrame;
+    if (!visit_entity(soaCtx, result.key, currentFrame,
+                      [&](auto &store, uint32_t idx, uint32_t frame) {
+                          using Store = std::remove_cvref_t<decltype(store)>;
+                          if constexpr (requires {
+                                            typename Store::trait_type;
+                                            Store::trait_type::template on_hover(
+                                                world, inputCtx, soaCtx, result, frame);
+                                        })
+                              Store::trait_type::template on_hover(world, inputCtx,
+                                                                   soaCtx, result, frame);
+                      }))
+        ui_hover_leave(world, inputCtx, soaCtx); // 实体已失效：按离开处理
+}
 static constexpr auto inputController(auto &world, auto &inputCtx, auto &soaCtx)
 {
     auto &currentFrame = world.globalCtx.frameContext.currentFrame;
@@ -4147,7 +4162,7 @@ try
                     VertexAttribute{{0.0f, 1.0f, 0.0f}},
                     VertexAttribute{{0.0f, 0.0f, 1.0f}}};
 
-                uiStore.new_entity(inst, attrs);
+                uiStore.new_entity(inst, attrs, static_cast<uint32_t>(geo.node_idx));
                 cursorX += g->advance_x * FONT_SIZE_PX;
             }
         };
@@ -4233,7 +4248,7 @@ try
         }
         std::println("[USE_FLUTTER_UI] DEBUG: node={}, geo: x={}, y={}, w={}, h={}",
                      geo.node_id, geo.x, geo.y, geo.w, geo.h);
-        uiStore.new_entity(inst, attrs);
+        uiStore.new_entity(inst, attrs, static_cast<uint32_t>(geo.node_idx));
     };
 
     // ============================================================
