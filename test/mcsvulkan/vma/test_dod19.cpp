@@ -317,63 +317,235 @@ struct UvTransform
 //diff: [test_dod16] start
 struct object_key
 {
-    uint32_t object_type : 8;   // 假设高 8 位
-    uint32_t entity_index : 24; // 低 24 位
-
-    static consteval uint32_t max_type_value(int bit_with) noexcept
-    {
-        return (1u << bit_with) - 1; // 255
-    }
-
-    constexpr object_key(uint32_t type, uint32_t index) noexcept
-        : object_type{type}, entity_index{index}
-    {
-        assert(type <= max_type_value(8));
-        assert(type <= max_type_value(24));
-    }
-    constexpr object_key() : object_key(0, 0) {}
-
-    // 显式组合位，不依赖内存布局
-    constexpr operator uint32_t() const noexcept
-    {
-        return (static_cast<uint32_t>(object_type) << 24) | (entity_index & 0xFFFFFFu);
-    }
+    uint32_t object_type{};
+    uint32_t entity_index{};
+    auto operator<=>(const object_key &) const = default;
 };
-static_assert(sizeof(object_key) == sizeof(uint32_t));
+namespace std
+{
+    template <>
+    struct hash<object_key>
+    {
+        constexpr size_t operator()(const object_key &k) const noexcept
+        {
+            size_t h1 = hash<uint32_t>{}(k.object_type);
+            size_t h2 = hash<uint32_t>{}(k.entity_index);
+            return h1 ^ (h2 << 1);
+        }
+    };
+}; // namespace std
+static_assert(sizeof(object_key) == 2 * sizeof(uint32_t));
 struct picking_result
 {
     object_key key;
     uint32_t primitive_id;
 };
-
-struct InstanceData
-{
-    object_key objectId;
-    uint32_t textureIndex; // 纹理数组索引
-    uint32_t samplerIndex; // 采样器数组索引
-    object_data objectData;
-    VertexTransform vertexTransform; //diff: [test_dod13]
-    UvTransform uvTransform;
-
-    //diff: [test_dod12] start
-    uint32_t fontType = static_cast<uint32_t>(font::FontType::eNONE);
-    float pxRange;         //msdf 需要
-    uint32_t modulateFlag; // 混合需要
-    //diff: [test_dod12] end
-};
 //diff: [test_dod16] end
 
-struct CommandConstant
+namespace shader_data
 {
-    uint32_t perInstanceAttributeCount;
-};
+    //  C++是静态类型语言。传递指针，必须能用指定的结构体，解析指针
+    struct Glyph
+    {
+        uint32_t entity_index;   // 拾取实体索引（outPicking.y）
+        uint32_t textureIndex;   // 纹理数组下标（bindless）
+        uint32_t samplerIndex;   // 采样器数组下标（bindless）
+        uint32_t fontType;       // 字体类型（与 FontType 枚举一致）
+        float pxRange;           // MSDF 距离场范围
+        uint32_t modulateFlag;   // 1 = 用顶点色调制
+        glm::vec4 color;         // 顶点色（默认白）
+        glm::mat4 model;         // 平移 + 缩放：[-0.5,0.5] quad -> NDC 字形矩形
+        UvTransform uvTransform; // 图集 UV 变换
+    };
+    static_assert(sizeof(Glyph) == 120);
+
+    struct BufferResource
+    {
+        mcs::vulkan::memory::auto_map_buffer buffer{};
+        VkDeviceSize capacity{};
+        constexpr auto write(size_t offset, const void *src, size_t size) noexcept
+        {
+            // 断言：偏移 + 大小 必须 ≤ 总容量
+            assert(offset + size <= capacity);
+            return ::memcpy(static_cast<char *>(buffer.mapPtr()) + offset, src, size);
+        }
+        BufferResource() = default;
+        constexpr BufferResource(const LogicalDevice &device, VkDeviceSize capacity,
+                                 VkBufferUsageFlags usage, VkSharingMode sharingMode,
+                                 VkMemoryPropertyFlags properties)
+            : buffer{mcs::vulkan::memory::auto_map_buffer(
+                  mcs::vulkan::memory::create_simple_buffer(
+                      device,
+                      {.size = capacity, .usage = usage, .sharingMode = sharingMode},
+                      properties),
+                  capacity)},
+              capacity{capacity}
+        {
+        }
+    };
+    struct BufferResourceWithAddress
+    {
+        mcs::vulkan::memory::auto_map_buffer buffer{};
+        VkDeviceSize capacity{};
+        VkDeviceAddress address{};
+
+        constexpr auto write(size_t offset, const void *src, size_t size) noexcept
+        {
+            // 断言：偏移 + 大小 必须 ≤ 总容量
+            assert(offset + size <= capacity);
+            return ::memcpy(static_cast<char *>(buffer.mapPtr()) + offset, src, size);
+        }
+
+        BufferResourceWithAddress() = default;
+        constexpr BufferResourceWithAddress(const LogicalDevice &device,
+                                            VkDeviceSize capacity,
+                                            VkBufferUsageFlags usage,
+                                            VkSharingMode sharingMode,
+                                            VkMemoryPropertyFlags properties)
+            : buffer{mcs::vulkan::memory::auto_map_buffer(
+                  mcs::vulkan::memory::create_simple_buffer(
+                      device,
+                      {.size = capacity, .usage = usage, .sharingMode = sharingMode},
+                      properties),
+                  capacity)},
+              capacity{capacity}, address{device.getBufferDeviceAddress(
+                                      {.sType = sType<VkBufferDeviceAddressInfo>(),
+                                       .buffer = buffer.buffer()})}
+        {
+        }
+    };
+    struct CommandConstant
+    {
+        uint32_t type_id;
+        uint32_t adddress_offset;
+    };
+    static_assert(sizeof(CommandConstant) == 8); // 与 GLSL 端一致
+    // NOTE: 负责生成命令。 必须使用顶点绘制才能驱动GPU
+    struct ShaderDataRecorder
+    {
+        BufferResourceWithAddress globalVertexBuffer{};
+        BufferResource globalIndexBuffer{};
+
+        BufferResourceWithAddress globalHeapBuffer{};
+        BufferResource indirectDrawBuffer{};
+        BufferResourceWithAddress commandConstantsBuffer{};
+
+        // NOTE: 最佳或新增写入，压缩.要求必须连续
+        VkDrawIndexedIndirectCommand currentCommand{};
+        CommandConstant currentCommandConstant{};
+
+        static auto newVertexBuffer(const LogicalDevice &device, VkDeviceSize capacity)
+        {
+            return BufferResourceWithAddress{
+                device, capacity,
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                VK_SHARING_MODE_EXCLUSIVE,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+        static auto newIndexBuffer(const LogicalDevice &device, VkDeviceSize capacity)
+        {
+            return BufferResource{device, capacity, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                                  VK_SHARING_MODE_EXCLUSIVE,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+        static auto newHeapBuffer(const LogicalDevice &device, VkDeviceSize capacity)
+        {
+            return BufferResourceWithAddress{
+                device, capacity,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                VK_SHARING_MODE_EXCLUSIVE,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+        static auto newIndirectDrawBuffer(const LogicalDevice &device,
+                                          VkDeviceSize capacity)
+        {
+            return BufferResource{device, capacity, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                                  VK_SHARING_MODE_EXCLUSIVE,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+        static auto newCommandConstantsBuffer(const LogicalDevice &device,
+                                              VkDeviceSize capacity)
+        {
+            return BufferResourceWithAddress{
+                device, capacity,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                VK_SHARING_MODE_EXCLUSIVE,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+
+        constexpr ShaderDataRecorder(const LogicalDevice &device,
+                                     VkDeviceSize vertexCapacity,
+                                     VkDeviceSize indexCapacity,
+                                     VkDeviceSize heapCapacity,
+                                     VkDeviceSize indirectDrawCapacity,
+                                     VkDeviceSize commandConstantsCapacity)
+            : globalVertexBuffer{newVertexBuffer(device, vertexCapacity)},
+              globalIndexBuffer{newIndexBuffer(device, indexCapacity)},
+              globalHeapBuffer{newHeapBuffer(device, heapCapacity)},
+              indirectDrawBuffer{newIndirectDrawBuffer(device, indexCapacity)},
+              commandConstantsBuffer{
+                  newCommandConstantsBuffer(device, commandConstantsCapacity)}
+        {
+        }
+    };
+
+    // NOTE: 内存管理还是 自己自带的为好
+    // NOTE: 必须枚举出 shader可以输出的全部类型
+
+    // hover 应该是唯一的事件源
+    struct hover_manager
+    {
+        object_key object;
+
+        constexpr void hover_enter() noexcept {}
+        constexpr void hover_leave() noexcept {}
+        constexpr void hover(object_key o) noexcept
+        {
+            if (object != o)
+            {
+                hover_leave();
+                object = o;
+                hover_enter();
+            }
+        }
+    };
+
+}; // namespace shader_data
+constexpr auto initShaderDataRecorder(const LogicalDevice &device)
+{
+    constexpr auto vertexCapacity = sizeof(Vertex) * 1000;
+    constexpr auto indexCapacity = sizeof(uint32_t) * 1000;
+    constexpr auto heapCapacity = sizeof(shader_data::Glyph) * 2000;
+    // NOTE: 目前是不超过100条命令的
+    constexpr auto indirectDrawCapacity = sizeof(VkDrawIndexedIndirectCommand) * 100;
+    constexpr auto commandConstantsCapacity = sizeof(shader_data::CommandConstant) * 100;
+
+    std::array<shader_data::ShaderDataRecorder, MAX_FRAMES_IN_FLIGHT> shaderDataRecorder{
+        shader_data::ShaderDataRecorder(device, vertexCapacity, indexCapacity,
+                                        heapCapacity, indirectDrawCapacity,
+                                        commandConstantsCapacity),
+        shader_data::ShaderDataRecorder(device, vertexCapacity, indexCapacity,
+                                        heapCapacity, indirectDrawCapacity,
+                                        commandConstantsCapacity)};
+    return shaderDataRecorder;
+}
+
 struct PushData
 {
+    // 字段顺序必须与 test_dod19.vert 的 PushConsts 完全一致
+    // （GLSL: vertex/data/commandConstants/cameraIndex，Glyph 不需要 attributeAddress）
     uint64_t vertexAddress;           // 全局顶点缓冲区地址
-    uint64_t attributeAddress;        // 全局属性池地址
-    uint64_t instanceAddress;         // 全局实例缓冲区地址
-    uint64_t commandConstantsAddress; // 新增：命令常量缓冲区地址
-    uint32_t cameraIndex;
+    uint64_t instanceAddress;         // 全局实例堆地址（shader: dataAddress）
+    uint64_t commandConstantsAddress; // 命令常量缓冲区地址
+    uint32_t cameraIndex;             // 0: 3D, 1: UI
 };
 
 //diff: [test_dod8] end
@@ -2773,9 +2945,11 @@ constexpr auto initMeshManager()
 struct BufferResource
 {
     mcs::vulkan::memory::auto_map_buffer buffer{};
-    VkDeviceSize size{};
+    VkDeviceSize capacity{};
     constexpr auto write(size_t offset, const void *src, size_t size) noexcept
     {
+        // 断言：偏移 + 大小 必须 ≤ 总容量
+        assert(offset + size <= capacity);
         return ::memcpy(static_cast<char *>(buffer.mapPtr()) + offset, src, size);
     }
     BufferResource() = default;
@@ -2787,18 +2961,20 @@ struct BufferResource
                   device, {.size = capacity, .usage = usage, .sharingMode = sharingMode},
                   properties),
               capacity)},
-          size{capacity}
+          capacity{capacity}
     {
     }
 };
 struct BufferResourceWithAddress
 {
     mcs::vulkan::memory::auto_map_buffer buffer{};
-    VkDeviceSize size{};
+    VkDeviceSize capacity{};
     VkDeviceAddress address{};
 
     constexpr auto write(size_t offset, const void *src, size_t size) noexcept
     {
+        // 断言：偏移 + 大小 必须 ≤ 总容量
+        assert(offset + size <= capacity);
         return ::memcpy(static_cast<char *>(buffer.mapPtr()) + offset, src, size);
     }
 
@@ -2812,7 +2988,7 @@ struct BufferResourceWithAddress
                   device, {.size = capacity, .usage = usage, .sharingMode = sharingMode},
                   properties),
               capacity)},
-          size{capacity},
+          capacity{capacity},
           address{device.getBufferDeviceAddress(
               {.sType = sType<VkBufferDeviceAddressInfo>(), .buffer = buffer.buffer()})}
     {
@@ -2839,82 +3015,6 @@ struct FrameResources
     uint32_t drawCountTransparentUI = 0;
 };
 
-constexpr uint32_t MAX_INSTANCE_COUNT = 1000;
-constexpr uint32_t MAX_DRAW_CALLS = 10;
-constexpr auto initFrameResources(const LogicalDevice &device, const mesh_manager &m)
-{
-    auto &[allVertices, allIndices, meshMap] = m;
-    std::array<FrameResources, MAX_FRAMES_IN_FLIGHT> frameResources;
-    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
-    {
-        auto &batche = frameResources[i];
-        {
-            auto capacity = allVertices.size() * sizeof(Vertex);
-            batche.globalVertexBuffer =
-                BufferResourceWithAddress{device, capacity,
-                                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                                          VK_SHARING_MODE_EXCLUSIVE,
-                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
-            batche.globalVertexBuffer.write(0, allVertices.data(), capacity);
-        }
-        {
-            auto capacity = allIndices.size() * sizeof(uint32_t);
-            batche.globalIndexBuffer =
-                BufferResource{device, capacity, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                               VK_SHARING_MODE_EXCLUSIVE,
-                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                   VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
-            batche.globalIndexBuffer.write(0, allIndices.data(), capacity);
-        }
-        {
-            constexpr VkDeviceSize MAX_INSTANCE_DATA_SIZE =
-                MAX_DRAW_CALLS * MAX_INSTANCE_COUNT * sizeof(InstanceData);
-            batche.globalInstanceBuffer =
-                BufferResourceWithAddress{device, MAX_INSTANCE_DATA_SIZE,
-                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                                          VK_SHARING_MODE_EXCLUSIVE,
-                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
-
-            // NOTE: 绘制的时候，每帧填充
-        }
-        {
-            constexpr VkDeviceSize MAX_Attribute_SIZE = 1 * 1024 * 1024;
-            batche.globalAttributeBuffer =
-                BufferResourceWithAddress{device, MAX_Attribute_SIZE,
-                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                                          VK_SHARING_MODE_EXCLUSIVE,
-                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
-        }
-        {
-
-            constexpr VkDeviceSize MAX_IndirectDraw_SIZE = 1 * 1024 * 1024;
-            batche.indirectDrawBuffer = BufferResource{
-                device, MAX_IndirectDraw_SIZE, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-                VK_SHARING_MODE_EXCLUSIVE,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
-        }
-        {
-            // 新增 command constants buffer
-            constexpr VkDeviceSize MAX_CMD_CONST_SIZE =
-                MAX_DRAW_CALLS * sizeof(CommandConstant);
-            batche.commandConstantsBuffer =
-                BufferResourceWithAddress{device, MAX_CMD_CONST_SIZE,
-                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                              VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                                          VK_SHARING_MODE_EXCLUSIVE,
-                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
-        }
-    }
-    return frameResources;
-}
 constexpr auto run_text_pipeline(auto &fontSelect, const char8_t *rawText,
                                  std::string_view langBcp47, bool ltr = true)
 {
@@ -3246,399 +3346,11 @@ constexpr auto autoSpinStore_type_id = 0;
 constexpr auto interactive_type_id = 1;
 constexpr auto uiStore_type_id = 2;
 
-struct triat_for_autoSpin
-{
-    static constexpr auto inputController(auto &world, auto &inputCtx, auto &soaCtx,
-                                          uint32_t currentFrame)
-    {
-
-        // 每1秒添加一批实体，直到总数达到1000
-        {
-            auto &autoSpinStore = soaCtx.autoSpinStore;
-            constexpr int TARGET_ENTITIES = 1000;
-            constexpr int BATCH_SIZE = 100;
-
-            if (autoSpinStore.size() < TARGET_ENTITIES)
-            {
-                static auto lastAddTime = std::chrono::steady_clock::now();
-                auto now = std::chrono::steady_clock::now();
-                if (std::chrono::duration_cast<std::chrono::milliseconds>(now -
-                                                                          lastAddTime)
-                        .count() >= 1000)
-                {
-                    lastAddTime = now;
-                    int toAdd =
-                        std::min(BATCH_SIZE, TARGET_ENTITIES -
-                                                 static_cast<int>(autoSpinStore.size()));
-
-                    if (toAdd > autoSpinStore.free_size())
-                        autoSpinStore.expansion_size(toAdd - autoSpinStore.free_size());
-
-                    std::mt19937 rng(std::random_device{}());
-                    std::uniform_real_distribution<float> colorDist(0.0f, 1.0f);
-                    std::uniform_real_distribution<float> posDist(-1.5f,
-                                                                  1.5f); // 散开范围
-                    std::uniform_real_distribution<float> scaleDist(0.01f,
-                                                                    0.05f); // 粒子极小
-                    // 可选：随机使用不同纹理和采样器
-                    std::uniform_int_distribution<int> texDist(0, 1);
-                    std::uniform_int_distribution<int> sampDist(0, 1);
-
-                    for (uint32_t i = 0; i < toAdd; ++i)
-                    {
-                        float scale = scaleDist(rng);
-                        glm::vec3 pos(posDist(rng), posDist(rng), 0.0f);
-
-                        // 构建模型矩阵：先缩放，后平移（重要！否则位置会被缩放影响）
-                        glm::mat4 model = glm::translate(glm::mat4(1.0f), pos) *
-                                          glm::scale(glm::mat4(1.0f), glm::vec3(scale));
-                        // 若需要粒子旋转（不关心朝向，可加随机旋转）
-                        // model = model * glm::toMat4(glm::angleAxis(posDist(rng), glm::vec3(0,0,1)));
-
-                        uint32_t texIdx = texDist(rng) ? 3 : 0;   // 纹理0或3（棋盘/渐变）
-                        uint32_t sampIdx = sampDist(rng) ? 1 : 0; // 采样器0或1
-
-                        InstanceData instData{.objectId = {autoSpinStore_type_id,
-                                                           autoSpinStore.nextEntityId()},
-                                              .textureIndex = texIdx,
-                                              .samplerIndex = sampIdx,
-                                              .objectData = object_data{model}};
-
-                        std::array<VertexAttribute, 4> attrs;
-                        for (auto &attr : attrs)
-                            attr.color =
-                                glm::vec3(colorDist(rng), colorDist(rng), colorDist(rng));
-
-                        autoSpinStore.new_entity(instData, attrs);
-                    }
-                }
-            }
-        }
-    }
-
-    static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
-                                   picking_result result, uint32_t currentFrame)
-    {
-        uint32_t type = result.key.object_type;
-        uint32_t idx = result.key.entity_index;
-        assert(type == autoSpinStore_type_id);
-        auto &store = soaCtx.autoSpinStore;
-        if (store.alive(idx))
-        {
-            auto [inst] = store.template view_entity<"instanceData">(currentFrame, idx);
-            std::cout << "[AutoSpin] entity " << idx
-                      << " textureIndex=" << inst.textureIndex
-                      << " samplerIndex=" << inst.samplerIndex << "\n";
-        }
-        else
-        {
-            std::cout << "[AutoSpin] entity " << idx << " is dead\n";
-        }
-    }
-    static constexpr auto update(auto &world, auto &inputCtx, auto &soaCtx,
-                                 uint32_t currentFrame) noexcept
-    {
-        auto &autoSpinStore = soaCtx.autoSpinStore;
-        float elapsed = inputCtx.clock.getElapsed(); // 直接获取当前累积时间
-        uint32_t idx{};
-        for (auto [instanceData] :
-             autoSpinStore.template view<"instanceData">(currentFrame))
-        {
-            static_assert(std::is_reference_v<decltype(instanceData)>);
-            auto &mat = instanceData.objectData.matrix;
-            if (idx == 0) [[unlikely]]
-            {
-                float phaseOffset = idx * glm::radians(137.5f);
-                float angle = elapsed * glm::radians(90.0f) + phaseOffset;
-                // 从现有矩阵提取原始平移和缩放
-                auto [trans, scale] = camera::extractTranslationScale(mat);
-                glm::quat rot = glm::angleAxis(angle, glm::vec3(0, 0, 1));
-                mat = camera::composeTRS(trans, rot, scale);
-
-                //diff: [test_dod9] start
-                // ---- 动态 UV 变换 ----
-                auto &uv = instanceData.uvTransform;
-                // 示例1：纹理随时间向右滚动（重复模式）
-                uv.offset.x = fmodf(elapsed * 0.2f, 1.0f);
-                // 示例2：纹理在 0.5 倍到 1.5 倍之间周期性缩放
-                float s = 1.0f + 0.5f * sinf(elapsed * 2.0f);
-                uv.scale = glm::vec2(s, s);
-                //diff: [test_dod9] end
-            }
-            else [[likely]]
-            {
-                // 提取现有的平移和缩放
-
-                float phaseOffset = idx * glm::radians(137.5f);
-                float angle = elapsed * glm::radians(90.0f) + phaseOffset;
-                glm::quat rot = glm::angleAxis(angle, glm::vec3(0, 0, 1));
-                auto [trans, scale] = camera::extractTranslationScale(mat);
-                // 重构：缩放 → 旋转 → 平移（与创建时的顺序保持一致）
-                mat = camera::composeTRS(trans, rot, scale);
-            }
-
-            ++idx;
-        }
-    }
-};
-struct triat_for_interactive
-{
-    static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
-                                   picking_result result, uint32_t currentFrame)
-    {
-        uint32_t type = result.key.object_type;
-        uint32_t idx = result.key.entity_index;
-        assert(type == interactive_type_id);
-        auto &store = soaCtx.interactiveStore;
-        if (store.alive(idx))
-        {
-            auto [inst, state] = store.template view_entity<"instanceData", "modelState">(
-                currentFrame, idx);
-            std::cout << "[Interactive] entity " << idx << " pos=("
-                      << state.model_matrix.translation.x << ","
-                      << state.model_matrix.translation.y << ","
-                      << state.model_matrix.translation.z << ")\n";
-        }
-    }
-    static constexpr auto update(auto &world, auto &inputCtx, auto &soaCtx,
-                                 uint32_t currentFrame) noexcept
-    {
-        auto &interactiveStore = soaCtx.interactiveStore;
-        for (const auto &[instanceData, modelState] :
-             interactiveStore.template view<"instanceData", "modelState">(currentFrame))
-        {
-            //diff: [test_dod8] 构造时的偏移迁移到这里
-            auto &objectData = instanceData.objectData;
-            // modelState.model_matrix.translation.z = 0.5f; //diff: [test_dod9] 不需要补丁了。初始化的时候就填写好了
-            objectData = object_data{modelState.model_matrix()};
-        }
-    }
-    static constexpr auto model_update(auto &world, auto &inputCtx, auto &soaCtx,
-                                       uint32_t currentFrame)
-    {
-        auto &globalCtx = world.globalCtx;
-        auto &interactiveStore = soaCtx.interactiveStore;
-        auto [modelState, instanceData] =
-            *(interactiveStore.template view<"modelState", "instanceData">().begin());
-
-        const auto &input = inputCtx.input;
-        auto &camera = inputCtx.camera;
-        auto &swapchain = globalCtx.swapchain;
-
-        auto &[lastPos, isMiddleButtonPressed, isLeftButtonPressed,
-               rightButtonPressedLast, lastLeftPos, modelMatrix] = modelState;
-        using mcs::vulkan::event::MouseButtons;
-        using mcs::vulkan::event::Key;
-        using mcs::vulkan::event::scroll_event;
-        const auto cur = input.cursorPos();
-        const auto windowSize = swapchain.refImageExtent();
-
-        const bool curMiddlePressed =
-            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_MIDDLE);
-        const bool curLeftPressed =
-            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_LEFT);
-        const bool curRightPressed =
-            input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_RIGHT);
-
-        // ================= 滚轮缩放 =================
-        if (scroll_event{} != input.scroll())
-        {
-            std::println("input.scroll(): {}", input.scroll());
-            bool ctrlPressed = input.isKeyPressedOrRepeat(Key::eLEFT_CONTROL) ||
-                               input.isKeyPressedOrRepeat(Key::eRIGHT_CONTROL);
-            bool altPressed = input.isKeyPressedOrRepeat(Key::eLEFT_ALT) ||
-                              input.isKeyPressedOrRepeat(Key::eRIGHT_ALT);
-            bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
-                                input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
-            float delta = input.scroll().yoffset;
-            if (delta != 0.0f)
-            {
-                const float factor = (delta > 0) ? 1.1f : (1.0f / 1.1f);
-                int modCount =
-                    (ctrlPressed ? 1 : 0) + (altPressed ? 1 : 0) + (shiftPressed ? 1 : 0);
-                if (modCount == 1)
-                {
-                    if (ctrlPressed)
-                        modelMatrix.scale.x *= factor;
-                    else if (altPressed)
-                        modelMatrix.scale.y *= factor;
-                    else if (shiftPressed)
-                        modelMatrix.scale.z *= factor;
-                }
-                else
-                {
-                    modelMatrix.scale *= factor;
-                }
-            }
-        }
-
-        // ================= 右键复位 =================
-        if (curRightPressed && !rightButtonPressedLast)
-        {
-            // modelMatrix.translation = glm::vec3(0.0f); //NOTE: 暴露平移
-            modelMatrix.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
-            modelMatrix.scale = {1.0f, 1.0f, 1.0f};
-        }
-        rightButtonPressedLast = curRightPressed;
-
-        // ================= 左键旋转 =================
-        if (curLeftPressed)
-        {
-            if (!isLeftButtonPressed)
-            {
-                lastLeftPos = cur;
-                isLeftButtonPressed = true;
-            }
-            else
-            {
-                float dx = static_cast<float>(cur.xpos - lastLeftPos.xpos);
-                float dy = static_cast<float>(cur.ypos - lastLeftPos.ypos);
-                if (dx != 0.0f || dy != 0.0f)
-                {
-                    auto &viewObj = camera.refView();
-                    glm::vec3 worldRight = viewObj.getRight();
-                    glm::vec3 worldUp = viewObj.getUp();
-                    glm::vec3 worldForward = viewObj.getForward();
-
-                    const float sens = 0.01f;
-                    auto [yaw, pitch] =
-                        camera::VulkanNDCConfig::ScreenDragToYawPitch(dx, dy, sens);
-
-                    bool ctrl = input.isKeyPressedOrRepeat(Key::eLEFT_CONTROL) ||
-                                input.isKeyPressedOrRepeat(Key::eRIGHT_CONTROL);
-                    bool alt = input.isKeyPressedOrRepeat(Key::eLEFT_ALT) ||
-                               input.isKeyPressedOrRepeat(Key::eRIGHT_ALT);
-                    bool shift = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
-                                 input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
-
-                    // clang-format off
-                    // 旋转约束模式（模型旋转用）
-                    struct DefaultRotMode {};   // 绕世界 Up 和 Right 旋转
-                    struct PitchOnlyRotMode {}; // 仅绕世界 Right（俯仰）
-                    struct YawOnlyRotMode {};   // 仅绕世界 Up（偏航）
-                    struct RollRotMode {};      // 绕世界 Forward（滚转）
-                    using ModelRotMode = std::variant<DefaultRotMode, PitchOnlyRotMode,
-                                                    YawOnlyRotMode, RollRotMode>;
-                    // clang-format on
-                    // 确定旋转模式
-                    ModelRotMode rotMode = [&]() -> ModelRotMode {
-                        if (ctrl)
-                            return YawOnlyRotMode{};
-                        if (alt)
-                            return PitchOnlyRotMode{};
-                        if (shift)
-                            return RollRotMode{};
-                        return DefaultRotMode{};
-                    }();
-
-                    glm::quat delta = match(
-                        rotMode,
-                        [&](DefaultRotMode) {
-                            glm::quat rotY = glm::angleAxis(yaw, worldUp);
-                            glm::quat rotX = glm::angleAxis(pitch, worldRight);
-                            return rotY * rotX;
-                        },
-                        [&](PitchOnlyRotMode) {
-                            return glm::angleAxis(pitch, worldRight);
-                        },
-                        [&](YawOnlyRotMode) { return glm::angleAxis(yaw, worldUp); },
-                        [&](RollRotMode) { return glm::angleAxis(yaw, worldForward); });
-
-                    if (delta != glm::quat(1.0f, 0.0f, 0.0f, 0.0f))
-                        modelMatrix.rotation = delta * modelMatrix.rotation;
-                }
-                lastLeftPos = cur;
-            }
-        }
-        else
-        {
-            isLeftButtonPressed = false;
-        }
-
-        if (curMiddlePressed)
-        {
-            bool shiftPressed = input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
-                                input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
-
-            auto [rayOrigin, rayDir] = camera::VulkanNDCConfig::ScreenToWorldRay(
-                glm::ivec2(cur.xpos, cur.ypos),
-                glm::ivec2(windowSize.width, windowSize.height), camera.getViewMatrix(),
-                camera.getProjMatrix());
-
-            constexpr auto topLeftLocal = quadVerts[0].pos; //diff: [test_dod14] 固有属性
-            glm::vec3 currentTopLeftWorld = camera::transformPointToWorld(
-                topLeftLocal, instanceData.objectData.matrix,
-                instanceData.vertexTransform.matrix);
-
-            // clang-format off
-            struct WorldDepthMode {};   // 保持世界空间 Z 不变
-            struct CameraDepthMode {};  // 保持相机空间深度不变
-            using DepthMode = std::variant<WorldDepthMode, CameraDepthMode>;
-            // clang-format on
-            // 选择深度模式
-            DepthMode depthMode =
-                shiftPressed ? DepthMode{WorldDepthMode{}} : DepthMode{CameraDepthMode{}};
-
-            glm::vec3 hit = match(
-                depthMode,
-                [&](WorldDepthMode) noexcept {
-                    float targetZ = currentTopLeftWorld.z;
-                    float t = (targetZ - rayOrigin.z) / rayDir.z;
-                    return (t > 0) ? (rayOrigin + t * rayDir) : currentTopLeftWorld;
-                },
-                [&](CameraDepthMode) noexcept {
-                    glm::mat4 view = camera.getViewMatrix();
-                    glm::vec4 curView = view * glm::vec4(currentTopLeftWorld, 1.0f);
-                    glm::vec3 viewOrigin = view * glm::vec4(rayOrigin, 1.0f);
-                    glm::vec3 viewDir = view * glm::vec4(rayDir, 0.0f);
-                    float t = (curView.z - viewOrigin.z) / viewDir.z;
-                    return (t > 0) ? glm::vec3(glm::inverse(view) *
-                                               glm::vec4(viewOrigin + t * viewDir, 1.0f))
-                                   : currentTopLeftWorld;
-                });
-
-            glm::vec3 offset = camera::computeAnchorOffset(
-                topLeftLocal, modelMatrix, instanceData.vertexTransform.matrix);
-            modelMatrix.translation = hit - offset;
-
-            if (!isMiddleButtonPressed)
-                isMiddleButtonPressed = true;
-            lastPos = cur;
-        }
-        else
-        {
-            isMiddleButtonPressed = false;
-        }
-    };
-};
 struct triat_for_ui
 {
     static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
                                    picking_result result, uint32_t currentFrame)
     {
-        uint32_t type = result.key.object_type;
-        uint32_t idx = result.key.entity_index;
-        assert(type == uiStore_type_id);
-        auto &store = soaCtx.uiStore;
-        // 路由：GPU pick 命中的实例 id -> 实体上记录的 nodeIndex -> 节点（O(1)，无需再遍历节点矩形）
-        // 注意：visit_entity 已保证实体 alive
-        auto [nodeIndex] = store.template view_entity<"nodeIndex">(currentFrame, idx);
-        int node_idx = static_cast<int>(nodeIndex);
-        if (node_idx < 0 || node_idx >= static_cast<int>(soaCtx.uiTree.nodes.size()))
-            return;
-
-        // 薄转发：input + 命中实例 id 交给节点自己的 "hover"，不读设备、不解释
-        auto &input = inputCtx.input;
-        auto &node = soaCtx.uiTree.nodes[node_idx];
-        if (soaCtx.uiHoverNode != node_idx)
-        {
-            // 悬停转移：先通知旧节点离开（修复跨节点误 click）
-            int old = soaCtx.uiHoverNode;
-            if (old >= 0 && old < static_cast<int>(soaCtx.uiTree.nodes.size()))
-                soaCtx.uiTree.nodes[old].emit("hover", ui::UiEvent{ui::HoverEvent{}});
-            soaCtx.uiHoverNode = node_idx;
-        }
-        node.emit("hover", ui::UiEvent{ui::HoverEvent{&input, idx}});
     }
     static constexpr auto update(auto &world, auto &inputCtx, auto &soaCtx,
                                  uint32_t currentFrame) noexcept
@@ -3697,26 +3409,6 @@ struct triat_for_ui
     }
 };
 
-using auto_spin_data_type =
-    gen_soa_struct<triat_for_autoSpin, {"instanceData", ^^InstanceData},
-                   {"vertexAttribute", ^^std::array<VertexAttribute, 4>}>;
-struct model_state
-{
-    mcs::vulkan::event::position2d_event last_pos{};
-    bool is_middle_button_pressed = false;
-    bool is_left_button_pressed = false;
-    bool is_right_button_pressed_last = false; // 新增：记录上一帧右键状态
-    mcs::vulkan::event::position2d_event last_left_pos{};
-    model_matrix model_matrix{};
-};
-using interactive_data_type =
-    gen_soa_struct<triat_for_interactive, {"instanceData", ^^InstanceData},
-                   {"vertexAttribute", ^^std::array<VertexAttribute, 4>},
-                   {"modelState", ^^model_state}>;
-using ui_data_type = gen_soa_struct<triat_for_ui, {"instanceData", ^^InstanceData},
-                                    {"vertexAttribute", ^^std::array<VertexAttribute, 4>},
-                                    {"nodeIndex", ^^uint32_t}>;
-
 // ================= id -> 对象：统一实体访问 =================
 // 按 type_id 找到 store，把具体 store 类型交给 visitor（一次实现，取代各处成员遍历分派）
 static constexpr auto visit_store(auto &soaCtx, uint32_t type_id, auto &&visitor)
@@ -3732,44 +3424,14 @@ static constexpr auto visit_store(auto &soaCtx, uint32_t type_id, auto &&visitor
     throw std::out_of_range{"visit_store: bad type_id"};
 }
 
-// 实体级：type_id + entity_id -> 类型化引用（统一 alive 检查），返回是否命中
-static constexpr auto visit_entity(auto &soaCtx, object_key key, uint32_t frame,
-                                   auto &&visitor) -> bool
-{
-    return visit_store(soaCtx, key.object_type, [&](auto &store) {
-        if (!store.alive(key.entity_index))
-            return false;
-        visitor(store, key.entity_index, frame);
-        return true;
-    });
-}
-
 // 悬停离开：把 nullptr 输入指针发给当前悬停节点，节点自行复位（系统只做路由）
 static constexpr auto ui_hover_leave = [](auto &world, auto &inputCtx, auto &soaCtx) {
-    int node_idx = soaCtx.uiHoverNode;
-    if (node_idx < 0 || node_idx >= static_cast<int>(soaCtx.uiTree.nodes.size()))
-        return;
-    soaCtx.uiHoverNode = -1;
-    auto &node = soaCtx.uiTree.nodes[node_idx];
-    node.emit("hover", ui::UiEvent{ui::HoverEvent{}});
+
 };
 
 static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
                                picking_result result)
 {
-    auto &currentFrame = world.globalCtx.frameContext.currentFrame;
-    if (!visit_entity(soaCtx, result.key, currentFrame,
-                      [&](auto &store, uint32_t idx, uint32_t frame) {
-                          using Store = std::remove_cvref_t<decltype(store)>;
-                          if constexpr (requires {
-                                            typename Store::trait_type;
-                                            Store::trait_type::template on_hover(
-                                                world, inputCtx, soaCtx, result, frame);
-                                        })
-                              Store::trait_type::template on_hover(world, inputCtx,
-                                                                   soaCtx, result, frame);
-                      }))
-        ui_hover_leave(world, inputCtx, soaCtx); // 实体已失效：按离开处理
 }
 static constexpr auto inputController(auto &world, auto &inputCtx, auto &soaCtx)
 {
@@ -3834,9 +3496,6 @@ static constexpr auto model_update(auto &world, auto &inputCtx, auto &soaCtx) no
 }
 constexpr auto initSoaData()
 {
-    auto_spin_data_type autoSpinStore{1};
-    interactive_data_type interactiveStore{1};
-    ui_data_type uiStore{100};
 
     ContainerStyleObject containers{100};
     RowStyleObject rows{100};
@@ -3922,12 +3581,11 @@ constexpr auto initSoaData()
         }
     };
 
-    return make_aggregate<
-        "soaData", "autoSpinStore", "interactiveStore", "uiStore",
-        ContainerStyleObject::trait_type::name, RowStyleObject::trait_type::name,
-        ColumnStyleObject::trait_type::name, ExpandedStyleObject::trait_type::name,
-        TextStyleObject::trait_type::name, "get_member", "layout">(
-        std::move(autoSpinStore), std::move(interactiveStore), std::move(uiStore),
+    return make_aggregate<"soaData", ContainerStyleObject::trait_type::name,
+                          RowStyleObject::trait_type::name,
+                          ColumnStyleObject::trait_type::name,
+                          ExpandedStyleObject::trait_type::name,
+                          TextStyleObject::trait_type::name, "get_member", "layout">(
         std::move(containers), std::move(rows), std::move(columns), std::move(expandeds),
         std::move(texts), std::move(get_member), std::move(layout));
     //diff: [test_dod17] end
@@ -3987,7 +3645,69 @@ try
 
     auto meshManager = initMeshManager();
     auto &[allVertices, allIndices, meshMap] = meshManager;
-    auto frameResources = initFrameResources(device, meshManager);
+    auto shaderDataRecorder = initShaderDataRecorder(device);
+
+    // ============================================================
+    // 简单 Glyph 测试：只 shape 一个字符 "A"，生成 1 个 Glyph 实例。
+    // 目标：验证迁移后的着色器配置（test_dod19.vert/frag，Glyph-only，
+    //       移植自 test_sdf）能从实例堆读取 Glyph 并正确渲染 MSDF 字形。
+    // ============================================================
+    auto textResult = run_text_pipeline(fontSelect, u8"A", "zh-CN");
+    const auto &shapeResult = textResult.shape_result;
+
+    std::vector<shader_data::Glyph> simpleGlyphs;
+    constexpr float FONT_SIZE = 0.2f;         // 1em 对应的 NDC 高度
+    constexpr glm::vec2 ORIGIN{-0.1f, -0.1f}; // 字形块左上角（NDC，y 向下）
+    const float baselineY = ORIGIN.y + FONT_SIZE;
+    float cursorX = ORIGIN.x;
+    for (const auto &run : shapeResult)
+    {
+        for (const auto &g : run)
+        {
+            using bound_type = decltype(g.plane_bounds);
+            if (g.plane_bounds == bound_type{}) // 空格等无字形字符
+            {
+                cursorX += static_cast<float>(g.advance_x) * FONT_SIZE;
+                continue;
+            }
+            // 字形矩形（NDC，y 向下）：顶边在上（数值更小）
+            float left = cursorX + static_cast<float>(g.plane_bounds.left) * FONT_SIZE;
+            float bottom =
+                baselineY + static_cast<float>(g.plane_bounds.bottom) * FONT_SIZE;
+            float right = cursorX + static_cast<float>(g.plane_bounds.right) * FONT_SIZE;
+            float top = baselineY + static_cast<float>(g.plane_bounds.top) * FONT_SIZE;
+
+            glm::vec2 p0{left, top};
+            glm::vec2 p2{right, bottom};
+            glm::vec2 center = (p0 + p2) * 0.5f;
+            glm::vec2 full = p2 - p0;
+
+            // NOTE: 图集 UV 为 y 向下（bottom > top），
+            // 必须 offset=top、scale=bottom-top，否则字形上下颠倒。
+            UvTransform uv;
+            uv.scale = {static_cast<float>(g.uv_bounds.right - g.uv_bounds.left),
+                        static_cast<float>(g.uv_bounds.bottom - g.uv_bounds.top)};
+            uv.offset = {static_cast<float>(g.uv_bounds.left),
+                         static_cast<float>(g.uv_bounds.top)};
+
+            shader_data::Glyph tg{};
+            tg.entity_index = 0;
+            tg.textureIndex = g.font_ctx->bind.texture_index;
+            tg.samplerIndex = g.font_ctx->bind.sampler_index;
+            tg.fontType = static_cast<uint32_t>(g.font_ctx->type);
+            tg.pxRange =
+                static_cast<float>(g.font_ctx->font.atlas.distanceRange.value_or(0.0));
+            tg.modulateFlag = 1;
+            tg.color = glm::vec4(1.0f); // 白色字形（背景为黑色）
+            tg.model = glm::translate(glm::mat4(1.0f), glm::vec3(center, 0.0f)) *
+                       glm::scale(glm::mat4(1.0f), glm::vec3(full, 1.0f));
+            tg.uvTransform = uv;
+            simpleGlyphs.push_back(tg);
+            cursorX += static_cast<float>(g.advance_x) * FONT_SIZE;
+        }
+    }
+    std::cout << "simpleGlyphs size: " << simpleGlyphs.size() << '\n';
+    assert(not simpleGlyphs.empty()); // 必须至少 shape 出 1 个字形
 
     auto mainPipelineCtx = initPipeline(hardwareCtx, descriptorCtx);
     auto &[pipelineLayout, pipelineOpaque3D, pipelineTransparent3D, pipelineOpaqueUI,
@@ -4004,565 +3724,17 @@ try
 
     //diff: [test_dod8.cpp] start
 
-    auto [autoSpinStore, interactiveStore, uiStore, containers_, rows_, columns_,
-          expandeds_, texts_, get_member_, layout_] = initSoaData();
+    auto [containers_, rows_, columns_, expandeds_, texts_, get_member_, layout_] =
+        initSoaData();
 
-    //diff: [test_dod17] start
-    // ============================================================
-    // 1. 纯几何数据结构（从 Yoga/Node 提取出来的唯一产物）
-    // ============================================================
-    struct NodeGeometry
-    {
-        float x, y, w, h;
-        float pad_left, pad_right, pad_top, pad_bottom;
-        std::string node_id;
-        uint32_t traversal_id; // 遍历顺序编号，用于颜色等
-        int node_idx = -1;     // 节点在树中的索引：重命名/重名免疫
-    };
-    // ============================================================
-    // 3. 文本实例生成（纯函数，只依赖 NodeGeometry + 文本数据）
-    // ============================================================
-    static constexpr auto generate_text_instances =
-        [](float w, float h, ui_data_type &uiStore, const NodeGeometry &geo,
-           const std::vector<uint32_t> &codepoints, const auto &shape_results,
-           const auto &break_types, uint32_t modulateFlag = 1) {
-            // -------- 1. 排版参数 --------
-            float x = geo.x + geo.pad_left;
-            float y = geo.y + geo.pad_top;
-            float contentWidth = geo.w - geo.pad_left - geo.pad_right;
-            float contentHeight = geo.h - geo.pad_top - geo.pad_bottom;
-
-            const double FONT_SIZE_PX = std::min<double>(contentHeight, 12.0);
-            const double LINE_HEIGHT_PX = FONT_SIZE_PX * 1.5;
-            const double ORIGIN_X = static_cast<double>(x);
-            const double ORIGIN_Y = static_cast<double>(y) + FONT_SIZE_PX;
-            const double MAX_LINE_WIDTH = static_cast<double>(contentWidth);
-
-            // -------- 2. 收集字形与 advance --------
-            using GlyphType = std::remove_cvref_t<decltype(shape_results[0][0])>;
-            std::vector<const GlyphType *> visual_glyphs;
-            visual_glyphs.reserve([&] noexcept {
-                size_t total_glyphs = 0;
-                for (const auto &run : shape_results)
-                    total_glyphs += run.size();
-                return total_glyphs;
-            }());
-            std::vector<double> char_advance(codepoints.size(), 0.0);
-
-            for (const auto &run : shape_results)
-            {
-                for (const auto &glyph : run)
-                {
-                    visual_glyphs.push_back(&glyph);
-                    char_advance[glyph.logical_idx] += glyph.advance_x * FONT_SIZE_PX;
-                }
-            }
-
-            // -------- 3. 分行 --------
-            std::vector<int> line_of_logical(codepoints.size(), -1);
-            int current_line = 0;
-            double line_width = 0.0;
-            bool line_has_content = false;
-
-            for (size_t i = 0; i < break_types.size(); ++i)
-            {
-                if (break_types[i] == LINEBREAK_MUSTBREAK)
-                {
-                    if (line_has_content)
-                    {
-                        ++current_line;
-                        line_width = 0.0;
-                        line_has_content = false;
-                    }
-                    continue;
-                }
-                double adv = char_advance[i];
-                if (adv == 0.0)
-                    continue;
-
-                if (line_has_content && (line_width + adv) > MAX_LINE_WIDTH)
-                {
-                    ++current_line;
-                    line_width = 0.0;
-                    line_has_content = false;
-                }
-                line_of_logical[i] = current_line;
-                line_width += adv;
-                line_has_content = true;
-            }
-
-            // -------- 4. 生成字形实例 --------
-            const float ndc_scale_x = 2.0f / w;
-            const float ndc_scale_y = 2.0f / h;
-
-            double currentY = ORIGIN_Y;
-            double cursorX = ORIGIN_X;
-            int active_line = 0;
-
-            for (const auto *g : visual_glyphs)
-            {
-                int target_line = line_of_logical[g->logical_idx];
-                if (target_line < 0)
-                    continue;
-
-                if (target_line != active_line)
-                {
-                    currentY = ORIGIN_Y + LINE_HEIGHT_PX * target_line;
-                    cursorX = ORIGIN_X;
-                    active_line = target_line;
-                }
-
-                using bound_type = decltype(g->plane_bounds);
-                if (g->plane_bounds == bound_type{})
-                {
-                    cursorX += g->advance_x * FONT_SIZE_PX;
-                    continue;
-                }
-
-                double baselineY = currentY + g->offset_y * FONT_SIZE_PX;
-                float left =
-                    static_cast<float>(cursorX + g->plane_bounds.left * FONT_SIZE_PX);
-                float bottom =
-                    static_cast<float>(baselineY + g->plane_bounds.bottom * FONT_SIZE_PX);
-                float right =
-                    static_cast<float>(cursorX + g->plane_bounds.right * FONT_SIZE_PX);
-                float top =
-                    static_cast<float>(baselineY + g->plane_bounds.top * FONT_SIZE_PX);
-
-                glm::vec2 p0(left * ndc_scale_x - 1.0f, top * ndc_scale_y - 1.0f);
-                glm::vec2 p2(right * ndc_scale_x - 1.0f, bottom * ndc_scale_y - 1.0f);
-                glm::mat4 M = camera::VulkanNDCConfig::rectTransform(p0, p2, 0.0f);
-
-                UvTransform uv = UvTransform::from_target_verts(
-                    std::array<glm::vec2, 4>{{{static_cast<float>(g->uv_bounds.left),
-                                               static_cast<float>(g->uv_bounds.bottom)},
-                                              {static_cast<float>(g->uv_bounds.right),
-                                               static_cast<float>(g->uv_bounds.bottom)},
-                                              {static_cast<float>(g->uv_bounds.right),
-                                               static_cast<float>(g->uv_bounds.top)},
-                                              {static_cast<float>(g->uv_bounds.left),
-                                               static_cast<float>(g->uv_bounds.top)}}});
-
-                InstanceData inst{
-                    .objectId = {uiStore_type_id, uiStore.nextEntityId()},
-                    .textureIndex = g->font_ctx->bind.texture_index,
-                    .samplerIndex = g->font_ctx->bind.sampler_index,
-                    .objectData = object_data{glm::mat4(1.0f)},
-                    .vertexTransform = VertexTransform{M},
-                    .uvTransform = uv,
-                    .fontType = static_cast<uint32_t>(g->font_ctx->type),
-                    .pxRange = static_cast<float>(
-                        g->font_ctx->font.atlas.distanceRange.value_or(0.0)),
-                    .modulateFlag = modulateFlag};
-
-                std::array<VertexAttribute, 4> attrs = {
-                    VertexAttribute{{1.0f, 1.0f, 1.0f}},
-                    VertexAttribute{{1.0f, 0.0f, 0.0f}},
-                    VertexAttribute{{0.0f, 1.0f, 0.0f}},
-                    VertexAttribute{{0.0f, 0.0f, 1.0f}}};
-
-                uiStore.new_entity(inst, attrs, static_cast<uint32_t>(geo.node_idx));
-                cursorX += g->advance_x * FONT_SIZE_PX;
-            }
-        };
-    // ============================================================
-    // 4. 矩形实例生成（单个节点）
-    // ============================================================
-    static constexpr auto generate_rect_instance = [](float w, float h,
-                                                      ui_data_type &uiStore,
-                                                      const NodeGeometry &geo) {
-        glm::vec2 p0 = camera::VulkanNDCConfig::screenToNDC(geo.x, geo.y, w, h);
-        glm::vec2 p2 =
-            camera::VulkanNDCConfig::screenToNDC(geo.x + geo.w, geo.y + geo.h, w, h);
-        glm::mat4 M = camera::VulkanNDCConfig::rectTransform(p0, p2, 0.0f);
-        InstanceData inst{.objectId = {uiStore_type_id, uiStore.nextEntityId()},
-                          .textureIndex = UITextureIndex,
-                          .samplerIndex = 0,
-                          .objectData = object_data{glm::mat4(1.0f)},
-                          .vertexTransform = VertexTransform{M},
-                          .uvTransform = UvTransform::identity()};
-
-        // 8 组颜色表（与原始代码完全一致）
-        static const std::array<std::array<glm::vec3, 4>, 8> instanceColors = {
-            {{{{1.0f, 0.0f, 0.0f},
-               {1.0f, 0.5f, 0.0f},
-               {1.0f, 0.0f, 0.5f},
-               {1.0f, 0.5f, 0.2f}}},
-             {{{0.0f, 1.0f, 0.0f},
-               {0.5f, 1.0f, 0.0f},
-               {0.0f, 1.0f, 0.5f},
-               {0.2f, 1.0f, 0.2f}}},
-             {{{0.0f, 0.0f, 1.0f},
-               {0.0f, 0.5f, 1.0f},
-               {0.5f, 0.0f, 1.0f},
-               {0.2f, 0.5f, 1.0f}}},
-             {{{1.0f, 1.0f, 0.0f},
-               {1.0f, 0.8f, 0.0f},
-               {0.8f, 1.0f, 0.0f},
-               {1.0f, 1.0f, 0.3f}}},
-             {{{1.0f, 0.0f, 1.0f},
-               {1.0f, 0.5f, 0.5f},
-               {0.5f, 0.0f, 1.0f},
-               {0.8f, 0.2f, 0.8f}}},
-             {{{0.0f, 1.0f, 1.0f},
-               {0.0f, 0.8f, 0.8f},
-               {0.5f, 1.0f, 1.0f},
-               {0.2f, 0.8f, 0.8f}}},
-             {{{1.0f, 0.5f, 0.0f},
-               {1.0f, 0.3f, 0.0f},
-               {0.8f, 0.4f, 0.0f},
-               {1.0f, 0.6f, 0.2f}}},
-             {{{0.5f, 0.0f, 0.5f},
-               {0.6f, 0.2f, 0.6f},
-               {0.3f, 0.0f, 0.5f},
-               {0.7f, 0.3f, 0.7f}}}}};
-
-        size_t colorIdx = geo.traversal_id % 8;
-        std::array<VertexAttribute, 4> attrs{
-            {VertexAttribute{instanceColors[colorIdx][0]},
-             VertexAttribute{instanceColors[colorIdx][1]},
-             VertexAttribute{instanceColors[colorIdx][2]},
-             VertexAttribute{instanceColors[colorIdx][3]}}};
-
-        // 保留调试打印（与原始逻辑相同）
-        auto cur_id = inst.objectId.entity_index;
-        std::println("uiStore add id: {}", cur_id);
-        if (cur_id == 0)
-        {
-            auto printMat4 = [](const glm::mat4 &m) {
-                std::println("[{}, {}, {}, {}]", m[0][0], m[0][1], m[0][2], m[0][3]);
-                std::println("[{}, {}, {}, {}]", m[1][0], m[1][1], m[1][2], m[1][3]);
-                std::println("[{}, {}, {}, {}]", m[2][0], m[2][1], m[2][2], m[2][3]);
-                std::println("[{}, {}, {}, {}]", m[3][0], m[3][1], m[3][2], m[3][3]);
-            };
-            std::println("screen: w={}, h={}", w, h);
-            std::println(
-                "p0=({},{}), p1=({},{}), p2=({},{}), p3=({},{})", p0.x, p0.y,
-                camera::VulkanNDCConfig::screenToNDC(geo.x + geo.w, geo.y, w, h).x,
-                camera::VulkanNDCConfig::screenToNDC(geo.x + geo.w, geo.y, w, h).y, p2.x,
-                p2.y, camera::VulkanNDCConfig::screenToNDC(geo.x, geo.y + geo.h, w, h).x,
-                camera::VulkanNDCConfig::screenToNDC(geo.x, geo.y + geo.h, w, h).y);
-            std::println("matrix:");
-            printMat4(M);
-        }
-        std::println("[USE_FLUTTER_UI] DEBUG: node={}, geo: x={}, y={}, w={}, h={}",
-                     geo.node_id, geo.x, geo.y, geo.w, geo.h);
-        uiStore.new_entity(inst, attrs, static_cast<uint32_t>(geo.node_idx));
-    };
-
-    // ============================================================
-    // 4.5 节点状态与渲染绑定：TextState / RenderContext / RenderEvent
-    // ============================================================
-    struct TextState
-    {
-        std::u8string text;
-    };
-    struct RenderContext
-    {
-        float w = 0, h = 0;
-        ui_data_type *uiStore = nullptr;
-        std::remove_reference_t<decltype(fontSelect)> *font = nullptr;
-    };
-    struct RenderEvent
-    {
-        RenderContext rc;
-        NodeGeometry geo;
-    };
-    //-----------------------------------下面是新增的代码
-    // 1. 构建 UI 布局上下文
-    auto uiLayoutCtx =
-        make_aggregate_ref<"soaData", ContainerStyleObject::trait_type::name,
-                           RowStyleObject::trait_type::name,
-                           ColumnStyleObject::trait_type::name,
-                           ExpandedStyleObject::trait_type::name,
-                           TextStyleObject::trait_type::name, "get_member", "layout">(
-            containers_, rows_, columns_, expandeds_, texts_, get_member_, layout_);
-
-    // resize 事件负载：只带"发生了什么"，不带"该怎么做"
-    struct ResizeEvent
-    {
-        float w = 0, h = 0;
-        ui::FlatLayoutTree *tree = nullptr;
-        std::remove_reference_t<decltype(uiLayoutCtx)> *layoutCtx = nullptr;
-    };
-
-    // 测试按钮：状态照 model_state 的写法；颜色边沿触发，直接写实例属性
-    struct ButtonState
-    {
-        bool is_left_button_pressed = false;
-        bool hovered = false;
-        glm::vec4 hover_color{0.4f, 0.9f, 0.5f, 1.0f};
-        glm::vec4 press_color{0.9f, 0.4f, 0.2f, 1.0f};
-    };
-    // UI 只在初始化/resize 重建，prepareBatch 每帧全量上传：
-    // 直接写当前帧的实例属性，下帧上传自然生效，不需要脏标志
-    auto on_button_hover = [&uiStore, &frameContext](ui::FlatNode &n,
-                                                     const ui::UiEvent &e) {
-        auto &hv =
-            e.get<ui::HoverEvent>(); // 只转发 input + 命中实例 id；input=nullptr 表示离开
-        auto *input = hv.input;
-        auto &st = n.state<ButtonState>();
-
-        if (!input) // 离开节点：中断手势（修复"按下拖出再进入"的误 click）
-        {
-            st.hovered = false;
-            st.is_left_button_pressed = false;
-            return;
-        }
-        bool left = input->isMouseButtonPressed(
-            mcs::vulkan::event::MouseButtons::eMOUSE_BUTTON_LEFT);
-
-        auto set_color = [&](glm::vec4 c) {
-            // 直接改被命中实例的属性（GPU pick 回传的实体 id，随 hover 事件携带）
-            if (hv.instanceId == ~0u)
-                return;
-            auto [attrs] = uiStore.template view_entity<"vertexAttribute">(
-                frameContext.currentFrame, hv.instanceId);
-            for (auto &a : attrs)
-                a.color = c;
-        };
-
-        if (!st.hovered) // 进入：亮色（边沿）
-        {
-            st.hovered = true;
-            st.is_left_button_pressed = false; // 离开过：上次手势作废
-            if (left)
-                return; // 带着按下进入：按下不属于本节点
-            set_color(st.hover_color);
-            return;
-        }
-        if (left)
-        {
-            if (!st.is_left_button_pressed) // 按下边沿：按压色
-            {
-                st.is_left_button_pressed = true;
-                set_color(st.press_color);
-            }
-        }
-        else
-        {
-            if (st.is_left_button_pressed) // 抬起：点击/双击 + 恢复悬停色
-            {
-                set_color(st.hover_color);
-                n.emit("click", e); // 生成事件，转发给节点自身的其他函数
-            }
-            st.is_left_button_pressed = false;
-        }
-    };
-
-    // 布局刷新入口：render_all / extractGeometries 定义后赋值；
-    // resize、删除、移动等布局类变化统一走它
-    std::function<void()> ui_refresh;
-
-    // 2. 构建 UI 树（对应 Yoga 中的 screen / root / root2 / text_display）
-    ui::FlatLayoutTree uiTree;
-    uiTree.reserve(20);
-    UIBuilder<std::remove_cvref_t<decltype(uiLayoutCtx)>> builder(uiLayoutCtx, uiTree);
-
-    // 删除测试：点 child0 → 删除 child0-0（布局变更走 ui_refresh）
-    auto on_delete_child0_0 = [&](ui::FlatNode &, const ui::UiEvent &) {
-        if (auto t = uiTree.findNodeByName("child0-0"))
-        {
-            uiTree.removeNode(*t);
-            // 释放 layout store 实体（Entity 析构时自动 release）
-            uiTree.nodes[*t].ref =
-                Entity(Entity::invalid, Entity::invalid, [](uint32_t) noexcept {});
-        }
-        ui_refresh();
-    };
-    // 辅助 Lambda：构建子树（避免 resize 时重复写）
-    auto buildUITree = [&](auto &b) {
-        // screen（Root 节点）自己的 resize 行为——此刻 lastNodeIdx() == screen
-        b.on("resize", [](ui::FlatNode &n, const ui::UiEvent &e) {
-            auto &ev = e.get<ResizeEvent>();
-            auto &ref = n.ref;
-            auto [w, h] =
-                ev.layoutCtx->columns.view_entity<"width", "height">(0, ref.entity_id);
-            w = ev.w;
-            h = ev.h;
-        });
-        b.template Add<ColumnStyleTrait>(
-            "root",
-            [&](auto &b) {
-                b.template Add<ContainerStyleTrait>(
-                    "child0",
-                    [&](auto &b) {
-                        // child0 自己的 resize 行为——此刻 lastNodeIdx() == child0
-                        b.on("resize", [](ui::FlatNode &n, const ui::UiEvent &e) {
-                            auto &ev = e.get<ResizeEvent>();
-                            auto &tree = *ev.tree;
-                            int self = tree.findNodeByName(n.name).value_or(-1);
-                            int root = tree.findNodeByName("root").value_or(-1);
-                            int root2 = tree.findNodeByName("root2").value_or(-1);
-                            if (self == -1 || root == -1 || root2 == -1)
-                                return;
-                            if (tree.nodes[self].parent == root)
-                                tree.moveNode(self, root2, tree.nodes[root2].firstChild);
-                            else
-                                tree.moveNode(self, root, tree.nodes[root].firstChild);
-                        });
-                        // 链式：状态 + hover 事件一起挂（此刻 lastNodeIdx() == child0）
-                        b.status(ButtonState{})
-                            .on("hover", on_button_hover)
-                            .on("click", on_delete_child0_0);
-                        // child0-0 固定尺寸 50x50，margin 四边 5，padding 为 0
-                        b.template Add<ContainerStyleTrait>(
-                            "child0-0", 50.0f, 50.0f,
-                            EdgeInsets{5, 5, 5, 5}); // margin 四边 5
-                    },
-                    100.0f, 100.0f,         // width/height
-                    EdgeInsets{5, 5, 5, 5}, // margin 四边 5
-                    EdgeInsets{});          // padding = 0（Yoga 中 child0 无 padding）
-                b.template Add<ContainerStyleTrait>(
-                    "1", 100.0f, 20.0f, EdgeInsets{5, 5, 5, 5}, // margin 四边 5
-                    EdgeInsets{});
-            },
-            200.0f, 200.0f,             // root 尺寸
-            EdgeInsets{},               // margin 为 0
-            EdgeInsets{10, 10, 10, 10}, // padding 四边 10
-            MainAxisAlignment::start, CrossAxisAlignment::start, MainAxisSize::max);
-        b.template Add<ColumnStyleTrait>(
-            "root2",
-            [](auto &b) {
-                b.template Add<ContainerStyleTrait>(
-                    "1", 100.0f, 20.0f, EdgeInsets{5, 5, 5, 5}, // margin 四边 5
-                    EdgeInsets{});
-            },
-            200.0f, 200.0f, EdgeInsets{}, EdgeInsets{10, 10, 10, 10}); // padding 四边 10
-        // 链式注册：status = 节点自己的状态，on("render") = 节点自己的渲染函数
-        b.template Add<TextStyleTrait>("text_display", 200.0f, 200.0f, EdgeInsets{},
-                                       EdgeInsets{10, 10, 10, 10}) // padding 四边 10
-            .status(TextState{
-                u8"我你好世界你好世界你好世界🤣\nW3C (World)👪 ﷲ e\u0301 \nמעביר את "
-                u8"שירותי- ERCIM."})
-            .on("render", [](ui::FlatNode &n, const ui::UiEvent &e) {
-                auto &ev = e.get<RenderEvent>();
-                // 与原逻辑等价：文本节点先画自己的背景矩形，再叠加字形
-                // generate_* 是 main 里的 static lambda，无捕获直接调用
-                generate_rect_instance(ev.rc.w, ev.rc.h, *ev.rc.uiStore, ev.geo);
-                auto &st = n.state<TextState>();
-                auto [codepoints, shape_result, break_result] =
-                    run_text_pipeline(*ev.rc.font, st.text.c_str(), "zh-CN");
-                generate_text_instances(ev.rc.w, ev.rc.h, *ev.rc.uiStore, ev.geo,
-                                        codepoints, shape_result, break_result.types);
-            });
-    };
-
-    builder.Root<ColumnStyleTrait>("screen", buildUITree, static_cast<float>(WIDTH),
-                                   static_cast<float>(HEIGHT), EdgeInsets{},
-                                   EdgeInsets{});
-
-    // 2.5 默认渲染绑定：每个节点都有 "render"，文本节点已在声明处覆盖
-    auto default_rect_render = [](ui::FlatNode &n, const ui::UiEvent &e) {
-        auto &ev = e.get<RenderEvent>();
-        generate_rect_instance(ev.rc.w, ev.rc.h, *ev.rc.uiStore, ev.geo);
-    };
-    for (auto &n : uiTree.nodes)
-        if (!n.fns.contains("render"))
-            n.on("render", default_rect_render);
-
-    // 2.6 统一渲染循环：初始化与 resize 共用，算法已绑定到节点
-    // 命中/交互 = layout 几何路由（光标 vs 节点矩形）+ GPU pick 携带的实例 id。
-    auto render_all = [&](const std::vector<NodeGeometry> &geos, float w, float h) {
-        RenderContext rc{w, h, &uiStore, &fontSelect};
-        for (const auto &geo : geos)
-        {
-            // NodeGeometry 直接携带节点索引：重命名/重名都免疫
-            if (geo.node_idx < 0 || geo.node_idx >= static_cast<int>(uiTree.nodes.size()))
-                continue;
-            auto &n = uiTree.nodes[geo.node_idx];
-            if (auto itf = n.fns.find("render"); itf != n.fns.end())
-                itf->second(n, ui::UiEvent{RenderEvent{rc, geo}});
-        }
-    };
-
-    // 4. 几何提取（Flutter 专用，填充 NodeGeometry）
-    static constexpr auto extractGeometries = [](auto &uiLayoutCtx,
-                                                 const ui::FlatLayoutTree &tree) {
-        std::vector<NodeGeometry> geos;
-        uint32_t id = 0;
-        auto dfs = [&](this auto &self, int nodeIdx, float px, float py) -> void {
-            const ui::FlatNode &node = tree.nodes[nodeIdx];
-            float x = px + node.geometry.x;
-            float y = py + node.geometry.y;
-            float w = node.geometry.w;
-            float h = node.geometry.h;
-            if (w > 0 && h > 0)
-            {
-                NodeGeometry geo;
-                geo.x = x;
-                geo.y = y;
-                geo.w = w;
-                geo.h = h;
-                auto padOpt = do_get_member<"padding">(uiLayoutCtx, node.ref);
-                if (padOpt.has_value())
-                {
-                    auto &p = any_cast<ui::EdgeInsets>(padOpt);
-                    geo.pad_left = p.left;
-                    geo.pad_right = p.right;
-                    geo.pad_top = p.top;
-                    geo.pad_bottom = p.bottom;
-                }
-                else
-                {
-                    geo.pad_left = geo.pad_right = geo.pad_top = geo.pad_bottom = 0;
-                }
-                geo.node_id = node.name;
-                geo.node_idx = nodeIdx;
-                geo.traversal_id = id++;
-                geos.push_back(geo);
-            }
-            for (int c = node.firstChild; c != -1; c = tree.nodes[c].nextSibling)
-                self(c, x, y);
-        };
-        dfs(0, 0.0f, 0.0f);
-        return geos;
-    };
-
-    // 共享刷新：resize / 删除 / 移动 统一走这里（树已变更后调用）
-    ui_refresh = [&]() {
-        auto ext = swapchain.refImageExtent();
-        float w = static_cast<float>(ext.width);
-        float h = static_cast<float>(ext.height);
-        uiStore.clear();
-        ui::Constraints c{0.0f, w, 0.0f, h};
-        layout_(uiLayoutCtx, uiTree, 0, c);
-        auto geos = extractGeometries(uiLayoutCtx, uiTree);
-        render_all(geos, w, h);
-    };
-
-    // 5. 初始生成所有 UI 实例（与 resize/删除/移动共用同一条刷新链路）
-    ui_refresh();
-    uiTree.printLayout(uiLayoutCtx, 0); // 布局结果打印（与首次刷新共用）
-
-    // 6. Resize 回调（窗口大小改变时重建 UI）
-    auto screen_resize = [&](VkExtent2D newSize) {
-        static VkExtent2D lastSize{0, 0};
-        if (newSize.width == lastSize.width && newSize.height == lastSize.height)
-            return;
-        lastSize = newSize;
-
-        // 事件分发：screen 更新尺寸、child0 决定是否搬家——行为归节点自己
-        ui::UiEvent ev{ResizeEvent{static_cast<float>(newSize.width),
-                                   static_cast<float>(newSize.height), &uiTree,
-                                   &uiLayoutCtx}};
-        for (auto &n : uiTree.nodes)
-            n.emit("resize", ev);
-
-        ui_refresh(); // 与删除/移动共用
-    };
     //diff: [test_dod17] end
 
-    // uiStore
-    std::println("uiStore.size(): {}", uiStore.size());
     //diff: [test_dod10] end
 
     //diff: [test_dod14] 不再需要  topLeftLocal 字段，因为我们使用的公共的顶点我们是知道的
     // 系统路由状态：当前悬停的 UI 节点（仅路由，不解释手势）
     int uiHoverNode = -1;
-    auto soaCtx = make_aggregate_ref<"soaCtx", "autoSpinStore", "interactiveStore",
-                                     "uiStore", "screen_resize", "uiTree", "uiHoverNode">(
-        autoSpinStore, interactiveStore, uiStore, screen_resize, uiTree, uiHoverNode);
+    auto soaCtx = make_aggregate_ref<"soaCtx", "uiHoverNode">(uiHoverNode);
 
     //diff: [test_dod8.cpp] end
 
@@ -4593,9 +3765,9 @@ try
             pipelineTransparentUI, pipelineLayout, depthResourcesBuild, depthResource,
             msaaResourcesBuild, msaaResource);
 
-    auto mainShaderCtx = make_aggregate_ref<"mainShaderCtx", "indirectDrawBatches",
-                                            "uniformBuffers", "descriptorSets">(
-        frameResources, uniformBuffers, descriptorSets);
+    auto mainShaderCtx = make_aggregate_ref<"mainShaderCtx", "shaderDataRecorder",
+                                            "uniformBuffers", "descriptorSets", "glyphs">(
+        shaderDataRecorder, uniformBuffers, descriptorSets, simpleGlyphs);
     auto inputCtx =
         make_aggregate_ref<"inputCtx", "input", "camera", "uiCamera", "clock">(
             input, camera, uiCamera, clock);
@@ -4612,47 +3784,6 @@ try
     // diff: [test_dod2] start:  world之后 才能调用 数据API
 
     // init data
-
-    //diff: [test_dod8] start
-    // 从模型矩阵生成 model_state（其他交互字段保持默认）
-    constexpr auto make_model_state_from_matrix = [](const glm::mat4 &M) {
-        glm::vec3 trans, scale;
-        glm::quat rot;
-        glm::vec3 skew;
-        glm::vec4 persp;
-        glm::decompose(M, scale, rot, trans, skew, persp);
-
-        model_state state;
-        state.model_matrix.translation = trans;
-        state.model_matrix.rotation = rot;
-        state.model_matrix.scale = scale;
-        // last_pos, is_middle_button_pressed 等保持默认即可
-        return state;
-    };
-
-    auto autoSpinId = autoSpinStore.new_entity(
-        InstanceData{{autoSpinStore_type_id, autoSpinStore.nextEntityId()},
-                     0,
-                     0,
-                     object_data{camera::VulkanNDCConfig::rectTransform(
-                         glm::vec2(-0.5f, -0.5f), glm::vec2(0.5f, 0.5f))}},
-        std::array<VertexAttribute, 4>{
-            VertexAttribute{glm::vec3{1.0f, 0.0f, 0.0f}}, // 红
-            VertexAttribute{glm::vec3{1.0f, 0.0f, 0.0f}}, // 红
-            VertexAttribute{glm::vec3{0.0f, 1.0f, 0.0f}}, // 绿
-            VertexAttribute{glm::vec3{0.0f, 1.0f, 0.0f}}, // 绿
-        });
-    auto interactiveId = interactiveStore.new_entity(
-        InstanceData{
-            {interactive_type_id, interactiveStore.nextEntityId()}, 3, 1, object_data{}},
-        std::array<VertexAttribute, 4>{
-            VertexAttribute{{1.0f, 0.0f, 1.0f}}, // 品红
-            VertexAttribute{{0.0f, 1.0f, 1.0f}}, // 青
-            VertexAttribute{{1.0f, 0.5f, 0.0f}}, // 橙
-            VertexAttribute{{0.5f, 0.0f, 0.5f}}, // 紫
-        },
-        model_state{make_model_state_from_matrix(camera::VulkanNDCConfig::rectTransform(
-            glm::vec2(-0.5f, -0.5f), glm::vec2(0.5f, 0.5f), 0.2f))});
 
     // 随机生成两个纹理索引和采样器索引
 
@@ -4951,12 +4082,10 @@ try
     };
 
     // diff: [test_model_matrix2] end
-
     static constexpr auto updateVertexData = [](world_type &world, input_type &inputCtx,
                                                 data_type &soaCtx,
                                                 uint32_t currentFrame) noexcept {
-        auto &autoSpinStore = soaCtx.autoSpinStore;
-        auto &interactiveStore = soaCtx.interactiveStore;
+
     };
 
     // diff: [test_indirectdraw] start prepareBatch：动态分配合批资源并填充数据 // NOLINTNEXTLINE
@@ -4965,122 +4094,43 @@ try
         auto &globalCtx = world.globalCtx;
         auto &mainShaderCtx = world.mainShaderCtx;
 
-        auto &device = globalCtx.device;
-        auto &meshMap = globalCtx.meshMap;
+        auto &shaderDataRecorder = mainShaderCtx.shaderDataRecorder;
+        auto &glyphs = mainShaderCtx.glyphs;
 
-        auto &descriptorSets = mainShaderCtx.descriptorSets;
-        auto &frameResources = mainShaderCtx.indirectDrawBatches;
+        auto &batch = shaderDataRecorder[currentFrame];
 
-        auto &descriptorSet = descriptorSets[currentFrame];
-        auto &batch = frameResources[currentFrame];
+        // ============ 简单 Glyph 测试：写 quad + Glyph 实例 + 间接命令 ============
+        // quad 顶点与 test_sdf 一致：[-0.5,0.5] 单位矩形（shader 端 Glyph 语义）
+        constexpr std::array<Vertex, 4> glyphQuad = {
+            Vertex{{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f}}, // 左上
+            Vertex{{0.5f, -0.5f, 0.0f}, {1.0f, 0.0f}},  // 右上
+            Vertex{{0.5f, 0.5f, 0.0f}, {1.0f, 1.0f}},   // 右下
+            Vertex{{-0.5f, 0.5f, 0.0f}, {0.0f, 1.0f}}   // 左下
+        };
+        constexpr std::array<uint32_t, 6> glyphQuadIdx = {0, 1, 2, 0, 2, 3};
 
-        auto &autoSpinStore = soaCtx.autoSpinStore;
-        auto &interactiveStore = soaCtx.interactiveStore;
-        auto &uiStore = soaCtx.uiStore;
+        // 1. 顶点 / 索引（每帧直接写，简单直接）
+        batch.globalVertexBuffer.write(0, glyphQuad.data(), sizeof(glyphQuad));
+        batch.globalIndexBuffer.write(0, glyphQuadIdx.data(), sizeof(glyphQuadIdx));
 
-        auto start = std::chrono::high_resolution_clock::now();
-        //diff: [test_dod11] start
-        {
-            // 临时命令和常量数组
-            std::vector<VkDrawIndexedIndirectCommand> cmds;
-            std::vector<CommandConstant> cmdConsts;
+        // 2. Glyph 实例（heap 偏移 0）
+        batch.globalHeapBuffer.write(0, glyphs.data(),
+                                     glyphs.size() * sizeof(shader_data::Glyph));
 
-            // 用于写入 buffer 的偏移
-            VkDeviceSize instanceOffset = 0;
-            VkDeviceSize attributeOffset = 0;
-            batch.drawCountOpaque3D = 0;
-            batch.drawCountOpaqueUI = 0;
+        // 3. 间接绘制命令（1 条：quad，glyphs.size() 个实例）
+        VkDrawIndexedIndirectCommand cmd{.indexCount = 6,
+                                         .instanceCount =
+                                             static_cast<uint32_t>(glyphs.size()),
+                                         .firstIndex = 0,
+                                         .vertexOffset = 0,
+                                         .firstInstance = 0};
+        batch.currentCommand = cmd;
+        batch.indirectDrawBuffer.write(0, &cmd, sizeof(cmd));
 
-            // 处理一个 store（它绑定到一个 mesh，mesh 提供顶点数）
-            auto processStore = [&](auto &store, const mesh_data &mesh, uint32_t frame) {
-                uint32_t count = store.size(); // 存活实体数
-                if (count == 0)
-                    return;
-                // ★ 计算正确的 firstInstance
-                uint32_t firstInstance =
-                    static_cast<uint32_t>(instanceOffset / sizeof(InstanceData));
-
-                // 1. 整体拷贝实例数据（每个实体一个 InstanceData）
-                // 假设 store 中有 "instanceData" 字段，且类型为 InstanceData
-                InstanceData *instSrc =
-                    store.template raw_field<"instanceData">(frame).data();
-                VkDeviceSize instSize = count * sizeof(InstanceData);
-                batch.globalInstanceBuffer.write(instanceOffset, instSrc, instSize);
-
-                // 2. 整体拷贝属性数据（每个实体一个 std::array<VertexAttribute, 4>）
-                std::array<VertexAttribute, 4> *attrSrc =
-                    store.template raw_field<"vertexAttribute">(frame).data();
-                VkDeviceSize attrSize = count * sizeof(std::array<VertexAttribute, 4>);
-                batch.globalAttributeBuffer.write(attributeOffset, attrSrc, attrSize);
-
-                // 3. 生成间接命令
-                cmds.push_back(mesh.getDrawCommand(count, firstInstance));
-
-                // 4. 生成命令常量
-                cmdConsts.push_back(CommandConstant{mesh.vertexCount});
-
-                instanceOffset += instSize;
-                attributeOffset += attrSize;
-
-                // std::cout << "写入了实体: " << count << std::endl;
-            };
-
-            const mesh_data &quadMesh = meshMap["quad"];
-            // 3D
-            {
-                processStore(autoSpinStore, quadMesh, currentFrame);
-                processStore(interactiveStore, quadMesh, currentFrame);
-            }
-            uint32_t drawCountOpaque3D = static_cast<uint32_t>(cmds.size());
-            batch.drawCountOpaque3D = drawCountOpaque3D;
-
-            // UI
-            if (1)
-            {
-                // ========== UI 周期显示控制 ==========
-                constexpr float UI_ON_DURATION = 2.0f;  // 显示 2 秒
-                constexpr float UI_OFF_DURATION = 3.0f; // 隐藏 3 秒
-                constexpr float UI_PERIOD = UI_ON_DURATION + UI_OFF_DURATION;
-
-                static auto s_uiCycleStart = std::chrono::steady_clock::now();
-                auto now = std::chrono::steady_clock::now();
-                float elapsed =
-                    std::chrono::duration<float>(now - s_uiCycleStart).count();
-                if (elapsed >= UI_PERIOD)
-                {
-                    s_uiCycleStart = now;
-                    elapsed = 0.0f;
-                }
-                bool showUI = (elapsed < UI_ON_DURATION);
-
-                if (showUI)
-                {
-                    processStore(uiStore, quadMesh, currentFrame);
-                }
-            }
-            // NOTE: todo 应该区分好. 这样确实没问题. 但是细节没做好.
-            batch.drawCountTransparentUI = cmds.size() - drawCountOpaque3D;
-
-            // 上传命令和常量
-            // 所有命令（3D+UI）一次性拷贝
-            size_t totalDrawCount = cmds.size();
-            batch.indirectDrawBuffer.write(
-                0, cmds.data(), totalDrawCount * sizeof(VkDrawIndexedIndirectCommand));
-            batch.commandConstantsBuffer.write(0, cmdConsts.data(),
-                                               totalDrawCount * sizeof(CommandConstant));
-        }
-        //diff: [test_dod11] end
-        // 3. 记录结束时间点
-        auto end = std::chrono::high_resolution_clock::now();
-
-        // 4. 计算时间差，并转换为毫秒
-        auto duration =
-            std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-        // NOTE: 函数执行耗时: 2 毫秒. [FPS]  77.1 (avg frame: 12.963 ms) 占用了1/6
-        // 5. 打印耗时
-        if (auto count = duration.count(); count > 0)
-            std::cout << "函数执行耗时: " << duration.count() << " 毫秒" << std::endl;
+        // 4. 命令常量（type 2 = Glyph，heap 偏移 0）
+        shader_data::CommandConstant cc{.type_id = 2, .adddress_offset = 0};
+        batch.currentCommandConstant = cc;
+        batch.commandConstantsBuffer.write(0, &cc, sizeof(cc));
     };
 
     // diff: [test_indirectdraw] end
@@ -5254,8 +4304,8 @@ try
             auto imageExtent = swapchain.imageExtent();
             auto &pipelineLayout = mainCtx.pipelineLayout;
 
-            auto &frameResources = mainShaderCtx.indirectDrawBatches;
-            auto &batch = frameResources[currentFrame];
+            auto &shaderDataRecorder = mainShaderCtx.shaderDataRecorder;
+            auto &batch = shaderDataRecorder[currentFrame];
 
             auto &descriptorSets = mainShaderCtx.descriptorSets;
             auto descriptorSet = descriptorSets[currentFrame];
@@ -5309,52 +4359,25 @@ try
             const auto &[currentFrame, imageIndex] = recordCtx.info;
             const auto &commandBuffer = commandBuffers[currentFrame];
 
-            auto &frameResources = mainShaderCtx.indirectDrawBatches;
-            auto &batch = frameResources[currentFrame];
+            auto &shaderDataRecorder = mainShaderCtx.shaderDataRecorder;
+            auto &batch = shaderDataRecorder[currentFrame];
 
-            // diff: [test_dod18] start 使用合并索引缓冲和间接绘制
-            // 按顺序绘制四个段，每个段绑定对应管线，并发送间接命令
-            struct DrawSegment
-            {
-                VkPipeline pipeline;
-                uint32_t drawCount;
-                VkDeviceSize indirectOffset;
-                uint32_t cameraIndex;
-            };
+            // ============ 简单 Glyph 测试：绑定管线 + 推送常量 + 间接绘制 ============
+            // 字形走 UI 透明管线（深度关、混合开，适配 MSDF 半透明）
+            commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                       *mainCtx.pipelineTransparentUI);
 
-            DrawSegment segments[] = {
-                {*mainCtx.pipelineOpaque3D, batch.drawCountOpaque3D, 0, 0},
-                {*mainCtx.pipelineTransparent3D, batch.drawCountTransparent3D,
-                 batch.drawCountOpaque3D * sizeof(VkDrawIndexedIndirectCommand), 0},
-                {*mainCtx.pipelineOpaqueUI, batch.drawCountOpaqueUI,
-                 (batch.drawCountOpaque3D + batch.drawCountTransparent3D) *
-                     sizeof(VkDrawIndexedIndirectCommand),
-                 1},
-                {*mainCtx.pipelineTransparentUI, batch.drawCountTransparentUI,
-                 (batch.drawCountOpaque3D + batch.drawCountTransparent3D +
-                  batch.drawCountOpaqueUI) *
-                     sizeof(VkDrawIndexedIndirectCommand),
-                 1}};
+            // 推送常量：顶点 / 实例堆 / 命令常量地址 + UI 相机（cameraIndex = 1）
+            PushData pc{.vertexAddress = batch.globalVertexBuffer.address,
+                        .instanceAddress = batch.globalHeapBuffer.address,
+                        .commandConstantsAddress = batch.commandConstantsBuffer.address,
+                        .cameraIndex = 1}; // UI 相机
+            commandBuffer.pushConstants(*pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                                        sizeof(pc), &pc);
 
-            for (const auto &seg : segments)
-            {
-                if (seg.drawCount == 0)
-                    continue;
-                PushData push = {.vertexAddress = batch.globalVertexBuffer.address,
-                                 .attributeAddress = batch.globalAttributeBuffer.address,
-                                 .instanceAddress = batch.globalInstanceBuffer.address,
-                                 .commandConstantsAddress =
-                                     batch.commandConstantsBuffer.address,
-                                 .cameraIndex = seg.cameraIndex};
-                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, seg.pipeline);
-                commandBuffer.pushConstants(*pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
-                                            0, sizeof(PushData), &push);
-                commandBuffer.drawIndexedIndirect(
-                    batch.indirectDrawBuffer.buffer.buffer(), seg.indirectOffset,
-                    seg.drawCount, sizeof(VkDrawIndexedIndirectCommand));
-            }
-
-            // diff: [test_dod18] end
+            // 1 条间接绘制命令（quad + N 个 Glyph 实例）
+            commandBuffer.drawIndexedIndirect(batch.indirectDrawBuffer.buffer.buffer(), 0,
+                                              1, sizeof(VkDrawIndexedIndirectCommand));
         }>{},
         std::constant_wrapper<[](world_type &world, input_type &inputCtx,
                                  data_type &soaCtx) {
@@ -5486,10 +4509,6 @@ try
             resolveResourcesBuild.setCreateInfoExtent(imageExtent).build(device);
 
         pickMouse.valid = false;
-
-        // diff: [test_dod12.cpp] start
-        soaCtx.screen_resize(newExtent);
-        // diff: [test_dod12.cpp] end
 
         frameContext.rebuild(swapchain.imagesSize());
     };
@@ -5638,7 +4657,7 @@ try
                                          //  NOTE: 应该提取出来的
                                          auto *data = static_cast<picking_result *>(
                                              pickingFrames[readIdx].mapPtr());
-                                         if (data->key != 0xFFFFFFFF)
+                                         if (data->key.object_type != 0xFFFFFFFF)
                                          {
                                              on_hover(world, inputCtx, soaCtx, *data);
                                              if (data->key.object_type != uiStore_type_id)
