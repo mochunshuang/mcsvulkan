@@ -5,6 +5,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <exception>
 #include <flat_map>
 #include <iostream>
@@ -335,11 +336,15 @@ namespace std
     };
 }; // namespace std
 static_assert(sizeof(object_key) == 2 * sizeof(uint32_t));
+// picking_result：与 R32G32B32A32_UINT 附件 + frag 的 uvec4 输出严格对齐（16B）
+// xy = object_key(type_id, entity_index) 外键；z = primitive_id；w = hover_fn（池实体下标，0xFFFFFFFF = 未绑定）
 struct picking_result
 {
-    object_key key;
-    uint32_t primitive_id;
+    object_key key;        // outPicking.xy
+    uint32_t primitive_id; // outPicking.z
+    uint32_t hover_fn;     // outPicking.w：hover 函数池实体下标（0xFFFFFFFF = 未绑定）
 };
+static_assert(sizeof(picking_result) == 16);
 //diff: [test_dod16] end
 
 namespace shader_data
@@ -356,8 +361,10 @@ namespace shader_data
         glm::vec4 color;         // 顶点色（默认白）
         glm::mat4 model;         // 平移 + 缩放：[-0.5,0.5] quad -> NDC 字形矩形
         UvTransform uvTransform; // 图集 UV 变换
+        uint32_t hover_fn =
+            ~0u; // 绑定的 hover 函数池实体下标（0xFFFFFFFF = 未绑定），随 Glyph 上传
     };
-    static_assert(sizeof(Glyph) == 120);
+    static_assert(sizeof(Glyph) == 124);
 
     struct BufferResource
     {
@@ -418,8 +425,9 @@ namespace shader_data
     {
         uint32_t type_id;
         uint32_t adddress_offset;
+        uint32_t slot_count; // 每实例顶点槽位数（通用网格类型用，任意 N；固定类型忽略）
     };
-    static_assert(sizeof(CommandConstant) == 8); // 与 GLSL 端一致
+    static_assert(sizeof(CommandConstant) == 12); // 与 GLSL 端一致
     // NOTE: 负责生成命令。 必须使用顶点绘制才能驱动GPU
     struct ShaderDataRecorder
     {
@@ -500,23 +508,100 @@ namespace shader_data
     // NOTE: 内存管理还是 自己自带的为好
     // NOTE: 必须枚举出 shader可以输出的全部类型
 
-    // hover 应该是唯一的事件源
-    struct hover_manager
+    // ===================== hover 函数池 + 外键状态机 =====================
+    // 全局唯一一份 实体→函数 关联：一个池实体 = 一个可共享的 hover 处理函数，
+    // 多个字形可指向同一个 hover_fn（函数被共享）。hover_fn = 0xFFFFFFFF 表示未绑定。
+    struct hover_fn_trait
     {
-        object_key object;
+    };
+    using HoverFnObject =
+        gen_soa_struct<hover_fn_trait, {"fn", ^^std::move_only_function<void(
+                                            picking_result, bool enter) noexcept>}>;
 
-        constexpr void hover_enter() noexcept {}
-        constexpr void hover_leave() noexcept {}
-        constexpr void hover(object_key o) noexcept
+    struct hover_pool
+    {
+        HoverFnObject store{64}; // 容量 64，可 reserve 扩展
+
+        // 绑定一个可共享的 hover 函数，返回池实体下标（0 也是合法下标）
+        uint32_t bind(
+            std::move_only_function<void(picking_result, bool enter) noexcept> fn)
         {
-            if (object != o)
-            {
-                hover_leave();
-                object = o;
-                hover_enter();
-            }
+            return store.new_entity(std::move(fn));
+        }
+        // 按实体下标调用（0xFFFFFFFF = 未绑定；已释放 = 不调用）
+        void call(uint32_t entity, const picking_result &r, bool enter) noexcept
+        {
+            if (entity == ~0u || !store.alive(entity))
+                return;
+            auto [fn] = store.view_entity<"fn">(0, entity);
+            if (fn)
+                fn(r, enter);
         }
     };
+
+    // 外键状态机：只存当前命中 cur（换新时旧 cur 就是 pre，用来发 leave）
+    struct hover_manager
+    {
+        picking_result cur{object_key{0xFFFFFFFF, 0}, 0,
+                           0}; // 当前命中（key 无效 = 未悬停）
+
+        void hover(const picking_result &r, hover_pool &pool) noexcept
+        {
+            if (cur.key == r.key)
+                return; // 同一外键：无动作
+            if (cur.key.object_type != 0xFFFFFFFF && cur.hover_fn != ~0u)
+                pool.call(cur.hover_fn, cur,
+                          false); // hover_leave：离开旧对象（cur 即 pre）
+            cur = r;
+            if (r.key.object_type != 0xFFFFFFFF && r.hover_fn != ~0u)
+                pool.call(r.hover_fn, r, true); // hover_enter：进入新对象
+        }
+    };
+
+    // ===================== 矩形线框（布局 debug 边框；独立于圆角阴影矩形）=====================
+    struct UiRect
+    {
+        uint32_t entity_index; // 布局节点索引（拾取外键）
+        uint32_t hover_fn;     // hover 池下标（0xFFFFFFFF = 未绑定）
+        glm::vec4 center_size; // center.xy + size.xy（NDC）
+        glm::vec4 color;       // 边框色
+        float border;          // 边框半宽（NDC）
+    };
+    static_assert(sizeof(UiRect) == 44);
+
+    // ===================== 圆角阴影矩形（照抄 test_sdf Rectangle；TYPE_ROUND_RECT=5）=====================
+    // 与 GLSL Rectangle（RECTANGLE_SIZE=264）严格一致；HTML box-shadow 风格
+    struct VertexTransform
+    {
+        glm::mat4 matrix;
+    };
+    struct Rectangle
+    {
+        uint32_t entity_index;           // 拾取实体索引（outPicking.y）
+        uint32_t effects;                // 特效标志（FX_ROUNDED/SHADOW/FILL）
+        glm::vec4 colors[4];             // 四顶点颜色（单色 = 四顶点同色）
+        glm::mat4 model;                 // 平移 + 旋转
+        VertexTransform vertexTransform; // 顶点缩放（quad × size）
+        UvTransform uvTransform;         // UV 变换
+        glm::vec2 size;                  // 卡片完整宽/高（NDC，SDF 用）
+        glm::vec2 shadowOffset;          // 阴影偏移（相对卡片尺寸）
+        glm::vec4 radiusSoftness;        // x=圆角比例 y=边缘柔化 z=阴影模糊 w=阴影扩散
+        glm::vec4 shadowColor;           // 阴影色 RGBA（a=0 → 无阴影）
+    };
+    static_assert(sizeof(Rectangle) == 264);
+    static constexpr uint32_t FX_ROUNDED = 1u;
+    static constexpr uint32_t FX_SHADOW = 2u;
+    static constexpr uint32_t FX_FILL = 4u;
+
+    // ===================== 顶点属性（普通绘制用）：每顶点一份 =====================
+    // 顶点本身 + 每顶点属性（无 SDF）；多实例共享顶点/索引，实例数据 = 属性池
+    // attrIdx = gl_InstanceIndex × N + 槽位（N = 命令常量 slot_count，任意）
+    struct VertexAttr
+    {
+        glm::vec3 pos;   // 顶点位置（NDC，直接作为顶点）
+        glm::vec4 color; // 每顶点颜色（插值 → 渐变）
+    };
+    static_assert(sizeof(VertexAttr) == 28);
 
 }; // namespace shader_data
 constexpr auto initShaderDataRecorder(const LogicalDevice &device)
@@ -912,36 +997,7 @@ namespace ui
         float x = 0, y = 0, w = 0, h = 0;
     };
 
-    // 统一事件：任意负载（点击/渲染上下文等），name-function 分发的载体
-    struct UiEvent
-    {
-        std::any payload;
-
-        template <typename T>
-        UiEvent(T value) : payload(std::move(value))
-        {
-        }
-
-        template <typename T>
-        T &get()
-        {
-            return std::any_cast<T &>(payload);
-        }
-        template <typename T>
-        const T &get() const
-        {
-            return std::any_cast<const T &>(payload);
-        }
-    };
-
-    // hover 事件负载：input 指针（薄转发）+ 命中的 UI 实例实体 id（GPU pick 回传，~0u=无）
-    struct HoverEvent
-    {
-        glfw_input *input = nullptr;
-        uint32_t instanceId = ~0u;
-    };
-
-    // 扁平树节点（使用全局 Entity）：每个节点自己的状态 + 自己的函数
+    // 扁平树节点（使用全局 Entity）：布局只负责产出几何（位置坐标），不承载事件
     struct FlatNode
     {
         Entity ref; // 全局 Entity，ui 内可直接访问
@@ -951,30 +1007,6 @@ namespace ui
         BoxGeometry geometry;
         std::string name;
         float baseline = 0;
-
-        // 每个节点自己的状态：任意 struct（有状态，归节点所有）
-        std::any status;
-        // 每个节点自己的函数：name -> function（无状态，分发时 self 传入）
-        std::unordered_map<std::string,
-                           std::move_only_function<void(FlatNode &, const UiEvent &)>>
-            fns;
-
-        template <typename T>
-        T &state()
-        {
-            return std::any_cast<T &>(status);
-        }
-
-        void on(std::string name,
-                std::move_only_function<void(FlatNode &, const UiEvent &)> fn)
-        {
-            fns.emplace(std::move(name), std::move(fn));
-        }
-        void emit(const std::string &name, const UiEvent &e)
-        {
-            if (auto it = fns.find(name); it != fns.end())
-                it->second(*this, e);
-        }
     };
 
     // 树管理器
@@ -1183,8 +1215,6 @@ namespace ui
             child.parent = -1;
             child.nextSibling = -1;
             child.firstChild = -1;
-            child.fns.clear();    // 摘除即失效：释放闭包
-            child.status.reset(); // 释放节点状态
         }
 
         constexpr void clear()
@@ -2009,26 +2039,6 @@ class UIBuilder
     int lastNodeIdx() const noexcept
     {
         return static_cast<int>(tree_.nodes.size() - 1);
-    }
-
-    // ========== 链式注册：status / on，绑定到"当前节点" ==========
-    FlatNode &node() noexcept
-    {
-        return tree_.nodes[lastNodeIdx()];
-    }
-
-    template <typename T>
-    UIBuilder &status(T value)
-    {
-        node().status = std::move(value);
-        return *this;
-    }
-
-    UIBuilder &on(std::string name,
-                  std::move_only_function<void(FlatNode &, const UiEvent &)> fn)
-    {
-        node().on(std::move(name), std::move(fn));
-        return *this;
     }
 
     // ========== 叶子版本（无子节点） ==========
@@ -3128,7 +3138,7 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
     // ========== 拾取资源 =========
     auto pickResourcesBuild = mcs::vulkan::memory::build_simple_resource(
         {.imageType = VK_IMAGE_TYPE_2D,
-         .format = VK_FORMAT_R32G32_UINT,
+         .format = VK_FORMAT_R32G32B32A32_UINT, // 128位：外键 + primitive_id + hover_fn
          .extent = {.width = WIDTH, .height = HEIGHT, .depth = 1},
          .mipLevels = 1,
          .arrayLayers = 1,
@@ -3184,7 +3194,7 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
     std::array<mcs::vulkan::memory::auto_map_buffer, MAX_FRAMES_IN_FLIGHT> pickingFrames;
     for (auto &pf : pickingFrames)
     {
-        constexpr auto BUFFER_SIZE = 8;
+        constexpr auto BUFFER_SIZE = sizeof(picking_result); // 16B = 一个 4×u32 texel
         pf = mcs::vulkan::memory::auto_map_buffer(
             mcs::vulkan::memory::create_simple_buffer(
                 device,
@@ -3223,7 +3233,7 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
     // 定义两个颜色附件格式
     std::array<VkFormat, 2> mainColorFormats = {
         swapchainBuild.refImageFormat(), // location 0 (swapchain)
-        VK_FORMAT_R32G32_UINT            // location 1 (picking)
+        VK_FORMAT_R32G32B32A32_UINT      // location 1 (picking)
     };
 
     /*
@@ -3309,10 +3319,12 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
                               },
                               //diff: [test_indirectdraw_no_pick] start
                               {
-                                  // location 1 (R32G32_UINT，不能混合)
+                                  // location 1 (拾取：4 通道全写，zw = primitive_id + hover_fn)
                                   .blendEnable = VK_FALSE,
-                                  .colorWriteMask =
-                                      VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT,
+                                  .colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
+                                                    VK_COLOR_COMPONENT_G_BIT |
+                                                    VK_COLOR_COMPONENT_B_BIT |
+                                                    VK_COLOR_COMPONENT_A_BIT,
                               },
                               //diff: [test_indirectdraw_no_pick] end
                           }},
@@ -3342,73 +3354,6 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
         std::move(pickingAttachments));
 }
 
-constexpr auto autoSpinStore_type_id = 0;
-constexpr auto interactive_type_id = 1;
-constexpr auto uiStore_type_id = 2;
-
-struct triat_for_ui
-{
-    static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
-                                   picking_result result, uint32_t currentFrame)
-    {
-    }
-    static constexpr auto update(auto &world, auto &inputCtx, auto &soaCtx,
-                                 uint32_t currentFrame) noexcept
-    {
-        //diff: [test_dod8] start
-        auto start = std::chrono::high_resolution_clock::now();
-        float elapsed = inputCtx.clock.getElapsed(); // 直接获取当前累积时间
-        // diff: [test_dod11] start
-        // UI 的矩阵操作. 各自UI组件的中心旋转
-        if (0)
-        {
-            auto &uiStore = soaCtx.uiStore;
-
-            int idx = 0;
-            for (auto [instanceData] :
-                 uiStore.template view<"instanceData">(currentFrame))
-            {
-                float angle = elapsed * 0.5f + idx * 0.2f;
-                float s = 1.0f + 0.3f * sinf(elapsed * 2.0f + idx);
-                glm::mat4 dynamicMat =
-                    glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0, 0, 1)) *
-                    glm::scale(glm::mat4(1.0f), glm::vec3(s, s, 1.0f));
-                instanceData.objectData.matrix = dynamicMat;
-                ++idx;
-            }
-        }
-        else if (0) // 整体 UI 组动画
-        {
-            auto &uiStore = soaCtx.uiStore;
-
-            float angle = elapsed * 0.5f;
-            float s = 1.0f + 0.3f * sinf(elapsed * 2.0f);
-            glm::mat4 dynamicTransform =
-                glm::rotate(glm::mat4(1.0f), angle, glm::vec3(0, 0, 1)) *
-                glm::scale(glm::mat4(1.0f), glm::vec3(s, s, 1.0f));
-
-            for (auto [instanceData] :
-                 uiStore.template view<"instanceData">(currentFrame))
-            {
-                instanceData.objectData.matrix = dynamicTransform;
-            }
-        }
-        // diff: [test_dod11] end
-        // 3. 记录结束时间点
-        auto end = std::chrono::high_resolution_clock::now();
-
-        // 4. 计算时间差，并转换为毫秒
-        auto duration =
-            std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-        // 5. 打印耗时
-        // if (auto count = duration.count(); count > 0)
-        //     std::cout << "updateObjectData耗时: " << duration.count()
-        //               << " 毫秒,数据量: " << idx << std::endl;
-        //diff: [test_dod8] end
-    }
-};
-
 // ================= id -> 对象：统一实体访问 =================
 // 按 type_id 找到 store，把具体 store 类型交给 visitor（一次实现，取代各处成员遍历分派）
 static constexpr auto visit_store(auto &soaCtx, uint32_t type_id, auto &&visitor)
@@ -3424,15 +3369,6 @@ static constexpr auto visit_store(auto &soaCtx, uint32_t type_id, auto &&visitor
     throw std::out_of_range{"visit_store: bad type_id"};
 }
 
-// 悬停离开：把 nullptr 输入指针发给当前悬停节点，节点自行复位（系统只做路由）
-static constexpr auto ui_hover_leave = [](auto &world, auto &inputCtx, auto &soaCtx) {
-
-};
-
-static constexpr auto on_hover(auto &world, auto &inputCtx, auto &soaCtx,
-                               picking_result result)
-{
-}
 static constexpr auto inputController(auto &world, auto &inputCtx, auto &soaCtx)
 {
     auto &currentFrame = world.globalCtx.frameContext.currentFrame;
@@ -3698,7 +3634,7 @@ try
             tg.pxRange =
                 static_cast<float>(g.font_ctx->font.atlas.distanceRange.value_or(0.0));
             tg.modulateFlag = 1;
-            tg.color = glm::vec4(1.0f); // 白色字形（背景为黑色）
+            tg.color = glm::vec4(1.0f); // 白色字形（调制路径输出 fragColor.rgb*opacity）
             tg.model = glm::translate(glm::mat4(1.0f), glm::vec3(center, 0.0f)) *
                        glm::scale(glm::mat4(1.0f), glm::vec3(full, 1.0f));
             tg.uvTransform = uv;
@@ -3732,11 +3668,120 @@ try
     //diff: [test_dod10] end
 
     //diff: [test_dod14] 不再需要  topLeftLocal 字段，因为我们使用的公共的顶点我们是知道的
-    // 系统路由状态：当前悬停的 UI 节点（仅路由，不解释手势）
-    int uiHoverNode = -1;
-    auto soaCtx = make_aggregate_ref<"soaCtx", "uiHoverNode">(uiHoverNode);
+    // soaCtx：布局系统（stores + get_member + layout + uiRects）；事件走 shader_data::hover_manager
+    std::vector<shader_data::Rectangle>
+        uiRects; // 圆角卡片（照抄 test_sdf Rectangle）；线框另存 uiWireRects
+    std::vector<shader_data::UiRect> uiWireRects; // 线框边框
+    auto soaCtx =
+        make_aggregate_ref<"soaCtx", "containers", "rows", "columns", "expandeds",
+                           "texts", "get_member", "layout", "uiRects", "uiWireRects">(
+            containers_, rows_, columns_, expandeds_, texts_, get_member_, layout_,
+            uiRects, uiWireRects);
 
     //diff: [test_dod8.cpp] end
+
+    // ===================== UI 布局树：构建 + 布局 + 打印 =====================
+    // 画布 = NDC 0..2（y 向下）；桥输出 NDC 中心（画布中心 - 1）
+    FlatLayoutTree uiTree;
+    uiTree.reserve(16);
+    {
+        UIBuilder builder(soaCtx, uiTree);
+        builder.Root<ContainerStyleTrait>(
+            "root",
+            [](auto &b) {
+                b.template Add<RowStyleTrait>("row", [](auto &b) {
+                    b.template Add<ContainerStyleTrait>("left", 0.8f, 1.6f);
+                    b.template Add<ContainerStyleTrait>("right", 0.8f, 1.6f);
+                });
+            },
+            2.0f, 2.0f); // root 填满画布
+    }
+    soaCtx.layout(soaCtx, uiTree, 0, Constraints{0.0f, 2.0f, 0.0f, 2.0f});
+    uiTree.printLayout(soaCtx); // 相对 + 绝对坐标
+
+    // 桥：前序遍历 → 圆角卡片（Rectangle）+ 线框（UiRect）
+    constexpr glm::vec4 kLevelColors[] = {glm::vec4(1, 0, 0, 1), glm::vec4(0, 1, 0, 1),
+                                          glm::vec4(0, 0, 1, 1), glm::vec4(1, 1, 0, 1),
+                                          glm::vec4(0, 1, 1, 1), glm::vec4(1, 0, 1, 1)};
+    {
+        auto collectLayoutRects = [&](const FlatLayoutTree &tree) {
+            uiRects.clear();
+            uiWireRects.clear();
+            // 矩形构建器（照抄 test_sdf makeRect：HTML box-shadow 卡片）
+            struct RectStyle
+            {
+                glm::vec4 fillColor{1.0f, 1.0f, 1.0f, 1.0f};
+                glm::vec4 shadowColor{0.0f, 0.0f, 0.0f, 0.0f};
+                glm::vec2 shadowOffset{0.0f, 0.04f};
+                float radius = 0.08f;
+                float edgeSoftness = 0.006f;
+                float shadowBlur = 0.08f;
+                float shadowSpread = 1.0f;
+                float rotation = 0.0f;
+                uint32_t effects = 0u;
+            };
+            auto makeRect = [&](glm::vec2 center, glm::vec2 size, RectStyle s) {
+                shader_data::Rectangle r{};
+                r.colors[0] = s.fillColor;
+                r.colors[1] = s.fillColor;
+                r.colors[2] = s.fillColor;
+                r.colors[3] = s.fillColor;
+                r.model =
+                    glm::rotate(glm::translate(glm::mat4(1.0f), glm::vec3(center, 0.0f)),
+                                glm::radians(s.rotation), glm::vec3(0.0f, 0.0f, 1.0f));
+                r.vertexTransform.matrix =
+                    glm::scale(glm::mat4(1.0f), glm::vec3(size, 1.0f));
+                r.uvTransform = UvTransform{glm::vec2(1.0f), glm::vec2(0.0f)};
+                r.size = size;
+                r.shadowOffset = s.shadowOffset;
+                r.radiusSoftness =
+                    glm::vec4(s.radius, s.edgeSoftness, s.shadowBlur, s.shadowSpread);
+                r.shadowColor = s.shadowColor;
+                r.effects = s.effects;
+                return r;
+            };
+
+            // [1] 底层背景：中灰不透明（让黑色投影可见）
+            uiRects.push_back(makeRect({0.0f, 0.0f}, {2.0f, 2.0f},
+                                       {.fillColor = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f)}));
+            // [2] 标准 HTML 卡片（照抄 test_sdf [2]）：白色圆角 + 黑色投影
+            uiRects.push_back(makeRect({0.3f, 0.15f}, {0.5f, 0.35f},
+                                       {.fillColor = glm::vec4(1.0f),
+                                        .shadowColor = glm::vec4(0.0f, 0.0f, 1.0f, 0.45f),
+                                        .shadowOffset = {0.0f, 0.05f},
+                                        .radius = 0.08f,
+                                        .shadowBlur = 0.08f}));
+            // 布局线框（所有节点，结构可见）：细白线
+            auto walk = [&](this auto &&self, int idx, float ax, float ay,
+                            int depth) -> void {
+                const auto &n = tree.nodes[idx];
+                float x = ax + n.geometry.x, y = ay + n.geometry.y;
+                shader_data::UiRect w{};
+                w.entity_index = static_cast<uint32_t>(idx);
+                w.hover_fn = ~0u;
+                w.center_size = {x + n.geometry.w * 0.5f - 1.0f,
+                                 y + n.geometry.h * 0.5f - 1.0f, n.geometry.w,
+                                 n.geometry.h};
+                w.color = {1.0f, 1.0f, 1.0f, 0.6f};
+                w.border = 0.003f;
+                uiWireRects.push_back(w);
+                std::println("[UI] node={} name={} abs=({:.3f},{:.3f}) "
+                             "size=({:.3f},{:.3f}) depth={}",
+                             idx, n.name, x, y, n.geometry.w, n.geometry.h, depth);
+                for (int c = n.firstChild; c != -1; c = tree.nodes[c].nextSibling)
+                    self(c, x, y, depth + 1);
+            };
+            walk(0, 0.0f, 0.0f, 0);
+            std::println("[UI] total cards: {} wire: {}", uiRects.size(),
+                         uiWireRects.size());
+        };
+        collectLayoutRects(uiTree);
+        // [DBG2] 收集后 C++ 向量里的值（桥是否正确）
+        std::println(
+            "[DBG2] uiRects[0]: entity={} fill.a={} shadow.a={} size=({:.2f},{:.2f})",
+            uiRects[0].entity_index, uiRects[0].colors[0].a, uiRects[0].shadowColor.a,
+            uiRects[0].size.x, uiRects[0].size.y);
+    }
 
     struct record_info
     {
@@ -3772,11 +3817,28 @@ try
         make_aggregate_ref<"inputCtx", "input", "camera", "uiCamera", "clock">(
             input, camera, uiCamera, clock);
 
+    // ===== hover：全局唯一一份 实体→函数 关联（外键 = 池实体下标）=====
+    shader_data::hover_pool hoverPool{};
+    shader_data::hover_manager hoverManager{};
+
+    // 测试绑定：所有字形共享同一个 hover 函数（演示"函数可被共享"）
+    uint32_t testHover = hoverPool.bind([](picking_result r, bool enter) noexcept {
+        std::println("[HOVER] type={} entity={} primitive={} {} (hover_fn={})",
+                     r.key.object_type, r.key.entity_index, r.primitive_id,
+                     enter ? "ENTER" : "LEAVE", r.hover_fn);
+    });
+    for (auto &g : simpleGlyphs)
+        g.hover_fn = testHover;
+
+    // [DBG0] 绑定后立即检查：池实体下标 + 字形实际值
+    std::println("[DBG0] testHover={} glyph0.hover_fn={} sizeofGlyph={}", testHover,
+                 simpleGlyphs[0].hover_fn, sizeof(shader_data::Glyph));
+
     // record_info
     auto recordCtx = make_aggregate<"recordCtx", "info">(record_info{});
     auto world = make_aggregate_ref<"world", "globalCtx", "mainCtx", "mainShaderCtx",
-                                    "pickCtx", "recordCtx">(
-        globalCtx, mainCtx, mainShaderCtx, pickCtx, recordCtx);
+                                    "pickCtx", "recordCtx", "hoverPool", "hoverManager">(
+        globalCtx, mainCtx, mainShaderCtx, pickCtx, recordCtx, hoverPool, hoverManager);
     using world_type = decltype(world);
     using input_type = decltype(inputCtx);
     using data_type = decltype(soaCtx);
@@ -4116,21 +4178,62 @@ try
         // 2. Glyph 实例（heap 偏移 0）
         batch.globalHeapBuffer.write(0, glyphs.data(),
                                      glyphs.size() * sizeof(shader_data::Glyph));
+        // 2b. Rectangle（圆角卡片） + UiRect（线框） 实例，紧跟 glyphs
+        const size_t cardOffset = glyphs.size() * sizeof(shader_data::Glyph);
+        const size_t wireOffset =
+            cardOffset + soaCtx.uiRects.size() * sizeof(shader_data::Rectangle);
+        batch.globalHeapBuffer.write(cardOffset, soaCtx.uiRects.data(),
+                                     soaCtx.uiRects.size() *
+                                         sizeof(shader_data::Rectangle));
+        batch.globalHeapBuffer.write(wireOffset, soaCtx.uiWireRects.data(),
+                                     soaCtx.uiWireRects.size() *
+                                         sizeof(shader_data::UiRect));
 
-        // 3. 间接绘制命令（1 条：quad，glyphs.size() 个实例）
-        VkDrawIndexedIndirectCommand cmd{.indexCount = 6,
-                                         .instanceCount =
-                                             static_cast<uint32_t>(glyphs.size()),
-                                         .firstIndex = 0,
-                                         .vertexOffset = 0,
-                                         .firstInstance = 0};
-        batch.currentCommand = cmd;
-        batch.indirectDrawBuffer.write(0, &cmd, sizeof(cmd));
+        // [DBG1] 上传后从 host 映射读回
+        {
+            static bool dbgOnce = true;
+            if (dbgOnce)
+            {
+                dbgOnce = false;
+                auto *hp =
+                    static_cast<const char *>(batch.globalHeapBuffer.buffer.mapPtr());
+                auto &g0 = *reinterpret_cast<const shader_data::Glyph *>(hp);
+                auto &r0 =
+                    *reinterpret_cast<const shader_data::Rectangle *>(hp + cardOffset);
+                auto &w0 =
+                    *reinterpret_cast<const shader_data::UiRect *>(hp + wireOffset);
+                std::println(
+                    "[DBG1] glyph: hover_fn={} entity={} tex={} | rect0: entity={} "
+                    "fill.a={} shadow.a={} size=({:.2f},{:.2f}) | wire0: entity={} "
+                    "border={}",
+                    g0.hover_fn, g0.entity_index, g0.textureIndex, r0.entity_index,
+                    r0.colors[0].a, r0.shadowColor.a, r0.size.x, r0.size.y,
+                    w0.entity_index, w0.border);
+            }
+        }
 
-        // 4. 命令常量（type 2 = Glyph，heap 偏移 0）
-        shader_data::CommandConstant cc{.type_id = 2, .adddress_offset = 0};
-        batch.currentCommandConstant = cc;
-        batch.commandConstantsBuffer.write(0, &cc, sizeof(cc));
+        // 3. 间接绘制命令（3 条：圆角卡片 → 线框 → glyph）
+        std::array<VkDrawIndexedIndirectCommand, 3> cmds{{
+            {.indexCount = 6,
+             .instanceCount =
+                 static_cast<uint32_t>(soaCtx.uiRects.size())}, // TYPE_ROUND_RECT
+            {.indexCount = 6,
+             .instanceCount =
+                 static_cast<uint32_t>(soaCtx.uiWireRects.size())}, // TYPE_RECT
+            {.indexCount = 6,
+             .instanceCount = static_cast<uint32_t>(glyphs.size())}, // TYPE_GLYPH
+        }};
+        batch.indirectDrawBuffer.write(0, cmds.data(), sizeof(cmds));
+
+        // 4. 命令常量（3 条，与 indirect 同序）
+        std::array<shader_data::CommandConstant, 3> ccs{{
+            {.type_id = 5,
+             .adddress_offset = static_cast<uint32_t>(cardOffset)}, // TYPE_ROUND_RECT
+            {.type_id = 3,
+             .adddress_offset = static_cast<uint32_t>(wireOffset)}, // TYPE_RECT（线框）
+            {.type_id = 2, .adddress_offset = 0},                   // TYPE_GLYPH
+        }};
+        batch.commandConstantsBuffer.write(0, ccs.data(), sizeof(ccs));
     };
 
     // diff: [test_indirectdraw] end
@@ -4375,9 +4478,9 @@ try
             commandBuffer.pushConstants(*pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0,
                                         sizeof(pc), &pc);
 
-            // 1 条间接绘制命令（quad + N 个 Glyph 实例）
+            // 3 条间接绘制命令（圆角卡片、线框、glyph；gl_DrawIDARB 0/1/2）
             commandBuffer.drawIndexedIndirect(batch.indirectDrawBuffer.buffer.buffer(), 0,
-                                              1, sizeof(VkDrawIndexedIndirectCommand));
+                                              3, sizeof(VkDrawIndexedIndirectCommand));
         }>{},
         std::constant_wrapper<[](world_type &world, input_type &inputCtx,
                                  data_type &soaCtx) {
@@ -4396,11 +4499,10 @@ try
             auto &pickingFrames = pickCtx.frames;
             auto &pickMouse = pickCtx.mouse;
 
-            auto &mouseValid = pickMouse.valid;
             auto &mousePos = pickMouse.pos;
 
             commandBuffer.endRendering();
-            if (mouseValid)
+            // 无条件录制拷贝：鼠标无效时用最后位置，保证回读缓冲总是被写入（避免读到全零初值）
             {
                 //diff: [test_indirectdraw_no_pick] start
                 // 转换 resolve 目标到 TRANSFER_SRC
@@ -4630,51 +4732,44 @@ try
         },
         [] {
             return schedulable_task{
-                .task = {.name = "waitforfences_post_processing",
-                         .function =
-                             ^^decltype([](world_type &world, input_type &inputCtx,
-                                           data_type &soaCtx) {
-                                 auto &globalCtx = world.globalCtx;
-                                 auto &pickCtx = world.pickCtx;
+                .task =
+                    {.name = "waitforfences_post_processing",
+                     .function = ^^decltype([](world_type &world, input_type &inputCtx,
+                                               data_type &soaCtx) {
+                         auto &globalCtx = world.globalCtx;
+                         auto &pickCtx = world.pickCtx;
 
-                                 auto &frameContext = globalCtx.frameContext;
+                         auto &frameContext = globalCtx.frameContext;
 
-                                 auto &pickMouse = pickCtx.mouse;
-                                 auto &pickingFrames = pickCtx.frames;
+                         auto &pickMouse = pickCtx.mouse;
+                         auto &pickingFrames = pickCtx.frames;
 
-                                 auto &currentFrame = frameContext.currentFrame;
+                         auto &currentFrame = frameContext.currentFrame;
 
-                                 // 等待栅栏后，正式获取图像前
-                                 // currentFrame == 0 时拾取回读未就绪，不当作"离开"
-                                 if (currentFrame > 0)
-                                 {
-                                     if (pickMouse.valid)
-                                     {
-                                         uint32_t readIdx =
-                                             (currentFrame - 1 + MAX_FRAMES_IN_FLIGHT) %
-                                             MAX_FRAMES_IN_FLIGHT;
-                                         //diff: [test_dod16] start
-                                         //  NOTE: 应该提取出来的
-                                         auto *data = static_cast<picking_result *>(
-                                             pickingFrames[readIdx].mapPtr());
-                                         if (data->key.object_type != 0xFFFFFFFF)
-                                         {
-                                             on_hover(world, inputCtx, soaCtx, *data);
-                                             if (data->key.object_type != uiStore_type_id)
-                                                 ui_hover_leave(world, inputCtx, soaCtx);
-                                         }
-                                         else
-                                         {
-                                             ui_hover_leave(world, inputCtx, soaCtx);
-                                         }
-                                         //diff: [test_dod16] end
-                                     }
-                                     else
-                                     {
-                                         ui_hover_leave(world, inputCtx, soaCtx);
-                                     }
-                                 }
-                             })},
+                         // 等待栅栏后，正式获取图像前
+                         // currentFrame == 0 时拾取回读未就绪，不当作"离开"
+                         if (currentFrame > 0)
+                         {
+                             uint32_t readIdx =
+                                 (currentFrame - 1 + MAX_FRAMES_IN_FLIGHT) %
+                                 MAX_FRAMES_IN_FLIGHT;
+                             //diff: [test_dod19] start: 全部逻辑交给 hover_manager（不耦合全局函数）
+                             auto *data = static_cast<picking_result *>(
+                                 pickingFrames[readIdx].mapPtr());
+                             picking_result r = *data;
+                             if (!pickMouse.valid)
+                                 r.key.object_type =
+                                     0xFFFFFFFF; // 光标不在窗口 = 无命中（自动 leave）
+                             // [PICKDBG] 定位用：每帧打印 GPU 回读原始值（可删）
+                             std::println(
+                                 "[PICKDBG] frame={} valid={} type={:#x} entity={} "
+                                 "primitive={} hover_fn={}",
+                                 currentFrame, pickMouse.valid, r.key.object_type,
+                                 r.key.entity_index, r.primitive_id, r.hover_fn);
+                             world.hoverManager.hover(r, world.hoverPool);
+                             //diff: [test_dod19] end
+                         }
+                     })},
                 .befores = {"after_waitForfences_start"},
                 .afters = {"after_waitForfences_end"},
             };

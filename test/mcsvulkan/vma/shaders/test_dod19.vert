@@ -31,12 +31,13 @@ layout(set = 0, binding = 0) uniform UniformBufferObject
 }
 ubo;
 
-// 命令常量：一条间接绘制命令对应一条（type_id + 实例数据区偏移）
-// 与 test_sdf.vert 的 CommandConstant 布局完全一致（16B）
+// 命令常量：一条间接绘制命令对应一条（type_id + 实例数据区偏移 + 每实例顶点槽位数）
+// 与 C++ shader_data::CommandConstant 布局完全一致（12B）
 struct CommandConstant
 {
     uint type_id;         // 实例类型（Glyph = 2）
     uint adddress_offset; // 实例数据区偏移（heap 基址偏移）
+    uint slot_count;      // 每实例顶点槽位数（通用网格类型用，任意 N；固定类型忽略）
 };
 layout(buffer_reference, scalar) readonly buffer CommandConstBuffer
 {
@@ -58,9 +59,14 @@ layout(location = 2) flat out uint type_id;
 layout(location = 3) flat out uint64_t instancePtr;
 
 layout(location = 4) out vec2 localPos; // 归一化局部坐标 [-0.5,0.5]
+layout(location = 5) flat out uint
+    instanceId; // 实例 id（frag 拾取用；gl_InstanceIndex 只在顶点阶段有效）
 
 // 实例类型（与 C++ shader_data 约定一致；追加式）
-const uint TYPE_GLYPH = 2u; // 字形
+const uint TYPE_GLYPH = 2u;      // 字形
+const uint TYPE_RECT = 3u;       // 布局矩形线框
+const uint TYPE_MESH = 4u;       // 普通网格绘制（无 SDF）：顶点 + 顶点属性
+const uint TYPE_ROUND_RECT = 5u; // 圆角阴影矩形（填充 + 阴影）
 
 void main()
 {
@@ -74,6 +80,7 @@ void main()
     CommandConstBuffer cmdConsts = CommandConstBuffer(pc.commandConstantsAddress);
     CommandConstant cc = cmdConsts.consts[gl_DrawIDARB];
     type_id = cc.type_id;
+    instanceId = gl_InstanceIndex; // 0..N-1，实例 id（顶点阶段内建量，flat 传给 frag）
     uint64_t heapBaseStart = pc.dataAddress + cc.adddress_offset;
     CameraInfo cam = ubo.cameraInfo[pc.cameraIndex];
 
@@ -90,6 +97,51 @@ void main()
         fragTexCoord = inst.uvTransform.offset + v.texCoord * inst.uvTransform.scale;
         localPos = v.pos.xy;
         pos = v.pos;
+    }
+    break;
+    case TYPE_RECT: { // 布局矩形线框：自包含实例，localPos 来自几何
+        instancePtr = heapBaseStart + gl_InstanceIndex * UI_RECT_SIZE;
+        UiRect inst = RectBuffer(instancePtr).rects[0];
+        model = mat4(vec4(inst.center_size.z, 0.0, 0.0, 0.0),
+                     vec4(0.0, inst.center_size.w, 0.0, 0.0), vec4(0.0, 0.0, 1.0, 0.0),
+                     vec4(inst.center_size.xy, 0.0, 1.0));
+        fragColor = inst.color;
+        localPos = v.pos.xy; // frag 掏空用
+        pos = v.pos;
+    }
+    break;
+    case TYPE_ROUND_RECT: { // 圆角阴影矩形（照抄 test_sdf case 0）
+        instancePtr = heapBaseStart + gl_InstanceIndex * RECTANGLE_SIZE;
+        Rectangle inst = RectangleBuffer(instancePtr).rects[0];
+        model = inst.model * inst.vertexTransform.matrix; // 平移 + 尺寸缩放
+        uint localVertexIndex = gl_VertexIndex - gl_BaseVertexARB;
+        fragColor = inst.colors[localVertexIndex]; // 顶点颜色来自实例
+        fragTexCoord = inst.uvTransform.offset + v.texCoord * inst.uvTransform.scale;
+        // 阴影几何外扩：保证卡片+阴影落在顶点几何内
+        bool hasShadow = (inst.effects & FX_SHADOW) != 0u || inst.shadowColor.a > 0.0;
+        vec2 expand = vec2(1.0);
+        if (hasShadow)
+        {
+            vec2 cardHalf = inst.size * 0.5;
+            float edgeSoft = max(inst.radiusSoftness.y, 0.0005) * inst.size.x;
+            float blur = max(inst.radiusSoftness.z, 0.0005) * inst.size.x;
+            vec2 shadowHalf = cardHalf * max(inst.radiusSoftness.w, 0.0);
+            vec2 offset = inst.shadowOffset * inst.size;
+            vec2 margin = max(shadowHalf + blur + abs(offset) - cardHalf, vec2(0.0));
+            margin += vec2(edgeSoft * 0.5);
+            expand = (cardHalf + margin) / max(cardHalf, vec2(1e-6));
+        }
+        localPos = v.pos.xy * expand;
+        pos.xy = v.pos.xy * expand;
+    }
+    break;
+    case TYPE_MESH: { // 普通绘制（无 SDF）：实例数据 = VertexAttr 池，无实例结构体
+        uint slot = gl_VertexIndex - gl_BaseVertexARB;
+        uint attrIdx = gl_InstanceIndex * cc.slot_count + slot; // 实例 id × N + 槽位
+        VertexAttr attr = AttrBuffer(pc.dataAddress + cc.adddress_offset).attrs[attrIdx];
+        fragColor = attr.color; // 每顶点颜色（普通绘制，无 SDF）
+        localPos = v.pos.xy;
+        pos = attr.pos; // 顶点位置来自属性池
     }
     break;
     default:
