@@ -16,7 +16,8 @@ struct Glyph
     vec4 color;              // 顶点色（默认白）
     mat4 model;              // 平移 + 缩放：[-0.5,0.5] quad -> NDC 字形矩形
     UvTransform uvTransform; // 图集 UV 变换
-    uint hover_fn;           // 绑定的 hover 函数池实体下标（0xFFFFFFFF = 未绑定），随实例上传，写回 outPicking.w
+    uint
+        hover_fn; // 绑定的 hover 函数池实体下标（0xFFFFFFFF = 未绑定），随实例上传，写回 outPicking.w
 };
 layout(buffer_reference, scalar) readonly buffer GlyphBuffer
 {
@@ -27,11 +28,11 @@ layout(buffer_reference, scalar) readonly buffer GlyphBuffer
 #define UI_RECT_SIZE 44
 struct UiRect
 {
-    uint entity_index;  // 拾取外键
-    uint hover_fn;      // hover 池下标（0xFFFFFFFF = 未绑定）
-    vec4 center_size;   // center.xy + size.xy（NDC）
-    vec4 color;         // 边框色
-    float border;       // 边框半宽（NDC）
+    uint entity_index; // 拾取外键
+    uint hover_fn;     // hover 池下标（0xFFFFFFFF = 未绑定）
+    vec4 center_size;  // center.xy + size.xy（NDC）
+    vec4 color;        // 边框色
+    float border;      // 边框半宽（NDC）
 };
 layout(buffer_reference, scalar) readonly buffer RectBuffer
 {
@@ -72,10 +73,9 @@ layout(buffer_reference, scalar) readonly buffer RectangleBuffer
 // 顶点本身 + 每顶点属性（无 SDF）；顶点位置直接来自属性池
 struct VertexAttr
 {
-    vec3 pos;   // 顶点位置（NDC/局部坐标，直接作为顶点）
     vec4 color; // 每顶点颜色（插值 → 渐变）
 };
-#define VERTEX_ATTR_SIZE 28
+#define VERTEX_ATTR_SIZE 16
 layout(buffer_reference, scalar) readonly buffer AttrBuffer
 {
     VertexAttr attrs[];

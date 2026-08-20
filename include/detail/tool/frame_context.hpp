@@ -45,7 +45,7 @@ namespace mcs::vulkan::tool
         frame_context &operator=(const frame_context &) = delete;
         constexpr frame_context &operator=(frame_context &&o) noexcept
         {
-            if (*o != this)
+            if (&o != this)
             {
                 destroy();
                 device_ = {std::exchange(o.device_, {})};

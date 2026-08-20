@@ -139,7 +139,7 @@ void main()
         VertexAttr attr = AttrBuffer(pc.dataAddress + cc.adddress_offset).attrs[attrIdx];
         fragColor = attr.color; // 每顶点颜色（普通绘制，无 SDF）
         localPos = v.pos.xy;
-        pos = attr.pos; // 顶点位置来自属性池
+        pos = v.pos;
     }
     break;
     default:

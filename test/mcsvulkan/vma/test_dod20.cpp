@@ -346,12 +346,29 @@ struct picking_result
 };
 static_assert(sizeof(picking_result) == 16);
 //diff: [test_dod16] end
+struct mesh_data
+{
+    uint32_t vertexCount;  // 网格的顶点数量
+    uint32_t vertexOffset; // 在全局顶点池中的偏移
+    uint32_t indexOffset;  // 在全局索引池中的偏移
+    uint32_t indexCount;   // 索引数量
 
+    [[nodiscard]] VkDrawIndexedIndirectCommand getDrawCommand(
+        uint32_t instanceCount, uint32_t firstInstance = 0) const noexcept
+    {
+        return {.indexCount = indexCount,
+                .instanceCount = instanceCount,
+                .firstIndex = indexOffset,
+                .vertexOffset = static_cast<int32_t>(vertexOffset),
+                .firstInstance = firstInstance};
+    }
+};
 namespace shader_data
 {
     //  C++是静态类型语言。传递指针，必须能用指定的结构体，解析指针
     struct Glyph
     {
+        static constexpr auto type_id = 2;
         uint32_t entity_index;   // 拾取实体索引（outPicking.y）
         uint32_t textureIndex;   // 纹理数组下标（bindless）
         uint32_t samplerIndex;   // 采样器数组下标（bindless）
@@ -361,8 +378,7 @@ namespace shader_data
         glm::vec4 color;         // 顶点色（默认白）
         glm::mat4 model;         // 平移 + 缩放：[-0.5,0.5] quad -> NDC 字形矩形
         UvTransform uvTransform; // 图集 UV 变换
-        uint32_t hover_fn =
-            ~0u; // 绑定的 hover 函数池实体下标（0xFFFFFFFF = 未绑定），随 Glyph 上传
+        uint32_t hover_fn = ~0U;
     };
     static_assert(sizeof(Glyph) == 124);
 
@@ -425,6 +441,7 @@ namespace shader_data
     {
         uint32_t type_id;
         uint32_t adddress_offset;
+        // NOTE: 可能是错误的方向
         uint32_t slot_count; // 每实例顶点槽位数（通用网格类型用，任意 N；固定类型忽略）
     };
     static_assert(sizeof(CommandConstant) == 12); // 与 GLSL 端一致
@@ -498,11 +515,100 @@ namespace shader_data
             : globalVertexBuffer{newVertexBuffer(device, vertexCapacity)},
               globalIndexBuffer{newIndexBuffer(device, indexCapacity)},
               globalHeapBuffer{newHeapBuffer(device, heapCapacity)},
-              indirectDrawBuffer{newIndirectDrawBuffer(device, indexCapacity)},
+              indirectDrawBuffer{newIndirectDrawBuffer(device, indirectDrawCapacity)},
               commandConstantsBuffer{
                   newCommandConstantsBuffer(device, commandConstantsCapacity)}
         {
         }
+
+        // write data help
+        std::optional<VkDrawIndexedIndirectCommand> pending_cmd;
+        std::optional<shader_data::CommandConstant> pending_constant;
+        size_t heapOffsetStart = 0;
+        size_t indirectDrawOffsetStart = 0;
+        size_t commandConstantsOffsetStart = 0;
+        static constexpr size_t appendIndirectDrawOffset =
+            sizeof(VkDrawIndexedIndirectCommand);
+        static constexpr size_t appendCommandConstantsOffset =
+            sizeof(shader_data::CommandConstant);
+        constexpr auto write_shader_data(const auto &data, const mesh_data &meta)
+        {
+            using T = std::remove_cvref_t<decltype(data[0])>;
+            constexpr auto type_id = T::type_id;
+
+            const size_t append_offset = data.size() * sizeof(T);
+            this->globalHeapBuffer.write(heapOffsetStart, data.data(), append_offset);
+
+            VkDrawIndexedIndirectCommand cmd =
+                meta.getDrawCommand(static_cast<uint32_t>(data.size()));
+            shader_data::CommandConstant constant = {
+                .type_id = type_id,
+                .adddress_offset = static_cast<uint32_t>(heapOffsetStart)};
+
+            heapOffsetStart += append_offset;
+
+            // NOTE: 决定是否生成命令
+            if (not pending_cmd) [[unlikely]]
+            {
+                pending_cmd = cmd;
+                pending_constant = constant;
+            }
+            else [[likely]]
+            {
+                VkDrawIndexedIndirectCommand &pre_cmd = *pending_cmd;
+                shader_data::CommandConstant &pre_constant = *pending_constant;
+                const auto can_cmd_merge = [&] {
+                    // NOTE: 就 instanceCount 不同，就能合并cmd。简化处理。目的是使用的是同一种mesh
+                    return pre_cmd.indexCount == cmd.indexCount &&
+                           pre_cmd.firstIndex == cmd.firstIndex &&
+                           pre_cmd.vertexOffset == cmd.vertexOffset &&
+                           pre_cmd.firstInstance == cmd.firstInstance;
+                };
+                const auto can_constant_merge = [&] {
+                    // NOTE: 目的是使用的是同一类的  shader_data
+                    return pre_constant.type_id == constant.type_id;
+                };
+                if (can_cmd_merge() && can_constant_merge())
+                {
+                    // 不写入 indirectDrawBuffer、commandConstantsBuffer
+                    pre_cmd.instanceCount += cmd.instanceCount;
+                    // adddress_offset 不变，adddress_offset是起始地址无需改变
+                }
+                else
+                {
+                    // 写入 indirectDrawBuffer、commandConstantsBuffer。真实生成一条实例命令
+                    this->indirectDrawBuffer.write(indirectDrawOffsetStart, &pre_cmd,
+                                                   appendIndirectDrawOffset);
+                    this->commandConstantsBuffer.write(commandConstantsOffsetStart,
+                                                       &pre_constant,
+                                                       appendCommandConstantsOffset);
+
+                    pending_cmd = cmd;
+                    pending_constant = constant;
+                    indirectDrawOffsetStart += appendIndirectDrawOffset;
+                    commandConstantsOffsetStart += appendCommandConstantsOffset;
+                }
+            }
+        };
+        constexpr auto flush_pending_cmd()
+        {
+            if (pending_cmd)
+            {
+                VkDrawIndexedIndirectCommand &pre_cmd = *pending_cmd;
+                shader_data::CommandConstant &pre_constant = *pending_constant;
+                this->indirectDrawBuffer.write(indirectDrawOffsetStart, &pre_cmd,
+                                               appendIndirectDrawOffset);
+                this->commandConstantsBuffer.write(commandConstantsOffsetStart,
+                                                   &pre_constant,
+                                                   appendCommandConstantsOffset);
+
+                pending_cmd = {};
+                pending_constant = {};
+                heapOffsetStart = 0;
+                indirectDrawOffsetStart = 0;
+                commandConstantsOffsetStart = 0;
+            }
+        };
     };
 
     // NOTE: 内存管理还是 自己自带的为好
@@ -511,56 +617,56 @@ namespace shader_data
     // ===================== hover 函数池 + 外键状态机 =====================
     // 全局唯一一份 实体→函数 关联：一个池实体 = 一个可共享的 hover 处理函数，
     // 多个字形可指向同一个 hover_fn（函数被共享）。hover_fn = 0xFFFFFFFF 表示未绑定。
-    struct hover_fn_trait
-    {
-    };
-    using HoverFnObject =
-        gen_soa_struct<hover_fn_trait, {"fn", ^^std::move_only_function<void(
-                                            picking_result, bool enter) noexcept>}>;
-
     struct hover_pool
     {
-        HoverFnObject store{64}; // 容量 64，可 reserve 扩展
+        using hover_callback_t =
+            std::move_only_function<void(picking_result, bool enter) noexcept>;
+        std::vector<hover_callback_t> hover_fns;
 
         // 绑定一个可共享的 hover 函数，返回池实体下标（0 也是合法下标）
         uint32_t bind(
             std::move_only_function<void(picking_result, bool enter) noexcept> fn)
         {
-            return store.new_entity(std::move(fn));
+            hover_fns.push_back(std::move(fn));
+            return hover_fns.size() - 1;
         }
         // 按实体下标调用（0xFFFFFFFF = 未绑定；已释放 = 不调用）
         void call(uint32_t entity, const picking_result &r, bool enter) noexcept
         {
-            if (entity == ~0u || !store.alive(entity))
+            if (entity == ~0U)
                 return;
-            auto [fn] = store.view_entity<"fn">(0, entity);
-            if (fn)
-                fn(r, enter);
+            assert(entity < hover_fns.size());
+            auto &fn = hover_fns[entity];
+            assert(fn);
+            fn(r, enter);
         }
     };
 
     // 外键状态机：只存当前命中 cur（换新时旧 cur 就是 pre，用来发 leave）
     struct hover_manager
     {
+        static constexpr auto hover_leave = false;
+        static constexpr auto hover_enter = true;
         picking_result cur{object_key{0xFFFFFFFF, 0}, 0,
                            0}; // 当前命中（key 无效 = 未悬停）
 
-        void hover(const picking_result &r, hover_pool &pool) noexcept
+        constexpr void hover(const picking_result &r, hover_pool &pool) noexcept
         {
+            static_assert(0xFFFFFFFF == uint32_t{~0U});
             if (cur.key == r.key)
                 return; // 同一外键：无动作
-            if (cur.key.object_type != 0xFFFFFFFF && cur.hover_fn != ~0u)
-                pool.call(cur.hover_fn, cur,
-                          false); // hover_leave：离开旧对象（cur 即 pre）
+            if (cur.key.object_type != 0xFFFFFFFF && cur.hover_fn != ~0U)
+                pool.call(cur.hover_fn, cur, hover_leave);
             cur = r;
-            if (r.key.object_type != 0xFFFFFFFF && r.hover_fn != ~0u)
-                pool.call(r.hover_fn, r, true); // hover_enter：进入新对象
+            if (r.key.object_type != 0xFFFFFFFF && r.hover_fn != ~0U)
+                pool.call(r.hover_fn, r, hover_enter);
         }
     };
 
     // ===================== 矩形线框（布局 debug 边框；独立于圆角阴影矩形）=====================
     struct UiRect
     {
+        static constexpr auto type_id = 3;
         uint32_t entity_index; // 布局节点索引（拾取外键）
         uint32_t hover_fn;     // hover 池下标（0xFFFFFFFF = 未绑定）
         glm::vec4 center_size; // center.xy + size.xy（NDC）
@@ -577,6 +683,7 @@ namespace shader_data
     };
     struct Rectangle
     {
+        static constexpr auto type_id = 5;
         uint32_t entity_index;           // 拾取实体索引（outPicking.y）
         uint32_t effects;                // 特效标志（FX_ROUNDED/SHADOW/FILL）
         glm::vec4 colors[4];             // 四顶点颜色（单色 = 四顶点同色）
@@ -598,10 +705,9 @@ namespace shader_data
     // attrIdx = gl_InstanceIndex × N + 槽位（N = 命令常量 slot_count，任意）
     struct VertexAttr
     {
-        glm::vec3 pos;   // 顶点位置（NDC，直接作为顶点）
         glm::vec4 color; // 每顶点颜色（插值 → 渐变）
     };
-    static_assert(sizeof(VertexAttr) == 28);
+    static_assert(sizeof(VertexAttr) == 16); //NOTE:
 
 }; // namespace shader_data
 constexpr auto initShaderDataRecorder(const LogicalDevice &device)
@@ -2080,14 +2186,6 @@ class UIBuilder
         std::invoke(std::forward<BuildFn>(buildFn), *this);
         popParent();
     }
-
-    // ========== If 条件分支 ==========
-    UIBuilder &If(bool condition, std::function<void(UIBuilder &)> build)
-    {
-        if (condition)
-            build(*this);
-        return *this;
-    }
 };
 
 //diff: [test_dod17] end
@@ -2899,23 +2997,7 @@ constexpr auto inputInit(auto &swapchain)
     return make_aggregate<"inputDataCtx", "input", "camera", "uiCamera", "clock">(
         std::move(input), std::move(camera), std::move(uiCamera), FrameClock{});
 }
-struct mesh_data
-{
-    uint32_t vertexCount;  // 网格的顶点数量
-    uint32_t vertexOffset; // 在全局顶点池中的偏移
-    uint32_t indexOffset;  // 在全局索引池中的偏移
-    uint32_t indexCount;   // 索引数量
 
-    [[nodiscard]] VkDrawIndexedIndirectCommand getDrawCommand(
-        uint32_t instanceCount, uint32_t firstInstance = 0) const noexcept
-    {
-        return {.indexCount = indexCount,
-                .instanceCount = instanceCount,
-                .firstIndex = indexOffset,
-                .vertexOffset = static_cast<int32_t>(vertexOffset),
-                .firstInstance = firstInstance};
-    }
-};
 struct mesh_manager
 {
     std::vector<Vertex> allVertices;
@@ -2928,6 +3010,7 @@ struct mesh_manager
         assert(not name.empty());
         assert(not verts.empty());
         assert(not indices.empty());
+        assert(not meshMap.contains(name));
         uint32_t vOff = static_cast<uint32_t>(allVertices.size());
         uint32_t iOff = static_cast<uint32_t>(allIndices.size());
         allVertices.insert(allVertices.end(), verts.begin(), verts.end());
@@ -2939,10 +3022,10 @@ struct mesh_manager
 
 // NOTE: 考虑放到一个命名空间或等区域统一处理
 constexpr std::array<Vertex, 4> quadVerts = {
-    Vertex{{-1.0f, -1.0f, 0.0f}, {0.0f, 0.0f}}, // 左上
-    Vertex{{1.0f, -1.0f, 0.0f}, {1.0f, 0.0f}},  // 右上
-    Vertex{{1.0f, 1.0f, 0.0f}, {1.0f, 1.0f}},   // 右下
-    Vertex{{-1.0f, 1.0f, 0.0f}, {0.0f, 1.0f}}   // 左下
+    Vertex{{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f}}, // 左上
+    Vertex{{0.5f, -0.5f, 0.0f}, {1.0f, 0.0f}},  // 右上
+    Vertex{{0.5f, 0.5f, 0.0f}, {1.0f, 1.0f}},   // 右下
+    Vertex{{-0.5f, 0.5f, 0.0f}, {0.0f, 1.0f}}   // 左下
 };
 constexpr auto quadIdx = std::array<uint32_t, 6>{0, 1, 2, 0, 2, 3};
 constexpr auto initMeshManager()
@@ -2951,79 +3034,6 @@ constexpr auto initMeshManager()
     m.addMesh("quad", std::span{quadVerts}, std::span{quadIdx});
     return m;
 }
-
-struct BufferResource
-{
-    mcs::vulkan::memory::auto_map_buffer buffer{};
-    VkDeviceSize capacity{};
-    constexpr auto write(size_t offset, const void *src, size_t size) noexcept
-    {
-        // 断言：偏移 + 大小 必须 ≤ 总容量
-        assert(offset + size <= capacity);
-        return ::memcpy(static_cast<char *>(buffer.mapPtr()) + offset, src, size);
-    }
-    BufferResource() = default;
-    constexpr BufferResource(const LogicalDevice &device, VkDeviceSize capacity,
-                             VkBufferUsageFlags usage, VkSharingMode sharingMode,
-                             VkMemoryPropertyFlags properties)
-        : buffer{mcs::vulkan::memory::auto_map_buffer(
-              mcs::vulkan::memory::create_simple_buffer(
-                  device, {.size = capacity, .usage = usage, .sharingMode = sharingMode},
-                  properties),
-              capacity)},
-          capacity{capacity}
-    {
-    }
-};
-struct BufferResourceWithAddress
-{
-    mcs::vulkan::memory::auto_map_buffer buffer{};
-    VkDeviceSize capacity{};
-    VkDeviceAddress address{};
-
-    constexpr auto write(size_t offset, const void *src, size_t size) noexcept
-    {
-        // 断言：偏移 + 大小 必须 ≤ 总容量
-        assert(offset + size <= capacity);
-        return ::memcpy(static_cast<char *>(buffer.mapPtr()) + offset, src, size);
-    }
-
-    BufferResourceWithAddress() = default;
-    constexpr BufferResourceWithAddress(const LogicalDevice &device,
-                                        VkDeviceSize capacity, VkBufferUsageFlags usage,
-                                        VkSharingMode sharingMode,
-                                        VkMemoryPropertyFlags properties)
-        : buffer{mcs::vulkan::memory::auto_map_buffer(
-              mcs::vulkan::memory::create_simple_buffer(
-                  device, {.size = capacity, .usage = usage, .sharingMode = sharingMode},
-                  properties),
-              capacity)},
-          capacity{capacity},
-          address{device.getBufferDeviceAddress(
-              {.sType = sType<VkBufferDeviceAddressInfo>(), .buffer = buffer.buffer()})}
-    {
-    }
-};
-struct FrameResources
-{
-    BufferResourceWithAddress globalVertexBuffer{};
-
-    BufferResource globalIndexBuffer{};
-
-    BufferResourceWithAddress globalInstanceBuffer{};
-
-    BufferResourceWithAddress globalAttributeBuffer{};
-
-    BufferResource indirectDrawBuffer{};
-
-    // 新增：命令常量缓冲区
-    BufferResourceWithAddress commandConstantsBuffer{};
-
-    uint32_t drawCountOpaque3D = 0;
-    uint32_t drawCountTransparent3D = 0;
-    uint32_t drawCountOpaqueUI = 0;
-    uint32_t drawCountTransparentUI = 0;
-};
 
 constexpr auto run_text_pipeline(auto &fontSelect, const char8_t *rawText,
                                  std::string_view langBcp47, bool ltr = true)
@@ -3582,6 +3592,13 @@ try
     auto meshManager = initMeshManager();
     auto &[allVertices, allIndices, meshMap] = meshManager;
     auto shaderDataRecorder = initShaderDataRecorder(device);
+    for (auto &recorder : shaderDataRecorder)
+    {
+        recorder.globalVertexBuffer.write(0, allVertices.data(),
+                                          allVertices.size() * sizeof(allVertices[0]));
+        recorder.globalIndexBuffer.write(0, allIndices.data(),
+                                         allIndices.size() * sizeof(allIndices[0]));
+    }
 
     // ============================================================
     // 简单 Glyph 测试：只 shape 一个字符 "A"，生成 1 个 Glyph 实例。
@@ -4156,84 +4173,20 @@ try
         auto &globalCtx = world.globalCtx;
         auto &mainShaderCtx = world.mainShaderCtx;
 
+        auto &meshMap = globalCtx.meshMap;
+
         auto &shaderDataRecorder = mainShaderCtx.shaderDataRecorder;
         auto &glyphs = mainShaderCtx.glyphs;
 
         auto &batch = shaderDataRecorder[currentFrame];
 
         // ============ 简单 Glyph 测试：写 quad + Glyph 实例 + 间接命令 ============
-        // quad 顶点与 test_sdf 一致：[-0.5,0.5] 单位矩形（shader 端 Glyph 语义）
-        constexpr std::array<Vertex, 4> glyphQuad = {
-            Vertex{{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f}}, // 左上
-            Vertex{{0.5f, -0.5f, 0.0f}, {1.0f, 0.0f}},  // 右上
-            Vertex{{0.5f, 0.5f, 0.0f}, {1.0f, 1.0f}},   // 右下
-            Vertex{{-0.5f, 0.5f, 0.0f}, {0.0f, 1.0f}}   // 左下
-        };
-        constexpr std::array<uint32_t, 6> glyphQuadIdx = {0, 1, 2, 0, 2, 3};
+        static mesh_data &quad_meta = meshMap["quad"];
 
-        // 1. 顶点 / 索引（每帧直接写，简单直接）
-        batch.globalVertexBuffer.write(0, glyphQuad.data(), sizeof(glyphQuad));
-        batch.globalIndexBuffer.write(0, glyphQuadIdx.data(), sizeof(glyphQuadIdx));
-
-        // 2. Glyph 实例（heap 偏移 0）
-        batch.globalHeapBuffer.write(0, glyphs.data(),
-                                     glyphs.size() * sizeof(shader_data::Glyph));
-        // 2b. Rectangle（圆角卡片） + UiRect（线框） 实例，紧跟 glyphs
-        const size_t cardOffset = glyphs.size() * sizeof(shader_data::Glyph);
-        const size_t wireOffset =
-            cardOffset + soaCtx.uiRects.size() * sizeof(shader_data::Rectangle);
-        batch.globalHeapBuffer.write(cardOffset, soaCtx.uiRects.data(),
-                                     soaCtx.uiRects.size() *
-                                         sizeof(shader_data::Rectangle));
-        batch.globalHeapBuffer.write(wireOffset, soaCtx.uiWireRects.data(),
-                                     soaCtx.uiWireRects.size() *
-                                         sizeof(shader_data::UiRect));
-
-        // [DBG1] 上传后从 host 映射读回
-        {
-            static bool dbgOnce = true;
-            if (dbgOnce)
-            {
-                dbgOnce = false;
-                auto *hp =
-                    static_cast<const char *>(batch.globalHeapBuffer.buffer.mapPtr());
-                auto &g0 = *reinterpret_cast<const shader_data::Glyph *>(hp);
-                auto &r0 =
-                    *reinterpret_cast<const shader_data::Rectangle *>(hp + cardOffset);
-                auto &w0 =
-                    *reinterpret_cast<const shader_data::UiRect *>(hp + wireOffset);
-                std::println(
-                    "[DBG1] glyph: hover_fn={} entity={} tex={} | rect0: entity={} "
-                    "fill.a={} shadow.a={} size=({:.2f},{:.2f}) | wire0: entity={} "
-                    "border={}",
-                    g0.hover_fn, g0.entity_index, g0.textureIndex, r0.entity_index,
-                    r0.colors[0].a, r0.shadowColor.a, r0.size.x, r0.size.y,
-                    w0.entity_index, w0.border);
-            }
-        }
-
-        // 3. 间接绘制命令（3 条：圆角卡片 → 线框 → glyph）
-        std::array<VkDrawIndexedIndirectCommand, 3> cmds{{
-            {.indexCount = 6,
-             .instanceCount =
-                 static_cast<uint32_t>(soaCtx.uiRects.size())}, // TYPE_ROUND_RECT
-            {.indexCount = 6,
-             .instanceCount =
-                 static_cast<uint32_t>(soaCtx.uiWireRects.size())}, // TYPE_RECT
-            {.indexCount = 6,
-             .instanceCount = static_cast<uint32_t>(glyphs.size())}, // TYPE_GLYPH
-        }};
-        batch.indirectDrawBuffer.write(0, cmds.data(), sizeof(cmds));
-
-        // 4. 命令常量（3 条，与 indirect 同序）
-        std::array<shader_data::CommandConstant, 3> ccs{{
-            {.type_id = 5,
-             .adddress_offset = static_cast<uint32_t>(cardOffset)}, // TYPE_ROUND_RECT
-            {.type_id = 3,
-             .adddress_offset = static_cast<uint32_t>(wireOffset)}, // TYPE_RECT（线框）
-            {.type_id = 2, .adddress_offset = 0},                   // TYPE_GLYPH
-        }};
-        batch.commandConstantsBuffer.write(0, ccs.data(), sizeof(ccs));
+        batch.write_shader_data(soaCtx.uiRects, quad_meta);
+        batch.write_shader_data(soaCtx.uiWireRects, quad_meta);
+        batch.write_shader_data(glyphs, quad_meta);
+        batch.flush_pending_cmd();
     };
 
     // diff: [test_indirectdraw] end
@@ -4611,8 +4564,8 @@ try
             resolveResourcesBuild.setCreateInfoExtent(imageExtent).build(device);
 
         pickMouse.valid = false;
-
-        frameContext.rebuild(swapchain.imagesSize());
+        frameContext =
+            std::decay_t<decltype(frameContext)>(device, swapchain.imagesSize());
     };
     // diff: [test_dod5] start
 
