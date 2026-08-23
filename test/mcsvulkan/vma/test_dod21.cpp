@@ -361,6 +361,25 @@ struct mesh_data
                 .vertexOffset = static_cast<int32_t>(vertexOffset),
                 .firstInstance = firstInstance};
     }
+    bool operator==(const mesh_data &o) const noexcept = default;
+    constexpr bool valid() const noexcept
+    {
+        return vertexCount != 0 && indexCount != 0;
+    }
+};
+struct PushData
+{
+    // 字段顺序必须与 test_dod19.vert 的 PushConsts 完全一致
+    // （GLSL: vertex/data/commandConstants/cameraIndex，Glyph 不需要 attributeAddress）
+    uint64_t vertexAddress;           // 全局顶点缓冲区地址
+    uint64_t instanceAddress;         // 全局实例堆地址（shader: dataAddress）
+    uint64_t commandConstantsAddress; // 命令常量缓冲区地址
+    uint32_t cameraIndex;             // 0: 3D, 1: UI
+    bool operator==(const PushData &o) const noexcept = default;
+    constexpr bool valid() const noexcept
+    {
+        return vertexAddress != 0 && instanceAddress != 0 && commandConstantsAddress != 0;
+    }
 };
 namespace shader_data
 {
@@ -707,6 +726,793 @@ namespace shader_data
         glm::vec4 color; // 每顶点颜色（插值 → 渐变）
     };
     static_assert(sizeof(VertexAttr) == 16); //NOTE:
+#if 0
+    // ========================== 替换ShaderDataRecorder命令录入 ===============================
+    struct DrawStateKey
+    {
+        VkPipeline pipeline{};
+        VkPipelineLayout layout{};
+        mesh_data mesh; // 注意：meshId 仅用于合并判断，不影响 draw 状态（见下）
+        PushData pushData;
+        std::vector<VkRect2D> scissors;
+        std::vector<VkViewport> viewports;
+
+        constexpr bool valid() const noexcept
+        {
+            return pipeline != nullptr && layout != nullptr && mesh.valid() &&
+                   pushData.valid() && not scissors.empty() && not viewports.empty();
+        }
+
+        static constexpr auto equel_scissor(const std::vector<VkRect2D> &a,
+                                            const std::vector<VkRect2D> &b)
+        {
+            return std::ranges::equal(
+                a, b, [](const VkRect2D &a, const VkRect2D &b) noexcept {
+                    return a.offset.x == b.offset.x && a.offset.y == b.offset.y &&
+                           a.extent.width == b.extent.width &&
+                           a.extent.height == b.extent.height;
+                });
+        };
+        static constexpr auto equel_viewport(const std::vector<VkViewport> &a,
+                                             const std::vector<VkViewport> &b)
+        {
+            return std::ranges::equal(
+                a, b, [](const VkViewport &a, const VkViewport &b) noexcept {
+                    return a.x == b.x && a.y == b.y && a.width == b.width &&
+                           a.height == b.height && a.minDepth == b.minDepth &&
+                           a.maxDepth == b.maxDepth;
+                });
+        };
+
+        constexpr bool operator==(const DrawStateKey &o) const noexcept
+        {
+            return pipeline == o.pipeline && layout == o.layout && mesh == o.mesh &&
+                   pushData == o.pushData && equel_scissor(scissors, o.scissors) &&
+                   equel_viewport(viewports, o.viewports);
+        }
+    };
+
+    struct DrawUnit
+    {
+        DrawStateKey state;           // 该 draw 的状态
+        uint32_t indirectOffsetStart; // 间接命令缓冲区起始偏移（字节）
+        uint32_t constantOffsetStart; // 命令常量缓冲区起始偏移（字节）
+        uint32_t commandCount;        // 间接命令数量
+        constexpr bool valid() const noexcept
+        {
+            return state.valid() && commandCount != 0;
+        }
+    };
+
+    struct PendingDraw
+    {
+        DrawStateKey state;                             // 当前 draw 的状态
+        std::vector<VkDrawIndexedIndirectCommand> cmds; // 暂存的间接命令
+        std::vector<CommandConstant> consts;            // 暂存的命令常量
+
+        constexpr bool valid() const noexcept
+        {
+            return state.valid() && !cmds.empty() && !consts.empty();
+        }
+    };
+
+    class DrawRecorder
+    {
+      public:
+        // 缓冲区
+        BufferResourceWithAddress globalVertexBuffer{};
+        BufferResource globalIndexBuffer{};
+        BufferResourceWithAddress globalHeapBuffer;
+        BufferResource indirectDrawBuffer;
+        BufferResourceWithAddress commandConstantsBuffer;
+
+        // 偏移
+        size_t heapOffset = 0;
+        size_t indirectOffset = 0;
+        size_t constantOffset = 0;
+
+        // 已完成的 draw 列表
+        std::vector<DrawUnit> draws;
+
+        // 当前状态
+        DrawStateKey currentState{};
+
+        // 当前 pending draw
+        std::optional<PendingDraw> pendingDraw;
+
+        // 构造函数：分配缓冲区
+        static auto newVertexBuffer(const LogicalDevice &device, VkDeviceSize capacity)
+        {
+            return BufferResourceWithAddress{
+                device, capacity,
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                VK_SHARING_MODE_EXCLUSIVE,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+        static auto newIndexBuffer(const LogicalDevice &device, VkDeviceSize capacity)
+        {
+            return BufferResource{device, capacity, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                                  VK_SHARING_MODE_EXCLUSIVE,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+        static auto newHeapBuffer(const LogicalDevice &device, VkDeviceSize capacity)
+        {
+            return BufferResourceWithAddress{
+                device, capacity,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                VK_SHARING_MODE_EXCLUSIVE,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+        static auto newIndirectDrawBuffer(const LogicalDevice &device,
+                                          VkDeviceSize capacity)
+        {
+            return BufferResource{device, capacity, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                                  VK_SHARING_MODE_EXCLUSIVE,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+        static auto newCommandConstantsBuffer(const LogicalDevice &device,
+                                              VkDeviceSize capacity)
+        {
+            return BufferResourceWithAddress{
+                device, capacity,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                VK_SHARING_MODE_EXCLUSIVE,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+
+        constexpr DrawRecorder(const LogicalDevice &device, VkDeviceSize vertexCapacity,
+                               VkDeviceSize indexCapacity, VkDeviceSize heapCapacity,
+                               VkDeviceSize indirectDrawCapacity,
+                               VkDeviceSize commandConstantsCapacity)
+            : globalVertexBuffer{newVertexBuffer(device, vertexCapacity)},
+              globalIndexBuffer{newIndexBuffer(device, indexCapacity)},
+              globalHeapBuffer{newHeapBuffer(device, heapCapacity)},
+              indirectDrawBuffer{newIndirectDrawBuffer(device, indirectDrawCapacity)},
+              commandConstantsBuffer{
+                  newCommandConstantsBuffer(device, commandConstantsCapacity)}
+        {
+        }
+
+        // 每帧重置
+        constexpr void reset()
+        {
+            heapOffset = 0;
+            indirectOffset = 0;
+            constantOffset = 0;
+            draws.clear();
+            currentState = {};
+            pendingDraw.reset();
+        }
+
+        // 结束当前 pending draw 并将其加入 draws
+        constexpr void finishDraw()
+        {
+            if (!pendingDraw || pendingDraw->cmds.empty())
+            {
+                pendingDraw.reset();
+                return;
+            }
+            assert(pendingDraw->valid());
+
+            // 写入间接命令缓冲
+            size_t cmdBytes =
+                pendingDraw->cmds.size() * sizeof(VkDrawIndexedIndirectCommand);
+            indirectDrawBuffer.write(indirectOffset, pendingDraw->cmds.data(), cmdBytes);
+
+            // 写入命令常量缓冲
+            size_t constBytes = pendingDraw->consts.size() * sizeof(CommandConstant);
+            commandConstantsBuffer.write(constantOffset, pendingDraw->consts.data(),
+                                         constBytes);
+
+            // 记录 DrawUnit，注意保存常量偏移（写入前的偏移）
+            draws.push_back(
+                {.state = pendingDraw->state,
+                 .indirectOffsetStart = static_cast<uint32_t>(indirectOffset),
+                 .constantOffsetStart = static_cast<uint32_t>(constantOffset),
+                 .commandCount = static_cast<uint32_t>(pendingDraw->cmds.size())});
+
+            indirectOffset += cmdBytes;
+            constantOffset += constBytes;
+            pendingDraw.reset();
+        }
+        // ============ 状态设置器 ============
+        constexpr void setPipeline(VkPipeline pipeline)
+        {
+            if (currentState.pipeline != pipeline)
+            {
+                if (currentState.valid())
+                    finishDraw();
+                currentState.pipeline = pipeline;
+            }
+        }
+        constexpr void setLayout(VkPipelineLayout layout)
+        {
+            if (currentState.layout != layout)
+            {
+                if (currentState.valid())
+                    finishDraw();
+                currentState.layout = layout;
+            }
+        }
+        constexpr void setPushData(const PushData &pushData)
+        {
+            if (currentState.pushData != pushData)
+            {
+                if (currentState.valid())
+                    finishDraw();
+                currentState.pushData = pushData;
+            }
+        }
+
+        constexpr void setMesh(const mesh_data &mesh)
+        {
+            if (currentState.mesh != mesh)
+            {
+                if (currentState.valid())
+                    finishDraw();
+                currentState.mesh = mesh;
+            }
+        }
+
+        constexpr void setScissors(const std::vector<VkRect2D> &scissors)
+        {
+            if (not DrawStateKey::equel_scissor(currentState.scissors, scissors))
+            {
+                if (currentState.valid())
+                    finishDraw();
+                currentState.scissors = std::move(scissors);
+            }
+        }
+
+        constexpr void setViewports(const std::vector<VkViewport> &viewports)
+        {
+            if (not DrawStateKey::equel_viewport(currentState.viewports, viewports))
+            {
+                if (currentState.valid())
+                    finishDraw();
+                currentState.viewports = std::move(viewports);
+            }
+        }
+
+        // ============ 添加实例数据: 直接往GPU填充数据 ============
+        template <typename T>
+        constexpr void addInstances(std::span<const T> instances)
+        {
+            assert(currentState.valid());
+            // 使用当前状态中的网格
+            const auto &mesh = currentState.mesh;
+
+            // 如果没有 pending draw，则创建一个（使用当前状态）
+            if (!pendingDraw)
+                pendingDraw = PendingDraw{currentState, {}, {}};
+
+            // 写入实例数据到堆
+            size_t dataOffset = heapOffset;
+            globalHeapBuffer.write(heapOffset, instances.data(),
+                                   instances.size() * sizeof(T));
+            heapOffset += instances.size() * sizeof(T);
+
+            // 生成候选命令和常量
+            VkDrawIndexedIndirectCommand cmd =
+                mesh.getDrawCommand(static_cast<uint32_t>(instances.size()));
+            CommandConstant constant{.type_id = T::type_id,
+                                     .adddress_offset = static_cast<uint32_t>(dataOffset),
+                                     .slot_count = 0};
+
+            // 尝试与最后一个命令合并
+            if (!pendingDraw->cmds.empty())
+            {
+                auto &last = pendingDraw->cmds.back();
+                auto &lastConst = pendingDraw->consts.back();
+                bool canMerge = last.indexCount == cmd.indexCount &&
+                                last.firstIndex == cmd.firstIndex &&
+                                last.vertexOffset == cmd.vertexOffset &&
+                                last.firstInstance == cmd.firstInstance &&
+                                lastConst.type_id == constant.type_id;
+                if (canMerge)
+                {
+                    last.instanceCount += cmd.instanceCount;
+                    return; // 合并成功，不新增命令
+                }
+            }
+
+            // 追加新命令
+            pendingDraw->cmds.push_back(cmd);
+            pendingDraw->consts.push_back(constant);
+        }
+
+        // 结束所有绘制
+        constexpr void begin(DrawStateKey drawState)
+        {
+            currentState = drawState;
+        }
+        constexpr void end()
+        {
+            finishDraw();
+        }
+
+        // 录制命令缓冲
+        constexpr void doDraw(CommandBufferView cmd)
+        {
+            assert(!pendingDraw); // 确保没有未提交的 pending draw
+            for (const auto &du : draws)
+            {
+                assert(du.valid());
+
+                // 拷贝一份 PushData，调整命令常量地址为该 DrawUnit 的起始偏移
+                PushData pc = du.state.pushData;
+                //NOTE: 着色器通过 gl_DrawIDARB 索引命令常量时，每个 drawIndexedIndirect 调用内部的 gl_DrawIDARB 都是从 0 开始的.记录constantOffsetStart是为了适配这个因素
+                // 每个 DrawUnit 内的 gl_DrawIDARB 就会从它自己的命令常量区起始位置开始读取，互不干扰
+                pc.commandConstantsAddress =
+                    commandConstantsBuffer.address + du.constantOffsetStart;
+
+                cmd.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, du.state.pipeline);
+                cmd.setViewport(0, du.state.viewports);
+                cmd.setScissor(0, du.state.scissors);
+                cmd.pushConstants(du.state.layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                                  sizeof(PushData), &pc);
+                cmd.drawIndexedIndirect(indirectDrawBuffer.buffer.buffer(),
+                                        du.indirectOffsetStart, du.commandCount,
+                                        sizeof(VkDrawIndexedIndirectCommand));
+            }
+        }
+    };
+#endif
+}; // namespace shader_data
+namespace shader_data
+{
+    // ===================== 静态绘制状态（不随区域变化） =====================
+    struct StaticDrawKey
+    {
+        VkPipeline pipeline{};
+        VkPipelineLayout layout{};
+        mesh_data mesh;
+        PushData pushData; // 注意：commandConstantsAddress 将在提交时动态填充
+        bool operator==(const StaticDrawKey &) const = default;
+        constexpr bool valid() const noexcept
+        {
+            return pipeline != nullptr && layout != nullptr && mesh.valid() &&
+                   pushData.valid();
+        }
+    };
+
+    // ===================== 动态绘制状态（随区域变化） =====================
+    static constexpr bool equal_scissors(const std::vector<VkRect2D> &a,
+                                         const std::vector<VkRect2D> &b) noexcept
+    {
+        if (a.size() != b.size())
+            return false;
+        for (size_t i = 0; i < a.size(); ++i)
+        {
+            const auto &ra = a[i], &rb = b[i];
+            if (ra.offset.x != rb.offset.x || ra.offset.y != rb.offset.y ||
+                ra.extent.width != rb.extent.width ||
+                ra.extent.height != rb.extent.height)
+                return false;
+        }
+        return true;
+    }
+
+    static constexpr bool equal_viewports(const std::vector<VkViewport> &a,
+                                          const std::vector<VkViewport> &b) noexcept
+    {
+        if (a.size() != b.size())
+            return false;
+        for (size_t i = 0; i < a.size(); ++i)
+        {
+            const auto &va = a[i], &vb = b[i];
+            if (va.x != vb.x || va.y != vb.y || va.width != vb.width ||
+                va.height != vb.height || va.minDepth != vb.minDepth ||
+                va.maxDepth != vb.maxDepth)
+                return false;
+        }
+        return true;
+    }
+    struct DynamicDrawState
+    {
+        std::vector<VkRect2D> scissors;
+        std::vector<VkViewport> viewports;
+
+        bool operator==(const DynamicDrawState &o) const noexcept
+        {
+            return equal_scissors(scissors, o.scissors) &&
+                   equal_viewports(viewports, o.viewports);
+        }
+    };
+
+    // ===================== 绘制段：一个动态状态对应一次实际的 drawIndexedIndirect =====================
+    struct DrawSegment
+    {
+        DynamicDrawState dynamic;
+
+        // 段首命令在 pendingDraw->cmds / consts 中的下标
+        uint32_t commandStart{0};
+        uint32_t commandCount{0};
+
+        // 最终写入 GPU 缓冲后的字节偏移，由 finishDraw() 填充
+        uint32_t indirectOffsetStart{0};
+        uint32_t constantOffsetStart{0};
+    };
+
+    // ===================== 绘制单元：共享静态状态，包含多个段 =====================
+    struct DrawUnit
+    {
+        StaticDrawKey staticKey;
+        std::vector<DrawSegment> segments;
+        uint32_t totalCommandCount{0};
+
+        constexpr bool valid() const noexcept
+        {
+            return staticKey.valid() && !segments.empty() && totalCommandCount > 0;
+        }
+    };
+
+    // ===================== 待提交的绘制数据 =====================
+    struct PendingDraw
+    {
+        StaticDrawKey staticKey;
+
+        // 所有命令（跨段连续存储）
+        std::vector<VkDrawIndexedIndirectCommand> cmds;
+        std::vector<CommandConstant> consts;
+
+        // 已经固定下来的段
+        std::vector<DrawSegment> segments;
+
+        // 当前活动段的起始命令下标
+        size_t currentSegmentCmdStart{0};
+
+        // 当前活动段使用的动态状态
+        DynamicDrawState activeDynamic;
+    };
+
+    // ===================== DrawRecorder（修正版） =====================
+    class DrawRecorder
+    {
+      public:
+        // 缓冲区
+        BufferResourceWithAddress globalVertexBuffer{};
+        BufferResource globalIndexBuffer{};
+        BufferResourceWithAddress globalHeapBuffer;
+        BufferResource indirectDrawBuffer;
+        BufferResourceWithAddress commandConstantsBuffer;
+
+        // 全局字节偏移
+        size_t heapOffset = 0;
+        size_t indirectOffset = 0;
+        size_t constantOffset = 0;
+
+        // 已完成的绘制单元
+        std::vector<DrawUnit> draws;
+
+        // 当前静态 / 动态状态
+        StaticDrawKey currentStatic{};
+        DynamicDrawState currentDynamic;
+
+        // 当前待提交的绘制
+        std::optional<PendingDraw> pendingDraw;
+
+        // ---------- 构造函数 ----------
+        static auto newVertexBuffer(const LogicalDevice &device, VkDeviceSize capacity)
+        {
+            return BufferResourceWithAddress{
+                device, capacity,
+                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                VK_SHARING_MODE_EXCLUSIVE,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+
+        static auto newIndexBuffer(const LogicalDevice &device, VkDeviceSize capacity)
+        {
+            return BufferResource{device, capacity, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                                  VK_SHARING_MODE_EXCLUSIVE,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+
+        static auto newHeapBuffer(const LogicalDevice &device, VkDeviceSize capacity)
+        {
+            return BufferResourceWithAddress{
+                device, capacity,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                VK_SHARING_MODE_EXCLUSIVE,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+
+        static auto newIndirectDrawBuffer(const LogicalDevice &device,
+                                          VkDeviceSize capacity)
+        {
+            return BufferResource{device, capacity, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                                  VK_SHARING_MODE_EXCLUSIVE,
+                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+
+        static auto newCommandConstantsBuffer(const LogicalDevice &device,
+                                              VkDeviceSize capacity)
+        {
+            return BufferResourceWithAddress{
+                device, capacity,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                VK_SHARING_MODE_EXCLUSIVE,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        }
+
+        constexpr DrawRecorder(const LogicalDevice &device, VkDeviceSize vertexCapacity,
+                               VkDeviceSize indexCapacity, VkDeviceSize heapCapacity,
+                               VkDeviceSize indirectDrawCapacity,
+                               VkDeviceSize commandConstantsCapacity)
+            : globalVertexBuffer{newVertexBuffer(device, vertexCapacity)},
+              globalIndexBuffer{newIndexBuffer(device, indexCapacity)},
+              globalHeapBuffer{newHeapBuffer(device, heapCapacity)},
+              indirectDrawBuffer{newIndirectDrawBuffer(device, indirectDrawCapacity)},
+              commandConstantsBuffer{
+                  newCommandConstantsBuffer(device, commandConstantsCapacity)}
+        {
+        }
+
+        // ---------- 每帧重置 ----------
+        void reset()
+        {
+            heapOffset = 0;
+            indirectOffset = 0;
+            constantOffset = 0;
+            draws.clear();
+            currentStatic = {};
+            currentDynamic = {};
+            pendingDraw.reset();
+        }
+
+        // ---------- 只结束当前活动段，绝不修改已经记录的段 ----------
+        void pushCurrentSegment()
+        {
+            if (!pendingDraw)
+                return;
+
+            const size_t cmdCount =
+                pendingDraw->cmds.size() - pendingDraw->currentSegmentCmdStart;
+
+            if (cmdCount > 0)
+            {
+                DrawSegment seg{};
+                seg.dynamic = pendingDraw->activeDynamic;
+                seg.commandStart =
+                    static_cast<uint32_t>(pendingDraw->currentSegmentCmdStart);
+                seg.commandCount = static_cast<uint32_t>(cmdCount);
+
+                pendingDraw->segments.push_back(seg);
+            }
+
+            // 下一次命令从当前 cmds.size() 开始
+            pendingDraw->currentSegmentCmdStart = pendingDraw->cmds.size();
+        }
+
+        // ---------- 结束当前 DrawUnit ----------
+        void finishDraw()
+        {
+            if (!pendingDraw)
+                return;
+
+            // 结束最后一个活动段
+            pushCurrentSegment();
+
+            if (pendingDraw->cmds.empty())
+            {
+                pendingDraw.reset();
+                return;
+            }
+
+            assert(!pendingDraw->segments.empty());
+
+            const size_t cmdBytes =
+                pendingDraw->cmds.size() * sizeof(VkDrawIndexedIndirectCommand);
+            const size_t constBytes =
+                pendingDraw->consts.size() * sizeof(CommandConstant);
+
+            const size_t baseIndirect = indirectOffset;
+            const size_t baseConstant = constantOffset;
+
+            // 连续写入所有命令和命令常量
+            indirectDrawBuffer.write(baseIndirect, pendingDraw->cmds.data(), cmdBytes);
+            commandConstantsBuffer.write(baseConstant, pendingDraw->consts.data(),
+                                         constBytes);
+
+            // 根据 commandStart 计算每个段实际字节偏移
+            for (auto &seg : pendingDraw->segments)
+            {
+                seg.indirectOffsetStart = static_cast<uint32_t>(
+                    baseIndirect +
+                    seg.commandStart * sizeof(VkDrawIndexedIndirectCommand));
+                seg.constantOffsetStart = static_cast<uint32_t>(
+                    baseConstant + seg.commandStart * sizeof(CommandConstant));
+            }
+
+            DrawUnit unit{};
+            unit.staticKey = pendingDraw->staticKey;
+            unit.segments = std::move(pendingDraw->segments);
+            unit.totalCommandCount = static_cast<uint32_t>(pendingDraw->cmds.size());
+            draws.push_back(std::move(unit));
+
+            indirectOffset += cmdBytes;
+            constantOffset += constBytes;
+
+            pendingDraw.reset();
+        }
+
+        // ---------- 静态状态设置 ----------
+        void setPipeline(VkPipeline pipeline)
+        {
+            if (currentStatic.pipeline != pipeline)
+            {
+                if (currentStatic.valid())
+                    finishDraw();
+                currentStatic.pipeline = pipeline;
+            }
+        }
+
+        void setLayout(VkPipelineLayout layout)
+        {
+            if (currentStatic.layout != layout)
+            {
+                if (currentStatic.valid())
+                    finishDraw();
+                currentStatic.layout = layout;
+            }
+        }
+
+        void setPushData(const PushData &pushData)
+        {
+            if (currentStatic.pushData != pushData)
+            {
+                if (currentStatic.valid())
+                    finishDraw();
+                currentStatic.pushData = pushData;
+            }
+        }
+
+        void setMesh(const mesh_data &mesh)
+        {
+            if (currentStatic.mesh != mesh)
+            {
+                if (currentStatic.valid())
+                    finishDraw();
+                currentStatic.mesh = mesh;
+            }
+        }
+
+        // ---------- 动态状态设置：先结束旧段，再切换状态 ----------
+        void setScissors(const std::vector<VkRect2D> &scissors)
+        {
+            if (!equal_scissors(currentDynamic.scissors, scissors))
+            {
+                if (pendingDraw)
+                    pushCurrentSegment();
+
+                currentDynamic.scissors = scissors;
+
+                if (pendingDraw)
+                    pendingDraw->activeDynamic = currentDynamic;
+            }
+        }
+
+        void setViewports(const std::vector<VkViewport> &viewports)
+        {
+            if (!equal_viewports(currentDynamic.viewports, viewports))
+            {
+                if (pendingDraw)
+                    pushCurrentSegment();
+
+                currentDynamic.viewports = viewports;
+
+                if (pendingDraw)
+                    pendingDraw->activeDynamic = currentDynamic;
+            }
+        }
+
+        // ---------- 添加实例数据 ----------
+        template <typename T>
+        void addInstances(std::span<const T> instances)
+        {
+            assert(currentStatic.valid());
+            const auto &mesh = currentStatic.mesh;
+
+            if (!pendingDraw)
+            {
+                pendingDraw = PendingDraw{currentStatic, {}, {}, {}, 0, currentDynamic};
+            }
+
+            // 写入堆
+            const size_t dataOffset = heapOffset;
+            globalHeapBuffer.write(heapOffset, instances.data(),
+                                   instances.size() * sizeof(T));
+            heapOffset += instances.size() * sizeof(T);
+
+            VkDrawIndexedIndirectCommand cmd =
+                mesh.getDrawCommand(static_cast<uint32_t>(instances.size()));
+            CommandConstant constant{.type_id = T::type_id,
+                                     .adddress_offset = static_cast<uint32_t>(dataOffset),
+                                     .slot_count = 0};
+
+            // 只与当前活动段的最后一条命令合并
+            if (!pendingDraw->cmds.empty() &&
+                pendingDraw->currentSegmentCmdStart < pendingDraw->cmds.size())
+            {
+                auto &lastCmd = pendingDraw->cmds.back();
+                auto &lastConst = pendingDraw->consts.back();
+
+                const bool canMerge = lastCmd.indexCount == cmd.indexCount &&
+                                      lastCmd.firstIndex == cmd.firstIndex &&
+                                      lastCmd.vertexOffset == cmd.vertexOffset &&
+                                      lastCmd.firstInstance == cmd.firstInstance &&
+                                      lastConst.type_id == constant.type_id;
+
+                if (canMerge)
+                {
+                    lastCmd.instanceCount += cmd.instanceCount;
+                    return; // 合并成功，不新增命令
+                }
+            }
+
+            pendingDraw->cmds.push_back(cmd);
+            pendingDraw->consts.push_back(constant);
+        }
+
+        // ---------- 结束录制 ----------
+        void end()
+        {
+            finishDraw();
+        }
+
+        // ---------- 提交 Vulkan 命令 ----------
+        void doDraw(CommandBufferView cmd)
+        {
+            assert(!pendingDraw);
+            VkPipeline lastPipeline = VK_NULL_HANDLE; // 缓存当前 CommandBuffer 的管线状态
+            for (const auto &du : draws)
+            {
+                assert(du.valid());
+
+                // 只有管线真正改变时才调用绑定
+                if (du.staticKey.pipeline != lastPipeline)
+                {
+                    cmd.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                     du.staticKey.pipeline);
+                    lastPipeline = du.staticKey.pipeline;
+                }
+
+                for (const auto &seg : du.segments)
+                {
+                    cmd.setViewport(0, seg.dynamic.viewports);
+                    cmd.setScissor(0, seg.dynamic.scissors);
+
+                    PushData pc = du.staticKey.pushData;
+                    pc.commandConstantsAddress =
+                        commandConstantsBuffer.address + seg.constantOffsetStart;
+
+                    cmd.pushConstants(du.staticKey.layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
+                                      sizeof(PushData), &pc);
+
+                    cmd.drawIndexedIndirect(indirectDrawBuffer.buffer.buffer(),
+                                            seg.indirectOffsetStart, seg.commandCount,
+                                            sizeof(VkDrawIndexedIndirectCommand));
+                }
+            }
+        }
+    };
 
 }; // namespace shader_data
 constexpr auto initShaderDataRecorder(const LogicalDevice &device)
@@ -727,16 +1533,22 @@ constexpr auto initShaderDataRecorder(const LogicalDevice &device)
                                         commandConstantsCapacity)};
     return shaderDataRecorder;
 }
-
-struct PushData
+constexpr auto initDrawRecorder(const LogicalDevice &device)
 {
-    // 字段顺序必须与 test_dod19.vert 的 PushConsts 完全一致
-    // （GLSL: vertex/data/commandConstants/cameraIndex，Glyph 不需要 attributeAddress）
-    uint64_t vertexAddress;           // 全局顶点缓冲区地址
-    uint64_t instanceAddress;         // 全局实例堆地址（shader: dataAddress）
-    uint64_t commandConstantsAddress; // 命令常量缓冲区地址
-    uint32_t cameraIndex;             // 0: 3D, 1: UI
-};
+    constexpr auto vertexCapacity = sizeof(Vertex) * 1000;
+    constexpr auto indexCapacity = sizeof(uint32_t) * 1000;
+    constexpr auto heapCapacity = sizeof(shader_data::Glyph) * 2000;
+    // NOTE: 目前是不超过100条命令的
+    constexpr auto indirectDrawCapacity = sizeof(VkDrawIndexedIndirectCommand) * 100;
+    constexpr auto commandConstantsCapacity = sizeof(shader_data::CommandConstant) * 100;
+
+    std::array<shader_data::DrawRecorder, MAX_FRAMES_IN_FLIGHT> drawRecorder{
+        shader_data::DrawRecorder(device, vertexCapacity, indexCapacity, heapCapacity,
+                                  indirectDrawCapacity, commandConstantsCapacity),
+        shader_data::DrawRecorder(device, vertexCapacity, indexCapacity, heapCapacity,
+                                  indirectDrawCapacity, commandConstantsCapacity)};
+    return drawRecorder;
+}
 
 //diff: [test_dod8] end
 
@@ -816,7 +1628,7 @@ auto generateGradientTexture(const LogicalDevice &device, const CommandPool &poo
 // NOLINTEND
 //diff: [test_indirectdraw2] end
 
-using mcs::vulkan::ecs::static_string;
+using mcs::vulkan::meta::static_string;
 
 // 删除了 UI 命名空间及其所有依赖（Container/Row/Column/Expanded/Text Trait, UIBuilder, FlatLayoutTree 等）
 
@@ -2081,6 +2893,14 @@ try
         recorder.globalIndexBuffer.write(0, allIndices.data(),
                                          allIndices.size() * sizeof(allIndices[0]));
     }
+    auto drawRecorder = initDrawRecorder(device);
+    for (auto &recorder : drawRecorder)
+    {
+        recorder.globalVertexBuffer.write(0, allVertices.data(),
+                                          allVertices.size() * sizeof(allVertices[0]));
+        recorder.globalIndexBuffer.write(0, allIndices.data(),
+                                         allIndices.size() * sizeof(allIndices[0]));
+    }
 
     // ============================================================
     // 简单 Glyph 测试：只 shape 一个字符 "A"，生成 1 个 Glyph 实例。
@@ -2237,9 +3057,11 @@ try
             pipelineTransparentUI, pipelineLayout, depthResourcesBuild, depthResource,
             msaaResourcesBuild, msaaResource);
 
-    auto mainShaderCtx = make_aggregate_ref<"mainShaderCtx", "shaderDataRecorder",
-                                            "uniformBuffers", "descriptorSets", "glyphs">(
-        shaderDataRecorder, uniformBuffers, descriptorSets, simpleGlyphs);
+    auto mainShaderCtx =
+        make_aggregate_ref<"mainShaderCtx", "shaderDataRecorder", "drawRecorder",
+                           "uniformBuffers", "descriptorSets", "glyphs">(
+            shaderDataRecorder, drawRecorder, uniformBuffers, descriptorSets,
+            simpleGlyphs);
     auto inputCtx =
         make_aggregate_ref<"inputCtx", "input", "camera", "uiCamera", "clock">(
             input, camera, uiCamera, clock);
@@ -2827,7 +3649,7 @@ try
 
             auto &shaderDataRecorder = mainShaderCtx.shaderDataRecorder;
             auto &batch = shaderDataRecorder[currentFrame];
-
+#if 0
             // ============ 简单 Glyph 测试：绑定管线 + 推送常量 + 间接绘制 ============
             // 字形走 UI 透明管线（深度关、混合开，适配 MSDF 半透明）
             commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -2844,6 +3666,193 @@ try
             // 3 条间接绘制命令（圆角卡片、线框、glyph；gl_DrawIDARB 0/1/2）
             commandBuffer.drawIndexedIndirect(batch.indirectDrawBuffer.buffer.buffer(), 0,
                                               3, sizeof(VkDrawIndexedIndirectCommand));
+#endif
+            // ============================================================
+            // 使用 DrawRecorder 构建真实 UI 场景（含文字）
+            // ============================================================
+            auto &recorder = mainShaderCtx.drawRecorder[currentFrame];
+            recorder.reset();
+
+            auto &meshMap = globalCtx.meshMap;
+            auto &quad_meta = meshMap["quad"];
+            auto &swapchain = globalCtx.swapchain;
+            auto extent = swapchain.refImageExtent();
+
+            // ---------- 视口 / 裁剪 ----------
+            VkViewport fullVP{0.0f, 0.0f, (float)extent.width, (float)extent.height,
+                              0.0f, 1.0f};
+            VkRect2D fullSC{{0, 0}, {extent.width, extent.height}};
+
+            PushData pcBase{.vertexAddress = recorder.globalVertexBuffer.address,
+                            .instanceAddress = recorder.globalHeapBuffer.address,
+                            .commandConstantsAddress =
+                                recorder.commandConstantsBuffer.address,
+                            .cameraIndex = 1};
+
+            const float elapsed = inputCtx.clock.getElapsed();
+            uint32_t entityCounter = 0;
+            auto nextId = [&]() {
+                return entityCounter++;
+            };
+
+            auto makeRect = [&](glm::vec2 center, glm::vec2 size, glm::vec4 color,
+                                uint32_t effects,
+                                glm::vec4 radiusSoftness = glm::vec4(0.0f),
+                                glm::vec2 shadowOffset = glm::vec2(0.0f),
+                                glm::vec4 shadowColor = glm::vec4(0.0f)) {
+                shader_data::Rectangle r{};
+                r.entity_index = nextId();
+                r.effects = effects;
+                for (auto &c : r.colors)
+                    c = color;
+                r.model = glm::translate(glm::mat4(1.0f), glm::vec3(center, 0.0f));
+                r.vertexTransform.matrix =
+                    glm::scale(glm::mat4(1.0f), glm::vec3(size, 1.0f));
+                r.uvTransform = UvTransform{glm::vec2(1.0f), glm::vec2(0.0f)};
+                r.size = size;
+                r.shadowOffset = shadowOffset;
+                r.radiusSoftness = radiusSoftness;
+                r.shadowColor = shadowColor;
+                return r;
+            };
+
+            auto makeUiRect = [&](glm::vec2 center, glm::vec2 size, glm::vec4 color,
+                                  float border) {
+                shader_data::UiRect r{};
+                r.entity_index = nextId();
+                r.hover_fn = ~0U;
+                r.center_size = glm::vec4(center, size);
+                r.color = color;
+                r.border = border;
+                return r;
+            };
+
+            // ---------- 布局常量 ----------
+            const float PANEL_W = 0.9f, PANEL_H = 0.7f;
+            const float HEADER_Y = 0.18f, HEADER_H = 0.07f;
+            const float TABLE_LEFT = -0.42f, TABLE_RIGHT = 0.42f;
+            const float TABLE_TOP = 0.10f, TABLE_BOTTOM = -0.24f;
+            const float TABLE_W = TABLE_RIGHT - TABLE_LEFT;
+            const float TABLE_H = TABLE_TOP - TABLE_BOTTOM;
+            const float TABLE_CENTER_Y = (TABLE_TOP + TABLE_BOTTOM) * 0.5f;
+            const float ROW_H = 0.055f, ROW_GAP = 0.005f;
+            const float BUTTON_W = 0.16f, BUTTON_H = 0.08f;
+            const float BUTTON_Y = -0.29f;
+
+            // ---------- 全屏数据 ----------
+            std::vector<shader_data::Rectangle> fullRects;
+            std::vector<shader_data::UiRect> fullUiRects;
+
+            // 1. 背景面板（圆角 + 阴影 + 渐变）
+            shader_data::Rectangle panel{};
+            panel.entity_index = nextId();
+            panel.effects =
+                shader_data::FX_ROUNDED | shader_data::FX_SHADOW | shader_data::FX_FILL;
+            panel.colors[0] = glm::vec4(0.18f, 0.20f, 0.25f, 1.0f);
+            panel.colors[1] = glm::vec4(0.18f, 0.20f, 0.25f, 1.0f);
+            panel.colors[2] = glm::vec4(0.10f, 0.11f, 0.14f, 1.0f);
+            panel.colors[3] = glm::vec4(0.10f, 0.11f, 0.14f, 1.0f);
+            panel.model = glm::translate(glm::mat4(1.0f), glm::vec3(0.0f));
+            panel.vertexTransform.matrix =
+                glm::scale(glm::mat4(1.0f), glm::vec3(PANEL_W, PANEL_H, 1.0f));
+            panel.uvTransform = UvTransform{glm::vec2(1.0f), glm::vec2(0.0f)};
+            panel.size = glm::vec2(PANEL_W, PANEL_H);
+            panel.shadowOffset = glm::vec2(0.0f, -0.03f);
+            panel.radiusSoftness = glm::vec4(0.03f, 0.005f, 0.02f, 1.0f);
+            panel.shadowColor = glm::vec4(0.0f, 0.0f, 0.0f, 0.35f);
+            fullRects.push_back(panel);
+
+            // 2. 表头背景
+            fullRects.push_back(makeRect(glm::vec2(0.0f, HEADER_Y),
+                                         glm::vec2(0.86f, HEADER_H),
+                                         glm::vec4(0.28f, 0.30f, 0.36f, 1.0f),
+                                         shader_data::FX_ROUNDED | shader_data::FX_FILL,
+                                         glm::vec4(0.006f, 0.005f, 0.0f, 1.0f)));
+
+            // 3. 两个按钮（带脉冲效果）
+            float pulse = 0.5f + 0.5f * std::sin(elapsed * 3.0f);
+            glm::vec4 okColor = glm::mix(glm::vec4(0.16f, 0.50f, 0.20f, 1.0f),
+                                         glm::vec4(0.24f, 0.75f, 0.28f, 1.0f), pulse);
+            glm::vec4 cancelColor = glm::mix(glm::vec4(0.50f, 0.16f, 0.16f, 1.0f),
+                                             glm::vec4(0.75f, 0.24f, 0.24f, 1.0f), pulse);
+
+            fullRects.push_back(makeRect(
+                glm::vec2(0.25f, BUTTON_Y), glm::vec2(BUTTON_W, BUTTON_H), okColor,
+                shader_data::FX_ROUNDED | shader_data::FX_SHADOW | shader_data::FX_FILL,
+                glm::vec4(0.015f, 0.005f, 0.01f, 1.0f), glm::vec2(0.0f, -0.01f),
+                glm::vec4(0.0f, 0.0f, 0.0f, 0.2f)));
+            fullRects.push_back(makeRect(
+                glm::vec2(-0.25f, BUTTON_Y), glm::vec2(BUTTON_W, BUTTON_H), cancelColor,
+                shader_data::FX_ROUNDED | shader_data::FX_SHADOW | shader_data::FX_FILL,
+                glm::vec4(0.015f, 0.005f, 0.01f, 1.0f), glm::vec2(0.0f, -0.01f),
+                glm::vec4(0.0f, 0.0f, 0.0f, 0.2f)));
+
+            // 4. 表格外框 + 列分隔线
+            fullUiRects.push_back(makeUiRect(glm::vec2(0.0f, TABLE_CENTER_Y),
+                                             glm::vec2(TABLE_W, TABLE_H),
+                                             glm::vec4(1.0f, 1.0f, 1.0f, 0.25f), 0.002f));
+            fullUiRects.push_back(makeUiRect(glm::vec2(-0.18f, TABLE_CENTER_Y),
+                                             glm::vec2(0.002f, TABLE_H),
+                                             glm::vec4(1.0f, 1.0f, 1.0f, 0.2f), 0.001f));
+            fullUiRects.push_back(makeUiRect(glm::vec2(0.06f, TABLE_CENTER_Y),
+                                             glm::vec2(0.002f, TABLE_H),
+                                             glm::vec4(1.0f, 1.0f, 1.0f, 0.2f), 0.001f));
+            fullUiRects.push_back(makeUiRect(glm::vec2(0.26f, TABLE_CENTER_Y),
+                                             glm::vec2(0.002f, TABLE_H),
+                                             glm::vec4(1.0f, 1.0f, 1.0f, 0.2f), 0.001f));
+
+            // ---------- 滚动表格数据（仅矩形，无文字） ----------
+            std::vector<shader_data::Rectangle> tableRects;
+            const int totalRows = 12;
+            float rowSpan = ROW_H + ROW_GAP;
+            float scroll = std::fmod(elapsed * 0.2f, totalRows * rowSpan);
+            int highlightRow = int(elapsed * 3.0f) % totalRows;
+
+            for (int i = 0; i < totalRows; ++i)
+            {
+                float y = TABLE_TOP - ROW_H * 0.5f - i * rowSpan + scroll;
+                glm::vec4 rowColor = (i % 2 == 0) ? glm::vec4(0.30f, 0.31f, 0.36f, 0.9f)
+                                                  : glm::vec4(0.24f, 0.25f, 0.29f, 0.9f);
+                if (i == highlightRow)
+                    rowColor = glm::vec4(0.40f, 0.50f, 0.60f, 1.0f);
+
+                tableRects.push_back(
+                    makeRect(glm::vec2(0.0f, y), glm::vec2(TABLE_W, ROW_H), rowColor,
+                             shader_data::FX_ROUNDED | shader_data::FX_FILL,
+                             glm::vec4(0.004f, 0.003f, 0.0f, 1.0f)));
+            }
+
+            // ---------- 设置全屏状态，绘制底层 UI ----------
+            recorder.setPipeline(*mainCtx.pipelineTransparentUI);
+            recorder.setLayout(*mainCtx.pipelineLayout);
+            recorder.setPushData(pcBase);
+            recorder.setMesh(quad_meta);
+            recorder.setViewports({fullVP});
+            recorder.setScissors({fullSC});
+
+            // 添加矩形（背景、表头、按钮）和线框
+            recorder.addInstances(std::span<const shader_data::Rectangle>(fullRects));
+            recorder.addInstances(std::span<const shader_data::UiRect>(fullUiRects));
+
+            // ---------- 切换裁剪区域，绘制表格滚动内容 ----------
+            int32_t scX = static_cast<int32_t>((TABLE_LEFT + 1.0f) * 0.5f * extent.width);
+            int32_t scY = static_cast<int32_t>((1.0f - TABLE_TOP) * 0.5f * extent.height);
+            uint32_t scW =
+                static_cast<uint32_t>((TABLE_RIGHT - TABLE_LEFT) * 0.5f * extent.width);
+            uint32_t scH =
+                static_cast<uint32_t>((TABLE_TOP - TABLE_BOTTOM) * 0.5f * extent.height);
+            VkRect2D tableSC{{scX, scY}, {scW, scH}};
+
+            recorder.setScissors({tableSC}); // 状态改变 -> 结束上一个 DrawUnit
+            recorder.addInstances(std::span<const shader_data::Rectangle>(tableRects));
+
+            // ---------- 切回全屏状态，绘制文字（最上层） ----------
+            recorder.setScissors({fullSC}); // 再次改变状态 -> 结束表格 DrawUnit
+            recorder.addInstances(
+                std::span<const shader_data::Glyph>(mainShaderCtx.glyphs));
+
+            recorder.end();
+            recorder.doDraw(commandBuffer);
         }>{},
         std::constant_wrapper<[](world_type &world, input_type &inputCtx,
                                  data_type &soaCtx) {

@@ -30,7 +30,9 @@ namespace mcs::vulkan::meta
         }
         constexpr bool operator==(const static_string &o) const noexcept
         {
-            return view() == o;
+            if (value == o.value) // 指针相等快速路径
+                return true;
+            return view() == o.view();
         }
         constexpr bool operator==(const std::string_view &o) const noexcept
         {
