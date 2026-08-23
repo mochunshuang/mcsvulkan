@@ -3667,6 +3667,7 @@ try
             commandBuffer.drawIndexedIndirect(batch.indirectDrawBuffer.buffer.buffer(), 0,
                                               3, sizeof(VkDrawIndexedIndirectCommand));
 #endif
+            // diff: [test_dod21] start: 区别在 直接往 GPU 写入数据.是 shaderDataRecorder 的增强版本
             // ============================================================
             // 使用 DrawRecorder 构建真实 UI 场景（含文字）
             // ============================================================
@@ -3853,6 +3854,7 @@ try
 
             recorder.end();
             recorder.doDraw(commandBuffer);
+            // diff: [test_dod21] end
         }>{},
         std::constant_wrapper<[](world_type &world, input_type &inputCtx,
                                  data_type &soaCtx) {
