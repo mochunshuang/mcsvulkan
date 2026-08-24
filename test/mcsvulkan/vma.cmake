@@ -179,6 +179,8 @@ add_std_glsl_target(test_dod20 test_dod20.vert test_dod20.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_dod21 test_dod20.vert test_dod20.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
+add_std_glsl_target(test_dod22 test_dod20.vert test_dod20.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
 
 add_std_glsl_target(test_viewport test_sdf.vert test_sdf.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
