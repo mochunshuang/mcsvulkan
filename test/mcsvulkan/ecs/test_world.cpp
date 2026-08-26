@@ -13,6 +13,7 @@ using mcs::vulkan::ecs::static_string;
 using mcs::vulkan::ecs::soa_class;
 using mcs::vulkan::ecs::world;
 using mcs::vulkan::ecs::gen_soa_vector;
+using mcs::vulkan::ecs::soa_vector;
 using mcs::vulkan::ecs::proxy_value;
 using mcs::vulkan::ecs::name_spec;
 
@@ -601,6 +602,67 @@ int main()
         CHECK(x2 == 100);
     }
     std::println("Test9 (tuple entity) passed.");
+
+    {
+        using auto_vec = soa_vector<SimplePod>;
+
+        // 1. 自动扩容的 allocate
+        {
+            auto_vec vec;
+            std::vector<size_t> ids;
+            for (int i = 0; i < 100; ++i)
+            {
+                size_t id = vec.allocate(); // 不会失败
+                vec.construct_at(id, i, i * 1.0, char('a' + i % 26));
+                ids.push_back(id);
+            }
+            CHECK(vec.size() == 100);
+            CHECK(vec.capacity() >= 100);
+            // 验证数据
+            for (size_t i = 0; i < ids.size(); ++i)
+            {
+                CHECK(vec.template get<"x">(ids[i]) == static_cast<int>(i));
+            }
+        }
+
+        // 2. 自动扩容的 make_soa_value
+        {
+            auto_vec vec;
+            std::vector<proxy_value<auto_vec>> proxies;
+            for (int i = 0; i < 10; ++i)
+            {
+                proxies.push_back(vec.make_soa_value(i, i * 2.0, 'A' + i));
+            }
+            CHECK(vec.size() == 10);
+            CHECK(vec.capacity() >= 10);
+            // 数据正确性
+            for (int i = 0; i < 10; ++i)
+            {
+                auto [x, y, z] = *proxies[i];
+                CHECK(x == i);
+                CHECK(y == i * 2.0);
+                CHECK(z == 'A' + i);
+            }
+        }
+
+        // 3. 释放与重用（自动扩容不影响原有逻辑）
+        {
+            auto_vec vec;
+            auto id0 = vec.allocate();
+            auto id1 = vec.allocate();
+            vec.release(id0);
+            auto id2 = vec.allocate(); // 重用 id0
+            CHECK(id2 == id0);
+            CHECK(vec.capacity() == 4); // 未扩容
+        }
+
+        // 4. try_allocate 返回 optional（不抛异常）
+        {
+            auto_vec vec;
+            auto id = vec.try_allocate();
+            CHECK(id.has_value());
+        }
+    }
 
     std::println("\nAll tests passed!");
     return 0;

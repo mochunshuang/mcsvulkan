@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cassert>
+#include <optional>
 #include <utility>
+#include "nsdms_of.hpp"
 
 namespace mcs::vulkan::ecs
 {
@@ -61,6 +63,32 @@ namespace mcs::vulkan::ecs
         [[nodiscard]] constexpr bool has_value() const noexcept // NOLINT
         {
             return store_ != nullptr;
+        }
+
+        template <typename T, typename BindResult>
+        static constexpr T to_value_type(const BindResult &b) // NOLINT
+        {
+            T copy{};
+            static constexpr auto members = nsdms_of(^^T);           // NOLINT
+            static constexpr auto members2 = nsdms_of(^^BindResult); // NOLINT
+            static_assert(members.size() == members2.size());
+            template for (constexpr auto I : std::views::indices(members.size()))
+            {
+                copy.[:members[I]:] = b.[:members2[I]:];
+            }
+            return copy;
+        }
+
+        constexpr value_type value() const
+        {
+            assert(store_ != nullptr);
+            return to_value_type<value_type>(static_cast<const Store &>(*store_)[id_]);
+        }
+        constexpr std::optional<value_type> try_value() const // NOLINT
+        {
+            if (store_ == nullptr)
+                return std::nullopt;
+            return value();
         }
 
       private:

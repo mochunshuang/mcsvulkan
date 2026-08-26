@@ -82,6 +82,8 @@ using mcs::vulkan::meta::make_aggregate;
 
 using mcs::vulkan::ecs::gen_soa_aggregate;
 using mcs::vulkan::ecs::gen_soa_struct;
+using mcs::vulkan::ecs::soa_vector;
+using mcs::vulkan::ecs::proxy_value;
 
 using mcs::vulkan::task::make_task;
 using mcs::vulkan::task::init_task;
@@ -386,6 +388,7 @@ namespace shader_data
     struct Glyph
     {
         static constexpr auto type_id = 2;
+        uint64_t data;           //关联的CPU指针
         uint32_t entity_index;   // 拾取实体索引（outPicking.y）
         uint32_t textureIndex;   // 纹理数组下标（bindless）
         uint32_t samplerIndex;   // 采样器数组下标（bindless）
@@ -397,7 +400,7 @@ namespace shader_data
         UvTransform uvTransform; // 图集 UV 变换
         uint32_t hover_fn = ~0U;
     };
-    static_assert(sizeof(Glyph) == 124);
+    static_assert(sizeof(Glyph) == 136);
 
     struct BufferResource
     {
@@ -519,13 +522,14 @@ namespace shader_data
     struct UiRect
     {
         static constexpr auto type_id = 3;
+        uint64_t data;         //关联的CPU指针
         uint32_t entity_index; // 布局节点索引（拾取外键）
         uint32_t hover_fn;     // hover 池下标（0xFFFFFFFF = 未绑定）
         glm::vec4 center_size; // center.xy + size.xy（NDC）
         glm::vec4 color;       // 边框色
         float border;          // 边框半宽（NDC）
     };
-    static_assert(sizeof(UiRect) == 44);
+    static_assert(sizeof(UiRect) == 56);
 
     // ===================== 圆角阴影矩形（照抄 test_sdf Rectangle；TYPE_ROUND_RECT=5）=====================
     // 与 GLSL Rectangle（RECTANGLE_SIZE=264）严格一致；HTML box-shadow 风格
@@ -536,6 +540,7 @@ namespace shader_data
     struct Rectangle
     {
         static constexpr auto type_id = 5;
+        uint64_t data;                   //关联的CPU指针
         uint32_t entity_index;           // 拾取实体索引（outPicking.y）
         uint32_t effects;                // 特效标志（FX_ROUNDED/SHADOW/FILL）
         glm::vec4 colors[4];             // 四顶点颜色（单色 = 四顶点同色）
@@ -547,7 +552,7 @@ namespace shader_data
         glm::vec4 radiusSoftness;        // x=圆角比例 y=边缘柔化 z=阴影模糊 w=阴影扩散
         glm::vec4 shadowColor;           // 阴影色 RGBA（a=0 → 无阴影）
     };
-    static_assert(sizeof(Rectangle) == 264);
+    static_assert(sizeof(Rectangle) == 272);
     static constexpr uint32_t FX_ROUNDED = 1u;
     static constexpr uint32_t FX_SHADOW = 2u;
     static constexpr uint32_t FX_FILL = 4u;
@@ -1031,6 +1036,7 @@ constexpr auto initDrawRecorder(const LogicalDevice &device)
                                   indirectDrawCapacity, commandConstantsCapacity)};
     return drawRecorder;
 }
+//
 
 //diff: [test_dod8] end
 
@@ -1883,6 +1889,12 @@ constexpr auto initFont(auto &hardwareCtx, auto &descriptorCtx)
     return make_aggregate<"fontCtx", "loader", "fontFactory", "fontSelect">(
         std::move(loaderPtr), std::move(font_factoryPtr), std::move(fontSelect));
 }
+using HardwareCtx = decltype(init());
+using DescriptorCtx = decltype(descriptorInit(std::declval<HardwareCtx &>()));
+using FontCtx =
+    decltype(initFont(std::declval<HardwareCtx &>(), std::declval<DescriptorCtx &>()));
+using FontSelect = std::remove_cvref_t<decltype(std::declval<FontCtx>().fontSelect)>;
+
 constexpr auto inputInit(auto &swapchain)
 {
     auto camera = [&]() {
@@ -1959,7 +1971,7 @@ constexpr auto initMeshManager()
     return m;
 }
 
-constexpr auto run_text_pipeline(auto &fontSelect, const char8_t *rawText,
+constexpr auto run_text_pipeline(auto &fontSelect, const auto *rawText,
                                  std::string_view langBcp47, bool ltr = true)
 {
     constexpr auto ltr_value = 0; // NOLINT
@@ -2312,6 +2324,11 @@ static constexpr auto model_update(auto &world, auto &inputCtx, auto &soaCtx) no
 }
 
 //diff: [test_dod22] start
+constexpr auto &hoverPool() noexcept
+{
+    static shader_data::hover_pool hoverPool{};
+    return hoverPool;
+}
 namespace ui
 {
     // 引入到全局，方便使用
@@ -2571,18 +2588,30 @@ namespace ui
     // ============================================================================
     // 数据挂载基类 IData
     // ============================================================================
-
+    class Node;
     class IData
     {
       public:
         virtual ~IData() = default;
     };
+    struct render_context
+    {
+        shader_data::DrawRecorder &drawRecorder;
+        glfw_input &input;
+        FrameClock &clock;
+        FontSelect &fontSelect;
+    };
+    using render_callback = void(Node *self, render_context &context);
+    class RenderData
+    {
+      public:
+        virtual ~RenderData() = default;
+        virtual void render(Node *self, render_context &context) = 0;
+    };
 
     // ============================================================================
     // 前置声明 Node 并定义 Widget 别名
     // ============================================================================
-
-    class Node;
     using Widget = pmr_unique_ptr<Node>;
 
     // ============================================================================
@@ -2617,6 +2646,19 @@ namespace ui
         std::vector<Widget> children;
         Node *parent = nullptr; // 父节点裸指针，不拥有所有权
         bool dirty = false;     // 脏标记，用于测试遍历是否覆盖
+        pmr_unique_ptr<RenderData> renderData;
+
+        constexpr void markDirty() noexcept
+        {
+            Node *current = this;
+            while (current)
+            {
+                if (current->dirty)
+                    break; // 祖先已经脏了，无需继续
+                current->dirty = true;
+                current = current->parent;
+            }
+        }
 
         // ---------- 数据挂载 API（使用 static_string 优化） ----------
         // 添加数据，返回原始指针以便后续修改
@@ -2627,6 +2669,18 @@ namespace ui
             auto ptr = make_pmr_unique<T>(nodeResource, std::forward<Args>(args)...);
             T *raw = ptr.get();
             dataMap_[key].push_back(std::move(ptr));
+            markDirty(); // 新增（若挂载数据不影响布局/渲染，可考虑不标，但保守起见标上）
+            return raw;
+        }
+        template <typename T, typename... Args>
+        T *setRenderData(Args &&...args)
+        {
+            static_assert(std::is_base_of_v<RenderData, T>,
+                          "T must derive from RenderData");
+            auto ptr = make_pmr_unique<T>(nodeResource, std::forward<Args>(args)...);
+            T *raw = ptr.get();
+            renderData = std::move(ptr);
+            markDirty(); // 新增
             return raw;
         }
 
@@ -2657,6 +2711,7 @@ namespace ui
             it->second.erase(it->second.begin() + index);
             if (it->second.empty())
                 dataMap_.erase(it);
+            markDirty(); // 新增
             return true;
         }
 
@@ -2676,6 +2731,7 @@ namespace ui
                           << finalSize.width - constraints.maxW << ", "
                           << finalSize.height - constraints.maxH << ")\n";
             }
+            dirty = false; // 布局完成，清除自身脏标志（子树已在递归中清除）
         }
 
         Size size() const
@@ -2706,6 +2762,7 @@ namespace ui
             auto detached = std::move(*it);
             children.erase(it);
             detached->parent = nullptr;
+            markDirty(); // 新增（旧父节点脏）
             return detached;
         }
 
@@ -2716,6 +2773,7 @@ namespace ui
                 return;
             child->parent = this;
             children.push_back(std::move(child));
+            markDirty(); // 新增
         }
 
         // 将已存在的子节点移动到新的父节点下
@@ -2729,7 +2787,7 @@ namespace ui
 
             Widget detached;
             if (oldParent)
-            {
+            { // removeChild 内部已调用 markDirty()
                 detached = oldParent->removeChild(child);
             }
             else
@@ -2738,7 +2796,7 @@ namespace ui
             }
 
             if (detached)
-            {
+            { // addChild 内部已调用 markDirty()
                 newParent->addChild(std::move(detached));
             }
         }
@@ -3309,6 +3367,13 @@ namespace ui
                 key, std::forward<Args>(args)...);
             return *static_cast<Derived *>(this);
         }
+        template <typename T, typename... Args>
+        Derived &renderData(Args &&...args)
+        {
+            static_cast<Derived *>(this)->node->template setRenderData<T>(
+                std::forward<Args>(args)...);
+            return *static_cast<Derived *>(this);
+        }
     };
 
     class ContainerBuilder : public DataMixin<ContainerBuilder>
@@ -3568,6 +3633,15 @@ namespace ui
         return ExpandedBuilder(flex, std::move(name));
     }
 } // namespace ui
+
+// shader_data::Glyph
+auto &glyphPool()
+{
+    using Pool = soa_vector<shader_data::Glyph>;
+    static Pool pool{};
+    return pool;
+}
+
 //diff: [test_dod22] end
 
 int main()
@@ -3704,9 +3778,6 @@ try
     auto &[pickResourcesBuild, pickResource, resolveResourcesBuild, resolveResource,
            pickingFrames, pickMouse] = pickingAttachments;
 
-    // 新的 soaCtx 仅包含 uiRects 和 uiWireRects
-    auto soaCtx = make_aggregate_ref<"soaCtx">();
-
     struct record_info
     {
         uint32_t current_frame;
@@ -3742,11 +3813,10 @@ try
             input, camera, uiCamera, clock);
 
     // ===== hover：全局唯一一份 实体→函数 关联（外键 = 池实体下标）=====
-    shader_data::hover_pool hoverPool{};
     shader_data::hover_manager hoverManager{};
 
     // 测试绑定：所有字形共享同一个 hover 函数（演示"函数可被共享"）
-    uint32_t testHover = hoverPool.bind([](picking_result r, bool enter) noexcept {
+    uint32_t testHover = hoverPool().bind([](picking_result r, bool enter) noexcept {
         std::println("[HOVER] type={} entity={} primitive={} {} (hover_fn={})",
                      r.key.object_type, r.key.entity_index, r.primitive_id,
                      enter ? "ENTER" : "LEAVE", r.hover_fn);
@@ -3756,19 +3826,185 @@ try
         int a;
         MyData(int val) : a(val) {} // 显式添加
     };
+
+    struct Render : public ui::RenderData
+    {
+        // 使用去除引用后的池类型
+        using GlyphPool = std::remove_reference_t<decltype(glyphPool())>;
+        static uint32_t hover_fn()
+        {
+            static uint32_t fn =
+                hoverPool().bind([](picking_result r, bool enter) noexcept {
+                    // NOTE: 目前就一个类型
+                    assert(r.key.object_type == GlyphPool::value_type::type_id);
+
+                    uint64_t ptr = glyphPool().template get<"data">(r.key.entity_index);
+                    std::println(
+                        "[Render-HOVER] type={} entity={} primitive={} {} (hover_fn={})",
+                        r.key.object_type, r.key.entity_index, r.primitive_id,
+                        enter ? "ENTER" : "LEAVE", r.hover_fn);
+
+                    auto *node = reinterpret_cast<ui::Node *>(ptr);
+                    auto *render = dynamic_cast<Render *>(node->renderData.get());
+                    if (render)
+                        std::println("text: {}", render->text);
+                });
+            return fn;
+        }
+
+        std::string text;
+        std::vector<proxy_value<GlyphPool>> textGlyphProxies;
+
+        Render(std::string s) : text(std::move(s))
+        {
+            (void)hover_fn();
+        }
+
+        void render(ui::Node *self, ui::render_context &context) override
+        {
+            auto *data_ptr = dynamic_cast<Render *>(self->renderData.get());
+            if (!data_ptr || data_ptr->text.empty())
+                return;
+
+            const std::string &str = data_ptr->text;
+
+            // 文本整形
+            auto textResult = run_text_pipeline(context.fontSelect, str.data(), "zh-CN");
+            const auto &shapeResult = textResult.shape_result;
+
+            // 节点几何
+            ui::BoxGeometry geom = self->geometry;
+            glm::vec2 topLeft(geom.x, geom.y);
+            const float FONT_SIZE = (geom.h > 0.0f) ? geom.h : 0.2f;
+            float baselineY = topLeft.y + FONT_SIZE;
+            float cursorX = topLeft.x;
+
+            auto &pool = glyphPool();
+
+            // 释放旧代理，归还池中实体
+            for (auto &proxy : data_ptr->textGlyphProxies)
+                proxy.release();
+            data_ptr->textGlyphProxies.clear();
+
+            // 为每个可见字形分配实体并填充数据
+            for (const auto &run : shapeResult)
+            {
+                for (const auto &g : run)
+                {
+                    using bound_type = decltype(g.plane_bounds);
+                    if (g.plane_bounds == bound_type{}) // 空格等无字形字符
+                    {
+                        cursorX += static_cast<float>(g.advance_x) * FONT_SIZE;
+                        continue;
+                    }
+
+                    // 计算几何
+                    float left =
+                        cursorX + static_cast<float>(g.plane_bounds.left) * FONT_SIZE;
+                    float bottom =
+                        baselineY + static_cast<float>(g.plane_bounds.bottom) * FONT_SIZE;
+                    float right =
+                        cursorX + static_cast<float>(g.plane_bounds.right) * FONT_SIZE;
+                    float top =
+                        baselineY + static_cast<float>(g.plane_bounds.top) * FONT_SIZE;
+
+                    glm::vec2 p0{left, top};
+                    glm::vec2 p2{right, bottom};
+                    glm::vec2 center = (p0 + p2) * 0.5f;
+                    glm::vec2 full = p2 - p0;
+
+                    UvTransform uv;
+                    uv.scale = {static_cast<float>(g.uv_bounds.right - g.uv_bounds.left),
+                                static_cast<float>(g.uv_bounds.bottom - g.uv_bounds.top)};
+                    uv.offset = {static_cast<float>(g.uv_bounds.left),
+                                 static_cast<float>(g.uv_bounds.top)};
+
+                    // 构造完整的 Glyph 临时对象
+                    shader_data::Glyph glyph{};
+                    glyph.data = reinterpret_cast<uint64_t>(self);
+                    glyph.entity_index = 0;
+                    glyph.textureIndex = g.font_ctx->bind.texture_index;
+                    glyph.samplerIndex = g.font_ctx->bind.sampler_index;
+                    glyph.fontType = static_cast<uint32_t>(g.font_ctx->type);
+                    glyph.pxRange = static_cast<float>(
+                        g.font_ctx->font.atlas.distanceRange.value_or(0.0));
+                    glyph.modulateFlag = 1;
+                    glyph.color = glm::vec4(1.0f);
+                    glyph.model =
+                        glm::translate(glm::mat4(1.0f), glm::vec3(center, 0.0f)) *
+                        glm::scale(glm::mat4(1.0f), glm::vec3(full, 1.0f));
+                    glyph.uvTransform = uv;
+                    glyph.hover_fn = hover_fn();
+
+                    // 通过移动构造存入池中，返回代理
+                    auto proxy = pool.make_soa_value(std::move(glyph));
+                    data_ptr->textGlyphProxies.push_back(std::move(proxy));
+
+                    cursorX += static_cast<float>(g.advance_x) * FONT_SIZE;
+                }
+            }
+
+            // 提交绘制：需要连续内存的 span，因此复制出 Glyph 值
+            if (!data_ptr->textGlyphProxies.empty())
+            {
+                std::vector<shader_data::Glyph> tempGlyphs;
+                tempGlyphs.reserve(data_ptr->textGlyphProxies.size());
+                for (auto &proxy : data_ptr->textGlyphProxies)
+                    tempGlyphs.push_back(proxy.value()); // 使用新增的 value() 方法
+                context.drawRecorder.addInstances(
+                    std::span<const shader_data::Glyph>(tempGlyphs));
+            }
+        }
+    };
     auto panel = ui::Container("panel")
                      .child(ui::Container("rectBox").data<MyData>("render", 1))
+                     .renderData<Render>(std::string{"CD"})
                      .build();
-    using render_callback = void();
     struct ui_tree
     {
+        ui::Widget root;
+        void layout(ui::Constraints c) noexcept
+        {
+            assert(root);
+            if (!root->dirty)
+                return; // 根节点不脏，整棵树无需布局
+            try
+            {
+                c = c.deflate(root->margin);
+                root->layout(c); // 递归布局，完成后整棵树 dirty 都会被清除
+            }
+            catch (const std::exception &e)
+            {
+                std::cerr << "FAIL: unexpected exception: " << e.what() << "\n";
+            }
+        }
+        // NOTE: 写入GPU数据，就算启动了
+        void render(ui::render_context &context)
+        {
+
+            const auto dfs = [&](this auto &self, ui::Node *node) {
+                if (!node || !node->renderData)
+                    return;
+                node->renderData->render(node, context);
+                for (auto &child : node->children)
+                    self(child.get());
+            };
+            dfs(root.get());
+        }
     };
+    ui_tree uiTree{.root = std::move(panel)};
+    uiTree.layout({0, WIDTH, 0, HEIGHT});
+
+    // 新的 soaCtx 仅包含 uiRects 和 uiWireRects
+    auto soaCtx = make_aggregate_ref<"soaCtx", "uiTree">(uiTree);
 
     // record_info
     auto recordCtx = make_aggregate<"recordCtx", "info">(record_info{});
-    auto world = make_aggregate_ref<"world", "globalCtx", "mainCtx", "mainShaderCtx",
-                                    "pickCtx", "recordCtx", "hoverPool", "hoverManager">(
-        globalCtx, mainCtx, mainShaderCtx, pickCtx, recordCtx, hoverPool, hoverManager);
+    auto world =
+        make_aggregate_ref<"world", "globalCtx", "mainCtx", "mainShaderCtx", "pickCtx",
+                           "recordCtx", "hoverPool", "hoverManager", "fontCtx">(
+            globalCtx, mainCtx, mainShaderCtx, pickCtx, recordCtx, hoverPool(),
+            hoverManager, fontCtx);
     using world_type = decltype(world);
     using input_type = decltype(inputCtx);
     using data_type = decltype(soaCtx);
@@ -4290,6 +4526,7 @@ try
             auto &recordCtx = world.recordCtx;
             auto &globalCtx = world.globalCtx;
             auto &mainCtx = world.mainCtx;
+            auto &fontCtx = world.fontCtx;
 
             auto &commandBuffers = globalCtx.commandBuffers;
             auto &pipelineLayout = mainCtx.pipelineLayout;
@@ -4481,6 +4718,14 @@ try
             recorder.setScissors({fullSC}); // 再次改变状态 -> 结束表格 DrawUnit
             recorder.addInstances(
                 std::span<const shader_data::Glyph>(mainShaderCtx.glyphs));
+
+            // NOTE: 上面是现有的，现在是uiTree的
+            auto &uiTree = soaCtx.uiTree;
+            ui::render_context context{.drawRecorder = recorder,
+                                       .input = inputCtx.input,
+                                       .clock = inputCtx.clock,
+                                       .fontSelect = fontCtx.fontSelect};
+            uiTree.render(context);
 
             recorder.end();
             recorder.doDraw(commandBuffer);
