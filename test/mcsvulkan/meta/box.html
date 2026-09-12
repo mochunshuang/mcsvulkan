@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>双盒子模型 · 完整数据输出</title>
+    <style>
+        :root {
+            /* Box A 变量 */
+            --margin-a: 30px;
+            --border-a: 10px;
+            --padding-a: 25px;
+            --content-w-a: 180px;
+            --content-h-a: 100px;
+            /* Box B 变量 */
+            --margin-b: 30px;
+            --border-b: 10px;
+            --padding-b: 25px;
+            --content-w-b: 160px;
+            --content-h-b: 90px;
+            --flex-direction: row;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'SF Mono', 'Consolas', 'Menlo', monospace;
+            background: #12121f;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 30px 20px;
+            color: #e0e0e0;
+        }
+
+        h1 {
+            font-size: 22px;
+            font-weight: 400;
+            letter-spacing: 2px;
+            margin-bottom: 20px;
+            color: #aaa;
+        }
+
+        .layout-switch {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 24px;
+        }
+
+        .layout-switch button {
+            background: #1e1e3a;
+            border: 1px solid #3a3a5e;
+            color: #ccc;
+            padding: 8px 20px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 14px;
+            letter-spacing: 1px;
+            transition: all 0.2s;
+        }
+
+        .layout-switch button.active {
+            background: #3a3a6e;
+            border-color: #6d6dff;
+            color: #fff;
+            box-shadow: 0 0 8px rgba(100, 100, 255, 0.3);
+        }
+
+        .stage {
+            background: #0d0d1a;
+            border: 1px solid #2a2a4a;
+            border-radius: 12px;
+            padding: 40px;
+            display: flex;
+            flex-direction: var(--flex-direction);
+            align-items: flex-start;
+            justify-content: center;
+            overflow: auto;
+            margin-bottom: 28px;
+            position: relative;
+            /* 用于坐标计算 */
+            min-width: 300px;
+            min-height: 200px;
+        }
+
+        .box {
+            flex-shrink: 0;
+            position: relative;
+        }
+
+        .box::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            box-shadow: 0 0 0 0px transparent;
+            pointer-events: none;
+            z-index: 0;
+            border-radius: 2px;
+        }
+
+        .box-border {
+            border: solid;
+            position: relative;
+            z-index: 1;
+        }
+
+        .box-padding {
+            padding: 0;
+            position: relative;
+            z-index: 2;
+        }
+
+        .box-content {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            font-size: 13px;
+            letter-spacing: 0.5px;
+            position: relative;
+            z-index: 3;
+            border-radius: 1px;
+        }
+
+        .box-a .box-border {
+            border-color: #e6c200;
+            background: rgba(255, 200, 0, 0.05);
+        }
+
+        .box-a .box-padding {
+            background: rgba(50, 220, 100, 0.25);
+        }
+
+        .box-a .box-content {
+            background: rgba(80, 160, 255, 0.35);
+            color: #cce5ff;
+        }
+
+        .box-a::before {
+            box-shadow: 0 0 0 var(--margin-a) rgba(255, 165, 0, 0.2);
+        }
+
+        .box-a {
+            border-radius: 2px;
+        }
+
+        .box-b .box-border {
+            border-color: #c084fc;
+            background: rgba(192, 132, 252, 0.05);
+        }
+
+        .box-b .box-padding {
+            background: rgba(0, 200, 200, 0.25);
+        }
+
+        .box-b .box-content {
+            background: rgba(255, 100, 150, 0.35);
+            color: #ffd6e0;
+        }
+
+        .box-b::before {
+            box-shadow: 0 0 0 var(--margin-b) rgba(255, 100, 200, 0.2);
+        }
+
+        .box-b {
+            border-radius: 2px;
+        }
+
+        .layer-label {
+            position: absolute;
+            font-size: 10px;
+            letter-spacing: 0.5px;
+            pointer-events: none;
+            opacity: 0.9;
+            z-index: 10;
+            white-space: nowrap;
+        }
+
+        .label-border-a {
+            color: #ffd700;
+            top: 2px;
+            left: 4px;
+        }
+
+        .label-padding-a {
+            color: #5ade7a;
+            top: calc(var(--border-a) + 2px);
+            left: calc(var(--border-a) + 4px);
+        }
+
+        .label-content-a {
+            color: #6db8ff;
+            top: calc(var(--border-a) + var(--padding-a) + 2px);
+            left: calc(var(--border-a) + var(--padding-a) + 4px);
+        }
+
+        .label-border-b {
+            color: #d8b4fe;
+            top: 2px;
+            left: 4px;
+        }
+
+        .label-padding-b {
+            color: #4dd8d8;
+            top: calc(var(--border-b) + 2px);
+            left: calc(var(--border-b) + 4px);
+        }
+
+        .label-content-b {
+            color: #ff8fa3;
+            top: calc(var(--border-b) + var(--padding-b) + 2px);
+            left: calc(var(--border-b) + var(--padding-b) + 4px);
+        }
+
+        /* 数据面板 - 扩展 */
+        .data-panel {
+            background: #0f0f1f;
+            border: 1px solid #2a2a4a;
+            border-radius: 12px;
+            padding: 20px 28px;
+            display: grid;
+            grid-template-columns: repeat(5, auto);
+            gap: 16px 36px;
+            align-items: start;
+            font-size: 13px;
+            margin-bottom: 24px;
+            max-width: 95vw;
+            overflow-x: auto;
+        }
+
+        .data-group {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            min-width: 140px;
+        }
+
+        .data-group h4 {
+            font-size: 13px;
+            color: #aaa;
+            letter-spacing: 1px;
+            margin-bottom: 4px;
+            border-bottom: 1px solid #2a2a4a;
+            padding-bottom: 4px;
+        }
+
+        .data-row {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            white-space: nowrap;
+        }
+
+        .data-label {
+            color: #999;
+            min-width: 55px;
+        }
+
+        .data-value {
+            color: #fff;
+            font-weight: bold;
+            min-width: 40px;
+            text-align: right;
+        }
+
+        .data-unit {
+            color: #666;
+            font-size: 10px;
+        }
+
+        .highlight {
+            color: #ffb347;
+            font-weight: bold;
+            font-size: 15px;
+        }
+
+        .controls-container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 28px;
+            justify-content: center;
+            margin-bottom: 20px;
+        }
+
+        .control-card {
+            background: #0f0f1f;
+            border: 1px solid #2a2a4a;
+            border-radius: 12px;
+            padding: 18px 24px;
+            width: 280px;
+        }
+
+        .control-card h3 {
+            font-size: 15px;
+            letter-spacing: 1px;
+            margin-bottom: 14px;
+            text-align: center;
+        }
+
+        .control-card.a h3 {
+            color: #ffb347;
+        }
+
+        .control-card.b h3 {
+            color: #c084fc;
+        }
+
+        .control-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 8px;
+            font-size: 12px;
+            color: #bbb;
+        }
+
+        .control-group label {
+            min-width: 58px;
+            text-align: right;
+        }
+
+        .control-group input[type="range"] {
+            flex: 1;
+            accent-color: #6db8ff;
+            cursor: pointer;
+        }
+
+        .control-group .val {
+            color: #fff;
+            font-weight: bold;
+            min-width: 32px;
+            text-align: center;
+            font-size: 13px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>双盒子模型 · 完整数据输出</h1>
+
+    <div class="layout-switch">
+        <button id="btnHorizontal" class="active" onclick="setLayout('row')">水平排列</button>
+        <button id="btnVertical" onclick="setLayout('column')">垂直排列</button>
+    </div>
+
+    <div class="stage" id="stage">
+        <!-- 盒子 A -->
+        <div class="box box-a" id="boxA">
+            <div class="box-border" id="boxABorder">
+                <span class="layer-label label-border-a">border</span>
+                <div class="box-padding" id="boxAPadding">
+                    <span class="layer-label label-padding-a">padding</span>
+                    <div class="box-content" id="boxAContent">
+                        A<br><span style="font-size:11px;opacity:0.7" id="contentSizeA"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 盒子 B -->
+        <div class="box box-b" id="boxB">
+            <div class="box-border" id="boxBBorder">
+                <span class="layer-label label-border-b">border</span>
+                <div class="box-padding" id="boxBPadding">
+                    <span class="layer-label label-padding-b">padding</span>
+                    <div class="box-content" id="boxBContent">
+                        B<br><span style="font-size:11px;opacity:0.7" id="contentSizeB"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- 数据面板：显示所有关键指标 -->
+    <div class="data-panel" id="dataPanel">
+        <!-- Box A 详细 -->
+        <div class="data-group">
+            <h4 style="color:#ffb347;">Box A</h4>
+            <div class="data-row"><span class="data-label">margin</span><span class="data-value"
+                    id="dvMarginA">30</span><span class="data-unit">px</span></div>
+            <div class="data-row"><span class="data-label">border</span><span class="data-value"
+                    id="dvBorderA">10</span><span class="data-unit">px</span></div>
+            <div class="data-row"><span class="data-label">padding</span><span class="data-value"
+                    id="dvPaddingA">25</span><span class="data-unit">px</span></div>
+            <div class="data-row"><span class="data-label">content</span><span class="data-value"
+                    id="dvContentWA">180</span><span class="data-unit">×</span><span class="data-value"
+                    id="dvContentHA">100</span><span class="data-unit">px</span></div>
+            <div class="data-row" style="border-top:1px solid #2a2a4a;padding-top:4px;margin-top:2px;">
+                <span class="data-label">总占用</span>
+                <span class="data-value highlight" id="dvTotalSizeA">240×140</span>
+                <span class="data-unit">px</span>
+            </div>
+            <div class="data-row">
+                <span class="data-label">坐标</span>
+                <span class="data-value highlight" id="dvPosA">0, 0</span>
+                <span class="data-unit">px</span>
+            </div>
+        </div>
+
+        <!-- Box B 详细 -->
+        <div class="data-group">
+            <h4 style="color:#c084fc;">Box B</h4>
+            <div class="data-row"><span class="data-label">margin</span><span class="data-value"
+                    id="dvMarginB">30</span><span class="data-unit">px</span></div>
+            <div class="data-row"><span class="data-label">border</span><span class="data-value"
+                    id="dvBorderB">10</span><span class="data-unit">px</span></div>
+            <div class="data-row"><span class="data-label">padding</span><span class="data-value"
+                    id="dvPaddingB">25</span><span class="data-unit">px</span></div>
+            <div class="data-row"><span class="data-label">content</span><span class="data-value"
+                    id="dvContentWB">160</span><span class="data-unit">×</span><span class="data-value"
+                    id="dvContentHB">90</span><span class="data-unit">px</span></div>
+            <div class="data-row" style="border-top:1px solid #2a2a4a;padding-top:4px;margin-top:2px;">
+                <span class="data-label">总占用</span>
+                <span class="data-value highlight" id="dvTotalSizeB">220×130</span>
+                <span class="data-unit">px</span>
+            </div>
+            <div class="data-row">
+                <span class="data-label">坐标</span>
+                <span class="data-value highlight" id="dvPosB">0, 0</span>
+                <span class="data-unit">px</span>
+            </div>
+        </div>
+
+        <!-- 间距信息 -->
+        <div class="data-group">
+            <h4 style="color:#5ade7a;">实际间距</h4>
+            <div class="data-row"><span class="data-label" id="gapLabel">水平间距</span><span class="data-value highlight"
+                    id="dvGap">60</span><span class="data-unit">px</span></div>
+            <div class="data-row" style="margin-top:8px;"><span class="data-label">规则</span><span
+                    style="color:#ccc;font-size:11px;" id="gapRule">margin 之和</span></div>
+        </div>
+
+        <!-- 总布局尺寸 -->
+        <div class="data-group">
+            <h4 style="color:#6db8ff;">总布局尺寸</h4>
+            <div class="data-row"><span class="data-label">总宽度</span><span class="data-value highlight"
+                    id="dvTotalW">530</span><span class="data-unit">px</span></div>
+            <div class="data-row"><span class="data-label">总高度</span><span class="data-value highlight"
+                    id="dvTotalH">220</span><span class="data-unit">px</span></div>
+        </div>
+
+        <!-- 补充说明 -->
+        <div class="data-group" style="min-width:200px;">
+            <h4 style="color:#888;">说明</h4>
+            <div style="font-size:11px;color:#999;line-height:1.5;">
+                “总占用” = (margin + border + padding) × 2 + content<br>
+                “坐标” 为 border-box 左上角相对舞台的位置
+            </div>
+        </div>
+    </div>
+
+    <!-- 控件区域 -->
+    <div class="controls-container">
+        <div class="control-card a">
+            <h3>Box A</h3>
+            <div class="control-group">
+                <label>margin</label>
+                <input type="range" id="slMarginA" min="0" max="80" value="30" step="1">
+                <span class="val" id="valMarginA">30</span>
+            </div>
+            <div class="control-group">
+                <label>border</label>
+                <input type="range" id="slBorderA" min="0" max="30" value="10" step="1">
+                <span class="val" id="valBorderA">10</span>
+            </div>
+            <div class="control-group">
+                <label>padding</label>
+                <input type="range" id="slPaddingA" min="0" max="50" value="25" step="1">
+                <span class="val" id="valPaddingA">25</span>
+            </div>
+            <div class="control-group">
+                <label>宽</label>
+                <input type="range" id="slWidthA" min="60" max="350" value="180" step="1">
+                <span class="val" id="valWidthA">180</span>
+            </div>
+            <div class="control-group">
+                <label>高</label>
+                <input type="range" id="slHeightA" min="40" max="250" value="100" step="1">
+                <span class="val" id="valHeightA">100</span>
+            </div>
+        </div>
+
+        <div class="control-card b">
+            <h3>Box B</h3>
+            <div class="control-group">
+                <label>margin</label>
+                <input type="range" id="slMarginB" min="0" max="80" value="30" step="1">
+                <span class="val" id="valMarginB">30</span>
+            </div>
+            <div class="control-group">
+                <label>border</label>
+                <input type="range" id="slBorderB" min="0" max="30" value="10" step="1">
+                <span class="val" id="valBorderB">10</span>
+            </div>
+            <div class="control-group">
+                <label>padding</label>
+                <input type="range" id="slPaddingB" min="0" max="50" value="25" step="1">
+                <span class="val" id="valPaddingB">25</span>
+            </div>
+            <div class="control-group">
+                <label>宽</label>
+                <input type="range" id="slWidthB" min="60" max="350" value="160" step="1">
+                <span class="val" id="valWidthB">160</span>
+            </div>
+            <div class="control-group">
+                <label>高</label>
+                <input type="range" id="slHeightB" min="40" max="250" value="90" step="1">
+                <span class="val" id="valHeightB">90</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        (function () {
+            const stage = document.getElementById('stage');
+            const boxA = document.getElementById('boxA');
+            const boxB = document.getElementById('boxB');
+            const boxABorder = document.getElementById('boxABorder');
+            const boxAPadding = document.getElementById('boxAPadding');
+            const boxAContent = document.getElementById('boxAContent');
+            const boxBBorder = document.getElementById('boxBBorder');
+            const boxBPadding = document.getElementById('boxBPadding');
+            const boxBContent = document.getElementById('boxBContent');
+
+            // 数据面板 - Box A
+            const dvMarginA = document.getElementById('dvMarginA');
+            const dvBorderA = document.getElementById('dvBorderA');
+            const dvPaddingA = document.getElementById('dvPaddingA');
+            const dvContentWA = document.getElementById('dvContentWA');
+            const dvContentHA = document.getElementById('dvContentHA');
+            const dvTotalSizeA = document.getElementById('dvTotalSizeA');
+            const dvPosA = document.getElementById('dvPosA');
+
+            // 数据面板 - Box B
+            const dvMarginB = document.getElementById('dvMarginB');
+            const dvBorderB = document.getElementById('dvBorderB');
+            const dvPaddingB = document.getElementById('dvPaddingB');
+            const dvContentWB = document.getElementById('dvContentWB');
+            const dvContentHB = document.getElementById('dvContentHB');
+            const dvTotalSizeB = document.getElementById('dvTotalSizeB');
+            const dvPosB = document.getElementById('dvPosB');
+
+            // 其他
+            const dvGap = document.getElementById('dvGap');
+            const gapLabel = document.getElementById('gapLabel');
+            const gapRule = document.getElementById('gapRule');
+            const dvTotalW = document.getElementById('dvTotalW');
+            const dvTotalH = document.getElementById('dvTotalH');
+            const contentSizeA = document.getElementById('contentSizeA');
+            const contentSizeB = document.getElementById('contentSizeB');
+
+            // 滑块
+            const slMarginA = document.getElementById('slMarginA');
+            const slBorderA = document.getElementById('slBorderA');
+            const slPaddingA = document.getElementById('slPaddingA');
+            const slWidthA = document.getElementById('slWidthA');
+            const slHeightA = document.getElementById('slHeightA');
+            const slMarginB = document.getElementById('slMarginB');
+            const slBorderB = document.getElementById('slBorderB');
+            const slPaddingB = document.getElementById('slPaddingB');
+            const slWidthB = document.getElementById('slWidthB');
+            const slHeightB = document.getElementById('slHeightB');
+
+            const valMarginA = document.getElementById('valMarginA');
+            const valBorderA = document.getElementById('valBorderA');
+            const valPaddingA = document.getElementById('valPaddingA');
+            const valWidthA = document.getElementById('valWidthA');
+            const valHeightA = document.getElementById('valHeightA');
+            const valMarginB = document.getElementById('valMarginB');
+            const valBorderB = document.getElementById('valBorderB');
+            const valPaddingB = document.getElementById('valPaddingB');
+            const valWidthB = document.getElementById('valWidthB');
+            const valHeightB = document.getElementById('valHeightB');
+
+            const btnHorizontal = document.getElementById('btnHorizontal');
+            const btnVertical = document.getElementById('btnVertical');
+
+            let currentLayout = 'row';
+
+            window.setLayout = function (direction) {
+                currentLayout = direction;
+                if (direction === 'row') {
+                    stage.style.flexDirection = 'row';
+                    btnHorizontal.classList.add('active');
+                    btnVertical.classList.remove('active');
+                } else {
+                    stage.style.flexDirection = 'column';
+                    btnVertical.classList.add('active');
+                    btnHorizontal.classList.remove('active');
+                }
+                updateMeasurements();
+            };
+
+            function updateCSS() {
+                const ma = parseInt(slMarginA.value);
+                const ba = parseInt(slBorderA.value);
+                const pa = parseInt(slPaddingA.value);
+                const wa = parseInt(slWidthA.value);
+                const ha = parseInt(slHeightA.value);
+                const mb = parseInt(slMarginB.value);
+                const bb = parseInt(slBorderB.value);
+                const pb = parseInt(slPaddingB.value);
+                const wb = parseInt(slWidthB.value);
+                const hb = parseInt(slHeightB.value);
+
+                document.documentElement.style.setProperty('--margin-a', ma + 'px');
+                document.documentElement.style.setProperty('--border-a', ba + 'px');
+                document.documentElement.style.setProperty('--padding-a', pa + 'px');
+                document.documentElement.style.setProperty('--content-w-a', wa + 'px');
+                document.documentElement.style.setProperty('--content-h-a', ha + 'px');
+                document.documentElement.style.setProperty('--margin-b', mb + 'px');
+                document.documentElement.style.setProperty('--border-b', bb + 'px');
+                document.documentElement.style.setProperty('--padding-b', pb + 'px');
+                document.documentElement.style.setProperty('--content-w-b', wb + 'px');
+                document.documentElement.style.setProperty('--content-h-b', hb + 'px');
+
+                boxA.style.margin = ma + 'px';
+                boxABorder.style.borderWidth = ba + 'px';
+                boxAPadding.style.padding = pa + 'px';
+                boxAContent.style.width = wa + 'px';
+                boxAContent.style.height = ha + 'px';
+
+                boxB.style.margin = mb + 'px';
+                boxBBorder.style.borderWidth = bb + 'px';
+                boxBPadding.style.padding = pb + 'px';
+                boxBContent.style.width = wb + 'px';
+                boxBContent.style.height = hb + 'px';
+
+                contentSizeA.textContent = wa + ' × ' + ha;
+                contentSizeB.textContent = wb + ' × ' + hb;
+
+                valMarginA.textContent = ma;
+                valBorderA.textContent = ba;
+                valPaddingA.textContent = pa;
+                valWidthA.textContent = wa;
+                valHeightA.textContent = ha;
+                valMarginB.textContent = mb;
+                valBorderB.textContent = bb;
+                valPaddingB.textContent = pb;
+                valWidthB.textContent = wb;
+                valHeightB.textContent = hb;
+
+                dvMarginA.textContent = ma;
+                dvBorderA.textContent = ba;
+                dvPaddingA.textContent = pa;
+                dvContentWA.textContent = wa;
+                dvContentHA.textContent = ha;
+                dvMarginB.textContent = mb;
+                dvBorderB.textContent = bb;
+                dvPaddingB.textContent = pb;
+                dvContentWB.textContent = wb;
+                dvContentHB.textContent = hb;
+
+                // 总占用尺寸（margin-box 尺寸）
+                const totalWidthA = ma * 2 + ba * 2 + pa * 2 + wa;
+                const totalHeightA = ma * 2 + ba * 2 + pa * 2 + ha;
+                dvTotalSizeA.textContent = totalWidthA + '×' + totalHeightA;
+
+                const totalWidthB = mb * 2 + bb * 2 + pb * 2 + wb;
+                const totalHeightB = mb * 2 + bb * 2 + pb * 2 + hb;
+                dvTotalSizeB.textContent = totalWidthB + '×' + totalHeightB;
+            }
+
+            function updateMeasurements() {
+                requestAnimationFrame(() => {
+                    const stageRect = stage.getBoundingClientRect();
+                    const rectA = boxA.getBoundingClientRect();
+                    const rectB = boxB.getBoundingClientRect();
+
+                    // 坐标（border-box 左上角相对于 stage 的 padding box）
+                    const posAX = Math.round(rectA.left - stageRect.left);
+                    const posAY = Math.round(rectA.top - stageRect.top);
+                    const posBX = Math.round(rectB.left - stageRect.left);
+                    const posBY = Math.round(rectB.top - stageRect.top);
+                    dvPosA.textContent = posAX + ', ' + posAY;
+                    dvPosB.textContent = posBX + ', ' + posBY;
+
+                    let gap, totalW, totalH;
+                    if (currentLayout === 'row') {
+                        gap = Math.round(rectB.left - rectA.right);
+                        gapLabel.textContent = '水平间距';
+                        gapRule.textContent = 'margin 之和 (正 margin 推离)';
+                        totalW = Math.round(Math.max(rectA.right, rectB.right) - Math.min(rectA.left, rectB.left));
+                        totalH = Math.round(Math.max(rectA.bottom, rectB.bottom) - Math.min(rectA.top, rectB.top));
+                    } else {
+                        gap = Math.round(rectB.top - rectA.bottom);
+                        gapLabel.textContent = '垂直间距';
+                        gapRule.textContent = 'margin 折叠 (取较大值)';
+                        totalH = Math.round(Math.max(rectA.bottom, rectB.bottom) - Math.min(rectA.top, rectB.top));
+                        totalW = Math.round(Math.max(rectA.right, rectB.right) - Math.min(rectA.left, rectB.left));
+                    }
+
+                    dvGap.textContent = gap;
+                    dvTotalW.textContent = totalW;
+                    dvTotalH.textContent = totalH;
+                });
+            }
+
+            const sliders = [
+                slMarginA, slBorderA, slPaddingA, slWidthA, slHeightA,
+                slMarginB, slBorderB, slPaddingB, slWidthB, slHeightB
+            ];
+            sliders.forEach(sl => {
+                sl.addEventListener('input', () => {
+                    updateCSS();
+                    updateMeasurements();
+                });
+            });
+
+            updateCSS();
+            setTimeout(updateMeasurements, 50);
+            window.addEventListener('resize', updateMeasurements);
+        })();
+    </script>
+</body>
+
+</html>
