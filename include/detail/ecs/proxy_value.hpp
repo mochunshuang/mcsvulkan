@@ -13,13 +13,14 @@ namespace mcs::vulkan::ecs
         using value_type = Store::value_type;
         using id_type = Store::id_type;
 
-        constexpr proxy_value(Store &store, id_type id) noexcept : store_{&store}, id_{id}
+        constexpr proxy_value(Store &store, id_type id) noexcept
+            : store_{&store}, entity_{id}
         {
         }
         proxy_value(const proxy_value &) = delete;
         proxy_value &operator=(const proxy_value &) = delete;
         constexpr proxy_value(proxy_value &&o) noexcept
-            : store_{std::exchange(o.store_, {})}, id_{std::exchange(o.id_, {})}
+            : store_{std::exchange(o.store_, {})}, entity_{std::exchange(o.entity_, {})}
         {
         }
         constexpr proxy_value &operator=(proxy_value &&o) noexcept
@@ -28,7 +29,7 @@ namespace mcs::vulkan::ecs
             {
                 release();
                 store_ = std::exchange(o.store_, {});
-                id_ = std::exchange(o.id_, {});
+                entity_ = std::exchange(o.entity_, {});
             }
             return *this;
         }
@@ -36,10 +37,10 @@ namespace mcs::vulkan::ecs
         {
             if (store_ != nullptr)
             {
-                store_->destroy_at(id_);
-                store_->release(id_);
+                store_->destroy_at(entity_);
+                store_->release(entity_);
                 store_ = {};
-                id_ = {};
+                entity_ = {};
             }
         }
         constexpr ~proxy_value() noexcept
@@ -49,12 +50,12 @@ namespace mcs::vulkan::ecs
         constexpr decltype(auto) operator*() noexcept
         {
             assert(store_ != nullptr);
-            return (*store_)[id_]; // 直接物理访问
+            return (*store_)[entity_]; // 直接物理访问
         }
         constexpr decltype(auto) operator*() const noexcept
         {
             assert(store_ != nullptr);
-            return static_cast<const Store &>(*store_)[id_];
+            return static_cast<const Store &>(*store_)[entity_];
         }
         constexpr operator bool() const noexcept // NOLINT
         {
@@ -82,7 +83,8 @@ namespace mcs::vulkan::ecs
         constexpr value_type value() const
         {
             assert(store_ != nullptr);
-            return to_value_type<value_type>(static_cast<const Store &>(*store_)[id_]);
+            return to_value_type<value_type>(
+                static_cast<const Store &>(*store_)[entity_]);
         }
         constexpr std::optional<value_type> try_value() const // NOLINT
         {
@@ -90,9 +92,19 @@ namespace mcs::vulkan::ecs
                 return std::nullopt;
             return value();
         }
+        constexpr void set_value(value_type val) noexcept(true) // NOLINT
+        {
+            assert(store_ != nullptr);
+            store_->construct_at(entity_, std::move(val));
+        }
+
+        constexpr id_type entity() const noexcept
+        {
+            return entity_;
+        }
 
       private:
         Store *store_;
-        id_type id_;
+        id_type entity_;
     };
 }; // namespace mcs::vulkan::ecs

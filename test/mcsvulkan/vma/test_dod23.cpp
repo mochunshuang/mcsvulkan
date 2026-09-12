@@ -3848,8 +3848,12 @@ try
         {
             static uint32_t fn =
                 hoverPool().bind([](picking_result r, bool enter) noexcept {
-                    assert(r.key.object_type == GlyphPool::value_type::type_id);
                     uint64_t ptr = glyphPool().template get<"data">(r.key.entity_index);
+                    std::println(
+                        "[Render-HOVER] type={} entity={} primitive={} {} (hover_fn={})",
+                        r.key.object_type, r.key.entity_index, r.primitive_id,
+                        enter ? "ENTER" : "LEAVE", r.hover_fn);
+
                     auto *node = reinterpret_cast<ui::Node *>(ptr);
                     auto *render = dynamic_cast<Render *>(node->renderData.get());
                     if (render)
@@ -3871,6 +3875,9 @@ try
             auto *data_ptr = dynamic_cast<Render *>(self->renderData.get());
             if (!data_ptr)
                 return;
+
+            // ---- 1. 释放上一帧的代理 ----
+            data_ptr->textGlyphProxies.clear();
 
             const auto &viewports = context.drawRecorder.currentDynamic.viewports;
             if (viewports.empty())
@@ -3963,10 +3970,15 @@ try
                                 positions[i].x - g.plane_bounds.left * fontSizePx;
                             float baselineY =
                                 positions[i].y + g.plane_bounds.top * fontSizePx;
-                            instances.push_back(make_glyph_instance(
+
+                            auto entity_index = glyphPool().allocate();
+                            shader_data::Glyph glyph = make_glyph_instance(
                                 g, windowWidth, windowHeight, fontSizePx, cursorX,
-                                baselineY, reinterpret_cast<uint64_t>(self), 0, ~0U,
-                                glm::vec4(1.0f), 1));
+                                baselineY, reinterpret_cast<uint64_t>(self), entity_index,
+                                hover_fn(), glm::vec4(1.0f), 1);
+                            auto proxy = glyphPool().make_soa_value(entity_index, glyph);
+                            data_ptr->textGlyphProxies.push_back(std::move(proxy));
+                            instances.push_back(std::move(glyph));
                         }
                         if (!instances.empty())
                             context.drawRecorder.addInstances(
@@ -4005,10 +4017,14 @@ try
                                 cursorX += g.advance_x * fontSizePx;
                                 continue;
                             }
-                            instances.push_back(make_glyph_instance(
+                            auto entity_index = glyphPool().allocate();
+                            shader_data::Glyph glyph = make_glyph_instance(
                                 g, windowWidth, windowHeight, fontSizePx, cursorX,
-                                baselineY, reinterpret_cast<uint64_t>(self), 0, ~0U,
-                                glm::vec4(1.0f), 1));
+                                baselineY, reinterpret_cast<uint64_t>(self), entity_index,
+                                hover_fn(), glm::vec4(1.0f), 1);
+                            auto proxy = glyphPool().make_soa_value(entity_index, glyph);
+                            data_ptr->textGlyphProxies.push_back(std::move(proxy));
+                            instances.push_back(std::move(glyph));
                             cursorX += g.advance_x * fontSizePx;
                         }
                     }
@@ -4045,7 +4061,6 @@ try
         // NOTE: 写入GPU数据，就算启动了
         void render(ui::render_context &context)
         {
-
             const auto dfs = [&](this auto &self, ui::Node *node) {
                 if (!node || !node->renderData)
                     return;

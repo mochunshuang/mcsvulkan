@@ -39,11 +39,16 @@ namespace mcs::vulkan::ecs
 
         // 自动扩容版本的 make_soa_value，返回 proxy_value 而非 optional
         template <typename... Args>
-        constexpr proxy_value<soa_vector> make_soa_value(Args &&...args)
+        constexpr proxy_value<soa_vector> make_soa_value(size_type id, Args &&...args)
+            requires(requires() { this->construct_at(id, std::forward<Args>(args)...); })
         {
-            size_type id = allocate();
             this->construct_at(id, std::forward<Args>(args)...);
             return proxy_value<soa_vector>(*this, id);
+        }
+        template <typename... Args>
+        constexpr proxy_value<soa_vector> make_soa_value(Args &&...args)
+        {
+            return make_soa_value(allocate(), std::forward<Args>(args)...);
         }
 
         // 可选：try_make_soa_value，返回 optional<proxy_value>
