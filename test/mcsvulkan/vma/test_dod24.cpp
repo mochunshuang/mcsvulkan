@@ -336,13 +336,119 @@ namespace std
     };
 }; // namespace std
 static_assert(sizeof(object_key) == 2 * sizeof(uint32_t));
+
+template <std::size_t Bits>
+class render_version
+{
+    static_assert(Bits >= 1 && Bits <= 32,
+                  "render_version: bit width must be in [1, 32]");
+
+  public:
+    // ── 最佳底层 uint 类型 ────────────────────────────────
+    //   Bits <=  8 → uint8_t
+    //   Bits <= 16 → uint16_t
+    //   Bits <= 32 → uint32_t
+    template <std::size_t B>
+    using best_uint_t =
+        std::conditional_t<(B <= 8), std::uint8_t,
+                           std::conditional_t<(B <= 16), std::uint16_t, std::uint32_t>>;
+
+    using underlying_t = best_uint_t<Bits>;
+
+    static constexpr std::size_t bit_width = Bits;
+
+    // ── 掩码：全 1 ────────────────────────────────────────
+    //   用 lambda + if constexpr 避开 `1u << 32` 的 UB
+    static constexpr underlying_t mask = [] {
+        if constexpr (Bits >= 32)
+            return static_cast<underlying_t>(~std::uint32_t{0});
+        else
+            return static_cast<underlying_t>((std::uint32_t{1} << Bits) - 1u);
+    }();
+
+    // ── 构造 ─────────────────────────────────────────────
+    constexpr render_version() noexcept = default;
+
+    // 从外部整数导入：自动按 mask 截断
+    constexpr explicit render_version(std::uint32_t v) noexcept
+        : value_{static_cast<underlying_t>(v & mask)}
+    {
+    }
+
+    // ── 自增：到 mask 后回绕到 0，永不越界 ────────────────
+    constexpr render_version &operator++() noexcept
+    {
+        value_ = static_cast<underlying_t>((value_ + 1u) & mask);
+        return *this;
+    }
+    constexpr render_version operator++(int) noexcept
+    {
+        auto old = *this;
+        ++*this;
+        return old;
+    }
+
+    // ── 隐式转换到最佳 uint 类型 ──────────────────────────
+    [[nodiscard]] constexpr operator underlying_t() const noexcept
+    {
+        return value_;
+    }
+
+    // 显式取 uint32（打包用）
+    [[nodiscard]] constexpr std::uint32_t to_u32() const noexcept
+    {
+        return static_cast<std::uint32_t>(value_);
+    }
+
+    [[nodiscard]] constexpr bool operator==(const render_version &) const noexcept =
+        default;
+
+  private:
+    underlying_t value_ = 0;
+};
+using render_version_t = render_version<16>; // 16 位版本号
 // picking_result：与 R32G32B32A32_UINT 附件 + frag 的 uvec4 输出严格对齐（16B）
 // xy = object_key(type_id, entity_index) 外键；z = primitive_id；w = hover_fn（池实体下标，0xFFFFFFFF = 未绑定）
 struct picking_result
 {
-    object_key key;        // outPicking.xy
-    uint32_t primitive_id; // outPicking.z
-    uint32_t hover_fn;     // outPicking.w：hover 函数池实体下标（0xFFFFFFFF = 未绑定）
+    // ── 位分配：由 version_t 的 bit_width 推导出 primitive 位宽 ──
+    using version_t = render_version_t; // 例如 render_version<16>
+    static constexpr std::size_t version_bits = version_t::bit_width;
+    static constexpr std::size_t total_bits = 32;
+    static constexpr std::size_t primitive_bits = total_bits - version_bits;
+
+    static_assert(primitive_bits >= 1 && primitive_bits < total_bits,
+                  "picking_result: version_t leaves no room for primitive_id");
+
+    // ── primitive_id 的返回类型同样按位宽选 ─────────────────
+    using primitive_t = version_t::template best_uint_t<primitive_bits>;
+
+    // ── 掩码 ────────────────────────────────────────────────
+    static constexpr std::uint32_t primitive_mask =
+        (std::uint32_t{1} << primitive_bits) - 1u;
+
+    // ── 数据 ────────────────────────────────────────────────
+    object_key key; // outPicking.xy
+    std::uint32_t
+        packed; // outPicking.z：高 version_bits=版本，低 primitive_bits=primitive_id
+    std::uint32_t hover_fn; // outPicking.w
+
+    // ── 读取 ────────────────────────────────────────────────
+    [[nodiscard]] constexpr primitive_t primitive_id() const noexcept
+    {
+        return static_cast<primitive_t>(packed & primitive_mask);
+    }
+    [[nodiscard]] constexpr version_t::underlying_t render_version() const noexcept
+    {
+        return version_t{packed >> version_bits}; // 构造时内部会再 mask 一次
+    }
+
+    // ── 写入（shader 侧对应同一个 pack 逻辑）────────────────
+    static constexpr std::uint32_t pack(version_t v, primitive_t p) noexcept
+    {
+        return (v.to_u32() << version_bits) |
+               (static_cast<std::uint32_t>(p) & primitive_mask);
+    }
 };
 static_assert(sizeof(picking_result) == 16);
 //diff: [test_dod16] end
@@ -376,6 +482,7 @@ struct PushData
     uint64_t instanceAddress;         // 全局实例堆地址（shader: dataAddress）
     uint64_t commandConstantsAddress; // 命令常量缓冲区地址
     uint32_t cameraIndex;             // 0: 3D, 1: UI
+    uint32_t renderVersion = 0;       // 渲染的版本。picking跨帧需要版本来过滤就版本
     bool operator==(const PushData &o) const noexcept = default;
     constexpr bool valid() const noexcept
     {
@@ -504,6 +611,11 @@ namespace shader_data
         static constexpr auto hover_enter = true;
         picking_result cur{object_key{0xFFFFFFFF, 0}, 0,
                            0}; // 当前命中（key 无效 = 未悬停）
+
+        constexpr void reset() noexcept
+        {
+            cur = {object_key{0xFFFFFFFF, 0}, 0, 0};
+        }
 
         constexpr void hover(const picking_result &r, hover_pool &pool) noexcept
         {
@@ -2310,7 +2422,8 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
             .setCreateInfo(
                 {.setLayouts = {*descriptorSetLayout},
                  // diff: [test_dod8] 推送常量传说地址更快，没有绑定的开销？
-                 .pushConstantRanges = {{.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+                 .pushConstantRanges = {{.stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
+                                                       VK_SHADER_STAGE_FRAGMENT_BIT,
                                          .offset = 0,
                                          .size = sizeof(PushData)}}})
             .build(device);
@@ -2757,16 +2870,17 @@ namespace ui_new
     };
     struct ScreenWidget
     {
+        constexpr render_version_t::underlying_t renderVersion() const noexcept { return renderVersion_ + static_cast<uint8_t>(versionDirty_);}
 
         constexpr void makeLayoutDirty(uint32_t frame) noexcept
-        { layoutDirty_[frame] = true; }
+        { layoutDirty_[frame] = true; makeVersionDirty(); }
         constexpr void clearLayoutDirty(uint32_t frame) noexcept
         { layoutDirty_[frame] = false; }
         constexpr bool isLayoutDirty(uint32_t frame) const noexcept
         { return layoutDirty_[frame]; }
 
         constexpr void makeRenderDirty(uint32_t frame) noexcept
-        { renderDirty_[frame] = true; }
+        { renderDirty_[frame] = true; makeVersionDirty();}
         constexpr void clearRenderDirty(uint32_t frame) noexcept
         { renderDirty_[frame] = false; }
         constexpr bool isRenderDirty(uint32_t frame) const noexcept
@@ -2781,9 +2895,11 @@ namespace ui_new
                 ptr->updateOffset({0,0});
             }
         }
-        constexpr void updateSize(double width,double height)
+        constexpr void updateSize(double width, double height) noexcept
         {
-            size_ = {width,height};
+            if (size_.width == width && size_.height == height)
+                return;
+            size_ = {width, height};
             for (std::size_t f = 0; f < MAX_FRAMES_IN_FLIGHT; ++f)
                 makeLayoutDirty(f);
         }
@@ -2813,14 +2929,17 @@ namespace ui_new
                 layout();
                 render(context);
 
+
                 clearLayoutDirty(frame);
                 clearRenderDirty(frame);
+                toNextRenderVersion();
                 return;
             }
             if(isRenderDirty(frame))
             {
                 render(context); //NOTE: 布局不变，仅仅是数据渲染更新
                 clearRenderDirty(frame);
+                toNextRenderVersion();
                 return;
             }
         }
@@ -2863,6 +2982,11 @@ namespace ui_new
         std::array<bool, MAX_FRAMES_IN_FLIGHT> renderDirty_;
         Size size_;
         std::unique_ptr<Widget> root_;
+        render_version_t renderVersion_{};   // 默认 0
+        bool versionDirty_ = false;
+        constexpr void makeVersionDirty() noexcept { versionDirty_ = true; }
+        constexpr void clearVersionDirty() noexcept { versionDirty_ = false; }
+        constexpr void toNextRenderVersion() noexcept { renderVersion_ = render_version_t{renderVersion()};clearVersionDirty(); }
     };
 
     // clang-format on
@@ -6298,7 +6422,23 @@ namespace my_ui
 
         explicit TextRenderObject(std::string s) : text(std::move(s)) {}
 
-        static uint32_t hover_fn();
+        // NOTE: 唯一性。渲染的时候，走这个返回值fn的函数，就注定解析hover数据
+        static uint32_t hover_fn()
+        {
+            static uint32_t fn = hoverPool().bind([](picking_result r,
+                                                     bool enter) noexcept {
+                // NOTE:
+                uint64_t ptr = glyphPool().template get<"data">(r.key.entity_index);
+                std::println("[Text-HOVER] type={} entity={} primitive={} ver={} {} "
+                             "(hover_fn={})",
+                             r.key.object_type, r.key.entity_index, r.primitive_id(),
+                             r.render_version(), enter ? "ENTER" : "LEAVE", r.hover_fn);
+
+                auto *render = reinterpret_cast<TextRenderObject *>(ptr);
+                std::println("text: {}", render->text);
+            });
+            return fn;
+        }
 
         void render(ui_new::ScreenWidget *screen, ui_new::Widget *owner,
                     render_context &context) override
@@ -6383,7 +6523,8 @@ namespace my_ui
                 return glyph;
             };
 
-            const uint64_t data_ptr = reinterpret_cast<uint64_t>(owner);
+            const uint64_t data_ptr =
+                reinterpret_cast<uint64_t>(owner->renderObject.get());
             const uint32_t hfn = hover_fn();
 
             // ================= 第一块：五位置单字符 =================
@@ -6500,28 +6641,6 @@ namespace my_ui
             return {};
         }
     };
-
-    inline uint32_t TextRenderObject::hover_fn()
-    {
-        static uint32_t fn = hoverPool().bind([](picking_result r, bool enter) noexcept {
-            uint64_t ptr = glyphPool().template get<"data">(r.key.entity_index);
-            std::println("[Text-HOVER] type={} entity={} primitive={} {} (hover_fn={})",
-                         r.key.object_type, r.key.entity_index, r.primitive_id,
-                         enter ? "ENTER" : "LEAVE", r.hover_fn);
-
-            auto *widget = reinterpret_cast<ui_new::Widget *>(ptr);
-            if (!widget)
-                return;
-            auto *box = dynamic_cast<TextBoxWidget *>(widget);
-            if (!box)
-                return;
-            auto *render = dynamic_cast<TextRenderObject *>(box->renderObject.get());
-            if (!render)
-                return;
-            std::println("text: {}", render->text);
-        });
-        return fn;
-    }
 } // namespace my_ui
 
 //diff: [test_dod24.cpp] end [替换旧的布局，并更新录制的算法]
@@ -6703,7 +6822,7 @@ try
     // 测试绑定：所有字形共享同一个 hover 函数（演示"函数可被共享"）
     uint32_t testHover = hoverPool().bind([](picking_result r, bool enter) noexcept {
         std::println("[HOVER] type={} entity={} primitive={} {} (hover_fn={})",
-                     r.key.object_type, r.key.entity_index, r.primitive_id,
+                     r.key.object_type, r.key.entity_index, r.primitive_id(),
                      enter ? "ENTER" : "LEAVE", r.hover_fn);
     });
 
@@ -7281,7 +7400,8 @@ try
                                 .instanceAddress = recorder.globalHeapBuffer.address,
                                 .commandConstantsAddress =
                                     recorder.commandConstantsBuffer.address,
-                                .cameraIndex = 1};
+                                .cameraIndex = 1,
+                                .renderVersion = screen.renderVersion()};
                 // ---------- 设置初始化状态 ----------
                 recorder.setPipeline(*mainCtx.pipelineTransparentUI);
                 recorder.setLayout(*mainCtx.pipelineLayout);
@@ -7412,6 +7532,8 @@ try
         auto &resolveResource = pickCtx.resolveResource;
         auto &pickMouse = pickCtx.mouse;
 
+        auto &screen = soaCtx.screen;
+
         surface.waitGoodFramebufferSize();
         device.waitIdle();
 
@@ -7419,6 +7541,8 @@ try
         auto newExtent = swapchain.refImageExtent();
         VkExtent3D imageExtent = {
             .width = newExtent.width, .height = newExtent.height, .depth = 1};
+
+        screen.updateSize(newExtent.width, newExtent.height);
 
         msaaResource = msaaResourcesBuild.setCreateInfoExtent(imageExtent).build(device);
         depthResource =
@@ -7577,15 +7701,24 @@ try
                              auto *data = static_cast<picking_result *>(
                                  pickingFrames[readIdx].mapPtr());
                              picking_result r = *data;
+                             // ★ 版本不匹配 → 旧世界的 picking，作废悬停状态，丢弃
+                             if (r.render_version() != soaCtx.screen.renderVersion())
+                             {
+                                 world.hoverManager.reset();
+                                 return;
+                             }
+
                              if (!pickMouse.valid)
                                  r.key.object_type =
                                      0xFFFFFFFF; // 光标不在窗口 = 无命中（自动 leave）
+
                              // [PICKDBG] 定位用：每帧打印 GPU 回读原始值（可删）
-                             std::println(
-                                 "[PICKDBG] frame={} valid={} type={:#x} entity={} "
-                                 "primitive={} hover_fn={}",
-                                 currentFrame, pickMouse.valid, r.key.object_type,
-                                 r.key.entity_index, r.primitive_id, r.hover_fn);
+                             std::println("[PICKDBG] frame={} valid={} type={:#x} "
+                                          "entity={} primitive={} ver={} hover_fn={}",
+                                          currentFrame, pickMouse.valid,
+                                          r.key.object_type, r.key.entity_index,
+                                          r.primitive_id(), r.render_version(),
+                                          r.hover_fn);
                              world.hoverManager.hover(r, world.hoverPool);
                              //diff: [test_dod19] end
                          }

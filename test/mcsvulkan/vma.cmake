@@ -184,7 +184,7 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_dod23 test_dod22.vert test_dod22.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
-add_std_glsl_target(test_dod24 test_dod22.vert test_dod22.frag)
+add_std_glsl_target(test_dod24 test_dod24.vert test_dod24.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
 add_std_glsl_target(test_viewport test_sdf.vert test_sdf.frag)
