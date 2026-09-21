@@ -133,6 +133,8 @@ namespace mcs::vulkan::conn
             requires(valid_signal_args<signal_key, Args...>)
         constexpr void emit(Args... args)
         {
+            if (signal_slot_map.empty())
+                return;
             auto it = signal_slot_map.find(object_id::make_signal_id<signal_key>());
             if (it != signal_slot_map.end())
             {
@@ -161,6 +163,7 @@ namespace mcs::vulkan::conn
             return detail::slot_function_type_string(slot_impl<Rcvr, slot_type>::id_type);
         }
 
+        // -------- 3 参数版本：继承风格（保持原有调用点不变）--------
         template <typename signal_key, std::derived_from<connect_object> Rcvr,
                   typename slot_type>
             requires(valid_traits_slot<traits_slot<slot_type>> &&
@@ -168,7 +171,18 @@ namespace mcs::vulkan::conn
         constexpr static auto connect(connect_object *sndr, Rcvr *recr,
                                       slot_type slot) noexcept -> connect_ptr *
         {
-            // NOTE: 多线程需要保持线程安全
+            return connect<signal_key>(sndr, recr, static_cast<connect_object *>(recr),
+                                       std::move(slot));
+        }
+
+        // -------- 4 参数版本：组合风格（新增，唯一真正实现）--------
+        template <typename signal_key, typename Rcvr, typename slot_type>
+            requires(valid_traits_slot<traits_slot<slot_type>> &&
+                     valid_signal<signal_key> && signal_slot_match<signal_key, slot_type>)
+        constexpr static auto connect(connect_object *sndr_hub, Rcvr *recr,
+                                      connect_object *rcvr_hub, slot_type slot) noexcept
+            -> connect_ptr *
+        {
             slot_interface *s =
                 new (std::nothrow) slot_impl<Rcvr, slot_type>{recr, std::move(slot)};
             if (s == nullptr)
@@ -183,17 +197,16 @@ namespace mcs::vulkan::conn
 
             try
             {
-                static_cast<connect_object *>(recr)->as_rcvr().connect_sndr(shared);
-                sndr->as_sndr().connect_rcvr(object_id::make_signal_id<signal_key>(),
-                                             shared);
+                rcvr_hub->as_rcvr().connect_sndr(shared);
+                sndr_hub->as_sndr().connect_rcvr(object_id::make_signal_id<signal_key>(),
+                                                 shared);
                 return shared;
             }
             catch (...)
             {
-                sndr->as_sndr().unsafe_remove_by_sndr(
+                sndr_hub->as_sndr().unsafe_remove_by_sndr(
                     object_id::make_signal_id<signal_key>(), shared);
-                static_cast<connect_object *>(recr)->as_rcvr().unsafe_remove_by_rcvr(
-                    shared);
+                rcvr_hub->as_rcvr().unsafe_remove_by_rcvr(shared);
                 delete s;
                 delete shared;
                 return nullptr;
@@ -209,6 +222,91 @@ namespace mcs::vulkan::conn
             assert(not slot->rcvr_hold());
             sndr->as_sndr().disconnect_sndr(object_id::make_signal_id<signal_key>(),
                                             slot);
+        }
+
+      private:
+        constexpr connect_ptr *find_existing(object_id sig, const void *tag, // NOLINT
+                                             const void *recvr) noexcept
+        {
+            auto it = signal_slot_map.find(sig);
+            if (it == signal_slot_map.end())
+                return nullptr;
+            for (connect_ptr *p : it->second)
+            {
+                if (not p->rcvr_hold()) // 孤儿：slot_ 已删，跳过
+                    continue;
+                if (p->slot()->matches(tag, recvr))
+                    return p;
+            }
+            return nullptr;
+        }
+
+        constexpr void erase_matching(object_id sig, const void *tag, // NOLINT
+                                      const void *recvr,
+                                      connect_object *rcvr_hub) noexcept
+        {
+            auto it = signal_slot_map.find(sig);
+            if (it == signal_slot_map.end())
+                return;
+
+            // 1. 先收集匹配指针，避免迭代中修改 vec
+            std::vector<connect_ptr *> victims;
+            for (connect_ptr *p : it->second)
+            {
+                if (not p->rcvr_hold())
+                    continue; // 孤儿交给过期清理
+                if (p->slot()->matches(tag, recvr))
+                    victims.push_back(p);
+            }
+
+            // 2. 逐个按现有两条路径清
+            for (connect_ptr *p : victims)
+            {
+                rcvr_hub->as_rcvr().disconnect_rcvr(p); // rcvr 侧 erase + 2→1
+                disconnect_sndr(sig, p);                // sndr 侧 erase + 1→0
+            }
+        }
+
+      public:
+        /*
+        // 追加（默认，对齐 Qt）
+        connect<Sig>(&sndr, &recvr, &rcvr_hub, slot);
+
+        // 去重（对齐 Qt::UniqueConnection）
+        connect_unique<Sig>(&sndr, &recvr, &rcvr_hub, slot);
+
+        // 替换全部（对齐 disconnect + connect 的糖）
+        connect_replace<Sig>(&sndr, &recvr, &rcvr_hub, slot);
+        */
+        // 去重：四元组命中 → 返回旧句柄，新 lambda 不构造
+        template <typename signal_key, typename Rcvr, typename slot_type>
+            requires(valid_traits_slot<traits_slot<slot_type>> &&
+                     valid_signal<signal_key> && signal_slot_match<signal_key, slot_type>)
+        constexpr static auto connect_unique(connect_object *sndr_hub, // NOLINT
+                                             Rcvr *recr, connect_object *rcvr_hub,
+                                             slot_type slot) noexcept -> connect_ptr *
+        {
+            const void *tag =
+                &object_id::signal_id_tag<slot_impl<Rcvr, slot_type>>::instance;
+            if (auto *p = sndr_hub->as_sndr().find_existing(
+                    object_id::make_signal_id<signal_key>(), tag, recr))
+                return p;
+            return connect<signal_key>(sndr_hub, recr, rcvr_hub, std::move(slot));
+        }
+
+        // 替换：四元组下全部清掉，只留新建的 1 个
+        template <typename signal_key, typename Rcvr, typename slot_type>
+            requires(valid_traits_slot<traits_slot<slot_type>> &&
+                     valid_signal<signal_key> && signal_slot_match<signal_key, slot_type>)
+        constexpr static auto connect_replace(connect_object *sndr_hub, // NOLINT
+                                              Rcvr *recr, connect_object *rcvr_hub,
+                                              slot_type slot) noexcept -> connect_ptr *
+        {
+            const void *tag =
+                &object_id::signal_id_tag<slot_impl<Rcvr, slot_type>>::instance;
+            sndr_hub->as_sndr().erase_matching(object_id::make_signal_id<signal_key>(),
+                                               tag, recr, rcvr_hub);
+            return connect<signal_key>(sndr_hub, recr, rcvr_hub, std::move(slot));
         }
     };
 

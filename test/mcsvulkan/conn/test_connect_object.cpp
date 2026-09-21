@@ -1,6 +1,6 @@
 #include <iostream>
 
-#include "../head.hpp"
+#include "head.hpp"
 
 #include <chrono>
 #include <print>
@@ -44,6 +44,24 @@ void test_slot_ptr()
         }
         int value{-1};
     };
+    {
+        using namespace mcs::vulkan::conn;
+
+        using slot_t = decltype(&my_slot::onClick);
+
+        // 1. 槽本身是否合法（能被 traits_slot 认领）
+        static_assert(valid_traits_slot<traits_slot<slot_t>>,
+                      "slot 不合法：检查 void / noexcept / 参数形态");
+
+        // 2. 信号本身是否合法
+        static_assert(
+            valid_signal<my_signal::signal_click>,
+            "signal_key 不合法：必须是 void(Args...) 或 void(Args...) noexcept");
+
+        // 3. 槽和信号是否匹配（args_tuple 完全一致）
+        static_assert(signal_slot_match<my_signal::signal_click, slot_t>,
+                      "slot 和 signal 参数不匹配");
+    }
     // c0: lambda
 
     {
@@ -166,9 +184,9 @@ void test_compile_time_overhead()
 
     struct TestSlot : connect_object
     {
-        void slot_one(this TestSlot &slef, int) noexcept {}
-        void slot_two(this TestSlot &slef, int, double) noexcept {}
-        void slot_three(this TestSlot &slef, int, double, const char *) noexcept {}
+        void slot_one(this TestSlot &, int) noexcept {}
+        void slot_two(this TestSlot &, int, double) noexcept {}
+        void slot_three(this TestSlot &, int, double, const char *) noexcept {}
     };
 
     TestSignal signal;

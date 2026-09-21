@@ -41,6 +41,10 @@ namespace mcs::vulkan::conn
         connect_ptr(connect_ptr &&) = delete;
         connect_ptr &operator=(connect_ptr &&) = delete;
         ~connect_ptr() = default;
+        [[nodiscard]] constexpr slot_interface *slot() const noexcept
+        {
+            return slot_;
+        }
 
       private:
         int ref_count_{MAX_COUNT}; // NOLINT

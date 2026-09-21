@@ -2,6 +2,7 @@
 
 #include "slot_interface.hpp"
 #include "traits_slot.hpp"
+#include "object_id.hpp"
 #include <functional>
 #include <type_traits>
 
@@ -72,6 +73,14 @@ namespace mcs::vulkan::conn
                     }
                 }(std::make_index_sequence<args_size>{});
             }
+        }
+
+        [[nodiscard]] constexpr bool matches(const void *slot_type_tag, // NOLINT
+                                             const void *receiver) const noexcept override
+        {
+            return slot_type_tag ==
+                       &object_id::signal_id_tag<slot_impl<Rcvr, slot_type>>::instance &&
+                   receiver == static_cast<const void *>(rcvr_);
         }
 
         constexpr slot_impl(Rcvr *rcvr, slot_type slot) noexcept
