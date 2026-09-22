@@ -116,14 +116,20 @@ namespace mcs::vulkan::conn
         }
 
       public:
-        connect_object() = default;
-        constexpr ~connect_object() noexcept
+        // 单端清理。延迟释放共享连接
+        constexpr void clearConnection() noexcept
         {
             as_rcvr_destroy();
             as_sndr_destroy();
         }
-        connect_object(connect_object &&) = default;
-        connect_object &operator=(connect_object &&) = default;
+        connect_object() = default;
+        constexpr ~connect_object() noexcept
+        {
+            clearConnection();
+        }
+        //NOTE: 组合的时候，连接可能需要重置+重建。这个时候旧连接可能被当前挂载的宿主使用
+        connect_object(connect_object &&) = delete;
+        connect_object &operator=(connect_object &&) = delete;
 
         connect_object(const connect_object &) = delete;
         connect_object &operator=(const connect_object &) = delete;
