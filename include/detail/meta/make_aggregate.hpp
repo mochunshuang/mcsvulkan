@@ -109,7 +109,7 @@ namespace mcs::vulkan::meta
 
         template <static_string m_fn>
             requires(gen_type::find_name(m_fn) != -1)
-        decltype(auto) invoke(this auto &&self, auto... args)
+        decltype(auto) invoke(this auto &&self, auto &&...args)
         {
             constexpr auto I = gen_type::find_name(m_fn);
             return self.[:members[I]:](std::forward<decltype(self)>(self),

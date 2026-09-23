@@ -6643,6 +6643,112 @@ namespace my_ui
     };
 } // namespace my_ui
 
+namespace my_ui2
+{
+    using GlyphPool = std::remove_reference_t<decltype(glyphPool())>;
+
+    // ============================================================
+    // 能力探测：Agg 里同时有 "hover" 和 "hover_fn" 才算有 hover
+    // ============================================================
+    template <class Agg>
+    concept has_hover = requires(Agg &a) {
+        a.template invoke<"hover">(picking_result{}, false);
+        a.hover_fn;
+    };
+
+    // ============================================================
+    // Base：所有 widget 桥接的共同骨架，不提 hover 一字
+    // ============================================================
+    template <class Agg>
+    struct WidgetBridgeBase : ui_new::Widget
+    {
+        Agg agg;
+
+        struct RenderObjectImpl : ui_new::RenderObject
+        {
+            WidgetBridgeBase *owner;
+
+            explicit RenderObjectImpl(WidgetBridgeBase *o) noexcept : owner(o) {}
+
+            void render(ui_new::ScreenWidget *s, ui_new::Widget *w,
+                        render_context &ctx) override
+            {
+                owner->agg.template invoke<"render">(s, w, ctx);
+            }
+        };
+
+        explicit WidgetBridgeBase(Agg a) : agg(std::move(a))
+        {
+            this->renderObject = std::make_unique<RenderObjectImpl>(this);
+        }
+
+        void layout(ui_new::BoxConstraints c) override
+        {
+            this->size = c.smallest();
+        }
+        void updateOffset(ui_new::Offset o) noexcept override
+        {
+            this->offset = o;
+        }
+        std::span<const std::unique_ptr<ui_new::Widget>> children()
+            const noexcept override
+        {
+            return {};
+        }
+    };
+
+    // ============================================================
+    // 无 hover 版本：干干净净，源码里没有 hover 的名字
+    // ============================================================
+    template <class Agg>
+    struct WidgetBridge : WidgetBridgeBase<Agg>
+    {
+        using Base = WidgetBridgeBase<Agg>;
+        using Base::Base;
+    };
+
+    // ============================================================
+    // 有 hover 版本：只在这里出现 hover 的概念
+    // ============================================================
+    template <class Agg>
+    struct HoverBridge : WidgetBridgeBase<Agg>
+    {
+        using Base = WidgetBridgeBase<Agg>;
+
+        explicit HoverBridge(Agg a) : Base(std::move(a))
+        {
+            this->agg.hover_fn = hover_fn_id();
+        }
+
+        static uint32_t hover_fn_id()
+        {
+            static const uint32_t fn =
+                hoverPool().bind([](picking_result r, bool enter) noexcept {
+                    uint64_t ptr = glyphPool().template get<"data">(r.key.entity_index);
+                    // 反查回 Base：Base 持有 agg，且是 Widget 的唯一基类，
+                    // reinterpret_cast 等价于 static_cast，安全
+                    auto *base = reinterpret_cast<Base *>(ptr);
+                    base->agg.template invoke<"hover">(r, enter);
+                });
+            return fn;
+        }
+    };
+
+    // ============================================================
+    // 工厂：编译期按能力二选一
+    // ============================================================
+    template <class Agg>
+    std::unique_ptr<ui_new::Widget> as_widget(std::string key, Agg &&a)
+    {
+        using D = std::decay_t<Agg>;
+        using W = std::conditional_t<has_hover<D>, HoverBridge<D>, WidgetBridge<D>>;
+
+        auto w = std::make_unique<W>(std::forward<Agg>(a));
+        w->key = std::move(key);
+        return w;
+    }
+} // namespace my_ui2
+
 //diff: [test_dod24.cpp] end [替换旧的布局，并更新录制的算法]
 
 //diff: [test_dod22] end
@@ -6826,11 +6932,226 @@ try
                      enter ? "ENTER" : "LEAVE", r.hover_fn);
     });
 
+    // ui_new::ScreenWidget screen{
+    //     ui_new::Size{WIDTH, HEIGHT},
+    //     ui_new::Container("panel")
+    //         .child(ui_new::Container("rectBox").width(0.0).height(0.0))
+    //         .child(std::make_unique<my_ui::TextBoxWidget>("text", "CD"))};
+
     ui_new::ScreenWidget screen{
         ui_new::Size{WIDTH, HEIGHT},
         ui_new::Container("panel")
             .child(ui_new::Container("rectBox").width(0.0).height(0.0))
-            .child(std::make_unique<my_ui::TextBoxWidget>("text", "CD"))};
+            .child(my_ui2::as_widget(
+                "text",
+                make_aggregate<"TextBox", "text", "textGlyphProxies", "cachedGlyphs",
+                               "cachedOwnerOffset", "cachedViewport", "hover_fn", "hover",
+                               "render">(
+                    std::string("CD"), std::vector<proxy_value<my_ui2::GlyphPool>>{},
+                    std::vector<shader_data::Glyph>{}, ui_new::Offset{-1e30, -1e30},
+                    glm::vec2{-1.0f, -1.0f}, 0u,
+
+                    // ============================================================
+                    // hover —— 用户逻辑，就地写
+                    // ============================================================
+                    [](auto &&self, picking_result r, bool enter) noexcept {
+                        std::println("[Text-HOVER] type={} entity={} primitive={} "
+                                     "ver={} {} (hover_fn={}) text={}",
+                                     r.key.object_type, r.key.entity_index,
+                                     r.primitive_id(), r.render_version(),
+                                     enter ? "ENTER" : "LEAVE", r.hover_fn, self.text);
+                    },
+
+                    // ============================================================
+                    // render —— 原 TextRenderObject::render + rebuildCache 整体
+                    // ============================================================
+                    [](auto &&self, ui_new::ScreenWidget *screen, ui_new::Widget *owner,
+                       render_context &ctx) {
+                        (void)screen;
+
+                        const auto &viewports = ctx.drawRecorder.currentDynamic.viewports;
+                        if (viewports.empty())
+                            return;
+
+                        const float windowWidth = viewports[0].width;
+                        const float windowHeight = viewports[0].height;
+                        const ui_new::Offset off = owner->offset;
+
+                        const bool cacheValid = !self.cachedGlyphs.empty() &&
+                                                self.cachedOwnerOffset.x == off.x &&
+                                                self.cachedOwnerOffset.y == off.y &&
+                                                self.cachedViewport.x == windowWidth &&
+                                                self.cachedViewport.y == windowHeight;
+
+                        if (!cacheValid)
+                        {
+                            self.textGlyphProxies.clear();
+                            self.cachedGlyphs.clear();
+
+                            // ---------- 状态无关的字形生成 Lambda ----------
+                            auto make_glyph =
+                                [](const auto &g, float W, float H, float fontSizePx,
+                                   float cursorX, float baselineY, uint64_t data,
+                                   uint32_t entity_index, uint32_t hover_fn_id,
+                                   glm::vec4 color,
+                                   uint32_t modulateFlag) -> shader_data::Glyph {
+                                float leftPx = cursorX + g.plane_bounds.left * fontSizePx;
+                                float rightPx =
+                                    cursorX + g.plane_bounds.right * fontSizePx;
+                                float topPx = baselineY - g.plane_bounds.top * fontSizePx;
+                                float bottomPx =
+                                    baselineY - g.plane_bounds.bottom * fontSizePx;
+                                float w = rightPx - leftPx;
+                                float h = bottomPx - topPx;
+
+                                float cx = ((leftPx + w * 0.5f) / W) * 2.0f - 1.0f;
+                                float cy = ((topPx + h * 0.5f) / H) * 2.0f - 1.0f;
+
+                                UvTransform uv;
+                                uv.scale =
+                                    glm::vec2(static_cast<float>(g.uv_bounds.right -
+                                                                 g.uv_bounds.left),
+                                              static_cast<float>(g.uv_bounds.top -
+                                                                 g.uv_bounds.bottom));
+                                uv.offset =
+                                    glm::vec2(static_cast<float>(g.uv_bounds.left),
+                                              static_cast<float>(g.uv_bounds.bottom));
+
+                                shader_data::Glyph glyph{};
+                                glyph.data = data;
+                                glyph.entity_index = entity_index;
+                                glyph.textureIndex = g.font_ctx->bind.texture_index;
+                                glyph.samplerIndex = g.font_ctx->bind.sampler_index;
+                                glyph.fontType = static_cast<uint32_t>(g.font_ctx->type);
+                                glyph.pxRange = static_cast<float>(
+                                    g.font_ctx->font.atlas.distanceRange.value_or(0.0));
+                                glyph.modulateFlag = modulateFlag;
+                                glyph.color = color;
+                                glyph.model = glm::translate(glm::mat4(1.0f),
+                                                             glm::vec3(cx, cy, 0.0f)) *
+                                              glm::scale(glm::mat4(1.0f),
+                                                         glm::vec3(w / W * 2.0f,
+                                                                   h / H * 2.0f, 1.0f));
+                                glyph.uvTransform = uv;
+                                glyph.hover_fn = hover_fn_id;
+                                return glyph;
+                            };
+
+                            // ★ 反查钥匙 = 桥接实例本身（owner 就是 WidgetBridge<Agg>*）
+                            const uint64_t data_ptr = reinterpret_cast<uint64_t>(owner);
+                            const uint32_t hfn = self.hover_fn;
+
+                            // ================= 第一块：五位置单字符 =================
+                            {
+                                const std::string testStr = "ABCDE";
+                                auto textResult = run_text_pipeline(
+                                    ctx.fontSelect, testStr.data(), "zh-CN");
+                                const auto &shapeResult = textResult.shape_result;
+                                if (!shapeResult.empty() && !shapeResult[0].empty())
+                                {
+                                    std::vector<const std::remove_cvref_t<
+                                        decltype(shapeResult[0][0])> *>
+                                        glyphPtrs;
+                                    for (const auto &run : shapeResult)
+                                        for (const auto &g : run)
+                                            glyphPtrs.push_back(&g);
+
+                                    if (glyphPtrs.size() >= 5)
+                                    {
+                                        const float margin = 20.0f;
+                                        const float fontSizePx = 24.0f;
+                                        std::array<glm::vec2, 5> positions = {
+                                            glm::vec2(margin, margin),
+                                            glm::vec2(windowWidth - margin - fontSizePx,
+                                                      margin),
+                                            glm::vec2(windowWidth - margin - fontSizePx,
+                                                      windowHeight - margin - fontSizePx),
+                                            glm::vec2(margin,
+                                                      windowHeight - margin - fontSizePx),
+                                            glm::vec2(windowWidth * 0.5f,
+                                                      windowHeight * 0.5f)};
+
+                                        for (int i = 0; i < 5; ++i)
+                                        {
+                                            const auto &g = *glyphPtrs[i];
+                                            if (g.plane_bounds ==
+                                                decltype(g.plane_bounds){})
+                                                continue;
+                                            float cursorX =
+                                                positions[i].x -
+                                                g.plane_bounds.left * fontSizePx;
+                                            float baselineY =
+                                                positions[i].y +
+                                                g.plane_bounds.top * fontSizePx;
+
+                                            auto entity_index = glyphPool().allocate();
+                                            shader_data::Glyph glyph = make_glyph(
+                                                g, windowWidth, windowHeight, fontSizePx,
+                                                cursorX, baselineY, data_ptr,
+                                                entity_index, hfn, glm::vec4(1.0f), 1);
+                                            auto proxy = glyphPool().make_soa_value(
+                                                entity_index, glyph);
+                                            self.textGlyphProxies.push_back(
+                                                std::move(proxy));
+                                            self.cachedGlyphs.push_back(std::move(glyph));
+                                        }
+                                    }
+                                }
+                            }
+
+                            // ============ 第二块：正式文本（顶部居中）============
+                            if (!self.text.empty())
+                            {
+                                auto textResult = run_text_pipeline(
+                                    ctx.fontSelect, self.text.data(), "zh-CN");
+                                const auto &shapeResult = textResult.shape_result;
+                                if (!shapeResult.empty() && !shapeResult[0].empty())
+                                {
+                                    const float fontSizePx = 24.0f;
+                                    const float topMargin = 20.0f;
+                                    const float baselineY = topMargin + fontSizePx;
+
+                                    float totalWidth = 0.0f;
+                                    for (const auto &run : shapeResult)
+                                        for (const auto &g : run)
+                                            totalWidth += g.advance_x * fontSizePx;
+
+                                    float cursorX = (windowWidth - totalWidth) * 0.5f;
+
+                                    for (const auto &run : shapeResult)
+                                    {
+                                        for (const auto &g : run)
+                                        {
+                                            if (g.plane_bounds ==
+                                                decltype(g.plane_bounds){})
+                                            {
+                                                cursorX += g.advance_x * fontSizePx;
+                                                continue;
+                                            }
+                                            auto entity_index = glyphPool().allocate();
+                                            shader_data::Glyph glyph = make_glyph(
+                                                g, windowWidth, windowHeight, fontSizePx,
+                                                cursorX, baselineY, data_ptr,
+                                                entity_index, hfn, glm::vec4(1.0f), 1);
+                                            auto proxy = glyphPool().make_soa_value(
+                                                entity_index, glyph);
+                                            self.textGlyphProxies.push_back(
+                                                std::move(proxy));
+                                            self.cachedGlyphs.push_back(std::move(glyph));
+                                            cursorX += g.advance_x * fontSizePx;
+                                        }
+                                    }
+                                }
+                            }
+
+                            self.cachedOwnerOffset = off;
+                            self.cachedViewport = {windowWidth, windowHeight};
+                        }
+
+                        if (!self.cachedGlyphs.empty())
+                            ctx.drawRecorder.addInstances(
+                                std::span<const shader_data::Glyph>(self.cachedGlyphs));
+                    })))};
 
     // 新的 soaCtx 仅包含 uiRects 和 uiWireRects
     auto soaCtx = make_aggregate_ref<"soaCtx", "screen">(screen);
