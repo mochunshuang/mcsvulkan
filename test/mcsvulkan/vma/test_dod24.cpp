@@ -2818,6 +2818,7 @@ namespace ui_new
     struct RenderObject
     {   
     virtual constexpr void render(ScreenWidget*screen,Widget* owner,render_context &context) = 0;
+        virtual ~RenderObject() = default;
     };
 
     // 自上而下传递约束（Constraints）
@@ -2862,6 +2863,12 @@ namespace ui_new
         {
             return findIf([k](const Widget &w) { return w.key == k; });
         }
+
+      protected:
+        Widget() noexcept = default;
+        constexpr explicit Widget(std::string k,
+                                  std::unique_ptr<RenderObject> ro = nullptr) noexcept
+            : key(std::move(k)), renderObject(std::move(ro)) {}
     };
 
     template <typename B>
@@ -3112,17 +3119,17 @@ namespace ui_new
     {
 
         ContainerWidget() = default; // NOLINTBEGIN
-        constexpr ContainerWidget(std::string key,
+        constexpr ContainerWidget(std::string key, std::unique_ptr<RenderObject> ro,
                                   std::optional<BoxConstraints> constraints,
                                   std::optional<Alignment> alignment,
                                   std::optional<EdgeInsetsGeometry> margin,
                                   std::optional<EdgeInsetsGeometry> border,
                                   std::optional<EdgeInsetsGeometry> padding,
                                   std::unique_ptr<Widget> child) noexcept
-            : constraints_{constraints}, alignment_{alignment}, margin_{margin},
-              border_{border}, padding_{padding}, child_{std::move(child)} // NOLINTEND
+            : Widget(std::move(key), std::move(ro)), constraints_{constraints},
+              alignment_{alignment}, margin_{margin}, border_{border}, padding_{padding},
+              child_{std::move(child)} // NOLINTEND
         {
-            Self().key = std::move(key);
             assert(not constraints_.has_value() || (*constraints_).isNormalized());
             assert(not margin_.has_value() || (*margin_).isNonNegative());
             assert(not border_.has_value() || (*border_).isNonNegative());
@@ -3280,7 +3287,7 @@ namespace ui_new
         constexpr explicit operator std::unique_ptr<Widget>()
         {
             return std::make_unique<ContainerWidget>(
-                std::move(key_),
+                std::move(key_), std::move(renderObject_),
                 width_.has_value() || height_.has_value()
                     ? std::optional<BoxConstraints>{BoxConstraints::tightFor(
                           {.width = width_, .height = height_})}
@@ -3290,6 +3297,11 @@ namespace ui_new
         constexpr auto &key(std::string key) noexcept
         {
             key_ = std::move(key);
+            return *this;
+        }
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
             return *this;
         }
         constexpr auto &width(double width) noexcept
@@ -3335,6 +3347,7 @@ namespace ui_new
 
       private:
         std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
         std::optional<double> width_;
         std::optional<double> height_;
         std::optional<Alignment> alignment_;
@@ -3351,13 +3364,14 @@ namespace ui_new
     struct AlignWidget : Widget
     {
         // NOLINTBEGIN
-        AlignWidget(std::string key, Alignment alignment,
-                    std::optional<double> widthFactor, std::optional<double> heightFactor,
+        AlignWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                    Alignment alignment, std::optional<double> widthFactor,
+                    std::optional<double> heightFactor,
                     std::unique_ptr<Widget> child) noexcept // NOLINTEND
-            : alignment_{alignment}, widthFactor_{widthFactor},
-              heightFactor_{heightFactor}, child_{std::move(child)}
+            : Widget(std::move(key), std::move(ro)), alignment_{alignment},
+              widthFactor_{widthFactor}, heightFactor_{heightFactor},
+              child_{std::move(child)}
         {
-            Self().key = std::move(key);
             assert(not widthFactor_.has_value() || *widthFactor_ >= 0);
             assert(not heightFactor_.has_value() || *heightFactor_ >= 0);
         }
@@ -3441,13 +3455,18 @@ namespace ui_new
         explicit AlignBuild(std::string key) noexcept : key_(std::move(key)) {}
         explicit operator std::unique_ptr<Widget>()
         {
-            return std::make_unique<AlignWidget>(std::move(key_), alignment_,
-                                                 widthFactor_, heightFactor_,
-                                                 std::move(child_));
+            return std::make_unique<AlignWidget>(
+                std::move(key_), std::move(renderObject_), alignment_, widthFactor_,
+                heightFactor_, std::move(child_));
         }
         constexpr auto &key(std::string key) noexcept
         {
             key_ = std::move(key);
+            return *this;
+        }
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
             return *this;
         }
         constexpr AlignBuild &alignment(Alignment alignment) noexcept
@@ -3478,6 +3497,7 @@ namespace ui_new
 
       private:
         std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
         Alignment alignment_ = Alignment::center;
         std::optional<double> widthFactor_;
         std::optional<double> heightFactor_;
@@ -3504,12 +3524,13 @@ namespace ui_new
     struct SizedBoxWidget : Widget
     {
         // NOLINTBEGIN
-        constexpr SizedBoxWidget(std::string key, std::optional<double> width,
+        constexpr SizedBoxWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                                 std::optional<double> width,
                                  std::optional<double> height,
                                  std::unique_ptr<Widget> child) noexcept
-            : width_{width}, height_{height}, child_{std::move(child)} // NOLINTEND
+            : Widget(std::move(key), std::move(ro)), width_{width}, height_{height},
+              child_{std::move(child)} // NOLINTEND
         {
-            Self().key = std::move(key);
             assert(not width_.has_value() || *width_ >= 0);
             assert(not height_.has_value() || *height_ >= 0);
         }
@@ -3561,13 +3582,19 @@ namespace ui_new
 
         explicit operator std::unique_ptr<Widget>()
         {
-            return std::make_unique<SizedBoxWidget>(std::move(key_), width_, height_,
-                                                    std::move(child_));
+            return std::make_unique<SizedBoxWidget>(std::move(key_),
+                                                    std::move(renderObject_), width_,
+                                                    height_, std::move(child_));
         }
 
         constexpr auto &key(std::string key) noexcept
         {
             key_ = std::move(key);
+            return *this;
+        }
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
             return *this;
         }
         constexpr auto &width(double width) noexcept
@@ -3593,6 +3620,7 @@ namespace ui_new
 
       private:
         std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
         std::optional<double> width_;
         std::optional<double> height_;
         std::unique_ptr<Widget> child_;
@@ -3604,11 +3632,12 @@ namespace ui_new
 
     struct PaddingWidget : Widget
     {
-        constexpr PaddingWidget(std::string key, EdgeInsetsGeometry padding,
+        constexpr PaddingWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                                EdgeInsetsGeometry padding,
                                 std::unique_ptr<Widget> child) noexcept
-            : padding_{padding}, child_{std::move(child)}
+            : Widget(std::move(key), std::move(ro)), padding_{padding},
+              child_{std::move(child)}
         {
-            Self().key = std::move(key);
             assert(padding_.isNonNegative());
         }
 
@@ -3672,13 +3701,18 @@ namespace ui_new
         {
             if (not padding_.has_value())
                 throw std::logic_error{"PaddingBuild required padding value"};
-            return std::make_unique<PaddingWidget>(std::move(key_), *padding_,
-                                                   std::move(child_));
+            return std::make_unique<PaddingWidget>(
+                std::move(key_), std::move(renderObject_), *padding_, std::move(child_));
         }
 
         constexpr auto &key(std::string key) noexcept
         {
             key_ = std::move(key);
+            return *this;
+        }
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
             return *this;
         }
         constexpr auto &padding(EdgeInsetsGeometry padding) noexcept
@@ -3699,6 +3733,7 @@ namespace ui_new
 
       private:
         std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
         std::optional<EdgeInsetsGeometry> padding_;
         std::unique_ptr<Widget> child_;
     };
@@ -3709,11 +3744,12 @@ namespace ui_new
 
     struct ConstrainedBoxWidget : Widget
     {
-        constexpr ConstrainedBoxWidget(std::string key, BoxConstraints constraints,
+        constexpr ConstrainedBoxWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                                       BoxConstraints constraints,
                                        std::unique_ptr<Widget> child) noexcept
-            : constraints_{constraints}, child_{std::move(child)}
+            : Widget(std::move(key), std::move(ro)), constraints_{constraints},
+              child_{std::move(child)}
         {
-            Self().key = std::move(key);
             assert(constraints_.isNormalized());
         }
 
@@ -3769,13 +3805,19 @@ namespace ui_new
         {
             if (not constraints_.has_value())
                 throw std::logic_error{"ConstrainedBoxWidget required constraints value"};
-            return std::make_unique<ConstrainedBoxWidget>(std::move(key_), *constraints_,
-                                                          std::move(child_));
+            return std::make_unique<ConstrainedBoxWidget>(
+                std::move(key_), std::move(renderObject_), *constraints_,
+                std::move(child_));
         }
 
         constexpr auto &key(std::string key) noexcept
         {
             key_ = std::move(key);
+            return *this;
+        }
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
             return *this;
         }
         constexpr auto &constraints(BoxConstraints constraints) noexcept
@@ -3796,6 +3838,7 @@ namespace ui_new
 
       private:
         std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
         std::optional<BoxConstraints> constraints_;
         std::unique_ptr<Widget> child_;
     };
@@ -3812,17 +3855,16 @@ namespace ui_new
     struct OverflowBoxWidget : Widget
     {
         // NOLINTBEGIN
-        constexpr OverflowBoxWidget(std::string key, Alignment alignment,
-                                    std::optional<double> minWidth,
+        constexpr OverflowBoxWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                                    Alignment alignment, std::optional<double> minWidth,
                                     std::optional<double> maxWidth,
                                     std::optional<double> minHeight,
                                     std::optional<double> maxHeight, OverflowBoxFit fit,
                                     std::unique_ptr<Widget> child) noexcept // NOLINTEND
-            : alignment_{alignment}, minWidth_{minWidth}, maxWidth_{maxWidth},
-              minHeight_{minHeight}, maxHeight_{maxHeight}, fit_{fit},
-              child_{std::move(child)}
+            : Widget(std::move(key), std::move(ro)), alignment_{alignment},
+              minWidth_{minWidth}, maxWidth_{maxWidth}, minHeight_{minHeight},
+              maxHeight_{maxHeight}, fit_{fit}, child_{std::move(child)}
         {
-            Self().key = std::move(key);
         }
 
         constexpr void layout(BoxConstraints c) override
@@ -3908,13 +3950,18 @@ namespace ui_new
         explicit operator std::unique_ptr<Widget>()
         {
             return std::make_unique<OverflowBoxWidget>(
-                std::move(key_), alignment_, minWidth_, maxWidth_, minHeight_, maxHeight_,
-                fit_, std::move(child_));
+                std::move(key_), std::move(renderObject_), alignment_, minWidth_,
+                maxWidth_, minHeight_, maxHeight_, fit_, std::move(child_));
         }
 
         constexpr auto &key(std::string key) noexcept
         {
             key_ = std::move(key);
+            return *this;
+        }
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
             return *this;
         }
         constexpr auto &alignment(Alignment alignment) noexcept
@@ -3960,6 +4007,7 @@ namespace ui_new
 
       private:
         std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
         Alignment alignment_ = Alignment::center;
         std::optional<double> minWidth_;
         std::optional<double> maxWidth_;
@@ -3991,12 +4039,12 @@ namespace ui_new
     {
         // NOLINTBEGIN
         constexpr UnconstrainedBoxWidget(
-            std::string key, Alignment alignment, std::optional<Axis> constrainedAxis,
+            std::string key, std::unique_ptr<RenderObject> ro, Alignment alignment,
+            std::optional<Axis> constrainedAxis,
             std::unique_ptr<Widget> child) noexcept // NOLINTEND
-            : alignment_{alignment}, constrainedAxis_{constrainedAxis},
-              child_{std::move(child)}
+            : Widget(std::move(key), std::move(ro)), alignment_{alignment},
+              constrainedAxis_{constrainedAxis}, child_{std::move(child)}
         {
-            Self().key = std::move(key);
         }
 
         constexpr void layout(BoxConstraints c) override
@@ -4082,12 +4130,19 @@ namespace ui_new
         explicit operator std::unique_ptr<Widget>()
         {
             return std::make_unique<UnconstrainedBoxWidget>(
-                std::move(key_), alignment_, constrainedAxis_, std::move(child_));
+                std::move(key_), std::move(renderObject_), alignment_, constrainedAxis_,
+                std::move(child_));
         }
 
         constexpr auto &key(std::string key) noexcept
         {
             key_ = std::move(key);
+            return *this;
+        }
+
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
             return *this;
         }
 
@@ -4121,6 +4176,7 @@ namespace ui_new
 
       private:
         std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
         Alignment alignment_ = Alignment::center;
         std::optional<Axis> constrainedAxis_;
         std::unique_ptr<Widget> child_;
@@ -4133,11 +4189,12 @@ namespace ui_new
     struct LimitedBoxWidget : Widget
     {
         // NOLINTBEGIN
-        constexpr LimitedBoxWidget(std::string key, double maxWidth, double maxHeight,
+        constexpr LimitedBoxWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                                   double maxWidth, double maxHeight,
                                    std::unique_ptr<Widget> child) noexcept // NOLINTEND
-            : maxWidth_{maxWidth}, maxHeight_{maxHeight}, child_{std::move(child)}
+            : Widget(std::move(key), std::move(ro)), maxWidth_{maxWidth},
+              maxHeight_{maxHeight}, child_{std::move(child)}
         {
-            Self().key = std::move(key);
             assert(maxWidth_ >= 0.0);
             assert(maxHeight_ >= 0.0);
         }
@@ -4200,13 +4257,20 @@ namespace ui_new
 
         explicit operator std::unique_ptr<Widget>()
         {
-            return std::make_unique<LimitedBoxWidget>(std::move(key_), maxWidth_,
+            return std::make_unique<LimitedBoxWidget>(std::move(key_),
+                                                      std::move(renderObject_), maxWidth_,
                                                       maxHeight_, std::move(child_));
         }
 
         constexpr auto &key(std::string key) noexcept
         {
             key_ = std::move(key);
+            return *this;
+        }
+
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
             return *this;
         }
 
@@ -4238,6 +4302,7 @@ namespace ui_new
         static constexpr auto inf = std::numeric_limits<double>::infinity();
 
         std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
         double maxWidth_{inf};
         double maxHeight_{inf};
         std::unique_ptr<Widget> child_;
@@ -4268,11 +4333,12 @@ namespace ui_new
     struct AspectRatioWidget : Widget
     {
         // NOLINTBEGIN
-        constexpr AspectRatioWidget(std::string key, double aspectRatio,
+        constexpr AspectRatioWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                                    double aspectRatio,
                                     std::unique_ptr<Widget> child) noexcept // NOLINTEND
-            : aspectRatio_{aspectRatio}, child_{std::move(child)}
+            : Widget(std::move(key), std::move(ro)), aspectRatio_{aspectRatio},
+              child_{std::move(child)}
         {
-            Self().key = std::move(key);
             assert(aspectRatio_ > 0.0);
         }
 
@@ -4351,13 +4417,20 @@ namespace ui_new
         {
             if (!(aspectRatio_ > 0.0))
                 throw std::logic_error{"AspectRatio requires aspectRatio > 0"};
-            return std::make_unique<AspectRatioWidget>(std::move(key_), aspectRatio_,
-                                                       std::move(child_));
+            return std::make_unique<AspectRatioWidget>(std::move(key_),
+                                                       std::move(renderObject_),
+                                                       aspectRatio_, std::move(child_));
         }
 
         constexpr auto &key(std::string key) noexcept
         {
             key_ = std::move(key);
+            return *this;
+        }
+
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
             return *this;
         }
 
@@ -4380,6 +4453,7 @@ namespace ui_new
 
       private:
         std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
         double aspectRatio_;
         std::unique_ptr<Widget> child_;
     };
@@ -4405,13 +4479,13 @@ namespace ui_new
     {
         // NOLINTBEGIN
         constexpr FractionallySizedBoxWidget(
-            std::string key, Alignment alignment, std::optional<double> widthFactor,
-            std::optional<double> heightFactor,
+            std::string key, std::unique_ptr<RenderObject> ro, Alignment alignment,
+            std::optional<double> widthFactor, std::optional<double> heightFactor,
             std::unique_ptr<Widget> child) noexcept // NOLINTEND
-            : alignment_{alignment}, widthFactor_{widthFactor},
-              heightFactor_{heightFactor}, child_{std::move(child)}
+            : Widget(std::move(key), std::move(ro)), alignment_{alignment},
+              widthFactor_{widthFactor}, heightFactor_{heightFactor},
+              child_{std::move(child)}
         {
-            Self().key = std::move(key);
             assert(!widthFactor_.has_value() || *widthFactor_ >= 0.0);
             assert(!heightFactor_.has_value() || *heightFactor_ >= 0.0);
         }
@@ -4506,13 +4580,19 @@ namespace ui_new
         explicit operator std::unique_ptr<Widget>()
         {
             return std::make_unique<FractionallySizedBoxWidget>(
-                std::move(key_), alignment_, widthFactor_, heightFactor_,
-                std::move(child_));
+                std::move(key_), std::move(renderObject_), alignment_, widthFactor_,
+                heightFactor_, std::move(child_));
         }
 
         constexpr auto &key(std::string key) noexcept
         {
             key_ = std::move(key);
+            return *this;
+        }
+
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
             return *this;
         }
 
@@ -4559,6 +4639,7 @@ namespace ui_new
 
       private:
         std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
         Alignment alignment_ = Alignment::center;
         std::optional<double> widthFactor_;
         std::optional<double> heightFactor_;
@@ -4655,8 +4736,8 @@ namespace ui_new
 
     struct FlexWidget : Widget
     {
-        constexpr FlexWidget(std::string key, Axis direction,
-                             MainAxisAlignment mainAxisAlignment,
+        constexpr FlexWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                             Axis direction, MainAxisAlignment mainAxisAlignment,
                              MainAxisSize mainAxisSize,
                              CrossAxisAlignment crossAxisAlignment,
                              std::optional<TextDirection> textDirection,
@@ -4664,13 +4745,12 @@ namespace ui_new
                              std::optional<TextBaseline> textBaseline,
                              std::vector<std::unique_ptr<Widget>> children,
                              std::vector<FlexInfo> flexes) noexcept
-            : direction_{direction}, mainAxisAlignment_{mainAxisAlignment},
-              mainAxisSize_{mainAxisSize}, crossAxisAlignment_{crossAxisAlignment},
-              textDirection_{textDirection}, verticalDirection_{verticalDirection},
-              textBaseline_{textBaseline}, children_{std::move(children)},
-              flexes_{std::move(flexes)}
+            : Widget(std::move(key), std::move(ro)), direction_{direction},
+              mainAxisAlignment_{mainAxisAlignment}, mainAxisSize_{mainAxisSize},
+              crossAxisAlignment_{crossAxisAlignment}, textDirection_{textDirection},
+              verticalDirection_{verticalDirection}, textBaseline_{textBaseline},
+              children_{std::move(children)}, flexes_{std::move(flexes)}
         {
-            Self().key = std::move(key);
             assert(crossAxisAlignment_ != CrossAxisAlignment::baseline ||
                    textBaseline_.has_value());
             assert(children_.size() == flexes_.size());
@@ -4887,14 +4967,20 @@ namespace ui_new
             if (!direction_)
                 throw std::logic_error{"Flex requires direction value"};
             return std::make_unique<FlexWidget>(
-                std::move(key_), *direction_, mainAxisAlignment_, mainAxisSize_,
-                crossAxisAlignment_, textDirection_, verticalDirection_, textBaseline_,
-                std::move(children_), std::move(flexes_));
+                std::move(key_), std::move(renderObject_), *direction_,
+                mainAxisAlignment_, mainAxisSize_, crossAxisAlignment_, textDirection_,
+                verticalDirection_, textBaseline_, std::move(children_),
+                std::move(flexes_));
         }
 
         constexpr auto &key(std::string key) noexcept
         {
             key_ = std::move(key);
+            return *this;
+        }
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
             return *this;
         }
         constexpr auto &direction(Axis v) noexcept
@@ -4973,6 +5059,7 @@ namespace ui_new
 
       private:
         std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
         std::optional<Axis> direction_;
         MainAxisAlignment mainAxisAlignment_ = MainAxisAlignment::start;
         MainAxisSize mainAxisSize_ = MainAxisSize::max;
@@ -5111,8 +5198,8 @@ class Spacer extends StatelessWidget {
         [[nodiscard]] std::unique_ptr<Widget> takeChild() noexcept
         {
             // 0×0 空盒子，key 由 Spacer 提供
-            return std::make_unique<SizedBoxWidget>(std::move(key_), std::nullopt,
-                                                    std::nullopt, nullptr);
+            return std::make_unique<SizedBoxWidget>(std::move(key_), nullptr,
+                                                    std::nullopt, std::nullopt, nullptr);
         }
 
       private:
@@ -5142,19 +5229,19 @@ class Spacer extends StatelessWidget {
     struct WrapWidget : Widget
     {
         // NOLINTBEGIN
-        constexpr WrapWidget(std::string key, Axis direction, WrapAlignment alignment,
-                             double spacing, WrapAlignment runAlignment,
-                             double runSpacing, WrapCrossAlignment crossAxisAlignment,
+        constexpr WrapWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                             Axis direction, WrapAlignment alignment, double spacing,
+                             WrapAlignment runAlignment, double runSpacing,
+                             WrapCrossAlignment crossAxisAlignment,
                              std::optional<TextDirection> textDirection,
                              VerticalDirection verticalDirection,
                              std::vector<std::unique_ptr<Widget>> children) noexcept
-            : direction_{direction}, alignment_{alignment}, spacing_{spacing},
-              runAlignment_{runAlignment}, runSpacing_{runSpacing},
-              crossAxisAlignment_{crossAxisAlignment}, textDirection_{textDirection},
-              verticalDirection_{verticalDirection},
+            : Widget(std::move(key), std::move(ro)), direction_{direction},
+              alignment_{alignment}, spacing_{spacing}, runAlignment_{runAlignment},
+              runSpacing_{runSpacing}, crossAxisAlignment_{crossAxisAlignment},
+              textDirection_{textDirection}, verticalDirection_{verticalDirection},
               children_{std::move(children)} // NOLINTEND
         {
-            Self().key = std::move(key);
         }
 
         constexpr void layout(BoxConstraints c) override
@@ -5434,6 +5521,11 @@ class Spacer extends StatelessWidget {
             key_ = std::move(k);
             return *this;
         }
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
         constexpr auto &direction(Axis v) noexcept
         {
             direction_ = v;
@@ -5493,14 +5585,15 @@ class Spacer extends StatelessWidget {
 
         constexpr explicit operator std::unique_ptr<Widget>()
         {
-            return std::make_unique<WrapWidget>(std::move(key_), direction_, alignment_,
-                                                spacing_, runAlignment_, runSpacing_,
-                                                crossAxisAlignment_, textDirection_,
-                                                verticalDirection_, std::move(children_));
+            return std::make_unique<WrapWidget>(
+                std::move(key_), std::move(renderObject_), direction_, alignment_,
+                spacing_, runAlignment_, runSpacing_, crossAxisAlignment_, textDirection_,
+                verticalDirection_, std::move(children_));
         }
 
       private:
         std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
         Axis direction_ = Axis::horizontal;
         WrapAlignment alignment_ = WrapAlignment::start;
         double spacing_ = 0.0;
@@ -5673,13 +5766,13 @@ NOTE: 我不需要，我会将这些信息和renderobject 绑定，更新model�
     // =========================================================================
     struct StackWidget : Widget
     {
-        StackWidget(std::string key, Alignment alignment, StackFit fit,
+        StackWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                    Alignment alignment, StackFit fit,
                     std::vector<std::unique_ptr<Widget>> children,
                     std::vector<StackChildInfo> infos) noexcept
-            : alignment_{alignment}, fit_{fit}, children_{std::move(children)},
-              infos_{std::move(infos)}
+            : Widget(std::move(key), std::move(ro)), alignment_{alignment}, fit_{fit},
+              children_{std::move(children)}, infos_{std::move(infos)}
         {
-            Self().key = std::move(key);
             assert(children_.size() == infos_.size());
         }
 
@@ -5836,6 +5929,11 @@ NOTE: 我不需要，我会将这些信息和renderobject 绑定，更新model�
             key_ = std::move(k);
             return *this;
         }
+        auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
         auto &alignment(Alignment a) noexcept
         {
             alignment_ = a;
@@ -5870,12 +5968,14 @@ NOTE: 我不需要，我会将这些信息和renderobject 绑定，更新model�
 
         explicit operator std::unique_ptr<Widget>()
         {
-            return std::make_unique<StackWidget>(std::move(key_), alignment_, fit_,
-                                                 std::move(children_), std::move(infos_));
+            return std::make_unique<StackWidget>(
+                std::move(key_), std::move(renderObject_), alignment_, fit_,
+                std::move(children_), std::move(infos_));
         }
 
       private:
         std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
         Alignment alignment_ = Alignment::topLeft;
         StackFit fit_ = StackFit::loose;
         std::vector<std::unique_ptr<Widget>> children_;
@@ -5890,11 +5990,11 @@ NOTE: 我不需要，我会将这些信息和renderobject 绑定，更新model�
 
     struct OffstageWidget : Widget
     {
-        OffstageWidget(std::string key, bool offstage,
+        OffstageWidget(std::string key, std::unique_ptr<RenderObject> ro, bool offstage,
                        std::unique_ptr<Widget> child) noexcept
-            : offstage_{offstage}, child_{std::move(child)}
+            : Widget(std::move(key), std::move(ro)), offstage_{offstage},
+              child_{std::move(child)}
         {
-            Self().key = std::move(key);
         }
 
         void layout(BoxConstraints c) override
@@ -5935,13 +6035,18 @@ NOTE: 我不需要，我会将这些信息和renderobject 绑定，更新model�
         explicit OffstageBuild(std::string key = {}) noexcept : key_(std::move(key)) {}
         explicit operator std::unique_ptr<Widget>()
         {
-            return std::make_unique<OffstageWidget>(std::move(key_), offstage_,
-                                                    std::move(child_));
+            return std::make_unique<OffstageWidget>(
+                std::move(key_), std::move(renderObject_), offstage_, std::move(child_));
         }
 
         auto &key(std::string k) noexcept
         {
             key_ = std::move(k);
+            return *this;
+        }
+        auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
             return *this;
         }
         auto &offstage(bool v) noexcept
@@ -5963,6 +6068,7 @@ NOTE: 我不需要，我会将这些信息和renderobject 绑定，更新model�
 
       private:
         std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
         bool offstage_ = true;
         std::unique_ptr<Widget> child_;
     };
@@ -6000,12 +6106,12 @@ NOTE: 我不需要，我会将这些信息和renderobject 绑定，更新model�
     };
     struct CustomSingleChildLayoutWidget : Widget
     {
-        CustomSingleChildLayoutWidget(std::string key,
+        CustomSingleChildLayoutWidget(std::string key, std::unique_ptr<RenderObject> ro,
                                       std::unique_ptr<SingleChildLayoutDelegate> delegate,
                                       std::unique_ptr<Widget> child) noexcept
-            : delegate_{std::move(delegate)}, child_{std::move(child)}
+            : Widget(std::move(key), std::move(ro)), delegate_{std::move(delegate)},
+              child_{std::move(child)}
         {
-            Self().key = std::move(key);
             assert(delegate_);
         }
 
@@ -6055,6 +6161,12 @@ NOTE: 我不需要，我会将这些信息和renderobject 绑定，更新model�
             return *this;
         }
 
+        auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+
         auto &delegate(std::unique_ptr<SingleChildLayoutDelegate> d) noexcept
         {
             delegate_ = std::move(d);
@@ -6077,11 +6189,13 @@ NOTE: 我不需要，我会将这些信息和renderobject 绑定，更新model�
             if (!delegate_)
                 throw std::logic_error{"CustomSingleChildLayout requires a delegate"};
             return std::make_unique<CustomSingleChildLayoutWidget>(
-                std::move(key_), std::move(delegate_), std::move(child_));
+                std::move(key_), std::move(renderObject_), std::move(delegate_),
+                std::move(child_));
         }
 
       private:
         std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
         std::unique_ptr<SingleChildLayoutDelegate> delegate_;
         std::unique_ptr<Widget> child_;
     };
@@ -6145,14 +6259,13 @@ NOTE: 我不需要，我会将这些信息和renderobject 绑定，更新model�
     }
     struct CustomMultiChildLayoutWidget : Widget
     {
-        CustomMultiChildLayoutWidget(std::string key,
+        CustomMultiChildLayoutWidget(std::string key, std::unique_ptr<RenderObject> ro,
                                      std::unique_ptr<MultiChildLayoutDelegate> delegate,
                                      std::vector<std::unique_ptr<Widget>> children,
                                      std::vector<std::string> ids) noexcept
-            : delegate_{std::move(delegate)}, children_{std::move(children)},
-              ids_{std::move(ids)}
+            : Widget(std::move(key), std::move(ro)), delegate_{std::move(delegate)},
+              children_{std::move(children)}, ids_{std::move(ids)}
         {
-            Self().key = std::move(key);
             assert(delegate_);
             assert(children_.size() == ids_.size());
             for (size_t i = 0; i < ids_.size(); ++i)
@@ -6228,6 +6341,12 @@ NOTE: 我不需要，我会将这些信息和renderobject 绑定，更新model�
             return *this;
         }
 
+        auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+
         auto &delegate(std::unique_ptr<MultiChildLayoutDelegate> d) noexcept
         {
             delegate_ = std::move(d);
@@ -6246,12 +6365,13 @@ NOTE: 我不需要，我会将这些信息和renderobject 绑定，更新model�
             if (!delegate_)
                 throw std::logic_error{"CustomMultiChildLayout requires a delegate"};
             return std::make_unique<CustomMultiChildLayoutWidget>(
-                std::move(key_), std::move(delegate_), std::move(children_),
-                std::move(ids_));
+                std::move(key_), std::move(renderObject_), std::move(delegate_),
+                std::move(children_), std::move(ids_));
         }
 
       private:
         std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
         std::unique_ptr<MultiChildLayoutDelegate> delegate_;
         std::vector<std::unique_ptr<Widget>> children_;
         std::vector<std::string> ids_;
@@ -6263,11 +6383,11 @@ NOTE: 我不需要，我会将这些信息和renderobject 绑定，更新model�
 
     struct RotatedBoxWidget : Widget
     {
-        RotatedBoxWidget(std::string key, int quarterTurns,
-                         std::unique_ptr<Widget> child) noexcept
-            : quarterTurns_{quarterTurns}, child_{std::move(child)}
+        RotatedBoxWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                         int quarterTurns, std::unique_ptr<Widget> child) noexcept
+            : Widget(std::move(key), std::move(ro)), quarterTurns_{quarterTurns},
+              child_{std::move(child)}
         {
-            Self().key = std::move(key);
         }
 
         void layout(BoxConstraints c) override
@@ -6345,6 +6465,11 @@ NOTE: 我不需要，我会将这些信息和renderobject 绑定，更新model�
             key_ = std::move(k);
             return *this;
         }
+        auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
         auto &quarterTurns(int q) noexcept
         {
             quarterTurns_ = q;
@@ -6364,12 +6489,14 @@ NOTE: 我不需要，我会将这些信息和renderobject 绑定，更新model�
 
         explicit operator std::unique_ptr<Widget>()
         {
-            return std::make_unique<RotatedBoxWidget>(std::move(key_), quarterTurns_,
-                                                      std::move(child_));
+            return std::make_unique<RotatedBoxWidget>(std::move(key_),
+                                                      std::move(renderObject_),
+                                                      quarterTurns_, std::move(child_));
         }
 
       private:
         std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
         int quarterTurns_ = 0;
         std::unique_ptr<Widget> child_;
     };
@@ -6382,6 +6509,7 @@ NOTE: 我不需要，我会将这些信息和renderobject 绑定，更新model�
     // flex 模式 [end]
     // ===============================================================================================
 }; // namespace ui_new
+
 // shader_data::Glyph
 auto &glyphPool()
 {
@@ -6749,6 +6877,52 @@ namespace my_ui2
     }
 } // namespace my_ui2
 
+namespace my_ui3
+{
+    // 能力探测：Agg 里同时有 "hover" 和 "hover_fn" 才算有 hover
+    template <class Agg>
+    concept has_hover = requires(Agg &a) {
+        a.template invoke<"hover">(picking_result{}, false);
+        a.hover_fn;
+    };
+
+    template <class Agg>
+    struct AggRenderObject final : ui_new::RenderObject
+    {
+        Agg agg;
+
+        explicit AggRenderObject(Agg a) noexcept : agg(std::move(a))
+        {
+            if constexpr (has_hover<Agg>)
+                agg.hover_fn = hover_fn_id();
+        }
+
+        void render(ui_new::ScreenWidget *s, ui_new::Widget *owner,
+                    render_context &ctx) override
+        {
+            agg.template invoke<"render">(s, owner, ctx);
+        }
+
+        static uint32_t hover_fn_id()
+        {
+            static const uint32_t fn =
+                hoverPool().bind([](picking_result r, bool enter) noexcept {
+                    uint64_t ptr = glyphPool().template get<"data">(r.key.entity_index);
+                    auto *agg_ptr = reinterpret_cast<Agg *>(ptr);
+                    agg_ptr->template invoke<"hover">(r, enter);
+                });
+            return fn;
+        }
+    };
+
+    template <class Agg>
+    [[nodiscard]] inline auto renderObject(Agg &&a)
+    {
+        using D = std::decay_t<Agg>;
+        return std::make_unique<AggRenderObject<D>>(std::forward<Agg>(a));
+    }
+} // namespace my_ui3
+
 //diff: [test_dod24.cpp] end [替换旧的布局，并更新录制的算法]
 
 //diff: [test_dod22] end
@@ -6934,224 +7108,430 @@ try
 
     // ui_new::ScreenWidget screen{
     //     ui_new::Size{WIDTH, HEIGHT},
+    //     ui_new::Container("panel").child(ui_new::Container("rectBox").renderObject(
+    //         std::make_unique<my_ui::TextRenderObject>("CD")))};
+
+    // ui_new::ScreenWidget screen{
+    //     ui_new::Size{WIDTH, HEIGHT},
     //     ui_new::Container("panel")
     //         .child(ui_new::Container("rectBox").width(0.0).height(0.0))
     //         .child(std::make_unique<my_ui::TextBoxWidget>("text", "CD"))};
 
+    // ui_new::ScreenWidget screen{
+    //     ui_new::Size{WIDTH, HEIGHT},
+    //     ui_new::Container("panel")
+    //         .child(ui_new::Container("rectBox").width(0.0).height(0.0))
+    //         .child(my_ui2::as_widget(
+    //             "text",
+    //             make_aggregate<"TextBox", "text", "textGlyphProxies", "cachedGlyphs",
+    //                            "cachedOwnerOffset", "cachedViewport", "hover_fn", "hover",
+    //                            "render", "rebuildCache">(
+    //                 std::string("CD"), std::vector<proxy_value<my_ui2::GlyphPool>>{},
+    //                 std::vector<shader_data::Glyph>{}, ui_new::Offset{-1e30, -1e30},
+    //                 glm::vec2{-1.0f, -1.0f}, 0u,
+
+    //                 // ============================================================
+    //                 // hover —— 用户逻辑，就地写
+    //                 // ============================================================
+    //                 [](auto &&self, picking_result r, bool enter) noexcept {
+    //                     std::println("[Text-HOVER] type={} entity={} primitive={} "
+    //                                  "ver={} {} (hover_fn={}) text={}",
+    //                                  r.key.object_type, r.key.entity_index,
+    //                                  r.primitive_id(), r.render_version(),
+    //                                  enter ? "ENTER" : "LEAVE", r.hover_fn, self.text);
+    //                 },
+
+    //                 // ============================================================
+    //                 // render —— 只负责「缓存校验 + 提交」
+    //                 // ============================================================
+    //                 [](auto &&self, ui_new::ScreenWidget *screen, ui_new::Widget *owner,
+    //                    render_context &ctx) {
+    //                     (void)screen;
+
+    //                     const auto &viewports = ctx.drawRecorder.currentDynamic.viewports;
+    //                     if (viewports.empty())
+    //                         return;
+
+    //                     const float windowWidth = viewports[0].width;
+    //                     const float windowHeight = viewports[0].height;
+    //                     const ui_new::Offset off = owner->offset;
+
+    //                     const bool cacheValid = !self.cachedGlyphs.empty() &&
+    //                                             self.cachedOwnerOffset.x == off.x &&
+    //                                             self.cachedOwnerOffset.y == off.y &&
+    //                                             self.cachedViewport.x == windowWidth &&
+    //                                             self.cachedViewport.y == windowHeight;
+
+    //                     if (!cacheValid)
+    //                         self.template invoke<"rebuildCache">(owner, windowWidth,
+    //                                                              windowHeight, ctx);
+
+    //                     if (!self.cachedGlyphs.empty())
+    //                         ctx.drawRecorder.addInstances(
+    //                             std::span<const shader_data::Glyph>(self.cachedGlyphs));
+    //                 },
+
+    //                 // ============================================================
+    //                 // rebuildCache —— 原 TextRenderObject::rebuildCache 整体
+    //                 // ============================================================
+    //                 [](auto &&self, ui_new::Widget *owner, float windowWidth,
+    //                    float windowHeight, render_context &ctx) {
+    //                     self.textGlyphProxies.clear();
+    //                     self.cachedGlyphs.clear();
+
+    //                     // ---------- 状态无关的字形生成 Lambda ----------
+    //                     auto make_glyph =
+    //                         [](const auto &g, float W, float H, float fontSizePx,
+    //                            float cursorX, float baselineY, uint64_t data,
+    //                            uint32_t entity_index, uint32_t hover_fn_id,
+    //                            glm::vec4 color,
+    //                            uint32_t modulateFlag) -> shader_data::Glyph {
+    //                         float leftPx = cursorX + g.plane_bounds.left * fontSizePx;
+    //                         float rightPx = cursorX + g.plane_bounds.right * fontSizePx;
+    //                         float topPx = baselineY - g.plane_bounds.top * fontSizePx;
+    //                         float bottomPx =
+    //                             baselineY - g.plane_bounds.bottom * fontSizePx;
+    //                         float w = rightPx - leftPx;
+    //                         float h = bottomPx - topPx;
+
+    //                         float cx = ((leftPx + w * 0.5f) / W) * 2.0f - 1.0f;
+    //                         float cy = ((topPx + h * 0.5f) / H) * 2.0f - 1.0f;
+
+    //                         UvTransform uv;
+    //                         uv.scale = glm::vec2(
+    //                             static_cast<float>(g.uv_bounds.right - g.uv_bounds.left),
+    //                             static_cast<float>(g.uv_bounds.top - g.uv_bounds.bottom));
+    //                         uv.offset = glm::vec2(static_cast<float>(g.uv_bounds.left),
+    //                                               static_cast<float>(g.uv_bounds.bottom));
+
+    //                         shader_data::Glyph glyph{};
+    //                         glyph.data = data;
+    //                         glyph.entity_index = entity_index;
+    //                         glyph.textureIndex = g.font_ctx->bind.texture_index;
+    //                         glyph.samplerIndex = g.font_ctx->bind.sampler_index;
+    //                         glyph.fontType = static_cast<uint32_t>(g.font_ctx->type);
+    //                         glyph.pxRange = static_cast<float>(
+    //                             g.font_ctx->font.atlas.distanceRange.value_or(0.0));
+    //                         glyph.modulateFlag = modulateFlag;
+    //                         glyph.color = color;
+    //                         glyph.model =
+    //                             glm::translate(glm::mat4(1.0f), glm::vec3(cx, cy, 0.0f)) *
+    //                             glm::scale(glm::mat4(1.0f),
+    //                                        glm::vec3(w / W * 2.0f, h / H * 2.0f, 1.0f));
+    //                         glyph.uvTransform = uv;
+    //                         glyph.hover_fn = hover_fn_id;
+    //                         return glyph;
+    //                     };
+
+    //                     // ★ 反查钥匙 = 桥接实例本身（owner 就是 WidgetBridge<Agg>*）
+    //                     const uint64_t data_ptr = reinterpret_cast<uint64_t>(owner);
+    //                     const uint32_t hfn = self.hover_fn;
+
+    //                     // ================= 第一块：五位置单字符 =================
+    //                     {
+    //                         const std::string testStr = "ABCDE";
+    //                         auto textResult = run_text_pipeline(ctx.fontSelect,
+    //                                                             testStr.data(), "zh-CN");
+    //                         const auto &shapeResult = textResult.shape_result;
+    //                         if (!shapeResult.empty() && !shapeResult[0].empty())
+    //                         {
+    //                             std::vector<const std::remove_cvref_t<
+    //                                 decltype(shapeResult[0][0])> *>
+    //                                 glyphPtrs;
+    //                             for (const auto &run : shapeResult)
+    //                                 for (const auto &g : run)
+    //                                     glyphPtrs.push_back(&g);
+
+    //                             if (glyphPtrs.size() >= 5)
+    //                             {
+    //                                 const float margin = 20.0f;
+    //                                 const float fontSizePx = 24.0f;
+    //                                 std::array<glm::vec2, 5> positions = {
+    //                                     glm::vec2(margin, margin),
+    //                                     glm::vec2(windowWidth - margin - fontSizePx,
+    //                                               margin),
+    //                                     glm::vec2(windowWidth - margin - fontSizePx,
+    //                                               windowHeight - margin - fontSizePx),
+    //                                     glm::vec2(margin,
+    //                                               windowHeight - margin - fontSizePx),
+    //                                     glm::vec2(windowWidth * 0.5f,
+    //                                               windowHeight * 0.5f)};
+
+    //                                 for (int i = 0; i < 5; ++i)
+    //                                 {
+    //                                     const auto &g = *glyphPtrs[i];
+    //                                     if (g.plane_bounds == decltype(g.plane_bounds){})
+    //                                         continue;
+    //                                     float cursorX = positions[i].x -
+    //                                                     g.plane_bounds.left * fontSizePx;
+    //                                     float baselineY = positions[i].y +
+    //                                                       g.plane_bounds.top * fontSizePx;
+
+    //                                     auto entity_index = glyphPool().allocate();
+    //                                     shader_data::Glyph glyph = make_glyph(
+    //                                         g, windowWidth, windowHeight, fontSizePx,
+    //                                         cursorX, baselineY, data_ptr, entity_index,
+    //                                         hfn, glm::vec4(1.0f), 1);
+    //                                     auto proxy = glyphPool().make_soa_value(
+    //                                         entity_index, glyph);
+    //                                     self.textGlyphProxies.push_back(std::move(proxy));
+    //                                     self.cachedGlyphs.push_back(std::move(glyph));
+    //                                 }
+    //                             }
+    //                         }
+    //                     }
+
+    //                     // ============ 第二块：正式文本（顶部居中）============
+    //                     if (!self.text.empty())
+    //                     {
+    //                         auto textResult = run_text_pipeline(
+    //                             ctx.fontSelect, self.text.data(), "zh-CN");
+    //                         const auto &shapeResult = textResult.shape_result;
+    //                         if (!shapeResult.empty() && !shapeResult[0].empty())
+    //                         {
+    //                             const float fontSizePx = 24.0f;
+    //                             const float topMargin = 20.0f;
+    //                             const float baselineY = topMargin + fontSizePx;
+
+    //                             float totalWidth = 0.0f;
+    //                             for (const auto &run : shapeResult)
+    //                                 for (const auto &g : run)
+    //                                     totalWidth += g.advance_x * fontSizePx;
+
+    //                             float cursorX = (windowWidth - totalWidth) * 0.5f;
+
+    //                             for (const auto &run : shapeResult)
+    //                             {
+    //                                 for (const auto &g : run)
+    //                                 {
+    //                                     if (g.plane_bounds == decltype(g.plane_bounds){})
+    //                                     {
+    //                                         cursorX += g.advance_x * fontSizePx;
+    //                                         continue;
+    //                                     }
+    //                                     auto entity_index = glyphPool().allocate();
+    //                                     shader_data::Glyph glyph = make_glyph(
+    //                                         g, windowWidth, windowHeight, fontSizePx,
+    //                                         cursorX, baselineY, data_ptr, entity_index,
+    //                                         hfn, glm::vec4(1.0f), 1);
+    //                                     auto proxy = glyphPool().make_soa_value(
+    //                                         entity_index, glyph);
+    //                                     self.textGlyphProxies.push_back(std::move(proxy));
+    //                                     self.cachedGlyphs.push_back(std::move(glyph));
+    //                                     cursorX += g.advance_x * fontSizePx;
+    //                                 }
+    //                             }
+    //                         }
+    //                     }
+
+    //                     self.cachedOwnerOffset = owner->offset;
+    //                     self.cachedViewport = {windowWidth, windowHeight};
+    //                 })))};
+
     ui_new::ScreenWidget screen{
         ui_new::Size{WIDTH, HEIGHT},
-        ui_new::Container("panel")
-            .child(ui_new::Container("rectBox").width(0.0).height(0.0))
-            .child(my_ui2::as_widget(
-                "text",
-                make_aggregate<"TextBox", "text", "textGlyphProxies", "cachedGlyphs",
-                               "cachedOwnerOffset", "cachedViewport", "hover_fn", "hover",
-                               "render">(
-                    std::string("CD"), std::vector<proxy_value<my_ui2::GlyphPool>>{},
-                    std::vector<shader_data::Glyph>{}, ui_new::Offset{-1e30, -1e30},
-                    glm::vec2{-1.0f, -1.0f}, 0u,
+        ui_new::Container("panel").child(ui_new::Container("rectBox").renderObject(
+            my_ui3::renderObject(make_aggregate<"TextBox", "text", "textGlyphProxies",
+                                                "cachedGlyphs", "cachedOwnerOffset",
+                                                "cachedViewport", "hover_fn", "hover",
+                                                "render", "rebuildCache">(
+                std::string("CD"), std::vector<proxy_value<my_ui2::GlyphPool>>{},
+                std::vector<shader_data::Glyph>{}, ui_new::Offset{-1e30, -1e30},
+                glm::vec2{-1.0f, -1.0f}, 0u,
 
-                    // ============================================================
-                    // hover —— 用户逻辑，就地写
-                    // ============================================================
-                    [](auto &&self, picking_result r, bool enter) noexcept {
-                        std::println("[Text-HOVER] type={} entity={} primitive={} "
-                                     "ver={} {} (hover_fn={}) text={}",
-                                     r.key.object_type, r.key.entity_index,
-                                     r.primitive_id(), r.render_version(),
-                                     enter ? "ENTER" : "LEAVE", r.hover_fn, self.text);
-                    },
+                // ════════════════════════════════════════════════════════
+                // hover —— 用户逻辑，就地写
+                // ════════════════════════════════════════════════════════
+                [](auto &&self, picking_result r, bool enter) noexcept {
+                    std::println("[Text-HOVER] type={} entity={} primitive={} "
+                                 "ver={} {} (hover_fn={}) text={}",
+                                 r.key.object_type, r.key.entity_index, r.primitive_id(),
+                                 r.render_version(), enter ? "ENTER" : "LEAVE",
+                                 r.hover_fn, self.text);
+                },
 
-                    // ============================================================
-                    // render —— 原 TextRenderObject::render + rebuildCache 整体
-                    // ============================================================
-                    [](auto &&self, ui_new::ScreenWidget *screen, ui_new::Widget *owner,
-                       render_context &ctx) {
-                        (void)screen;
+                // ════════════════════════════════════════════════════════
+                // render —— 只负责「缓存校验 + 提交」
+                // ════════════════════════════════════════════════════════
+                [](auto &&self, ui_new::ScreenWidget *screen, ui_new::Widget *owner,
+                   render_context &ctx) {
+                    (void)screen;
 
-                        const auto &viewports = ctx.drawRecorder.currentDynamic.viewports;
-                        if (viewports.empty())
-                            return;
+                    const auto &viewports = ctx.drawRecorder.currentDynamic.viewports;
+                    if (viewports.empty())
+                        return;
 
-                        const float windowWidth = viewports[0].width;
-                        const float windowHeight = viewports[0].height;
-                        const ui_new::Offset off = owner->offset;
+                    const float windowWidth = viewports[0].width;
+                    const float windowHeight = viewports[0].height;
+                    const ui_new::Offset off = owner->offset;
 
-                        const bool cacheValid = !self.cachedGlyphs.empty() &&
-                                                self.cachedOwnerOffset.x == off.x &&
-                                                self.cachedOwnerOffset.y == off.y &&
-                                                self.cachedViewport.x == windowWidth &&
-                                                self.cachedViewport.y == windowHeight;
+                    const bool cacheValid = !self.cachedGlyphs.empty() &&
+                                            self.cachedOwnerOffset.x == off.x &&
+                                            self.cachedOwnerOffset.y == off.y &&
+                                            self.cachedViewport.x == windowWidth &&
+                                            self.cachedViewport.y == windowHeight;
 
-                        if (!cacheValid)
-                        {
-                            self.textGlyphProxies.clear();
-                            self.cachedGlyphs.clear();
+                    if (!cacheValid)
+                        self.template invoke<"rebuildCache">(owner, windowWidth,
+                                                             windowHeight, ctx);
 
-                            // ---------- 状态无关的字形生成 Lambda ----------
-                            auto make_glyph =
-                                [](const auto &g, float W, float H, float fontSizePx,
-                                   float cursorX, float baselineY, uint64_t data,
-                                   uint32_t entity_index, uint32_t hover_fn_id,
-                                   glm::vec4 color,
-                                   uint32_t modulateFlag) -> shader_data::Glyph {
-                                float leftPx = cursorX + g.plane_bounds.left * fontSizePx;
-                                float rightPx =
-                                    cursorX + g.plane_bounds.right * fontSizePx;
-                                float topPx = baselineY - g.plane_bounds.top * fontSizePx;
-                                float bottomPx =
-                                    baselineY - g.plane_bounds.bottom * fontSizePx;
-                                float w = rightPx - leftPx;
-                                float h = bottomPx - topPx;
+                    if (!self.cachedGlyphs.empty())
+                        ctx.drawRecorder.addInstances(
+                            std::span<const shader_data::Glyph>(self.cachedGlyphs));
+                },
 
-                                float cx = ((leftPx + w * 0.5f) / W) * 2.0f - 1.0f;
-                                float cy = ((topPx + h * 0.5f) / H) * 2.0f - 1.0f;
+                // ════════════════════════════════════════════════════════
+                // rebuildCache —— 原 TextRenderObject::rebuildCache 整体
+                // ════════════════════════════════════════════════════════
+                [](auto &&self, ui_new::Widget *owner, float windowWidth,
+                   float windowHeight, render_context &ctx) {
+                    self.textGlyphProxies.clear();
+                    self.cachedGlyphs.clear();
 
-                                UvTransform uv;
-                                uv.scale =
-                                    glm::vec2(static_cast<float>(g.uv_bounds.right -
-                                                                 g.uv_bounds.left),
-                                              static_cast<float>(g.uv_bounds.top -
-                                                                 g.uv_bounds.bottom));
-                                uv.offset =
-                                    glm::vec2(static_cast<float>(g.uv_bounds.left),
+                    // ---------- 状态无关的字形生成 Lambda ----------
+                    auto make_glyph = [](const auto &g, float W, float H,
+                                         float fontSizePx, float cursorX, float baselineY,
+                                         uint64_t data, uint32_t entity_index,
+                                         uint32_t hover_fn_id, glm::vec4 color,
+                                         uint32_t modulateFlag) -> shader_data::Glyph {
+                        float leftPx = cursorX + g.plane_bounds.left * fontSizePx;
+                        float rightPx = cursorX + g.plane_bounds.right * fontSizePx;
+                        float topPx = baselineY - g.plane_bounds.top * fontSizePx;
+                        float bottomPx = baselineY - g.plane_bounds.bottom * fontSizePx;
+                        float w = rightPx - leftPx;
+                        float h = bottomPx - topPx;
+
+                        float cx = ((leftPx + w * 0.5f) / W) * 2.0f - 1.0f;
+                        float cy = ((topPx + h * 0.5f) / H) * 2.0f - 1.0f;
+
+                        UvTransform uv;
+                        uv.scale = glm::vec2(
+                            static_cast<float>(g.uv_bounds.right - g.uv_bounds.left),
+                            static_cast<float>(g.uv_bounds.top - g.uv_bounds.bottom));
+                        uv.offset = glm::vec2(static_cast<float>(g.uv_bounds.left),
                                               static_cast<float>(g.uv_bounds.bottom));
 
-                                shader_data::Glyph glyph{};
-                                glyph.data = data;
-                                glyph.entity_index = entity_index;
-                                glyph.textureIndex = g.font_ctx->bind.texture_index;
-                                glyph.samplerIndex = g.font_ctx->bind.sampler_index;
-                                glyph.fontType = static_cast<uint32_t>(g.font_ctx->type);
-                                glyph.pxRange = static_cast<float>(
-                                    g.font_ctx->font.atlas.distanceRange.value_or(0.0));
-                                glyph.modulateFlag = modulateFlag;
-                                glyph.color = color;
-                                glyph.model = glm::translate(glm::mat4(1.0f),
-                                                             glm::vec3(cx, cy, 0.0f)) *
-                                              glm::scale(glm::mat4(1.0f),
-                                                         glm::vec3(w / W * 2.0f,
-                                                                   h / H * 2.0f, 1.0f));
-                                glyph.uvTransform = uv;
-                                glyph.hover_fn = hover_fn_id;
-                                return glyph;
-                            };
+                        shader_data::Glyph glyph{};
+                        glyph.data = data;
+                        glyph.entity_index = entity_index;
+                        glyph.textureIndex = g.font_ctx->bind.texture_index;
+                        glyph.samplerIndex = g.font_ctx->bind.sampler_index;
+                        glyph.fontType = static_cast<uint32_t>(g.font_ctx->type);
+                        glyph.pxRange = static_cast<float>(
+                            g.font_ctx->font.atlas.distanceRange.value_or(0.0));
+                        glyph.modulateFlag = modulateFlag;
+                        glyph.color = color;
+                        glyph.model =
+                            glm::translate(glm::mat4(1.0f), glm::vec3(cx, cy, 0.0f)) *
+                            glm::scale(glm::mat4(1.0f),
+                                       glm::vec3(w / W * 2.0f, h / H * 2.0f, 1.0f));
+                        glyph.uvTransform = uv;
+                        glyph.hover_fn = hover_fn_id;
+                        return glyph;
+                    };
 
-                            // ★ 反查钥匙 = 桥接实例本身（owner 就是 WidgetBridge<Agg>*）
-                            const uint64_t data_ptr = reinterpret_cast<uint64_t>(owner);
-                            const uint32_t hfn = self.hover_fn;
+                    // ★ 反查钥匙 = Agg 自身（my_ui3 里 AggRenderObject 的 agg 字段）
+                    //    与 AggRenderObject::hover_fn_id 里的 reinterpret_cast<Agg*> 对应。
+                    const uint64_t data_ptr = reinterpret_cast<uint64_t>(&self);
+                    const uint32_t hfn = self.hover_fn;
 
-                            // ================= 第一块：五位置单字符 =================
+                    // ============ 第一块：五位置单字符 ============
+                    {
+                        const std::string testStr = "ABCDE";
+                        auto textResult =
+                            run_text_pipeline(ctx.fontSelect, testStr.data(), "zh-CN");
+                        const auto &shapeResult = textResult.shape_result;
+                        if (!shapeResult.empty() && !shapeResult[0].empty())
+                        {
+                            std::vector<
+                                const std::remove_cvref_t<decltype(shapeResult[0][0])> *>
+                                glyphPtrs;
+                            for (const auto &run : shapeResult)
+                                for (const auto &g : run)
+                                    glyphPtrs.push_back(&g);
+
+                            if (glyphPtrs.size() >= 5)
                             {
-                                const std::string testStr = "ABCDE";
-                                auto textResult = run_text_pipeline(
-                                    ctx.fontSelect, testStr.data(), "zh-CN");
-                                const auto &shapeResult = textResult.shape_result;
-                                if (!shapeResult.empty() && !shapeResult[0].empty())
+                                const float margin = 20.0f;
+                                const float fontSizePx = 24.0f;
+                                std::array<glm::vec2, 5> positions = {
+                                    glm::vec2(margin, margin),
+                                    glm::vec2(windowWidth - margin - fontSizePx, margin),
+                                    glm::vec2(windowWidth - margin - fontSizePx,
+                                              windowHeight - margin - fontSizePx),
+                                    glm::vec2(margin, windowHeight - margin - fontSizePx),
+                                    glm::vec2(windowWidth * 0.5f, windowHeight * 0.5f)};
+
+                                for (int i = 0; i < 5; ++i)
                                 {
-                                    std::vector<const std::remove_cvref_t<
-                                        decltype(shapeResult[0][0])> *>
-                                        glyphPtrs;
-                                    for (const auto &run : shapeResult)
-                                        for (const auto &g : run)
-                                            glyphPtrs.push_back(&g);
+                                    const auto &g = *glyphPtrs[i];
+                                    if (g.plane_bounds == decltype(g.plane_bounds){})
+                                        continue;
+                                    float cursorX =
+                                        positions[i].x - g.plane_bounds.left * fontSizePx;
+                                    float baselineY =
+                                        positions[i].y + g.plane_bounds.top * fontSizePx;
 
-                                    if (glyphPtrs.size() >= 5)
-                                    {
-                                        const float margin = 20.0f;
-                                        const float fontSizePx = 24.0f;
-                                        std::array<glm::vec2, 5> positions = {
-                                            glm::vec2(margin, margin),
-                                            glm::vec2(windowWidth - margin - fontSizePx,
-                                                      margin),
-                                            glm::vec2(windowWidth - margin - fontSizePx,
-                                                      windowHeight - margin - fontSizePx),
-                                            glm::vec2(margin,
-                                                      windowHeight - margin - fontSizePx),
-                                            glm::vec2(windowWidth * 0.5f,
-                                                      windowHeight * 0.5f)};
-
-                                        for (int i = 0; i < 5; ++i)
-                                        {
-                                            const auto &g = *glyphPtrs[i];
-                                            if (g.plane_bounds ==
-                                                decltype(g.plane_bounds){})
-                                                continue;
-                                            float cursorX =
-                                                positions[i].x -
-                                                g.plane_bounds.left * fontSizePx;
-                                            float baselineY =
-                                                positions[i].y +
-                                                g.plane_bounds.top * fontSizePx;
-
-                                            auto entity_index = glyphPool().allocate();
-                                            shader_data::Glyph glyph = make_glyph(
-                                                g, windowWidth, windowHeight, fontSizePx,
-                                                cursorX, baselineY, data_ptr,
-                                                entity_index, hfn, glm::vec4(1.0f), 1);
-                                            auto proxy = glyphPool().make_soa_value(
-                                                entity_index, glyph);
-                                            self.textGlyphProxies.push_back(
-                                                std::move(proxy));
-                                            self.cachedGlyphs.push_back(std::move(glyph));
-                                        }
-                                    }
+                                    auto entity_index = glyphPool().allocate();
+                                    shader_data::Glyph glyph = make_glyph(
+                                        g, windowWidth, windowHeight, fontSizePx, cursorX,
+                                        baselineY, data_ptr, entity_index, hfn,
+                                        glm::vec4(1.0f), 1);
+                                    auto proxy =
+                                        glyphPool().make_soa_value(entity_index, glyph);
+                                    self.textGlyphProxies.push_back(std::move(proxy));
+                                    self.cachedGlyphs.push_back(std::move(glyph));
                                 }
                             }
-
-                            // ============ 第二块：正式文本（顶部居中）============
-                            if (!self.text.empty())
-                            {
-                                auto textResult = run_text_pipeline(
-                                    ctx.fontSelect, self.text.data(), "zh-CN");
-                                const auto &shapeResult = textResult.shape_result;
-                                if (!shapeResult.empty() && !shapeResult[0].empty())
-                                {
-                                    const float fontSizePx = 24.0f;
-                                    const float topMargin = 20.0f;
-                                    const float baselineY = topMargin + fontSizePx;
-
-                                    float totalWidth = 0.0f;
-                                    for (const auto &run : shapeResult)
-                                        for (const auto &g : run)
-                                            totalWidth += g.advance_x * fontSizePx;
-
-                                    float cursorX = (windowWidth - totalWidth) * 0.5f;
-
-                                    for (const auto &run : shapeResult)
-                                    {
-                                        for (const auto &g : run)
-                                        {
-                                            if (g.plane_bounds ==
-                                                decltype(g.plane_bounds){})
-                                            {
-                                                cursorX += g.advance_x * fontSizePx;
-                                                continue;
-                                            }
-                                            auto entity_index = glyphPool().allocate();
-                                            shader_data::Glyph glyph = make_glyph(
-                                                g, windowWidth, windowHeight, fontSizePx,
-                                                cursorX, baselineY, data_ptr,
-                                                entity_index, hfn, glm::vec4(1.0f), 1);
-                                            auto proxy = glyphPool().make_soa_value(
-                                                entity_index, glyph);
-                                            self.textGlyphProxies.push_back(
-                                                std::move(proxy));
-                                            self.cachedGlyphs.push_back(std::move(glyph));
-                                            cursorX += g.advance_x * fontSizePx;
-                                        }
-                                    }
-                                }
-                            }
-
-                            self.cachedOwnerOffset = off;
-                            self.cachedViewport = {windowWidth, windowHeight};
                         }
+                    }
 
-                        if (!self.cachedGlyphs.empty())
-                            ctx.drawRecorder.addInstances(
-                                std::span<const shader_data::Glyph>(self.cachedGlyphs));
-                    })))};
+                    // ============ 第二块：正式文本（顶部居中）============
+                    if (!self.text.empty())
+                    {
+                        auto textResult =
+                            run_text_pipeline(ctx.fontSelect, self.text.data(), "zh-CN");
+                        const auto &shapeResult = textResult.shape_result;
+                        if (!shapeResult.empty() && !shapeResult[0].empty())
+                        {
+                            const float fontSizePx = 24.0f;
+                            const float topMargin = 20.0f;
+                            const float baselineY = topMargin + fontSizePx;
+
+                            float totalWidth = 0.0f;
+                            for (const auto &run : shapeResult)
+                                for (const auto &g : run)
+                                    totalWidth += g.advance_x * fontSizePx;
+
+                            float cursorX = (windowWidth - totalWidth) * 0.5f;
+
+                            for (const auto &run : shapeResult)
+                            {
+                                for (const auto &g : run)
+                                {
+                                    if (g.plane_bounds == decltype(g.plane_bounds){})
+                                    {
+                                        cursorX += g.advance_x * fontSizePx;
+                                        continue;
+                                    }
+                                    auto entity_index = glyphPool().allocate();
+                                    shader_data::Glyph glyph = make_glyph(
+                                        g, windowWidth, windowHeight, fontSizePx, cursorX,
+                                        baselineY, data_ptr, entity_index, hfn,
+                                        glm::vec4(1.0f), 1);
+                                    auto proxy =
+                                        glyphPool().make_soa_value(entity_index, glyph);
+                                    self.textGlyphProxies.push_back(std::move(proxy));
+                                    self.cachedGlyphs.push_back(std::move(glyph));
+                                    cursorX += g.advance_x * fontSizePx;
+                                }
+                            }
+                        }
+                    }
+
+                    self.cachedOwnerOffset = owner->offset;
+                    self.cachedViewport = {windowWidth, windowHeight};
+                }))))};
 
     // 新的 soaCtx 仅包含 uiRects 和 uiWireRects
     auto soaCtx = make_aggregate_ref<"soaCtx", "screen">(screen);
