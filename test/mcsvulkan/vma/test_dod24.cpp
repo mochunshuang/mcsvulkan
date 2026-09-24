@@ -6903,7 +6903,7 @@ namespace my_ui3
             agg.template invoke<"render">(s, owner, ctx);
         }
 
-        static uint32_t hover_fn_id()
+        constexpr static uint32_t hover_fn_id(auto &&...)
         {
             static const uint32_t fn =
                 hoverPool().bind([](picking_result r, bool enter) noexcept {
@@ -6916,7 +6916,7 @@ namespace my_ui3
     };
 
     template <class Agg>
-    [[nodiscard]] inline auto renderObject(Agg &&a)
+    [[nodiscard]] inline auto asRenderObject(Agg &&a)
     {
         using D = std::decay_t<Agg>;
         return std::make_unique<AggRenderObject<D>>(std::forward<Agg>(a));
@@ -7331,10 +7331,10 @@ try
     ui_new::ScreenWidget screen{
         ui_new::Size{WIDTH, HEIGHT},
         ui_new::Container("panel").child(ui_new::Container("rectBox").renderObject(
-            my_ui3::renderObject(make_aggregate<"TextBox", "text", "textGlyphProxies",
-                                                "cachedGlyphs", "cachedOwnerOffset",
-                                                "cachedViewport", "hover_fn", "hover",
-                                                "render", "rebuildCache">(
+            my_ui3::asRenderObject(make_aggregate<"TextBox", "text", "textGlyphProxies",
+                                                  "cachedGlyphs", "cachedOwnerOffset",
+                                                  "cachedViewport", "hover_fn", "hover",
+                                                  "render", "rebuildCache">(
                 std::string("CD"), std::vector<proxy_value<my_ui2::GlyphPool>>{},
                 std::vector<shader_data::Glyph>{}, ui_new::Offset{-1e30, -1e30},
                 glm::vec2{-1.0f, -1.0f}, 0u,
