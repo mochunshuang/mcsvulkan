@@ -33,8 +33,9 @@ namespace mcs::vulkan::meta
                 template for (constexpr auto I : std::ranges::views::indices(N))
                 {
                     auto name = Name...[I + 1];
-                    desc_.push_back(
-                        std::meta::data_member_spec(types_[I], {.name = name.view()}));
+                    auto is_empty = std::meta::is_empty_type(types_[I]);
+                    desc_.push_back(std::meta::data_member_spec(
+                        types_[I], {.name = name.view(), .no_unique_address = is_empty}));
                 }
                 std::meta::define_aggregate(^^type, desc_);
             }

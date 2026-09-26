@@ -4,6 +4,7 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <functional>
 #include <exception>
 #include <flat_map>
@@ -92,6 +93,8 @@ using mcs::vulkan::task::init_task;
 using mcs::vulkan::task::schedulable_task;
 
 using mcs::vulkan::match;
+
+using mcs::vulkan::fatal_error;
 
 constexpr uint32_t WIDTH = 800;
 constexpr uint32_t HEIGHT = 600;
@@ -677,8 +680,8 @@ namespace shader_data
     // 多个字形可指向同一个 hover_fn（函数被共享）。hover_fn = 0xFFFFFFFF 表示未绑定。
     struct hover_pool
     {
-        using hover_callback_t = std::move_only_function<void(
-            picking_result, bool, InputCtx &, ui_new::ScreenWidget *) noexcept>;
+        using hover_callback_t = void (*)(picking_result, bool, InputCtx &,
+                                          ui_new::ScreenWidget *) noexcept;
         std::vector<hover_callback_t> hover_fns;
 
         // 绑定一个可共享的 hover 函数，返回池实体下标（0 也是合法下标）
@@ -694,9 +697,7 @@ namespace shader_data
             if (entity == ~0U)
                 return;
             assert(entity < hover_fns.size());
-            auto &fn = hover_fns[entity];
-            assert(fn);
-            fn(r, enter, inputCtx, screen);
+            hover_fns[entity](r, enter, inputCtx, screen);
         }
     };
 
@@ -6614,8 +6615,26 @@ auto &rectanglePool()
     return pool;
 }
 
+// NOTE: hover在帧稳定才触发，noexcept 没有问题
+static constexpr uint64_t getShaderData(object_key key) noexcept
+{
+    using namespace shader_data;
+    auto [object_type, entity_index] = key;
+    switch (object_type)
+    {
+    case Glyph::type_id:
+        return glyphPool().template get<"data">(entity_index);
+    case UiRect::type_id:
+        return uiRectPool().template get<"data">(entity_index);
+    case Rectangle::type_id:
+        return rectanglePool().template get<"data">(entity_index);
+    }
+    fatal_error(std::format("no handle for entity_index: {}", entity_index));
+}
+
 namespace render
 {
+    // NOTE: 实现 RenderObject 的匿名实现类的效果
     template <class Agg>
     struct AggRenderObject final : ui_new::RenderObject
     {
@@ -6629,19 +6648,19 @@ namespace render
             agg.template invoke<"render">(s, owner, ctx);
         }
     };
-    template <typename T, static_string hover_fn_name>
+    template <typename Agg, static_string hover_fn_name>
     struct HoverFn
     {
-        static constexpr auto handler = [](picking_result r, bool enter,
-                                           InputCtx &inputCtx,
-                                           ui_new::ScreenWidget *screen) noexcept {
-            uint64_t ptr = glyphPool().template get<"data">(r.key.entity_index);
-            auto *obj = reinterpret_cast<T *>(ptr);
-            obj->template invoke<hover_fn_name>(r, enter, inputCtx, screen);
+        static constexpr auto handler(picking_result r, bool enter, InputCtx &inputCtx,
+                                      ui_new::ScreenWidget *screen) noexcept
+        {
+            uint64_t ptr = getShaderData(r.key);
+            auto *agg = reinterpret_cast<Agg *>(ptr);
+            agg->template invoke<hover_fn_name>(r, enter, inputCtx, screen);
         };
         static constexpr auto index()
         {
-            static const uint32_t fn = hoverPool().bind(handler);
+            static const uint32_t fn = hoverPool().bind(&handler);
             return fn;
         }
     };
