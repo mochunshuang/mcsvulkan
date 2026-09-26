@@ -136,9 +136,15 @@ namespace mcs::vulkan::meta
         }
     };
 
+    template <typename T>
+    concept is_entry_v = requires {
+        typename std::remove_cvref_t<T>::value_type;
+        std::remove_cvref_t<T>::name;
+    };
     template <static_string... name, typename... T>
+        requires(!(is_entry_v<T> && ...))
     static constexpr auto make_aggregate(T &&...member)
-        -> aggregate<aggregate_info<name...>, std::decay_t<T>...>
+        -> aggregate<aggregate_info<name...>, std::remove_cvref_t<T>...>
     {
         return {std::forward<T>(member)...};
     }
@@ -150,4 +156,31 @@ namespace mcs::vulkan::meta
         return {std::forward<T &>(member)...};
     }
 
+    template <static_string Name, typename T>
+    struct entry_t
+    {
+        static constexpr auto name = Name; // NOLINT
+        using value_type = T;
+        T value;
+    };
+
+    template <static_string Name, typename T>
+    static constexpr auto field(T &&v) noexcept -> entry_t<Name, std::decay_t<T>>
+    {
+        return {std::forward<T>(v)};
+    }
+
+    template <static_string Name, typename T>
+    static constexpr auto method(T &&v) noexcept -> entry_t<Name, std::decay_t<T>>
+    {
+        return {std::forward<T>(v)};
+    }
+    template <static_string ClassName, typename... Entries>
+        requires(is_entry_v<Entries> && ...)
+    constexpr auto make_aggregate(Entries &&...es)
+    {
+        return aggregate<aggregate_info<ClassName, std::remove_cvref_t<Entries>::name...>,
+                         typename std::remove_cvref_t<Entries>::value_type...>{
+            std::forward_like<Entries>(es.value)...};
+    }
 }; // namespace mcs::vulkan::meta

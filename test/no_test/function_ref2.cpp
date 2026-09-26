@@ -472,6 +472,130 @@ void test_ecs()
 }
 
 // ============================================================================
+// 测试5: 模板实现类的静态函数 (static member function of a template class)
+// 验证 _S_ptrs 路径 和 _S_nttp 路径 都能处理模板实例化后的静态函数
+// ============================================================================
+
+// 类型参数驱动的模板实现类
+template <typename Tag>
+struct Policy
+{
+    static int apply(int x)
+    {
+        return x + 10;
+    }
+    static int apply_noexcept(int x) noexcept
+    {
+        return x + 20;
+    }
+};
+
+// 非类型参数驱动的模板实现类
+template <int N>
+struct IntPolicy
+{
+    static int apply(int x)
+    {
+        return x * N;
+    }
+};
+
+// 特化版本
+struct FastTag
+{
+};
+struct SlowTag
+{
+};
+
+template <>
+struct Policy<FastTag>
+{
+    static int apply(int x)
+    {
+        return x * 2;
+    }
+};
+
+template <>
+struct Policy<SlowTag>
+{
+    static int apply(int x)
+    {
+        return x * 100;
+    }
+};
+
+void test_template_static_function()
+{
+    std::cout << "\n=== 测试5: 模板类静态函数 ===\n";
+
+    // ---- 路径 A: 直接函数指针 -> _S_ptrs ----
+    std::function_ref<int(int)> ref1 = &Policy<int>::apply;
+    std::function_ref<int(int)> ref2 = &Policy<double>::apply;
+    std::cout << "&Policy<int>::apply(5)    = " << ref1(5) << '\n'; // 15
+    std::cout << "&Policy<double>::apply(5) = " << ref2(5) << '\n'; // 15
+
+    // 特化
+    std::function_ref<int(int)> ref_fast = &Policy<FastTag>::apply;
+    std::function_ref<int(int)> ref_slow = &Policy<SlowTag>::apply;
+    std::cout << "&Policy<FastTag>::apply(5) = " << ref_fast(5) << '\n'; // 10
+    std::cout << "&Policy<SlowTag>::apply(5) = " << ref_slow(5) << '\n'; // 500
+
+    // 非类型模板参数
+    std::function_ref<int(int)> ref_n3 = &IntPolicy<3>::apply;
+    std::function_ref<int(int)> ref_n7 = &IntPolicy<7>::apply;
+    std::cout << "&IntPolicy<3>::apply(5) = " << ref_n3(5) << '\n'; // 15
+    std::cout << "&IntPolicy<7>::apply(5) = " << ref_n7(5) << '\n'; // 35
+
+    // ---- 路径 B: constant_wrapper -> _S_nttp ----
+    constexpr std::function_ref<int(int)> cw1 =
+        std::constant_wrapper<&Policy<int>::apply>{};
+    constexpr std::function_ref<int(int)> cw2 =
+        std::constant_wrapper<&Policy<char>::apply>{};
+    constexpr std::function_ref<int(int)> cw3 =
+        std::constant_wrapper<&IntPolicy<42>::apply>{};
+    constexpr std::function_ref<int(int)> cw4 =
+        std::constant_wrapper<&Policy<FastTag>::apply>{};
+
+    std::cout << "cw &Policy<int>::apply(5)     = " << cw1(5) << '\n'; // 15
+    std::cout << "cw &Policy<char>::apply(5)    = " << cw2(5) << '\n'; // 15
+    std::cout << "cw &IntPolicy<42>::apply(5)   = " << cw3(5) << '\n'; // 210
+    std::cout << "cw &Policy<FastTag>::apply(5) = " << cw4(5) << '\n'; // 10
+
+    // ---- noexcept 静态模板函数 ----
+    std::function_ref<int(int) noexcept> ref_ne = &Policy<int>::apply_noexcept;
+    std::function_ref<int(int) noexcept> cw_ne =
+        std::constant_wrapper<&Policy<int>::apply_noexcept>{};
+    std::cout << "noexcept ptr apply(5) = " << ref_ne(5) << '\n'; // 25
+    std::cout << "noexcept cw  apply(5) = " << cw_ne(5) << '\n';  // 25
+
+    // ---- 放入容器混合调用（两种路径混装） ----
+    std::vector<std::function_ref<int(int)>> ops;
+    ops.push_back(&Policy<FastTag>::apply);                        // _S_ptrs
+    ops.push_back(&Policy<SlowTag>::apply);                        // _S_ptrs
+    ops.push_back(&IntPolicy<3>::apply);                           // _S_ptrs
+    ops.push_back(std::constant_wrapper<&Policy<int>::apply>{});   // _S_nttp
+    ops.push_back(std::constant_wrapper<&IntPolicy<10>::apply>{}); // _S_nttp
+
+    std::cout << "vector 混合调用(4):\n";
+    for (auto op : ops)
+        std::cout << "  -> " << op(4) << '\n';
+
+    // ---- 与约束/大小相关的验证 ----
+    static_assert(sizeof(ref1) == 2 * sizeof(void *));
+    static_assert(std::is_constructible_v<std::function_ref<int(int)>,
+                                          decltype(&Policy<int>::apply)>);
+    static_assert(std::is_constructible_v<std::function_ref<int(int) noexcept>,
+                                          decltype(&Policy<int>::apply_noexcept)>);
+    // 非 noexcept 不能绑定到 noexcept
+    static_assert(!std::is_constructible_v<std::function_ref<int(int) noexcept>,
+                                           decltype(&Policy<int>::apply)>);
+
+    std::cout << "模板类静态函数组合工作正常。\n";
+}
+
+// ============================================================================
 // 主函数
 // ============================================================================
 int main()
@@ -482,6 +606,7 @@ int main()
     test_static_path();
     test_bind_ref_path();
     test_std_wrapper_path();
+    test_template_static_function(); // <-- 新增
     std::cout << "\n所有测试完成，内部路径已验证。\n";
 
     auto f1 = [](int x) {
