@@ -481,6 +481,82 @@ namespace mcs::vulkan::event
                                          const cursor_enter_event &b) noexcept = default;
     };
 
+    // ═══════════════════════════════════════════════════════════
+    // 输入补充
+    // ═══════════════════════════════════════════════════════════
+    struct char_event
+    {
+        std::uint32_t codepoint;
+        friend constexpr bool operator==(const char_event &,
+                                         const char_event &) noexcept = default;
+    };
+
+    struct drop_event
+    {
+        int count;
+        const char *const *paths; // 临时，仅在 distribute 期间有效
+
+        friend constexpr bool operator==(const drop_event &,
+                                         const drop_event &) noexcept = default;
+    };
+    // ═══════════════════════════════════════════════════════════
+    // 窗口
+    // ═══════════════════════════════════════════════════════════
+    struct window_focus_event
+    {
+        bool focused;
+        friend constexpr bool operator==(const window_focus_event &,
+                                         const window_focus_event &) noexcept = default;
+    };
+
+    struct window_pos_event
+    {
+        int x;
+        int y;
+        friend constexpr bool operator==(const window_pos_event &,
+                                         const window_pos_event &) noexcept = default;
+    };
+
+    struct window_size_event
+    {
+        int width;
+        int height;
+        friend constexpr bool operator==(const window_size_event &,
+                                         const window_size_event &) noexcept = default;
+    };
+
+    struct window_iconify_event
+    {
+        bool iconified;
+        friend constexpr bool operator==(const window_iconify_event &,
+                                         const window_iconify_event &) noexcept = default;
+    };
+
+    struct window_maximize_event
+    {
+        bool maximized;
+        friend constexpr bool operator==(const window_maximize_event &,
+                                         const window_maximize_event &) noexcept =
+            default;
+    };
+
+    struct framebuffer_size_event
+    {
+        int width;
+        int height;
+        friend constexpr bool operator==(const framebuffer_size_event &,
+                                         const framebuffer_size_event &) noexcept =
+            default;
+    };
+
+    struct content_scale_event
+    {
+        float xscale;
+        float yscale;
+        friend constexpr bool operator==(const content_scale_event &,
+                                         const content_scale_event &) noexcept = default;
+    };
+
 }; // namespace mcs::vulkan::event
 
 namespace std
@@ -945,37 +1021,168 @@ namespace std
         }
     };
 
+    // ═══════════════════════════════════════════════════════════
+    // 输入补充
+    // ═══════════════════════════════════════════════════════════
+    template <>
+    struct formatter<mcs::vulkan::event::char_event>
+    {
+        static constexpr auto parse(std::format_parse_context &ctx) noexcept
+        {
+            return ctx.begin();
+        }
+
+        static auto format(const mcs::vulkan::event::char_event &event,
+                           std::format_context &ctx)
+        {
+            return std::format_to(ctx.out(), "char_event{{codepoint=U+{:04X}}}",
+                                  event.codepoint);
+        }
+    };
+
+    template <>
+    struct formatter<mcs::vulkan::event::drop_event>
+    {
+        static constexpr auto parse(std::format_parse_context &ctx) noexcept
+        {
+            return ctx.begin();
+        }
+
+        static auto format(const mcs::vulkan::event::drop_event &event,
+                           std::format_context &ctx)
+        {
+            auto out = std::format_to(ctx.out(), "drop_event{{count={}", event.count);
+            if (event.count > 0 && event.paths != nullptr)
+            {
+                out = std::format_to(out, ", paths=[");
+                for (int i = 0; i < event.count; ++i)
+                {
+                    if (i > 0)
+                        out = std::format_to(out, ", ");
+                    out = std::format_to(out, "\"{}\"",
+                                         event.paths[i] != nullptr ? event.paths[i] : "");
+                }
+                out = std::format_to(out, "]");
+            }
+            return std::format_to(out, "}}");
+        }
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    // 窗口
+    // ═══════════════════════════════════════════════════════════
+    template <>
+    struct formatter<mcs::vulkan::event::window_focus_event>
+    {
+        static constexpr auto parse(std::format_parse_context &ctx) noexcept
+        {
+            return ctx.begin();
+        }
+
+        static auto format(const mcs::vulkan::event::window_focus_event &event,
+                           std::format_context &ctx)
+        {
+            return std::format_to(ctx.out(), "window_focus_event{{focused={}}}",
+                                  event.focused);
+        }
+    };
+
+    template <>
+    struct formatter<mcs::vulkan::event::window_pos_event>
+    {
+        static constexpr auto parse(std::format_parse_context &ctx) noexcept
+        {
+            return ctx.begin();
+        }
+
+        static auto format(const mcs::vulkan::event::window_pos_event &event,
+                           std::format_context &ctx)
+        {
+            return std::format_to(ctx.out(), "window_pos_event{{x={}, y={}}}", event.x,
+                                  event.y);
+        }
+    };
+
+    template <>
+    struct formatter<mcs::vulkan::event::window_size_event>
+    {
+        static constexpr auto parse(std::format_parse_context &ctx) noexcept
+        {
+            return ctx.begin();
+        }
+
+        static auto format(const mcs::vulkan::event::window_size_event &event,
+                           std::format_context &ctx)
+        {
+            return std::format_to(ctx.out(), "window_size_event{{width={}, height={}}}",
+                                  event.width, event.height);
+        }
+    };
+
+    template <>
+    struct formatter<mcs::vulkan::event::window_iconify_event>
+    {
+        static constexpr auto parse(std::format_parse_context &ctx) noexcept
+        {
+            return ctx.begin();
+        }
+
+        static auto format(const mcs::vulkan::event::window_iconify_event &event,
+                           std::format_context &ctx)
+        {
+            return std::format_to(ctx.out(), "window_iconify_event{{iconified={}}}",
+                                  event.iconified);
+        }
+    };
+
+    template <>
+    struct formatter<mcs::vulkan::event::window_maximize_event>
+    {
+        static constexpr auto parse(std::format_parse_context &ctx) noexcept
+        {
+            return ctx.begin();
+        }
+
+        static auto format(const mcs::vulkan::event::window_maximize_event &event,
+                           std::format_context &ctx)
+        {
+            return std::format_to(ctx.out(), "window_maximize_event{{maximized={}}}",
+                                  event.maximized);
+        }
+    };
+
+    template <>
+    struct formatter<mcs::vulkan::event::framebuffer_size_event>
+    {
+        static constexpr auto parse(std::format_parse_context &ctx) noexcept
+        {
+            return ctx.begin();
+        }
+
+        static auto format(const mcs::vulkan::event::framebuffer_size_event &event,
+                           std::format_context &ctx)
+        {
+            return std::format_to(ctx.out(),
+                                  "framebuffer_size_event{{width={}, height={}}}",
+                                  event.width, event.height);
+        }
+    };
+
+    template <>
+    struct formatter<mcs::vulkan::event::content_scale_event>
+    {
+        static constexpr auto parse(std::format_parse_context &ctx) noexcept
+        {
+            return ctx.begin();
+        }
+
+        static auto format(const mcs::vulkan::event::content_scale_event &event,
+                           std::format_context &ctx)
+        {
+            return std::format_to(ctx.out(),
+                                  "content_scale_event{{xscale={:.2f}, yscale={:.2f}}}",
+                                  event.xscale, event.yscale);
+        }
+    };
+
 }; // namespace std
-
-constexpr std::ostream &operator<<(std::ostream &os,
-                                   const mcs::vulkan::event::keyboard_event &event)
-{
-    os << std::format("{}", event);
-    return os;
-}
-
-constexpr std::ostream &operator<<(std::ostream &os,
-                                   const mcs::vulkan::event::mousebutton_event &event)
-{
-    os << std::format("{}", event);
-    return os;
-}
-constexpr std::ostream &operator<<(std::ostream &os,
-                                   const mcs::vulkan::event::scroll_event &event)
-{
-    os << std::format("{}", event);
-    return os;
-}
-
-constexpr std::ostream &operator<<(std::ostream &os,
-                                   const mcs::vulkan::event::position2d_event &event)
-{
-    os << std::format("{}", event);
-    return os;
-}
-constexpr std::ostream &operator<<(std::ostream &os,
-                                   const mcs::vulkan::event::cursor_enter_event &event)
-{
-    os << std::format("{}", event);
-    return os;
-}

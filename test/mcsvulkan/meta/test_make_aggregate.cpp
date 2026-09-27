@@ -162,10 +162,12 @@ static_assert(not std::is_empty_v<C>);
 // NOTE: make_aggregate 对空类型有优化。这样继承函数，没有任何的内存开销
 void test_no_unique_address()
 {
-    auto b = make_aggregate<"B", "x", "e">(int{0}, Empty{});
+    constexpr auto b = make_aggregate<"B", "x", "e">(int{0}, Empty{});
     static_assert(sizeof(decltype(b)) == 4);
-    std::printf("B_auto: &x=%p  &e=%p  (e 与 x 分离)\n", static_cast<void *>(&b.x),
-                static_cast<void *>(std::addressof(b.e)));
+    std::printf("B_auto: &x=%p  &e=%p  (e 与 x 分离)\n", static_cast<const void *>(&b.x),
+                static_cast<const void *>(std::addressof(b.e)));
+    static_assert(static_cast<const void *>(&b.x) ==
+                  static_cast<const void *>(std::addressof(b.e)));
 }
 
 int main()

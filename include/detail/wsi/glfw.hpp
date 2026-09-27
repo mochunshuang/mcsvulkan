@@ -20,6 +20,15 @@
 #include "../event/cursor_enter_event_dispatcher.hpp"
 #include "../event/distribute.hpp"
 
+#include "../event/char_event_dispatcher.hpp"
+#include "../event/drop_event_dispatcher.hpp"
+#include "../event/window_focus_event_dispatcher.hpp"
+#include "../event/window_pos_event_dispatcher.hpp"
+#include "../event/window_size_event_dispatcher.hpp"
+#include "../event/window_iconify_event_dispatcher.hpp"
+#include "../event/window_maximize_event_dispatcher.hpp"
+#include "../event/framebuffer_size_event_dispatcher.hpp"
+
 namespace mcs::vulkan::wsi::glfw
 {
 
@@ -119,6 +128,9 @@ namespace mcs::vulkan::wsi::glfw
             ::glfwSetScrollCallback(window_, &scrollCallback);
             ::glfwSetCursorEnterCallback(window_, &cursorEnterCallback);
             ::glfwSetFramebufferSizeCallback(window_, &framebufferResizeCallback);
+
+            ::glfwSetCharCallback(window_, &charCallback);
+            ::glfwSetDropCallback(window_, &dropCallback);
         }
         constexpr void teardown() noexcept
         {
@@ -224,8 +236,8 @@ namespace mcs::vulkan::wsi::glfw
                                          float yscale) noexcept
         {
             auto *app = static_cast<Window *>(::glfwGetWindowUserPointer(window));
-            app->contentScaleChange_ = true;
-            app->contentScaleback_(app, xscale, yscale);
+            app->contentScaleChange_ = true; //NOTE: 暂时保留。 yoga 相关的需要
+            app->contentScaleback_(app, xscale, yscale); //NOTE: 存函数该替换为 scale
         }
 
         void destroy() noexcept
@@ -238,24 +250,23 @@ namespace mcs::vulkan::wsi::glfw
             teardownGlfw();
         }
 
-        static void framebufferResizeCallback(GLFWwindow *window, int /*width*/,
-                                              int /*height*/) noexcept
+        static void framebufferResizeCallback(GLFWwindow *window, int width,
+                                              int height) noexcept
         {
             auto *app = static_cast<Window *>(::glfwGetWindowUserPointer(window));
             app->framebufferResized_ = true;
+            event::distribute<event::framebuffer_size_event_dispatcher>(
+                {.width = width, .height = height});
         }
         static void windowPosCallback(GLFWwindow *window, int xpos, int ypos)
         {
             auto *self = static_cast<Window *>(::glfwGetWindowUserPointer(window));
-            auto &isFullscreen = self->isFullscreen_;
-            auto &x_ = self->x_;
-            auto &y_ = self->y_;
-            if (!isFullscreen)
+            if (!self->isFullscreen_)
             {
-                x_ = xpos;
-                y_ = ypos;
-                MCSLOG_INFO("Pos change to ({},{})", x_, y_);
+                self->x_ = xpos;
+                self->y_ = ypos;
             }
+            event::distribute<event::window_pos_event_dispatcher>({.x = xpos, .y = ypos});
         }
 
         // NOLINTBEGIN
@@ -341,25 +352,66 @@ namespace mcs::vulkan::wsi::glfw
         // 窗口大小回调
         static void windowSizeCallback(GLFWwindow * /*window*/, int width, int height)
         {
-            MCSLOG_INFO("windowSize: {} x {}", width, height);
+            event::distribute<event::window_size_event_dispatcher>(
+                {.width = width, .height = height});
         }
 
         // 窗口焦点回调
         static void windowFocusCallback(GLFWwindow * /*window*/, int focused)
         {
-            MCSLOG_INFO("windowFocus: {}.",
-                        ((focused != 0) ? "get focus" : "lost focus"));
+            event::distribute<event::window_focus_event_dispatcher>(
+                {.focused = focused != 0});
         }
 
         // 窗口最小化/最大化回调
         static void windowIconifyCallback(GLFWwindow * /*window*/, int iconified)
         {
-
-            MCSLOG_INFO("iconified: {}.", (iconified != 0));
+            event::distribute<event::window_iconify_event_dispatcher>(
+                {.iconified = iconified != 0});
         }
         static void windowMaximizeCallback(GLFWwindow * /*window*/, int maximized)
         {
-            MCSLOG_INFO("maximized: {}.", (maximized != 0));
+            event::distribute<event::window_maximize_event_dispatcher>(
+                {.maximized = maximized != 0});
+        }
+
+        static void charCallback(GLFWwindow * /*window*/, unsigned int codepoint) noexcept
+        {
+            event::distribute<event::char_event_dispatcher>({.codepoint = codepoint});
+        }
+
+        static void dropCallback(GLFWwindow * /*window*/, int count,
+                                 const char **paths) noexcept
+        {
+            event::distribute<event::drop_event_dispatcher>(
+                event::drop_event{.count = count, .paths = paths});
+        }
+
+        // 广播 窗口 状态
+        constexpr void broadcastWindowState() const noexcept
+        {
+            // 位置（当前窗口化位置）
+            event::distribute<event::window_pos_event_dispatcher>({.x = x_, .y = y_});
+
+            // 尺寸
+            event::distribute<event::window_size_event_dispatcher>(
+                {.width = width_, .height = height_});
+
+            // framebuffer
+            {
+                int fw, fh; // NOLINT
+                ::glfwGetFramebufferSize(window_, &fw, &fh);
+                event::distribute<event::framebuffer_size_event_dispatcher>(
+                    {.width = fw, .height = fh});
+            }
+
+            // 布尔状态：查当前真实值
+            event::distribute<event::window_focus_event_dispatcher>(
+                {.focused = ::glfwGetWindowAttrib(window_, GLFW_FOCUSED) != 0});
+            event::distribute<event::window_iconify_event_dispatcher>(
+                {.iconified = ::glfwGetWindowAttrib(window_, GLFW_ICONIFIED) != 0});
+            event::distribute<event::window_maximize_event_dispatcher>(
+                {.maximized = ::glfwGetWindowAttrib(window_, GLFW_MAXIMIZED) != 0});
         }
 
         // -------------------------vulkan api-------------------------
