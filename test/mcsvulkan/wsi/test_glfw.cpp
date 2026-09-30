@@ -2,6 +2,7 @@
 #include <exception>
 #include <iostream>
 #include <print>
+#include <chrono>
 
 #include "../head.hpp"
 
@@ -64,6 +65,238 @@ namespace
     };
 } // namespace
 
+using mcs::vulkan::event::keyboard_event;
+using mcs::vulkan::event::scroll_event;
+using mcs::vulkan::event::mousebutton_event;
+using mcs::vulkan::event::position2d_event;
+using mcs::vulkan::event::cursor_enter_event;
+
+using mcs::vulkan::event::Key;
+using mcs::vulkan::event::MouseButtons;
+using mcs::vulkan::event::ModifierKey;
+using mcs::vulkan::event::Action;
+
+template <Key key>
+struct key_press
+{
+    constexpr auto operator()(const glfw_input &input) const noexcept
+    {
+        return input.isKeyPressed(key);
+    }
+};
+template <Key key>
+struct key_repeat
+{
+    constexpr auto operator()(const glfw_input &input) const noexcept
+    {
+        return input.isKeyRepeat(key);
+    }
+};
+template <Key key>
+struct key_press_or_repeat
+{
+    constexpr auto operator()(const glfw_input &input) const noexcept
+    {
+        return input.isKeyPressedOrRepeat(key);
+    }
+};
+template <Key key, ModifierKey::Value... m>
+struct key_has_modifiers
+{
+    constexpr auto operator()(const glfw_input &input) const noexcept
+    {
+        const auto &event = input.get_keyboard_event(key);
+        return event.template hasModifiers<m...>();
+    }
+};
+
+enum class key_status : std::uint8_t
+{
+    ePRESS,
+    eRELEASE,
+    eREPEAT,
+    ePRESS_OR_REPEAT,
+};
+template <key_status s, ModifierKey::Value... m>
+static constexpr auto key_probe(const glfw_input &input, Key key) noexcept
+{
+    using enum key_status;
+    const auto &event = input.get_keyboard_event(key);
+
+    bool status = {};
+    if constexpr (s == ePRESS)
+        status = event.press();
+    else if constexpr (s == eRELEASE)
+        status = event.release();
+    else if constexpr (s == eREPEAT)
+        status = event.repeat();
+    else
+        status = event.press() || event.repeat();
+    bool modifier = sizeof...(m) == 0 ? true : event.template hasModifiers<m...>();
+    return status && modifier;
+}
+
+enum class mouse_button_status : std::uint8_t
+{
+    ePRESS,
+    eRELEASE
+};
+template <mouse_button_status s, ModifierKey::Value... m>
+static constexpr auto mouse_button_probe(const glfw_input &input,
+                                         MouseButtons key) noexcept
+{
+    using enum mouse_button_status;
+    const auto &event = input.get_mousebutton_event(key);
+    bool status = {};
+    if constexpr (s == ePRESS)
+        status = event.press();
+    else
+        status = event.release();
+    bool modifier = sizeof...(m) == 0 ? true : event.template hasModifiers<m...>();
+    return status && modifier;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 编译期手势参数：不占运行时内存，不可被意外修改
+// ─────────────────────────────────────────────────────────────
+struct gesture_config
+{
+    std::chrono::milliseconds click_max_time{250};       // 单击最长时长
+    std::chrono::milliseconds multi_click_interval{500}; // 多击最大间隔
+    std::chrono::milliseconds long_press_time{500};      // 长按阈值
+
+    double click_max_move = 4.0;       // 单击最大位移
+    double multi_click_max_dist = 4.0; // 多击位置漂移容忍
+    double long_press_max_move = 4.0;  // 长按期间最大位移
+    double drag_min_dist = 4.0;        // 触发拖拽的最小位移
+};
+inline constexpr gesture_config kGesture{};
+
+class event_manager
+{
+  public:
+    explicit event_manager(glfw_input &input) noexcept : input_{input}
+    {
+        input_.subscribe<glfw_input ::keyboard_change_fn>(this,
+                                                          &event_manager::on_keyboard);
+        input_.subscribe<glfw_input ::mousebutton_change_fn>(
+            this, &event_manager::on_mousebutton);
+        input_.subscribe<glfw_input ::scroll_event_change_fn>(this,
+                                                              &event_manager::on_scroll);
+    }
+
+    ~event_manager() noexcept
+    {
+        input_.unsubscribe<glfw_input ::keyboard_change_fn>(this,
+                                                            &event_manager::on_keyboard);
+        input_.unsubscribe<glfw_input ::mousebutton_change_fn>(
+            this, &event_manager::on_mousebutton);
+        input_.unsubscribe<glfw_input ::scroll_event_change_fn>(
+            this, &event_manager::on_scroll);
+    }
+
+    event_manager(const event_manager &) = delete;
+    event_manager(event_manager &&) = delete;
+    event_manager &operator=(const event_manager &) = delete;
+    event_manager &operator=(event_manager &&) = delete;
+
+  private:
+    struct button_tracker
+    {
+        bool down = false;
+        position2d_event down_pos{};
+        std::chrono::steady_clock::time_point down_time{};
+
+        std::uint32_t click_count = 0;
+        position2d_event last_click_pos{};
+        std::chrono::steady_clock::time_point last_click_time{};
+    };
+
+    // 编译期工具：平方，省一次开方
+    static constexpr double sq(double v) noexcept
+    {
+        return v * v;
+    }
+    static constexpr double dist_sq(position2d_event a, position2d_event b) noexcept
+    {
+        return sq(a.xpos - b.xpos) + sq(a.ypos - b.ypos);
+    }
+
+    // ── 回调 ────────────────────────────────────────────────
+    static void on_keyboard(void * /*self*/, position2d_event,
+                            std::chrono::steady_clock::time_point,
+                            keyboard_event e) noexcept
+    {
+        std::println("[keyboard] {}", e);
+    }
+
+    static void on_scroll(void * /*self*/, position2d_event,
+                          std::chrono::steady_clock::time_point, scroll_event e) noexcept
+    {
+        std::println("[scroll] x={} y={}", e.xoffset, e.yoffset);
+    }
+
+    static void on_mousebutton(void *self, position2d_event pos,
+                               std::chrono::steady_clock::time_point t,
+                               mousebutton_event e) noexcept
+    {
+        auto &s = static_cast<event_manager *>(self)
+                      ->trackers_[static_cast<std::size_t>(e.button)];
+
+        // ── 按下：仅记录起点 ─────────────────────────────
+        if (e.press())
+        {
+            s.down = true;
+            s.down_pos = pos;
+            s.down_time = t;
+            return;
+        }
+        if (!e.release() || !s.down)
+            return;
+
+        s.down = false;
+
+        const auto held = t - s.down_time;
+        const double moved2 = dist_sq(pos, s.down_pos);
+
+        // ── 1. 长按：够久 + 几乎没动 ─────────────────────
+        if (held >= kGesture.long_press_time &&
+            moved2 <= sq(kGesture.long_press_max_move))
+        {
+            std::println("[long_press] button={}", static_cast<int>(e.button));
+            s.click_count = 0;
+            return;
+        }
+
+        // ── 2. 拖拽：位移够大 ────────────────────────────
+        if (moved2 >= sq(kGesture.drag_min_dist))
+        {
+            std::println("[drag_end] button={}", static_cast<int>(e.button));
+            s.click_count = 0;
+            return;
+        }
+
+        // ── 3. 点击 / 多击 ──────────────────────────────
+        if (held <= kGesture.click_max_time && moved2 <= sq(kGesture.click_max_move))
+        {
+            const bool chained =
+                s.click_count > 0 &&
+                (t - s.last_click_time) <= kGesture.multi_click_interval &&
+                dist_sq(pos, s.last_click_pos) <= sq(kGesture.multi_click_max_dist);
+
+            s.click_count = chained ? s.click_count + 1u : 1u;
+            s.last_click_time = t;
+            s.last_click_pos = pos;
+
+            std::println("[click] button={} count={}", static_cast<int>(e.button),
+                         s.click_count);
+        }
+    }
+
+    std::array<button_tracker, static_cast<std::size_t>(MouseButtons::eSIZE)> trackers_{};
+    glfw_input &input_;
+};
+
 int main()
 try
 {
@@ -72,28 +305,6 @@ try
 
     surface window{};
     window.setup({.width = WIDTH, .height = HEIGHT}, TITLE); // NOLINT
-
-    constexpr auto APIVERSION = vkApiVersion(0, 1, 4, 0);
-    auto enables = enable_intance_build{}
-                       .enableDebugExtension()
-                       .enableValidationLayer()
-                       .enableSurfaceExtension<surface>();
-    enables.check();
-    Instance instance =
-        create_instance{}
-            .setCreateInfo(
-                {.applicationInfo = {.pApplicationName = "Hello Triangle",
-                                     .applicationVersion = vkMakeVersion(1, 0, 0),
-                                     .pEngineName = "No Engine",
-                                     .engineVersion = vkMakeVersion(1, 0, 0),
-                                     // apiVersion必须是应用程序设计使用的Vulkan的最高版本
-                                     .apiVersion = APIVERSION},
-                 .enabledLayers = enables.enabledLayers(),
-                 .enabledExtensions = enables.enabledExtensions()})
-            .build();
-    auto debuger = create_debugger{}
-                       .setCreateInfo(create_debugger::defaultCreateInfo())
-                       .build(instance);
 
     /*
 NOTE: 进入窗口和移除窗口的事件
@@ -205,8 +416,71 @@ cursorEnter: cursor_enter_event{entered=true}
 
 */
     auto charDropTest = char_drop_test{};
+    struct ordinary_ctrl_shift_a
+    {
+        constexpr auto operator()(const glfw_input &input) const noexcept
+        {
+            return (input.isKeyPressedOrRepeat(Key::eLEFT_CONTROL) ||
+                    input.isKeyPressedOrRepeat(Key::eRIGHT_CONTROL)) &&
+                   (input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
+                    input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT)) &&
+                   input.isKeyPressedOrRepeat(Key::eA);
+        }
+    };
+    struct ctrl_shift_a
+    {
+        constexpr auto operator()(const glfw_input &input) const noexcept
+        {
+            const auto &event = input.get_keyboard_event(Key::eA);
+            return (event.press() || event.repeat()) &&
+                   event.hasModifiers<ModifierKey::eSHIFT, ModifierKey::eCONTROL>();
+        }
+    };
+    struct ctrl_shift_a_2
+    {
+        constexpr auto operator()(const glfw_input &input) const noexcept
+        {
+            return key_press_or_repeat<Key::eA>{}(input) &&
+                   key_has_modifiers<Key::eA, ModifierKey::eSHIFT,
+                                     ModifierKey::eCONTROL>{}(input);
+        }
+    };
+
+    // NOTE: 订阅有状态。变化的状态
+    event_manager eventManager{input};
+
     while (window.shouldClose() == 0)
     {
+#if 0
+        if (ordinary_ctrl_shift_a{}(input))
+        {
+            std::println("ordinary_ctrl_shift_a: ctrl_shift_a: true");
+        }
+        if (ctrl_shift_a{}(input))
+        {
+            std::println("ctrl_shift_a: ctrl_shift_a: true");
+        }
+        if (ctrl_shift_a_2{}(input))
+        {
+            std::println("ctrl_shift_a_2: ctrl_shift_a: true");
+        }
+        if (key_probe<key_status::ePRESS_OR_REPEAT, ModifierKey::eSHIFT,
+                      ModifierKey::eCONTROL>(input, Key::eA))
+        {
+            std::println("key_probe: ctrl_shift_a: true");
+        }
+        if (mouse_button_probe<mouse_button_status::ePRESS>(
+                input, MouseButtons::eMOUSE_BUTTON_LEFT))
+        {
+            std::println("mouse_button_probe: MOUSE_BUTTON_LEFT press");
+        }
+        // NOTE: 可能是BUG 因为旧值 不会被覆盖。 如果click 是一对 press + release ，release才触发信号，这可能就是BUG
+        if (mouse_button_probe<mouse_button_status::eRELEASE>(
+                input, MouseButtons::eMOUSE_BUTTON_LEFT))
+        {
+            std::println("mouse_button_probe: MOUSE_BUTTON_LEFT RELEASE");
+        }
+#endif
         surface::pollEvents();
     }
 

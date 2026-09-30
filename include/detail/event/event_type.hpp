@@ -264,6 +264,11 @@ namespace mcs::vulkan::event
         {
             return (value_ & other.value_) == other.value_;
         }
+        template <Value... Keys>
+        [[nodiscard]] constexpr bool hasAll() const noexcept
+        {
+            return (has(Keys) && ...);
+        }
 
         // 检查是否包含任意指定的修饰键
         [[nodiscard]] constexpr bool hasAny(ModifierKey other) const noexcept
@@ -424,6 +429,11 @@ namespace mcs::vulkan::event
         {
             return status == modifier_key;
         }
+        template <ModifierKey::Value... v>
+        [[nodiscard]] constexpr bool hasModifiers() const noexcept
+        {
+            return modifier_key.template hasAll<v...>();
+        }
         friend constexpr bool operator==(const keyboard_event &a,
                                          const keyboard_event &b) noexcept = default;
     };
@@ -453,6 +463,11 @@ namespace mcs::vulkan::event
         [[nodiscard]] bool isModifier(ModifierKey status) const noexcept
         {
             return status == modifier_key;
+        }
+        template <ModifierKey::Value... v>
+        [[nodiscard]] constexpr bool hasModifiers() const noexcept
+        {
+            return modifier_key.template hasAll<v...>();
         }
         friend constexpr bool operator==(const mousebutton_event &a,
                                          const mousebutton_event &b) noexcept = default;

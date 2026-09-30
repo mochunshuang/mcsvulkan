@@ -1,6 +1,6 @@
 #pragma once
 
-#include <unordered_set>
+#include <vector>
 
 namespace mcs::vulkan::event
 {
@@ -12,41 +12,54 @@ namespace mcs::vulkan::event
 
         struct value_type
         {
-            void *ctx;               // NOLINT
-            callback_type *callback; // NOLINT
-            bool operator==(const value_type &other) const
-            {
-                return ctx == other.ctx && callback == other.callback;
-            }
+            void *ctx;
+            callback_type *callback;
+            bool valid;
         };
-        struct value_type_hash
-        {
-            std::size_t operator()(const value_type &v) const
-            {
-                std::size_t h1 = std::hash<void *>{}(v.ctx);
-                std::size_t h2 = std::hash<callback_type *>{}(v.callback);
 
-                // 使用简单的组合方式（注意：这种组合方式可能不够理想）
-                // return h1 ^ (h2 << 1);
-                // 更好的组合方式（使用 boost::hash_combine 风格）
-                return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2)); // NOLINT
+        constexpr void subscribe(void *ctx, callback_type *cb)
+        {
+            if (distributing_)
+            {
+                pendingAdd_.push_back({ctx, cb, true});
+                return;
             }
-        };
+            callbacks_.push_back({ctx, cb, true});
+        }
+
+        constexpr void unsubscribe(void *ctx, callback_type *cb)
+        {
+            for (auto &item : callbacks_)
+                if (item.ctx == ctx && item.callback == cb)
+                    item.valid = false;
+            // 分发中：只标记；非分发中：下次 distribute 时会清掉
+        }
 
         constexpr void distribute(event_type event) noexcept
         {
-            for (const value_type &item : callbacks_)
-                (item.callback)(item.ctx, event);
-        }
-        constexpr void subscribe(void *ctx, callback_type *callback)
-        {
-            callbacks_.emplace(value_type{ctx, callback});
-        }
-        constexpr void unsubscribe(void *ctx, callback_type *callback)
-        {
-            callbacks_.erase(value_type{ctx, callback});
-        }
+            // 只有最外层才有资格清理和 apply pending，内层只遍历。处理递归
+            bool outer = !distributing_;
+            if (outer)
+                distributing_ = true;
 
+            for (const auto &item : callbacks_)
+                if (item.valid)
+                    (item.callback)(item.ctx, event);
+
+            if (outer)
+            {
+                distributing_ = false;
+
+                callbacks_.insert(callbacks_.end(), pendingAdd_.begin(),
+                                  pendingAdd_.end());
+                pendingAdd_.clear();
+
+                callbacks_.erase(
+                    std::remove_if(callbacks_.begin(), callbacks_.end(),
+                                   [](const value_type &v) { return !v.valid; }),
+                    callbacks_.end());
+            }
+        }
         constexpr static auto &instance() noexcept
         {
             static event_dispatcher instance;
@@ -54,7 +67,9 @@ namespace mcs::vulkan::event
         }
 
       private:
-        std::unordered_set<value_type, value_type_hash> callbacks_;
+        std::vector<value_type> callbacks_;
+        std::vector<value_type> pendingAdd_;
+        bool distributing_ = false;
         event_dispatcher() = default;
     };
 
