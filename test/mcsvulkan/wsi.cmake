@@ -15,6 +15,7 @@ macro(add_vulkan_wsi_test fileName)
 endmacro()
 
 add_vulkan_wsi_test(test_glfw)
+add_vulkan_wsi_test(test_glfw2)
 
 # end
 unset(BASE_LIBS)

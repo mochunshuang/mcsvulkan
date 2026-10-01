@@ -6813,6 +6813,7 @@ try
                                  r.key.object_type, r.key.entity_index, r.primitive_id(),
                                  r.render_version(), enter ? "ENTER" : "LEAVE",
                                  r.hover_fn, self.text);
+                    //NOTE: 是有Self的类型信息的。enter 决定加载和卸载，以及当前的处理函数
                 }),
                 method<"hover_1">([](auto &&self, picking_result r, bool enter,
                                      InputCtx &inputCtx,
