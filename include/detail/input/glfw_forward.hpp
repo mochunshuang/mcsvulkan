@@ -53,7 +53,7 @@ namespace mcs::vulkan::input
         // ────────────────────────────────────────────────────────
         // 构造 / 析构：注册转发中心为各 dispatcher 的订阅者
         // ────────────────────────────────────────────────────────
-        constexpr glfw_forward() noexcept
+        constexpr glfw_forward()
         {
             using self = glfw_forward;
 

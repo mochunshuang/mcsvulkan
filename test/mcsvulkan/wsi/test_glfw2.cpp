@@ -1,11 +1,15 @@
 #include <cassert>
+#include <cstdint>
 #include <exception>
 #include <iostream>
 #include <print>
 #include <chrono>
+#include <span>
+#include <vector>
 
 #include "head.hpp"
 
+// NOLINTBEGIN
 using surface = mcs::vulkan::wsi::glfw::Window;
 
 constexpr uint32_t WIDTH = 800;
@@ -14,6 +18,7 @@ constexpr auto TITLE = "test_my_triangle";
 
 using mcs::vulkan::input::glfw_input;
 using mcs::vulkan::input::glfw_window_state;
+using mcs::vulkan::input::glfw_forward;
 
 namespace
 {
@@ -66,227 +71,6 @@ using mcs::vulkan::event::MouseButtons;
 using mcs::vulkan::event::ModifierKey;
 using mcs::vulkan::event::Action;
 
-template <Key key>
-struct key_press
-{
-    constexpr auto operator()(const glfw_input &input) const noexcept
-    {
-        return input.isKeyPressed(key);
-    }
-};
-template <Key key>
-struct key_repeat
-{
-    constexpr auto operator()(const glfw_input &input) const noexcept
-    {
-        return input.isKeyRepeat(key);
-    }
-};
-template <Key key>
-struct key_press_or_repeat
-{
-    constexpr auto operator()(const glfw_input &input) const noexcept
-    {
-        return input.isKeyPressedOrRepeat(key);
-    }
-};
-template <Key key, ModifierKey::Value... m>
-struct key_has_modifiers
-{
-    constexpr auto operator()(const glfw_input &input) const noexcept
-    {
-        const auto &event = input.get_keyboard_event(key);
-        return event.template hasModifiers<m...>();
-    }
-};
-
-enum class key_status : std::uint8_t
-{
-    ePRESS,
-    eRELEASE,
-    eREPEAT,
-    ePRESS_OR_REPEAT,
-};
-template <key_status s, ModifierKey::Value... m>
-static constexpr auto key_probe(const glfw_input &input, Key key) noexcept
-{
-    using enum key_status;
-    const auto &event = input.get_keyboard_event(key);
-
-    bool status = {};
-    if constexpr (s == ePRESS)
-        status = event.press();
-    else if constexpr (s == eRELEASE)
-        status = event.release();
-    else if constexpr (s == eREPEAT)
-        status = event.repeat();
-    else
-        status = event.press() || event.repeat();
-    bool modifier = sizeof...(m) == 0 ? true : event.template hasModifiers<m...>();
-    return status && modifier;
-}
-
-enum class mouse_button_status : std::uint8_t
-{
-    ePRESS,
-    eRELEASE
-};
-template <mouse_button_status s, ModifierKey::Value... m>
-static constexpr auto mouse_button_probe(const glfw_input &input,
-                                         MouseButtons key) noexcept
-{
-    using enum mouse_button_status;
-    const auto &event = input.get_mousebutton_event(key);
-    bool status = {};
-    if constexpr (s == ePRESS)
-        status = event.press();
-    else
-        status = event.release();
-    bool modifier = sizeof...(m) == 0 ? true : event.template hasModifiers<m...>();
-    return status && modifier;
-}
-
-// ─────────────────────────────────────────────────────────────
-// 编译期手势参数：不占运行时内存，不可被意外修改
-// ─────────────────────────────────────────────────────────────
-struct gesture_config
-{
-    std::chrono::milliseconds click_max_time{250};       // 单击最长时长
-    std::chrono::milliseconds multi_click_interval{500}; // 多击最大间隔
-    std::chrono::milliseconds long_press_time{500};      // 长按阈值
-
-    double click_max_move = 4.0;       // 单击最大位移
-    double multi_click_max_dist = 4.0; // 多击位置漂移容忍
-    double long_press_max_move = 4.0;  // 长按期间最大位移
-    double drag_min_dist = 4.0;        // 触发拖拽的最小位移
-};
-inline constexpr gesture_config kGesture{};
-
-class event_manager
-{
-  public:
-    explicit event_manager(glfw_input &input) noexcept : input_{input}
-    {
-        input_.subscribe<glfw_input ::keyboard_change_fn>(this,
-                                                          &event_manager::on_keyboard);
-        input_.subscribe<glfw_input ::mousebutton_change_fn>(
-            this, &event_manager::on_mousebutton);
-        input_.subscribe<glfw_input ::scroll_event_change_fn>(this,
-                                                              &event_manager::on_scroll);
-    }
-
-    ~event_manager() noexcept
-    {
-        input_.unsubscribe<glfw_input ::keyboard_change_fn>(this,
-                                                            &event_manager::on_keyboard);
-        input_.unsubscribe<glfw_input ::mousebutton_change_fn>(
-            this, &event_manager::on_mousebutton);
-        input_.unsubscribe<glfw_input ::scroll_event_change_fn>(
-            this, &event_manager::on_scroll);
-    }
-
-    event_manager(const event_manager &) = delete;
-    event_manager(event_manager &&) = delete;
-    event_manager &operator=(const event_manager &) = delete;
-    event_manager &operator=(event_manager &&) = delete;
-
-  private:
-    struct button_tracker
-    {
-        bool down = false;
-        position2d_event down_pos{};
-        std::chrono::steady_clock::time_point down_time{};
-
-        std::uint32_t click_count = 0;
-        position2d_event last_click_pos{};
-        std::chrono::steady_clock::time_point last_click_time{};
-    };
-
-    // 编译期工具：平方，省一次开方
-    static constexpr double sq(double v) noexcept
-    {
-        return v * v;
-    }
-    static constexpr double dist_sq(position2d_event a, position2d_event b) noexcept
-    {
-        return sq(a.xpos - b.xpos) + sq(a.ypos - b.ypos);
-    }
-
-    // ── 回调 ────────────────────────────────────────────────
-    static void on_keyboard(void * /*self*/, position2d_event,
-                            std::chrono::steady_clock::time_point,
-                            keyboard_event e) noexcept
-    {
-        std::println("[keyboard] {}", e);
-    }
-
-    static void on_scroll(void * /*self*/, position2d_event,
-                          std::chrono::steady_clock::time_point, scroll_event e) noexcept
-    {
-        std::println("[scroll] x={} y={}", e.xoffset, e.yoffset);
-    }
-
-    static void on_mousebutton(void *self, position2d_event pos,
-                               std::chrono::steady_clock::time_point t,
-                               mousebutton_event e) noexcept
-    {
-        auto &s = static_cast<event_manager *>(self)
-                      ->trackers_[static_cast<std::size_t>(e.button)];
-
-        // ── 按下：仅记录起点 ─────────────────────────────
-        if (e.press())
-        {
-            s.down = true;
-            s.down_pos = pos;
-            s.down_time = t;
-            return;
-        }
-        if (!e.release() || !s.down)
-            return;
-
-        s.down = false;
-
-        const auto held = t - s.down_time;
-        const double moved2 = dist_sq(pos, s.down_pos);
-
-        // ── 1. 长按：够久 + 几乎没动 ─────────────────────
-        if (held >= kGesture.long_press_time &&
-            moved2 <= sq(kGesture.long_press_max_move))
-        {
-            std::println("[long_press] button={}", static_cast<int>(e.button));
-            s.click_count = 0;
-            return;
-        }
-
-        // ── 2. 拖拽：位移够大 ────────────────────────────
-        if (moved2 >= sq(kGesture.drag_min_dist))
-        {
-            std::println("[drag_end] button={}", static_cast<int>(e.button));
-            s.click_count = 0;
-            return;
-        }
-
-        // ── 3. 点击 / 多击 ──────────────────────────────
-        if (held <= kGesture.click_max_time && moved2 <= sq(kGesture.click_max_move))
-        {
-            const bool chained =
-                s.click_count > 0 &&
-                (t - s.last_click_time) <= kGesture.multi_click_interval &&
-                dist_sq(pos, s.last_click_pos) <= sq(kGesture.multi_click_max_dist);
-
-            s.click_count = chained ? s.click_count + 1u : 1u;
-            s.last_click_time = t;
-            s.last_click_pos = pos;
-
-            std::println("[click] button={} count={}", static_cast<int>(e.button),
-                         s.click_count);
-        }
-    }
-
-    std::array<button_tracker, static_cast<std::size_t>(MouseButtons::eSIZE)> trackers_{};
-    glfw_input &input_;
-};
-
 /*
 ⏱️ 竞技场裁决的延迟：确实存在，但并非总是发生
 竞技场裁决的延迟主要来自延迟裁决（Delayed Winning） 机制。当多个手势识别器竞争时，为了准确区分用户意图，系统不会立即宣布胜者，而是等待更多事件或超时。
@@ -337,7 +121,188 @@ Flutter 的核心是自绘引擎，它不依赖平台的原生控件，而是通
 // NOTE: 9. 上下文对象是 承接 事件和函数 管理的，是动态的，上下文一次性的，最好没有堆内存开销/varaint 的 明显有限范围，可以保证
 */
 
-// NOTE: 排序 交给 实现的竞技场 确定即可。
+// NOTE: 排序 交给 实现的竞技场 确定即可。\
+
+using mcs::vulkan::meta::make_aggregate;
+using mcs::vulkan::meta::field;
+using mcs::vulkan::meta::method;
+using mcs::vulkan::meta::static_string;
+
+using parameter_list = std::variant<int, double>;
+struct dynamic_pointer
+{
+    using Fn = void (*)(void *ptr, parameter_list) noexcept;
+
+    template <class Agg, static_string hover_fn_name>
+        requires(requires(Agg &agg, parameter_list p) {
+            agg.template invoke<hover_fn_name>(p);
+        })
+    static constexpr dynamic_pointer make() noexcept
+    {
+        return dynamic_pointer{[](void *ptr, parameter_list p) noexcept {
+            auto *agg = static_cast<std::decay_t<Agg> *>(ptr);
+            agg->template invoke<hover_fn_name>(p);
+        }};
+    }
+    constexpr void dispach(void *ptr, parameter_list p) noexcept
+    {
+        fn(ptr, std::move(p));
+    }
+
+    dynamic_pointer() = delete;
+
+  private:
+    Fn fn;
+    explicit constexpr dynamic_pointer(Fn f) noexcept : fn(f) {}
+};
+
+enum GestureRecognizerState
+{
+    undefined,
+    confirm,  // 确定比赛环境符合要求
+    possible, // 已收到 pointer，正在观察，还没裁决
+    accepted, // 赢了
+    rejected, // 输了
+};
+
+// NOTE: 决斗者： 必须可以和其他人，竞争，竞争的地方在竞技场。 必须和其他决斗者 能选出裁判
+// NOTE: 决斗者 必须 知道 和谁决斗。  决斗者们 自己选出 胜利者。 被动性写出规则
+struct fighter
+{
+    static_string name;
+    GestureRecognizerState state;
+
+    // 是否参与当前多人决斗：找是否存在
+    virtual bool confirm(std::span<fighter *> opponents) noexcept = 0;
+};
+
+// NOTE: 裁决算法： 由决定者们 共同生成规则。每一帧，检查，根据规则，选出决斗者。主动性
+struct arbiter
+{
+    void processing(std::span<fighter *> opponents) noexcept
+    {
+        //
+    }
+};
+
+// 竞技场
+// 由成员 + 裁决
+// 决斗成员 +  裁判 一定选出胜者
+//  选出胜者之后，直接生成胜利事件
+struct arena
+{
+    enum class GestureRecognizerState : uint8_t
+    {
+        undefined,
+        processing, // 确定比赛环境符合要求
+        success,
+        failure,
+    };
+
+    // NOTE: 1. 构造初始化，就完成封闭的决斗环境。中途不允许加入其他人员
+    // NOTE: 2. 可以有 候补
+    // NOTE: 3. 决斗比赛过程【每一帧检查】，可以选出淘汰者 或 胜利者
+    // NOTE: 4. 胜利者必须得到决斗成员的全部认可
+    bool confirm() {}
+
+    void run()
+    {
+        // NOTE: 干嘛呢？
+    }
+
+  private:
+    std::vector<fighter *> fighters_;
+    arbiter *arbiter_;
+};
+
+struct success_result
+{
+    std::chrono::steady_clock::time_point successTime;  // 完成时间
+    std::chrono::steady_clock::time_point acceptedTime; //接受时间
+};
+
+struct hardware_layer_input
+{
+    // NOTE: 谁来承接？ 肯定是竞技场。
+    constexpr explicit hardware_layer_input(glfw_forward &input, surface &window)
+        : input_{input}, window_{window}
+    {
+        input_.subscribe<glfw_forward::keyboard_change_fn>(
+            this, hardware_layer_input::onKeyboard);
+    }
+    ~hardware_layer_input() noexcept
+    {
+        input_.unsubscribe<glfw_forward::keyboard_change_fn>(
+            this, hardware_layer_input::onKeyboard);
+    }
+    hardware_layer_input(const hardware_layer_input &) = delete;
+    hardware_layer_input(hardware_layer_input &&) = delete;
+    hardware_layer_input &operator=(const hardware_layer_input &) = delete;
+    hardware_layer_input &operator=(hardware_layer_input &&) = delete;
+
+    static void onKeyboard(void *self, position2d_event,
+                           std::chrono::steady_clock::time_point,
+                           keyboard_event e) noexcept
+    {
+
+        std::println("onKeyboard cursor");
+    }
+    // NOTE: 转发给 需要这个事件的 竞技场。 按竞技场 先进行 物理切割，缩小范围。
+    // NOTE: 竞技场的 UI识别器 共享用一个信息，然后胜利者，进行最终的事件生成
+    // NOTE: 竞技场的胜利，是否可以编译期确定。可以的。必须互斥，必须可以阻碍胜利
+    // NOTE: 竞技场的成员，可以互相感知吗？应该是是需要的，必须有名字
+
+  private:
+    glfw_forward &input_;
+    surface &window_;
+
+    // NOTE: 光标的icon 可以改变
+    static void changeCursor(void *self, position2d_event,
+                             std::chrono::steady_clock::time_point,
+                             keyboard_event e) noexcept
+    {
+        if (!e.press())
+            return; // 只认按下，repeat/release 直接跳过
+
+        // 光标池：0 = NULL（默认箭头），1~10 懒创建
+        static GLFWcursor *pool[11] = {};
+        if (!pool[1])
+            pool[1] = glfwCreateStandardCursor(GLFW_ARROW_CURSOR);
+        if (!pool[2])
+            pool[2] = glfwCreateStandardCursor(GLFW_IBEAM_CURSOR);
+        if (!pool[3])
+            pool[3] = glfwCreateStandardCursor(GLFW_CROSSHAIR_CURSOR);
+        if (!pool[4])
+            pool[4] = glfwCreateStandardCursor(GLFW_POINTING_HAND_CURSOR);
+        if (!pool[5])
+            pool[5] = glfwCreateStandardCursor(GLFW_RESIZE_EW_CURSOR);
+        if (!pool[6])
+            pool[6] = glfwCreateStandardCursor(GLFW_RESIZE_NS_CURSOR);
+        if (!pool[7])
+            pool[7] = glfwCreateStandardCursor(GLFW_RESIZE_NWSE_CURSOR);
+        if (!pool[8])
+            pool[8] = glfwCreateStandardCursor(GLFW_RESIZE_NESW_CURSOR);
+        if (!pool[9])
+            pool[9] = glfwCreateStandardCursor(GLFW_RESIZE_ALL_CURSOR);
+        if (!pool[10])
+            pool[10] = glfwCreateStandardCursor(GLFW_NOT_ALLOWED_CURSOR);
+
+        // 循环递增
+        static std::size_t idx = 0;
+        idx = (idx + 1) % std::size(pool);
+
+        auto *s = static_cast<hardware_layer_input *>(self);
+        glfwSetCursor(s->window_.data(), pool[idx]); // s->window_ 需要是 GLFWwindow*
+
+        std::println("onKeyboard cursor idx={}", idx);
+    }
+};
+
+struct input_operator
+{
+    //
+};
+
 int main()
 try
 {
@@ -346,7 +311,9 @@ try
     window.setup({.width = WIDTH, .height = HEIGHT}, TITLE); // NOLINT
     auto input = glfw_input{};
     // NOTE: 订阅有状态。变化的状态
-    event_manager eventManager{input};
+
+    auto forward = glfw_forward{};
+    hardware_layer_input h{forward, window};
 
     while (window.shouldClose() == 0)
     {
@@ -360,4 +327,4 @@ try
 catch (std::exception &e)
 {
     std::println("main catch exception: {}", e.what());
-}
+} // NOLINTEND

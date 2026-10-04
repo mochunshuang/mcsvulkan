@@ -16,6 +16,7 @@ endmacro()
 
 add_vulkan_wsi_test(test_glfw)
 add_vulkan_wsi_test(test_glfw2)
+add_vulkan_wsi_test(test_glfw3)
 
 # end
 unset(BASE_LIBS)

@@ -13,7 +13,7 @@ namespace mcs::vulkan::input
 {
     struct glfw_window_state
     {
-        constexpr glfw_window_state() noexcept
+        constexpr glfw_window_state()
         {
             event::window_focus_event_dispatcher::instance().subscribe(
                 this, &glfw_window_state::onFocus);
