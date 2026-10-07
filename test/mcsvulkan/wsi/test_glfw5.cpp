@@ -1,5 +1,7 @@
+#include <array>
 #include <cassert>
 #include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <iostream>
@@ -9,6 +11,8 @@
 #include <span>
 #include <tuple>
 #include <type_traits>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "head.hpp"
@@ -39,6 +43,7 @@ using mcs::vulkan::meta::make_aggregate;
 using mcs::vulkan::meta::field;
 using mcs::vulkan::meta::method;
 using mcs::vulkan::meta::static_string;
+using mcs::vulkan::meta::name_spec;
 
 using mcs::vulkan::runtime_type_v;
 
@@ -171,6 +176,149 @@ struct hardware_layer_input
     glfw_forward &input_;
 };
 
+// NOTE: 识别器
+struct recognize
+{
+};
+// NOTE:
+struct arena
+{
+};
+
+struct ui_gen
+{
+
+    //
+
+    struct padding_result
+    {
+    };
+
+    struct recognize_item
+    {
+
+        ui_gen *reciver;
+    };
+
+    void setResult(padding_result result)
+    {
+        // NOTE:
+    }
+
+    padding_result padding_result;
+    recognize_item root;
+};
+
+template <class Agg, name_spec... Info>
+struct result_awaiter
+{
+    using result_variant = std::variant<std::monostate, typename[:Info.info:]...>;
+
+    static consteval auto unique_type()
+    {
+        constexpr std::array<name_spec, sizeof...(Info)> input{Info...};
+        for (std::size_t i = 0; i < input.size(); ++i)
+        {
+            auto spec_i = input[i];
+            for (std::size_t j = i + 1; j < input.size(); ++j)
+            {
+                auto spec_j = input[j];
+                if (spec_i.info == spec_j.info)
+                    return false;
+            }
+        }
+        return true;
+    };
+
+    using IndexStoreType = uint8_t;
+    struct empty_type
+    {
+        constexpr empty_type(IndexStoreType) {}
+    };
+    static_assert(sizeof(empty_type) == 1);
+    using IndexType = std::conditional_t<unique_type(), empty_type, IndexStoreType>;
+    static constexpr IndexType invalid_idx =
+        static_cast<IndexType>(std::numeric_limits<IndexStoreType>::max());
+    static_assert(sizeof...(Info) < std::numeric_limits<IndexStoreType>::max());
+
+    struct Dispach
+    {
+        template <static_string fn_name, class T>
+        void invoke(void *obj, T &&value) noexcept
+            requires(requires() {
+                {
+                    static_cast<Agg *>(obj)->template invoke<fn_name>(
+                        std::forward<T>(value))
+                } noexcept;
+            })
+        {
+            static_cast<Agg *>(obj)->template invoke<fn_name>(std::forward<T>(value));
+        }
+    };
+    constexpr void resume() noexcept
+    {
+        if constexpr (unique_type())
+        {
+            auto index = result.index();
+            if (index == 0 || obj == nullptr)
+                return;
+            template for (constexpr auto I : std::views::iota(0u, sizeof...(Info)))
+            {
+                constexpr name_spec spec = Info...[I];
+                if (I == index - 1)
+                {
+                    dispach.template invoke<spec.name>(
+                        obj, std::move(std::get<I + 1>(result)));
+                    result = std::monostate{};
+                    return;
+                }
+            }
+        }
+        else
+        {
+            if (idx == invalid_idx || obj == nullptr || result.index() == 0)
+                return;
+            template for (constexpr auto I :
+                          std::views::indices(sizeof...(Info) + 1) | std::views::drop(1))
+            {
+                constexpr name_spec spec = Info...[I - 1];
+                if (I == idx)
+                {
+                    dispach.template invoke<spec.name>(obj,
+                                                       std::move(std::get<I>(result)));
+
+                    result = std::monostate{};
+                    idx = ~0;
+                    return;
+                }
+            }
+        }
+    }
+    void *obj;
+    [[no_unique_address]] IndexType idx{invalid_idx};
+    [[no_unique_address]] Dispach dispach{};
+    [[no_unique_address]] result_variant result{};
+
+    constexpr explicit result_awaiter(Agg &p) noexcept : obj{&p} {}
+
+    template <typename T>
+    constexpr void setResult(T &&value) noexcept(
+        noexcept(result = std::forward<T>(value)))
+        requires(requires() { result = std::forward<T>(value); })
+    {
+        result = std::forward<T>(value);
+    }
+
+    template <std::size_t I, typename T>
+    constexpr void setResult(T &&value) noexcept(
+        noexcept(result.template emplace<I>(std::forward<T>(value))))
+        requires requires { result.template emplace<I>(std::forward<T>(value)); }
+    {
+        result.template emplace<I>(std::forward<T>(value));
+        idx = static_cast<IndexType>(I);
+    }
+};
+
 int main()
 try
 {
@@ -182,30 +330,11 @@ try
     auto forward = glfw_forward{};
     hardware_layer_input h{forward};
 
-    struct receiver
-    {
-        void runtime_invoke(position2d_event pos,
-                            std::chrono::steady_clock::time_point time_point,
-                            keyboard_event e) noexcept
-        {
-            std::println("onKeyboard cursor: {}", e);
-        }
-    };
-    receiver some_receiver;
-
-    struct not_receiver
-    {
-    };
-    not_receiver not_a_receiver;
-
     auto agg_receiver = make_aggregate<"TextBox">(
         field<"time_point">(std::optional<std::chrono::steady_clock::time_point>{}),
         method<"runtime_invoke">(
             []<class E>(auto &&self, position2d_event pos,
-                        std::chrono::steady_clock::time_point time_point, E e) noexcept
-            //NOTE: 只有 keyboard_event 被转发
-            // requires(std::same_as<E, keyboard_event>)
-            {
+                        std::chrono::steady_clock::time_point time_point, E e) noexcept {
                 std::println("runtime_invoke: {} , {} ,{}", pos,
                              time_point.time_since_epoch(), e);
                 using namespace std::chrono;
@@ -222,29 +351,6 @@ try
                 }
                 self.time_point = time_point;
             }));
-    {
-        auto agg_receiver = make_aggregate<"TextBox">(
-            field<"text">(std::string("CD")),
-            method<"runtime_invoke">(
-                []<class E>(auto &&self, position2d_event pos,
-                            std::chrono::steady_clock::time_point time_point,
-                            E e) noexcept
-                    requires(std::same_as<E, keyboard_event>)
-                {
-                    std::println("runtime_invoke: {} , {} ,{}", pos,
-                                 time_point.time_since_epoch(), e);
-                }));
-        agg_receiver.template invoke<"runtime_invoke">(
-            position2d_event{}, std::chrono::steady_clock::time_point{},
-            keyboard_event{});
-        // NOTE: 下面编译错误
-        // agg_receiver.template invoke<"runtime_invoke">(
-        //     position2d_event{}, std::chrono::steady_clock::time_point{},
-        //     mousebutton_event{});
-    }
-
-    // h.setReceiver(&some_receiver);
-    // h.setReceiver(&not_a_receiver);
     h.setReceiver(&agg_receiver);
 
     while (window.shouldClose() == 0)

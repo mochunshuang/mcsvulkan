@@ -112,10 +112,31 @@ void print2()
     }
 }
 
+template <size_t N>
+void print3()
+{
+    template for (constexpr auto e : std::views::indices(N + 1) | std::views::drop(1))
+    {
+        std::print("{}", e);
+    }
+    std::println();
+    // iota(a, b) 生成 [a, b)，所以 iota(1, N+1) 给 1..N。
+}
+
+void print()
+{
+    // NOTE: 下面编译错误。 因此 std::views::drop(1) 是必须的
+    // template for (constexpr auto e : std::ranges::views::iota(std::size_t{0}, 2))
+    // {
+    //     std::println("{}", e);
+    // }
+}
+
 int main()
 try
 {
     print2<3>();
+    print3<3>();
 
     template for (constexpr auto e : std::array{1, 3, 5})
     {
