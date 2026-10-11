@@ -607,6 +607,7 @@ struct glfw_arena
 
 using class_utils = mcs::vulkan::meta::class_utils;
 
+template <typename... Extra>
 struct proxy_class_invoke
 {
     static consteval std::optional<std::meta::info> find_function(std::meta::info cls,
@@ -684,11 +685,12 @@ struct proxy_class_invoke
                           "with the given arguments");
     }
 
-    using invoke_type = void (*)(void *ptr, const void *type, void *data) noexcept;
-    constexpr void invoke(void *ptr, const void *type, void *data) noexcept
+    using invoke_type = void (*)(void *ptr, const void *type, void *data,
+                                 Extra...) noexcept;
+    constexpr void invoke(void *ptr, const void *type, void *data, Extra... e) noexcept
     {
         assert(invoke_ != nullptr);
-        invoke_(ptr, type, data);
+        invoke_(ptr, type, data, e...);
     }
 
     proxy_class_invoke() = default;
@@ -697,20 +699,21 @@ struct proxy_class_invoke
     }
 
     template <static_string name, typename Obj, typename... Ts>
-    static constexpr void dispach_invoke(Obj *ptr, const void *type, void *p) noexcept
+    static constexpr void dispach_invoke(Obj *ptr, std::tuple<Ts...> *, const void *type,
+                                         void *p, Extra... e) noexcept
     {
         using mcs::vulkan::runtime_type_v;
-        auto invoke = [&](auto &e) noexcept {
-            if constexpr (requires() { ptr->template invoke<name>(e); })
-                ptr->template invoke<name>(e); //NOTE: 内置的聚合类型
-            else if constexpr (requires() { invoke_member<name>(*ptr, e); })
-                invoke_member<name>(*ptr, e); //NOTE: 普通类型
+        auto invoke = [&](auto &d) noexcept {
+            if constexpr (requires() { ptr->template invoke<name>(d, e...); })
+                ptr->template invoke<name>(d, e...); //NOTE: 内置的聚合类型
+            else if constexpr (requires() { invoke_member<name>(*ptr, d, e...); })
+                invoke_member<name>(*ptr, d, e...); //NOTE: 普通类型
             else
             {
                 // std::println("→ branch C (SKIP!)"); // ← 如果打到这里，根因坐实
             }
         };
-        ((can_noexcept_invoke<name, Obj, Ts> && type == runtime_type_v<Ts> &&
+        ((can_noexcept_invoke<name, Obj, Ts, Extra...> && type == runtime_type_v<Ts> &&
           (invoke(*static_cast<Ts *>(p)), true)) ||
          ...);
     }
@@ -719,12 +722,11 @@ struct proxy_class_invoke
     static constexpr auto build() noexcept
     {
         using object_type = std::remove_cvref_t<T>;
-        return proxy_class_invoke{
-            invoke_type{[](void *ptr, const void *type, void *data) noexcept {
+        return proxy_class_invoke{invoke_type{
+            [](void *ptr, const void *type, void *data, Extra... args) noexcept {
                 auto *obj = static_cast<object_type *>(ptr);
-                [&]<typename... Ts>(std::tuple<Ts...> *) {
-                    dispach_invoke<callable_name, object_type, Ts...>(obj, type, data);
-                }(static_cast<data_tuple *>(nullptr));
+                dispach_invoke<callable_name, object_type>(
+                    obj, static_cast<data_tuple *>(nullptr), type, data, args...);
             }}};
     }
 
@@ -745,15 +747,15 @@ void test_proxy_class_invoke()
             [](auto &&self, std::same_as<double> auto v) noexcept { self.value = -1; }));
 
     using RecvType = std::remove_cvref_t<decltype(receiver)>;
-    static_assert(proxy_class_invoke::can_noexcept_invoke<"on_int", RecvType, int>());
+    static_assert(proxy_class_invoke<>::can_noexcept_invoke<"on_int", RecvType, int>());
     static_assert(
-        proxy_class_invoke::can_noexcept_invoke<"on_double", RecvType, double>());
+        proxy_class_invoke<>::can_noexcept_invoke<"on_double", RecvType, double>());
 
     // 2. GenProxy 告诉 proxy 要处理哪些备选类型
     using GenProxy = std::tuple<int, double>;
 
     // 3. 针对 "on_int" 构建一个代理
-    auto proxy_int = proxy_class_invoke::build<"on_int", GenProxy, RecvType>();
+    auto proxy_int = proxy_class_invoke<>::build<"on_int", GenProxy, RecvType>();
 
     int i = 42;
     proxy_int.invoke(&receiver, runtime_type_v<int>, &i);
@@ -765,7 +767,7 @@ void test_proxy_class_invoke()
     assert(receiver.value == 42);
 
     // 5. 换成 "on_double" 再构建，验证另一个分支
-    auto proxy_dbl = proxy_class_invoke::build<"on_double", GenProxy, RecvType>();
+    auto proxy_dbl = proxy_class_invoke<>::build<"on_double", GenProxy, RecvType>();
     proxy_dbl.invoke(&receiver, runtime_type_v<double>, &d);
     assert(receiver.value == -1);
 
@@ -806,17 +808,19 @@ void test_plain_class_member_fn()
     using RecvType = std::remove_cvref_t<decltype(receiver)>;
 
     // 走路径 B（直接成员调用），不再是路径 A（聚合体 invoke<>）
-    static_assert(proxy_class_invoke::can_noexcept_invoke<"on_int", RecvType, int>());
-    static_assert(proxy_class_invoke::can_noexcept_invoke<"on_int", RecvType, int &>());
-    static_assert(!proxy_class_invoke::can_noexcept_invoke<"on_int", RecvType, double>());
+    static_assert(proxy_class_invoke<>::can_noexcept_invoke<"on_int", RecvType, int>());
+    static_assert(proxy_class_invoke<>::can_noexcept_invoke<"on_int", RecvType, int &>());
     static_assert(
-        proxy_class_invoke::can_noexcept_invoke<"on_double", RecvType, double>());
-    static_assert(!proxy_class_invoke::can_noexcept_invoke<"on_double", RecvType, int>());
+        !proxy_class_invoke<>::can_noexcept_invoke<"on_int", RecvType, double>());
+    static_assert(
+        proxy_class_invoke<>::can_noexcept_invoke<"on_double", RecvType, double>());
+    static_assert(
+        !proxy_class_invoke<>::can_noexcept_invoke<"on_double", RecvType, int>());
 
     using GenProxy = std::tuple<int, double>;
 
-    auto proxy_int = proxy_class_invoke::build<"on_int", GenProxy, RecvType>();
-    auto proxy_dbl = proxy_class_invoke::build<"on_double", GenProxy, RecvType>();
+    auto proxy_int = proxy_class_invoke<>::build<"on_int", GenProxy, RecvType>();
+    auto proxy_dbl = proxy_class_invoke<>::build<"on_double", GenProxy, RecvType>();
 
     int i = 42;
     proxy_int.invoke(&receiver, runtime_type_v<int>, &i);
@@ -864,12 +868,13 @@ void test_plain_class_data_member_fn()
     using RecvType = std::remove_cvref_t<decltype(receiver)>;
 
     // on_int 是数据成员（函数对象），走 has_member_data 分支
-    static_assert(proxy_class_invoke::can_noexcept_invoke<"on_int", RecvType, int>());
-    static_assert(proxy_class_invoke::can_noexcept_invoke<"on_int", RecvType, int &>());
-    static_assert(!proxy_class_invoke::can_noexcept_invoke<"on_int", RecvType, double>());
+    static_assert(proxy_class_invoke<>::can_noexcept_invoke<"on_int", RecvType, int>());
+    static_assert(proxy_class_invoke<>::can_noexcept_invoke<"on_int", RecvType, int &>());
+    static_assert(
+        !proxy_class_invoke<>::can_noexcept_invoke<"on_int", RecvType, double>());
 
     using GenProxy = std::tuple<int, double>;
-    auto proxy_int = proxy_class_invoke::build<"on_int", GenProxy, RecvType>();
+    auto proxy_int = proxy_class_invoke<>::build<"on_int", GenProxy, RecvType>();
 
     plain_lambda_state::call_count = 0;
     plain_lambda_state::last_value = 0;
@@ -928,11 +933,11 @@ struct glfw_input_translation
                    cursor_enter_event, char_event, drop_event, window_focus_event,
                    window_pos_event, window_size_event, window_iconify_event,
                    window_maximize_event, framebuffer_size_event>;
-
+    using proxy_class_type = proxy_class_invoke<>;
     struct receiver
     {
         constexpr receiver() noexcept = default;
-        receiver(void *receiver, proxy_class_invoke fn) noexcept
+        receiver(void *receiver, proxy_class_type fn) noexcept
             : receiver_{receiver}, fn_{fn}
         {
         }
@@ -947,7 +952,7 @@ struct glfw_input_translation
 
       private:
         void *receiver_{};
-        proxy_class_invoke fn_;
+        proxy_class_type fn_;
     };
     template <typename... event_type>
     struct SubscriptionForwarder
@@ -1218,11 +1223,11 @@ struct glfw_input_translation
 
     template <typename Obj>
         requires(requires() {
-            proxy_class_invoke::build<"input_event", data_tuple, Obj>();
+            proxy_class_type::build<"input_event", data_tuple, Obj>();
         })
     constexpr void setReceiver(Obj &obj) noexcept
     {
-        receiver_ = {&obj, proxy_class_invoke::build<"input_event", data_tuple, Obj>()};
+        receiver_ = {&obj, proxy_class_type::build<"input_event", data_tuple, Obj>()};
     }
 
   private:
