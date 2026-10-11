@@ -46,16 +46,42 @@ using mcs::vulkan::meta::static_string;
 using mcs::vulkan::meta::name_spec;
 
 using mcs::vulkan::runtime_type_v;
+using mcs::vulkan::ring_buffer;
 
 template <typename Obj, typename P>
 concept can_invoke = requires(Obj *ptr, position2d_event pos,
                               std::chrono::steady_clock::time_point time_point, P p) {
     requires requires {
-        { ptr->template invoke<"runtime_invoke">(pos, time_point, p) } noexcept;
+        { ptr->template invoke<"input_event">(pos, time_point, p) } noexcept;
     } || requires {
-        { ptr->runtime_invoke(pos, time_point, p) } noexcept;
+        { ptr->input_event(pos, time_point, p) } noexcept;
     };
 };
+
+namespace dispach
+{
+    template <class T>
+    static void onPosition2d(void *self, position2d_event pos,
+                             std::chrono::steady_clock::time_point time_point,
+                             position2d_event e) noexcept
+    {
+        static_cast<T *>(self)->forward(pos, time_point, e);
+    }
+    template <class T>
+    static void onKeyboard(void *self, position2d_event pos,
+                           std::chrono::steady_clock::time_point time_point,
+                           keyboard_event e) noexcept
+    {
+        static_cast<T *>(self)->forward(pos, time_point, e);
+    }
+    template <class T>
+    static void onMousebutton(void *self, position2d_event pos,
+                              std::chrono::steady_clock::time_point time_point,
+                              mousebutton_event e) noexcept
+    {
+        static_cast<T *>(self)->forward(pos, time_point, e);
+    }
+}; // namespace dispach
 
 struct dynamic_pointer
 {
@@ -93,68 +119,32 @@ struct dynamic_pointer
 
 struct hardware_layer_input
 {
-    using enable_forword = std::tuple<keyboard_event, mousebutton_event>;
-
-    template <typename Obj, typename... Ts>
-    static constexpr void runtime_invoke(Obj *ptr, position2d_event pos,
-                                         std::chrono::steady_clock::time_point time_point,
-                                         const void *type, void *p) noexcept
-    {
-        auto invoke = [&](auto &e) noexcept {
-            if constexpr (requires() {
-                              ptr->template invoke<"runtime_invoke">(pos, time_point, e);
-                          })
-                ptr->template invoke<"runtime_invoke">(pos, time_point, e);
-            else if constexpr (requires() { ptr->runtime_invoke(pos, time_point, e); })
-                ptr->runtime_invoke(pos, time_point, e);
-        };
-        ((can_invoke<Obj, Ts> && type == runtime_type_v<Ts> &&
-          (invoke(*static_cast<Ts *>(p)), true)) ||
-         ...);
-    }
-    template <typename Obj>
-    static constexpr void dispach(Obj *ptr, position2d_event pos,
-                                  std::chrono::steady_clock::time_point time_point,
-                                  const void *type, void *p) noexcept
-    {
-        [&]<typename... Ts>(std::tuple<Ts...>) {
-            runtime_invoke<Obj, Ts...>(ptr, pos, time_point, type, p);
-        }(enable_forword{});
-    }
-
+    using enable_forword =
+        std::tuple<keyboard_event, mousebutton_event, position2d_event>;
     constexpr explicit hardware_layer_input(glfw_forward &input) : input_{input}
     {
+        input_.subscribe<glfw_forward::position2d_change_fn>(
+            this, dispach::onPosition2d<hardware_layer_input>);
         input_.subscribe<glfw_forward::keyboard_change_fn>(
-            this, hardware_layer_input::onKeyboard);
+            this, dispach::onKeyboard<hardware_layer_input>);
         input_.subscribe<glfw_forward::mousebutton_change_fn>(
-            this, hardware_layer_input::onMousebutton);
+            this, dispach::onMousebutton<hardware_layer_input>);
     }
     constexpr ~hardware_layer_input() noexcept
     {
+        input_.unsubscribe<glfw_forward::position2d_change_fn>(
+            this, dispach::onPosition2d<hardware_layer_input>);
         input_.unsubscribe<glfw_forward::keyboard_change_fn>(
-            this, hardware_layer_input::onKeyboard);
+            this, dispach::onKeyboard<hardware_layer_input>);
         input_.unsubscribe<glfw_forward::mousebutton_change_fn>(
-            this, hardware_layer_input::onMousebutton);
+            this, dispach::onMousebutton<hardware_layer_input>);
     }
     hardware_layer_input(const hardware_layer_input &) = delete;
     hardware_layer_input(hardware_layer_input &&) = delete;
     hardware_layer_input &operator=(const hardware_layer_input &) = delete;
     hardware_layer_input &operator=(hardware_layer_input &&) = delete;
 
-    static void onKeyboard(void *self, position2d_event pos,
-                           std::chrono::steady_clock::time_point time_point,
-                           keyboard_event e) noexcept
-    {
-        static_cast<hardware_layer_input *>(self)->forword(pos, time_point, e);
-    }
-    static void onMousebutton(void *self, position2d_event pos,
-                              std::chrono::steady_clock::time_point time_point,
-                              mousebutton_event e) noexcept
-    {
-        static_cast<hardware_layer_input *>(self)->forword(pos, time_point, e);
-    }
-
-    constexpr void forword(position2d_event pos,
+    constexpr void forward(position2d_event pos,
                            std::chrono::steady_clock::time_point time_point,
                            auto e) noexcept
     {
@@ -168,6 +158,33 @@ struct hardware_layer_input
     {
         receiver_ = obj;
         fn_ = dynamic_pointer::make<hardware_layer_input, Obj>();
+    }
+
+    template <typename Obj, typename... Ts>
+    static constexpr void input_event(Obj *ptr, position2d_event pos,
+                                      std::chrono::steady_clock::time_point time_point,
+                                      const void *type, void *p) noexcept
+    {
+        auto invoke = [&](auto &e) noexcept {
+            if constexpr (requires() {
+                              ptr->template invoke<"input_event">(pos, time_point, e);
+                          })
+                ptr->template invoke<"input_event">(pos, time_point, e);
+            else if constexpr (requires() { ptr->input_event(pos, time_point, e); })
+                ptr->input_event(pos, time_point, e);
+        };
+        ((can_invoke<Obj, Ts> && type == runtime_type_v<Ts> &&
+          (invoke(*static_cast<Ts *>(p)), true)) ||
+         ...);
+    }
+    template <typename Obj>
+    static constexpr void dispach(Obj *ptr, position2d_event pos,
+                                  std::chrono::steady_clock::time_point time_point,
+                                  const void *type, void *p) noexcept
+    {
+        [&]<typename... Ts>(std::tuple<Ts...>) {
+            input_event<Obj, Ts...>(ptr, pos, time_point, type, p);
+        }(enable_forword{});
     }
 
   private:
@@ -319,39 +336,925 @@ struct result_awaiter
     }
 };
 
+// 指针事件是原始输入，手势事件是对这些原始输入的语义解读，键盘/焦点事件处理非指针输入，而通知和语义事件则分别服务于组件间通信和平台辅助功能。
+
+namespace event
+{
+    // ═══════════════════════════════════════════════════════════════
+    // 输入事件的语义模型
+    // ═══════════════════════════════════════════════════════════════
+    //
+    // 输入事件的三阶：
+    //   [一] 物理阶    平台原始信号
+    //   [二] 规范阶    平台无关的输入事件
+    //   [三] 语义阶    从规范阶序列解读出的用户意图
+    //
+    // 跨平台能力的落点：阶 [二] 是稳定边界。
+    // 应用只对接 [二] 和 [三]，永不对接 [一]。
+
+    // 指针设备类型。不是"鼠标/触摸屏"的分类，而是"手感"的分类——
+    // slop 阈值、精度、是否支持压力都由此决定。
+    enum class PointerDeviceKind : std::uint8_t
+    {
+        eTOUCH,
+        eMOUSE,
+        eSTYLUS,
+        eINVERTED_STYLUS,
+        eTRACKPAD,
+        eUNKNOWN,
+    };
+
+    struct DeviceInput
+    {
+        PointerDeviceKind kind;
+    };
+
+    // ─────────────────────────────────────────────────────────────
+    // 阶 [二]·指针族
+    //
+    // 核心思想：**事件是状态快照，不是变化通知。**
+    //
+    // 平台原始信号是"位置变了"和"按钮变了"两条独立的流。指针事
+    // 件把二者合并，每一个事件都自带完整上下文——哪个指针、在哪、
+    // 按着什么、何时、什么设备。订阅者只看一个事件就够，不需要在
+    // 自己内部维护状态副本。
+    //
+    // 一个指针 = 一次交互主体。它有从出现到消失的完整生命周期。
+    // 事件类型表达的不是"阶段"，而是"这个主体此刻发生了什么事实"。
+    //
+    // 取消是一等公民。中断不是异常，是正常事实。没有它，被外力
+    // 打断的交互会让状态机永久卡住。
+
+    struct PointerDownEvent : DeviceInput
+    {
+    }; // 从未接触到接触
+    struct PointerMoveEvent : DeviceInput
+    {
+
+    }; // 接触状态下的移动
+    struct PointerUpEvent : DeviceInput
+    {
+    }; // 从接触到未接触
+    struct PointerCancelEvent : DeviceInput
+    {
+    }; // 交互作废，后续事件不可信
+
+    struct PointerHoverEvent : DeviceInput
+    {
+    }; // 未接触状态下的移动
+
+    // 指针在设备跟踪范围内的出现与消失。
+    // 比 Down/Up 更外层——Down 之前必有 Added，Up 之后未必立即
+    // Removed（可能继续 Hover）。
+    struct PointerAddedEvent : DeviceInput
+    {
+    };
+    struct PointerRemovedEvent : DeviceInput
+    {
+    };
+
+    // 指针进入 / 离开某个目标对象。
+    // 与 Added/Removed 不同：这是目标对象级的边界，需要命中测试
+    // 才能合成，不是平台原生事件。
+    struct PointerEnterEvent : DeviceInput
+    {
+    };
+    struct PointerExitEvent : DeviceInput
+    {
+    };
+
+    // 离散信号。不改变指针状态，不参与手势序列。
+    // 与接触类事件的关键区别：它是一次性的，不是过程的一部分。
+    struct PointerScrollEvent : DeviceInput
+    {
+    };
+    struct PointerScaleEvent : DeviceInput
+    {
+    };
+
+    // 触摸板多指平移 / 缩放的复合序列。
+    // 有状态：Start → Update → End。
+    struct PointerPanZoomStartEvent : DeviceInput
+    {
+    };
+    struct PointerPanZoomUpdateEvent : DeviceInput
+    {
+    };
+    struct PointerPanZoomEndEvent : DeviceInput
+    {
+    };
+
+    // ─────────────────────────────────────────────────────────────
+    // 阶 [三]·手势族
+    //
+    // 手势是**结论**，不是输入。识别器订阅指针序列，从中推断用户
+    // 意图，产出零个或多个手势事件。
+    //
+    // 分工边界：
+    //   指针层不懂手势含义；
+    //   手势层不懂平台细节。
+    // 因此同一个识别器可跨平台工作。
+
+    // ── 点击 ──
+    // 一次短促、未越 slop、完整闭合的接触。
+    // 判据不是"down 与 up 位置相等"，而是"down 到 up 期间任何时刻
+    // 相对起点的位移都未超 slop"。一旦超限，永久出局。
+    // slop 由设备决定——触摸 18px、鼠标 1px。手感是设备属性，不是
+    // 常量。
+    struct TapDownEvent
+    {
+    };
+    struct TapUpEvent
+    {
+    };
+    struct TapEvent
+    {
+    };
+    struct TapCancelEvent
+    {
+    };
+
+    // ── 双击 ──
+    // 独立意图，与单击互斥。
+    // 实现上单击不"输给"双击，而是被暂缓：双击 hold 住竞技场，
+    // 超时无第二击才释放给单击。宁可让用户等，也不发出可能被撤销
+    // 的假回调。
+    struct DoubleTapEvent
+    {
+    };
+
+    // ── 长按 ──
+    // 在原地持续接触超过阈值时间。与点击互斥。
+    struct LongPressEvent
+    {
+    };
+
+    // ── 拖动 ──
+    // 接触状态下的持续移动，有始有终。
+    // 三个轴变体共享 Start/Update/End 结构。轴在首次超阈值时确定，
+    // 本次拖动不再改轴。
+    struct VerticalDragStartEvent
+    {
+    };
+    struct VerticalDragUpdateEvent
+    {
+    };
+    struct VerticalDragEndEvent
+    {
+    };
+
+    struct HorizontalDragStartEvent
+    {
+    };
+    struct HorizontalDragUpdateEvent
+    {
+    };
+    struct HorizontalDragEndEvent
+    {
+    };
+
+    struct PanStartEvent
+    {
+    };
+    struct PanUpdateEvent
+    {
+    };
+    struct PanEndEvent
+    {
+    };
+
+    // ─────────────────────────────────────────────────────────────
+    // 阶 [二]·键盘族
+    //
+    // 语义是**物理按键状态的变化**。不关心布局——按 A 键得到的
+    // 是"A 被按下"，不是"字母 a 产生"。后者属于文本族。
+    //
+    // 与指针族的唯一交叉是"修饰键快照"——它是修饰键状态的一次
+    // 采样，被指针事件携带，不是键盘事件本身。
+
+    struct KeyDownEvent
+    {
+    };
+    struct KeyRepeatEvent
+    {
+    };
+    struct KeyUpEvent
+    {
+    };
+
+    // ─────────────────────────────────────────────────────────────
+    // 阶 [二]·文本族
+    //
+    // 语义是**布局后的可见字符输入**。
+    //
+    // 与键盘族的区别：按下 Shift+A 产生一个键盘事件（A 键按下）
+    // 和一个文本事件（字符 'A'）。IME 输入、emoji、组合键都只产
+    // 生文本事件，不产生键盘事件。反之，功能键（F1、方向键）只
+    // 产生键盘事件，不产生文本事件。
+    //
+    // 二者不是一一对应。
+
+    struct CharEvent
+    {
+    };
+
+    // ─────────────────────────────────────────────────────────────
+    // 阶 [二]·拖放族
+    //
+    // 语义是**外部数据传入**。不携带屏幕坐标——它是"数据到了"，
+    // 不是"指针做了什么"。
+    // 与指针拖动完全不同的概念：一个来自操作系统文件管理器，一个
+    // 来自应用内部的指针序列。
+
+    struct DropEvent
+    {
+    };
+
+    // ─────────────────────────────────────────────────────────────
+    // 阶 [二]·窗口族
+    //
+    // 语义是**承载输入的环境状态变化**。
+    // 它不描述"输入"，描述"输入可能发生或不再可能发生"。
+    // 例如：窗口失焦意味着后续键盘输入不再路由到此应用。
+
+    struct WindowFocusEvent
+    {
+    }; // 应用是否在前台
+    struct WindowPosEvent
+    {
+    }; // 窗口在屏幕中的位置
+    struct WindowSizeEvent
+    {
+    }; // 窗口尺寸（逻辑）
+    struct WindowIconifyEvent
+    {
+    }; // 最小化
+    struct WindowMaximizeEvent
+    {
+    }; // 最大化
+    struct FramebufferSizeEvent
+    {
+    }; // 绘制区尺寸（物理像素）
+    struct ContentScaleEvent
+    {
+    }; // DPI 缩放
+
+}; // namespace event
+
+struct glfw_arena
+{
+};
+
+using class_utils = mcs::vulkan::meta::class_utils;
+
+struct proxy_class_invoke
+{
+    static consteval std::optional<std::meta::info> find_function(std::meta::info cls,
+                                                                  static_string name)
+    {
+        return class_utils::find_member(
+            cls, name,
+            [](std::meta::info m) -> bool {
+                return std::meta::is_function(m) || std::meta::is_function_template(m);
+            },
+            std::meta::access_context::current());
+    }
+    static consteval std::optional<std::meta::info> find_nonstatic_data_member(
+        std::meta::info cls, static_string name)
+    {
+        return class_utils::find_member(
+            cls, name,
+            [](std::meta::info m) -> bool {
+                return std::meta::is_nonstatic_data_member(m);
+            },
+            std::meta::access_context::current());
+    }
+
+    template <static_string fn_name, class T>
+    static consteval std::meta::info resolve_callable()
+    {
+        if (auto f = find_function(^^T, fn_name); f.has_value())
+            return *f;
+        if (auto d = find_nonstatic_data_member(^^T, fn_name); d.has_value())
+            return *d;
+        return std::meta::info{};
+    }
+
+    // ========== can_noexcept_invoke ==========
+    template <static_string fn_name, class Obj, class... Args>
+    static constexpr bool can_noexcept_invoke() noexcept
+    {
+        using T = std::remove_cvref_t<Obj>;
+
+        // 路径 A：聚合体的 invoke<fn_name>(args...) —— 和 dispach_invoke 的第一个分支对齐
+        if constexpr (requires(T &o, Args &&...as) {
+                          {
+                              o.template invoke<fn_name>(std::forward<Args>(as)...)
+                          } noexcept;
+                      })
+            return true;
+
+        // 路径 B：直接成员调用
+        constexpr auto callable = resolve_callable<fn_name, T>();
+        if constexpr (callable == std::meta::info{})
+            return false;
+        else
+            return requires(T &o, Args &&...as) {
+                { o.[:callable:](std::forward<Args>(as)...) } noexcept;
+            } || requires(T &o, Args &&...as) {
+                { o.template[:callable:](std::forward<Args>(as)...) } noexcept;
+            };
+    }
+
+    // ========== invoke_member ==========
+    template <static_string fn_name, class Obj, class... Args>
+        requires(can_noexcept_invoke<fn_name, std::remove_cvref_t<Obj>, Args...>())
+    static constexpr decltype(auto) invoke_member(Obj &obj, Args &&...args) noexcept
+    {
+        using T = std::remove_cvref_t<Obj>;
+        constexpr auto m = resolve_callable<fn_name, T>();
+
+        if constexpr (requires { obj.[:m:](std::forward<Args>(args)...); })
+            return obj.[:m:](std::forward<Args>(args)...);
+        else if constexpr (requires { obj.template[:m:](std::forward<Args>(args)...); })
+            return obj.template[:m:](std::forward<Args>(args)...);
+        else
+            static_assert(sizeof(Obj) == 0,
+                          "invoke_member: member exists but not callable "
+                          "with the given arguments");
+    }
+
+    using invoke_type = void (*)(void *ptr, const void *type, void *data) noexcept;
+    constexpr void invoke(void *ptr, const void *type, void *data) noexcept
+    {
+        assert(invoke_ != nullptr);
+        invoke_(ptr, type, data);
+    }
+
+    proxy_class_invoke() = default;
+    constexpr explicit proxy_class_invoke(invoke_type invoke) noexcept : invoke_{invoke}
+    {
+    }
+
+    template <static_string name, typename Obj, typename... Ts>
+    static constexpr void dispach_invoke(Obj *ptr, const void *type, void *p) noexcept
+    {
+        using mcs::vulkan::runtime_type_v;
+        auto invoke = [&](auto &e) noexcept {
+            if constexpr (requires() { ptr->template invoke<name>(e); })
+                ptr->template invoke<name>(e); //NOTE: 内置的聚合类型
+            else if constexpr (requires() { invoke_member<name>(*ptr, e); })
+                invoke_member<name>(*ptr, e); //NOTE: 普通类型
+            else
+            {
+                // std::println("→ branch C (SKIP!)"); // ← 如果打到这里，根因坐实
+            }
+        };
+        ((can_noexcept_invoke<name, Obj, Ts> && type == runtime_type_v<Ts> &&
+          (invoke(*static_cast<Ts *>(p)), true)) ||
+         ...);
+    }
+
+    template <static_string callable_name, typename data_tuple, class T>
+    static constexpr auto build() noexcept
+    {
+        using object_type = std::remove_cvref_t<T>;
+        return proxy_class_invoke{
+            invoke_type{[](void *ptr, const void *type, void *data) noexcept {
+                auto *obj = static_cast<object_type *>(ptr);
+                [&]<typename... Ts>(std::tuple<Ts...> *) {
+                    dispach_invoke<callable_name, object_type, Ts...>(obj, type, data);
+                }(static_cast<data_tuple *>(nullptr));
+            }}};
+    }
+
+  private:
+    invoke_type invoke_{};
+};
+
+void test_proxy_class_invoke()
+{
+    using mcs::vulkan::runtime_type_v;
+
+    // 1. 造一个接收者：带命名字段的聚合，含两个带名字的 method
+    auto receiver = make_aggregate<"TestWidget">(
+        field<"value">(int{0}),
+        method<"on_int">(
+            [](auto &&self, std::same_as<int> auto v) noexcept { self.value = v; }),
+        method<"on_double">(
+            [](auto &&self, std::same_as<double> auto v) noexcept { self.value = -1; }));
+
+    using RecvType = std::remove_cvref_t<decltype(receiver)>;
+    static_assert(proxy_class_invoke::can_noexcept_invoke<"on_int", RecvType, int>());
+    static_assert(
+        proxy_class_invoke::can_noexcept_invoke<"on_double", RecvType, double>());
+
+    // 2. GenProxy 告诉 proxy 要处理哪些备选类型
+    using GenProxy = std::tuple<int, double>;
+
+    // 3. 针对 "on_int" 构建一个代理
+    auto proxy_int = proxy_class_invoke::build<"on_int", GenProxy, RecvType>();
+
+    int i = 42;
+    proxy_int.invoke(&receiver, runtime_type_v<int>, &i);
+    assert(receiver.value == 42);
+
+    // 4. 类型不匹配（double）：应被静默跳过，不改变状态
+    double d = 3.14;
+    proxy_int.invoke(&receiver, runtime_type_v<double>, &d);
+    assert(receiver.value == 42);
+
+    // 5. 换成 "on_double" 再构建，验证另一个分支
+    auto proxy_dbl = proxy_class_invoke::build<"on_double", GenProxy, RecvType>();
+    proxy_dbl.invoke(&receiver, runtime_type_v<double>, &d);
+    assert(receiver.value == -1);
+
+    // 6. 同样的 double 派发，但代理绑的是 on_int → 依然跳过
+    proxy_int.invoke(&receiver, runtime_type_v<double>, &d);
+    assert(receiver.value == -1);
+
+    std::println("test_proxy_class_invoke PASSED");
+}
+// ============================================================
+// 非聚合体测试
+// ============================================================
+
+// -------- 测试 1：非聚合体 + 成员函数（模板精确类型） --------
+struct PlainWidgetMemberFn
+{
+    int value = 0;
+
+    template <std::same_as<int> T>
+    void on_int(T v) noexcept
+    {
+        value = v;
+    }
+
+    template <std::same_as<double> T>
+    void on_double(T) noexcept
+    {
+        value = -1;
+    }
+};
+
+void test_plain_class_member_fn()
+{
+    using mcs::vulkan::runtime_type_v;
+    std::println("\n=== test_plain_class_member_fn ===");
+
+    PlainWidgetMemberFn receiver{};
+    using RecvType = std::remove_cvref_t<decltype(receiver)>;
+
+    // 走路径 B（直接成员调用），不再是路径 A（聚合体 invoke<>）
+    static_assert(proxy_class_invoke::can_noexcept_invoke<"on_int", RecvType, int>());
+    static_assert(proxy_class_invoke::can_noexcept_invoke<"on_int", RecvType, int &>());
+    static_assert(!proxy_class_invoke::can_noexcept_invoke<"on_int", RecvType, double>());
+    static_assert(
+        proxy_class_invoke::can_noexcept_invoke<"on_double", RecvType, double>());
+    static_assert(!proxy_class_invoke::can_noexcept_invoke<"on_double", RecvType, int>());
+
+    using GenProxy = std::tuple<int, double>;
+
+    auto proxy_int = proxy_class_invoke::build<"on_int", GenProxy, RecvType>();
+    auto proxy_dbl = proxy_class_invoke::build<"on_double", GenProxy, RecvType>();
+
+    int i = 42;
+    proxy_int.invoke(&receiver, runtime_type_v<int>, &i);
+    assert(receiver.value == 42);
+
+    double d = 3.14;
+    proxy_int.invoke(&receiver, runtime_type_v<double>, &d);
+    assert(receiver.value == 42); // 类型不符 → 跳过
+
+    proxy_dbl.invoke(&receiver, runtime_type_v<double>, &d);
+    assert(receiver.value == -1);
+
+    proxy_dbl.invoke(&receiver, runtime_type_v<int>, &i);
+    assert(receiver.value == -1); // 类型不符 → 跳过
+
+    std::println("test_plain_class_member_fn PASSED");
+}
+// -------- 测试 2：非聚合体 + 数据成员函数对象（lambda-like） --------
+namespace plain_lambda_state
+{
+    inline int last_value = 0;
+    inline int call_count = 0;
+} // namespace plain_lambda_state
+
+struct PlainWidgetDataMemberFn
+{
+    struct OnIntFn
+    {
+        template <std::same_as<int> T>
+        void operator()(T v) const noexcept
+        {
+            plain_lambda_state::last_value = v;
+            ++plain_lambda_state::call_count;
+        }
+    };
+    OnIntFn on_int{};
+};
+
+void test_plain_class_data_member_fn()
+{
+    using mcs::vulkan::runtime_type_v;
+    std::println("\n=== test_plain_class_data_member_fn ===");
+
+    PlainWidgetDataMemberFn receiver{};
+    using RecvType = std::remove_cvref_t<decltype(receiver)>;
+
+    // on_int 是数据成员（函数对象），走 has_member_data 分支
+    static_assert(proxy_class_invoke::can_noexcept_invoke<"on_int", RecvType, int>());
+    static_assert(proxy_class_invoke::can_noexcept_invoke<"on_int", RecvType, int &>());
+    static_assert(!proxy_class_invoke::can_noexcept_invoke<"on_int", RecvType, double>());
+
+    using GenProxy = std::tuple<int, double>;
+    auto proxy_int = proxy_class_invoke::build<"on_int", GenProxy, RecvType>();
+
+    plain_lambda_state::call_count = 0;
+    plain_lambda_state::last_value = 0;
+
+    int i = 42;
+    proxy_int.invoke(&receiver, runtime_type_v<int>, &i);
+    assert(plain_lambda_state::call_count == 1);
+    assert(plain_lambda_state::last_value == 42);
+
+    double d = 3.14;
+    proxy_int.invoke(&receiver, runtime_type_v<double>, &d);
+    assert(plain_lambda_state::call_count == 1); // 类型不符 → 没增加
+    assert(plain_lambda_state::last_value == 42);
+
+    std::println("test_plain_class_data_member_fn PASSED");
+}
+
+// 指针事件有队列且不丢弃；手势识别器在竞争期间临时缓存事件，胜出则保留、失败则丢弃；
+// 手势事件本身没有队列，是识别器处理指针事件时同步产生的。
+
+//NOTE: "订阅者只看一个事件就够"是两个承诺：一个是事件带完整当前状态（结构体该有的字段），
+//NOTE: 一个是订阅者不需要任何跨事件状态（错——识别器必须维护自己的推理状态）。
+/*
+两个东西，必须分开
+名称	谁维护	内容
+A	当前状态	生成端（唯一一份）	指针此刻在哪、按着什么、何时、什么设备
+B	推理状态	每个识别器（各自一份）	起点、按下时长、上次点击时刻
+A 被事件携带。B 不在事件里，也不可能在事件里——它是每个识别器私有的、跨事件累积的。
+// NOTE: 因为上下文信息，必须是交给 识别器，按需需要。不应该提升到 translation。 translation 的工作应该简单
+*/
+struct glfw_input_translation
+{
+    // surface::pollEvents(); 会产生事件，并且提供
+
+    using time_point_type = std::chrono::steady_clock::time_point;
+
+    // raw_event
+    using keyboard_event = mcs::vulkan::event::keyboard_event;
+    using mousebutton_event = mcs::vulkan::event::mousebutton_event;
+    using scroll_event = mcs::vulkan::event::scroll_event;
+    using position2d_event = mcs::vulkan::event::position2d_event;
+    using cursor_enter_event = mcs::vulkan::event::cursor_enter_event;
+
+    using char_event = mcs::vulkan::event::char_event;
+    using drop_event = mcs::vulkan::event::drop_event;
+
+    using window_focus_event = mcs::vulkan::event::window_focus_event;
+    using window_pos_event = mcs::vulkan::event::window_pos_event;
+    using window_size_event = mcs::vulkan::event::window_size_event;
+    using window_iconify_event = mcs::vulkan::event::window_iconify_event;
+    using window_maximize_event = mcs::vulkan::event::window_maximize_event;
+    using framebuffer_size_event = mcs::vulkan::event::framebuffer_size_event;
+
+    using data_tuple =
+        std::tuple<keyboard_event, mousebutton_event, scroll_event, position2d_event,
+                   cursor_enter_event, char_event, drop_event, window_focus_event,
+                   window_pos_event, window_size_event, window_iconify_event,
+                   window_maximize_event, framebuffer_size_event>;
+
+    struct receiver
+    {
+        constexpr receiver() noexcept = default;
+        receiver(void *receiver, proxy_class_invoke fn) noexcept
+            : receiver_{receiver}, fn_{fn}
+        {
+        }
+        template <typename T>
+        constexpr void invoke(T data) noexcept
+        {
+            if (receiver_ == nullptr)
+                return;
+            using mcs::vulkan::runtime_type_v;
+            fn_.invoke(receiver_, runtime_type_v<T>, &data);
+        }
+
+      private:
+        void *receiver_{};
+        proxy_class_invoke fn_;
+    };
+    template <typename... event_type>
+    struct SubscriptionForwarder
+    {
+        using callback_type = void (*)(void *self, event_type...);
+
+        struct value_type
+        {
+            void *ctx;
+            callback_type callback;
+            bool valid;
+        };
+        SubscriptionForwarder() = default;
+        SubscriptionForwarder(const SubscriptionForwarder &) = delete;
+        SubscriptionForwarder(SubscriptionForwarder &&) = delete;
+        SubscriptionForwarder &operator=(const SubscriptionForwarder &) = delete;
+        SubscriptionForwarder &operator=(SubscriptionForwarder &&) = delete;
+        ~SubscriptionForwarder() = default;
+
+        constexpr void subscribe(void *ctx, callback_type cb)
+        {
+            if (distributing_)
+            {
+                pendingAdd_.push_back({ctx, cb, true});
+                return;
+            }
+            callbacks_.push_back({ctx, cb, true});
+        }
+
+        constexpr void unsubscribe(void *ctx, callback_type cb)
+        {
+            // 正式列表：标记失效 + 打脏标记
+            for (auto &item : callbacks_)
+                if (item.ctx == ctx && item.callback == cb)
+                {
+                    item.valid = false;
+                    hasInvalid_ = true;
+                }
+
+            // 待加入列表：分发中 subscribe 又立刻 unsubscribe
+            for (auto &item : pendingAdd_)
+                if (item.ctx == ctx && item.callback == cb)
+                {
+                    item.valid = false;
+                    hasInvalid_ = true;
+                }
+        }
+
+        constexpr void distribute(event_type... event)
+        {
+            // 只有最外层才有资格 apply pending / 清理，内层只遍历。处理递归。
+            const bool outer = !distributing_; // NOLINT
+            if (outer)
+                distributing_ = true;
+
+            for (const auto &item : callbacks_)
+                if (item.valid)
+                    (item.callback)(item.ctx, event...);
+
+            if (outer)
+            {
+                distributing_ = false;
+
+                // 1) 提交本层分发期间新增的订阅（通常为空）
+                if (!pendingAdd_.empty())
+                {
+                    callbacks_.insert(callbacks_.end(),
+                                      std::make_move_iterator(pendingAdd_.begin()),
+                                      std::make_move_iterator(pendingAdd_.end()));
+                    pendingAdd_.clear();
+                }
+
+                // 2) 只有真的出现过 unsubscribe 才清理（常态下完全跳过 O(n)）
+                if (hasInvalid_)
+                {
+                    std::erase_if(callbacks_,
+                                  [](const value_type &v) noexcept { return !v.valid; });
+                    hasInvalid_ = false;
+                }
+            }
+        }
+
+      private:
+        std::vector<value_type> callbacks_;
+        std::vector<value_type> pendingAdd_;
+        bool distributing_ = false;
+        bool hasInvalid_ = false;
+    };
+
+    struct forward_object
+    {
+        // ── 转发中心代理：每个 event_type 一个，不做任何状态存储
+        SubscriptionForwarder<position2d_event> cursorPosNotify_;
+        SubscriptionForwarder<keyboard_event> keyboardNotify_;
+        SubscriptionForwarder<mousebutton_event> mousebuttonNotify_;
+        SubscriptionForwarder<scroll_event> scrollNotify_;
+        SubscriptionForwarder<cursor_enter_event> cursorEnterNotify_;
+
+        SubscriptionForwarder<char_event> charNotify_;
+        SubscriptionForwarder<drop_event> dropNotify_;
+
+        SubscriptionForwarder<window_focus_event> focusNotify_;
+        SubscriptionForwarder<window_pos_event> posNotify_;
+        SubscriptionForwarder<window_size_event> sizeNotify_;
+        SubscriptionForwarder<window_iconify_event> iconifyNotify_;
+        SubscriptionForwarder<window_maximize_event> maximizeNotify_;
+        SubscriptionForwarder<framebuffer_size_event> fbSizeNotify_;
+
+        // ────────────────────────────────────────────────────────
+        // 对外 API：subscribe / unsubscribe
+        // ────────────────────────────────────────────────────────
+        template <typename event_type>
+        constexpr void subscribe(void *ctx,
+                                 SubscriptionForwarder<event_type>::callback_type cb)
+            requires(requires() { notifier_of<event_type>(*this).subscribe(ctx, cb); })
+        {
+            notifier_of<event_type>(*this).subscribe(ctx, cb);
+        }
+
+        template <typename event_type>
+        constexpr void unsubscribe(void *ctx,
+                                   SubscriptionForwarder<event_type>::callback_type cb)
+            requires(requires() { notifier_of<event_type>(*this).unsubscribe(ctx, cb); })
+        {
+            notifier_of<event_type>(*this).unsubscribe(ctx, cb);
+        }
+
+        // 类型 → notifier 的唯一映射点：新增事件类型时，只改这里
+        template <typename Event>
+        static constexpr auto &notifier_of(auto &self) noexcept // NOLINT
+        {
+            if constexpr (std::is_same_v<Event, position2d_event>)
+                return self.cursorPosNotify_;
+            else if constexpr (std::is_same_v<Event, keyboard_event>)
+                return self.keyboardNotify_;
+            else if constexpr (std::is_same_v<Event, mousebutton_event>)
+                return self.mousebuttonNotify_;
+            else if constexpr (std::is_same_v<Event, scroll_event>)
+                return self.scrollNotify_;
+            else if constexpr (std::is_same_v<Event, cursor_enter_event>)
+                return self.cursorEnterNotify_;
+            else if constexpr (std::is_same_v<Event, char_event>)
+                return self.charNotify_;
+            else if constexpr (std::is_same_v<Event, drop_event>)
+                return self.dropNotify_;
+            else if constexpr (std::is_same_v<Event, window_focus_event>)
+                return self.focusNotify_;
+            else if constexpr (std::is_same_v<Event, window_pos_event>)
+                return self.posNotify_;
+            else if constexpr (std::is_same_v<Event, window_size_event>)
+                return self.sizeNotify_;
+            else if constexpr (std::is_same_v<Event, window_iconify_event>)
+                return self.iconifyNotify_;
+            else if constexpr (std::is_same_v<Event, window_maximize_event>)
+                return self.maximizeNotify_;
+            else if constexpr (std::is_same_v<Event, framebuffer_size_event>)
+                return self.fbSizeNotify_;
+            else
+                static_assert(false, "notifier_of: bad event_type");
+        }
+    };
+
+    // NOTE: 每发送一次更新一次: 突出瞬时，没有上下信息
+    // NOTE: GLFW 的回调：在主线程上，在 glfwPollEvents() 内部同步调用。一次一个，串行。回调返回后才处理下一个事件。
+    struct snapshot_data
+    {
+        time_point_type time_point;
+
+        ModifierKey modifier{ModifierKey::None()}; //NOTE: 特殊键
+
+        //  NOTE: 鼠标，按钮，滚轮，鼠标位置
+        using event_type =
+            std::variant<MouseButtons, Key, scroll_event, position2d_event>;
+        event_type event;
+    };
+
+    template <typename event_type>
+    static void forwarding(void *self, event_type e) noexcept
+    {
+        auto *impl = static_cast<glfw_input_translation *>(self);
+        impl->receiver_.invoke(e);
+    }
+
+    template <typename event_type>
+    struct event_dispatcher
+    {
+        constexpr static auto &instance() noexcept
+        {
+            namespace event = mcs::vulkan::event;
+            if constexpr (std::is_same_v<keyboard_event, event_type>)
+                return event::keyboard_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<mousebutton_event, event_type>)
+                return event::mousebutton_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<scroll_event, event_type>)
+                return event::scroll_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<position2d_event, event_type>)
+                return event::position2d_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<cursor_enter_event, event_type>)
+                return event::cursor_enter_event_dispatcher::instance();
+
+            else if constexpr (std::is_same_v<char_event, event_type>)
+                return event::char_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<drop_event, event_type>)
+                return event::drop_event_dispatcher::instance();
+
+            else if constexpr (std::is_same_v<window_focus_event, event_type>)
+                return event::window_focus_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<window_pos_event, event_type>)
+                return event::window_pos_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<window_size_event, event_type>)
+                return event::window_size_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<window_iconify_event, event_type>)
+                return event::window_iconify_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<window_maximize_event, event_type>)
+                return event::window_maximize_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<framebuffer_size_event, event_type>)
+                return event::framebuffer_size_event_dispatcher::instance();
+            else
+                static_assert(false, "not find dispatcher for this event_type");
+        }
+    };
+    template <typename... Events>
+    constexpr void subscribe_all()
+    {
+        (event_dispatcher<Events>::instance().subscribe(this, &forwarding<Events>), ...);
+    }
+    template <typename... Events>
+    constexpr void unsubscribe_all() noexcept
+    {
+        static_assert((noexcept(event_dispatcher<Events>::instance().unsubscribe(
+                           this, &forwarding<Events>)) &&
+                       ...),
+                      "~class() need noexcept is true");
+        (event_dispatcher<Events>::instance().unsubscribe(this, &forwarding<Events>),
+         ...);
+    }
+
+    // NOTE: 生成 阶 [二]·指针族
+    constexpr explicit glfw_input_translation()
+    {
+        subscribe_all<keyboard_event, mousebutton_event, scroll_event, position2d_event,
+                      cursor_enter_event, char_event, drop_event, window_focus_event,
+                      window_pos_event, window_size_event, window_iconify_event,
+                      window_maximize_event, framebuffer_size_event>();
+    }
+    constexpr ~glfw_input_translation() noexcept
+    {
+        unsubscribe_all<keyboard_event, mousebutton_event, scroll_event, position2d_event,
+                        cursor_enter_event, char_event, drop_event, window_focus_event,
+                        window_pos_event, window_size_event, window_iconify_event,
+                        window_maximize_event, framebuffer_size_event>();
+    }
+    glfw_input_translation(const glfw_input_translation &) = delete;
+    glfw_input_translation(glfw_input_translation &&) = delete;
+    glfw_input_translation &operator=(const glfw_input_translation &) = delete;
+    glfw_input_translation &operator=(glfw_input_translation &&) = delete;
+
+    template <typename event_type>
+    constexpr void subscribe(SubscriptionForwarder<event_type>::callback_type cb)
+    {
+    }
+
+    template <typename event_type>
+    constexpr void unsubscribe(SubscriptionForwarder<event_type>::callback_type cb)
+    {
+    }
+    // distribute
+
+    template <typename Obj>
+        requires(requires() {
+            proxy_class_invoke::build<"input_event", data_tuple, Obj>();
+        })
+    constexpr void setReceiver(Obj &obj) noexcept
+    {
+        receiver_ = {&obj, proxy_class_invoke::build<"input_event", data_tuple, Obj>()};
+    }
+
+  private:
+    receiver receiver_;
+    cursor_enter_event cursorEnter_;
+    ModifierKey modifier_;
+};
+struct glfw_gestures
+{
+};
+
+void test() {}
+
 int main()
 try
 {
+    test_proxy_class_invoke();
+    test_plain_class_member_fn();
+    test_plain_class_data_member_fn();
 
     surface window{};
     window.setup({.width = WIDTH, .height = HEIGHT}, TITLE); // NOLINT
     // auto input = glfw_input{};
 
-    auto forward = glfw_forward{};
-    hardware_layer_input h{forward};
+    glfw_input_translation input;
 
     auto agg_receiver = make_aggregate<"TextBox">(
         field<"time_point">(std::optional<std::chrono::steady_clock::time_point>{}),
-        method<"runtime_invoke">(
-            []<class E>(auto &&self, position2d_event pos,
-                        std::chrono::steady_clock::time_point time_point, E e) noexcept {
-                std::println("runtime_invoke: {} , {} ,{}", pos,
-                             time_point.time_since_epoch(), e);
-                using namespace std::chrono;
-                using namespace std::chrono_literals; // C++14 起可用
-                if (not self.time_point)
-                    self.time_point = time_point;
-
-                // 计算时间差，得到 duration
-                auto elapsed = time_point - *self.time_point;
-                auto ms = duration_cast<milliseconds>(elapsed).count();
-                if (ms > 1000)
-                {
-                    std::println("elapsed: {}", ms);
-                }
-                self.time_point = time_point;
-            }));
-    h.setReceiver(&agg_receiver);
+        method<"input_event">([]<class E>(auto &&self, E e) noexcept {
+            std::println("input_event: {} ", e);
+        }));
+    input.setReceiver(agg_receiver);
 
     while (window.shouldClose() == 0)
     {

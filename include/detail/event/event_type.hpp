@@ -394,6 +394,34 @@ namespace mcs::vulkan::event
         {
             return Control() | Alt() | Shift();
         }
+
+        // 瞬态：此刻按着
+        [[nodiscard]] constexpr bool shift() const noexcept
+        {
+            return has(eSHIFT);
+        }
+        [[nodiscard]] constexpr bool control() const noexcept
+        {
+            return has(eCONTROL);
+        }
+        [[nodiscard]] constexpr bool alt() const noexcept
+        {
+            return has(eALT);
+        }
+        [[nodiscard]] constexpr bool super() const noexcept
+        {
+            return has(eSUPER);
+        }
+
+        // 锁定：此刻处于锁定状态
+        [[nodiscard]] constexpr bool caps_locked() const noexcept
+        {
+            return has(eCAPS_LOCK);
+        }
+        [[nodiscard]] constexpr bool num_locked() const noexcept
+        {
+            return has(eNUM_LOCK);
+        }
         // NOLINTEND
     };
 

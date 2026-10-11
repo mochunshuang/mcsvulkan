@@ -7,4 +7,5 @@ namespace mcs::vulkan::event
     struct cursor_pos_event_dispatcher : event_dispatcher<position2d_event>
     {
     };
+    using position2d_event_dispatcher = cursor_pos_event_dispatcher;
 }; // namespace mcs::vulkan::event

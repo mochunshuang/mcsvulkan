@@ -31,6 +31,7 @@ namespace mcs::vulkan::input
         // ────────────────────────────────────────────────────────
         // 回调类型别名：一处定义，多处复用
         // ────────────────────────────────────────────────────────
+        using position2d_change_fn = event::gen_change_event_fn<event::position2d_event>;
         using keyboard_change_fn = event::gen_change_event_fn<event::keyboard_event>;
         using mousebutton_change_fn =
             event::gen_change_event_fn<event::mousebutton_event>;
@@ -204,7 +205,9 @@ namespace mcs::vulkan::input
         // ── 唯一不转发的事件：更新 cursorPos_（因为它是转发负载的一部分）
         static void onCursorPosEvent(void *self, event::position2d_event e) noexcept
         {
-            static_cast<glfw_forward *>(self)->cursorPos_ = e;
+            auto *impl = static_cast<glfw_forward *>(self);
+            impl->cursorPos_ = e;
+            impl->cursorPosNotify_.distribute(e, std::chrono::steady_clock::now(), e);
         }
 
         // ────────────────────────────────────────────────────────
@@ -252,7 +255,9 @@ namespace mcs::vulkan::input
         template <typename Event>
         static constexpr auto &notifier_of(glfw_forward &self) noexcept // NOLINT
         {
-            if constexpr (std::is_same_v<Event, event::keyboard_event>)
+            if constexpr (std::is_same_v<Event, event::position2d_event>)
+                return self.cursorPosNotify_;
+            else if constexpr (std::is_same_v<Event, event::keyboard_event>)
                 return self.keyboardNotify_;
             else if constexpr (std::is_same_v<Event, event::mousebutton_event>)
                 return self.mousebuttonNotify_;
@@ -282,6 +287,7 @@ namespace mcs::vulkan::input
 
         // ── 唯一的成员状态：转发负载需要它
         event::position2d_event cursorPos_{};
+        event_notifier<event::position2d_event> cursorPosNotify_;
 
         // ── 转发中心代理：每个 event_type 一个，不做任何状态存储
         event_notifier<event::keyboard_event> keyboardNotify_;

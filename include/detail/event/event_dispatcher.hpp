@@ -27,7 +27,7 @@ namespace mcs::vulkan::event
             callbacks_.push_back({ctx, cb, true});
         }
 
-        constexpr void unsubscribe(void *ctx, callback_type *cb)
+        constexpr void unsubscribe(void *ctx, callback_type *cb) noexcept
         {
             for (auto &item : callbacks_)
                 if (item.ctx == ctx && item.callback == cb)

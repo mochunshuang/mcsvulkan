@@ -3,3 +3,4 @@
 #include "./utils/match.hpp"
 #include "./utils/fatal_error.hpp"
 #include "./utils/runtime_type.hpp"
+#include "./utils/ring_buffer.hpp"

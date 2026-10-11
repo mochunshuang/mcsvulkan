@@ -9,3 +9,4 @@
 #include "./meta/static_nsdms_of.hpp"
 #include "./meta/static_parameters_of.hpp"
 #include "./meta/name_spec.hpp"
+#include "./meta/class_utils.hpp"

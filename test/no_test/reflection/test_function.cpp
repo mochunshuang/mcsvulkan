@@ -244,6 +244,175 @@ consteval bool test_lambda_reflection()
 
 static_assert(test_lambda_reflection());
 
+// ================= 模板夹具 =================
+struct TemplateFixture
+{
+    template <class T>
+    void tmpl_func(T)
+    {
+    } // 模板成员函数
+
+    template <class T>
+    T tmpl_op_plus(T)
+    {
+        return {};
+    } // 注意：名字带 op，但它是普通函数模板，不是 operator
+
+    template <class T>
+    operator T() const
+    {
+        return {};
+    } // 模板转换函数（T）
+
+    template <class T>
+    explicit operator T *() const
+    {
+        return nullptr;
+    } // 模板转换函数（T*）
+
+    template <class T>
+    TemplateFixture(T)
+    {
+    } // 模板构造函数
+
+    template <class T>
+    static T s_tmpl_var; // 模板静态数据成员
+
+    template <class T>
+    bool operator<(const T &) const
+    {
+        return false;
+    } // 真正的运算符函数模板（成员）
+};
+
+// 自由函数模板
+template <class T>
+void free_tmpl_func(T)
+{
+}
+template <class T>
+T free_tmpl_op(T, T)
+{
+    return {};
+} // 名字带 op，其实不是 operator
+template <class T>
+T free_tmpl_var = {};
+
+// 真正的自由运算符函数模板
+namespace op_ns
+{
+    template <class T>
+    T operator+(T, T)
+    {
+        return {};
+    }
+} // namespace op_ns
+
+// 类模板 / 别名模板 / 变量模板 / concept
+template <class T>
+struct ClassTmpl
+{
+};
+template <class T>
+using AliasTmpl = T *;
+template <class T>
+T VarTmpl = {};
+template <class T>
+concept ConceptTmpl = std::is_integral_v<T>;
+
+// 字面量运算符模板
+template <char... Cs>
+auto operator""_tmpl()
+{
+    return 0;
+}
+
+// ================= 辅助：按谓词从 members_of 里过滤 =================
+// ^^X::X、^^X::operator T 这类名可能构成重载集，无法直接反射，
+// 只能遍历 members_of 再用 is_*_template 谓词过滤。
+template <class Pred>
+consteval info find_if_member(info cls, Pred pred)
+{
+    for (auto m : members_of(cls, access_context::current()))
+        if (pred(m))
+            return m;
+    return {};
+}
+
+// ================= 模板相关静态断言 =================
+
+// ---- is_function_template ----
+static_assert(is_function_template(^^free_tmpl_func));
+static_assert(is_function_template(^^TemplateFixture::tmpl_func));
+static_assert(!is_function_template(^^global_func));     // 普通函数
+static_assert(!is_function_template(^^TemplateFixture)); // 类不是
+
+// ---- is_constructor_template ----
+// ^^TemplateFixture::TemplateFixture 是重载集（默认+拷贝+移动+模板），
+// 无法直接反射，必须用谓词过滤。
+constexpr info ctor_tmpl = find_if_member(^^TemplateFixture, [](info m) {
+  return is_constructor_template(m);
+});
+static_assert(ctor_tmpl != info{});
+static_assert(is_constructor_template(ctor_tmpl)); // 二次确认
+
+// ---- is_conversion_function_template ----
+// ^^TemplateFixture::operator int 也是重载集（operator T / operator T*），
+// 同样只能谓词过滤。
+constexpr info conv_tmpl = find_if_member(^^TemplateFixture, [](info m) {
+  return is_conversion_function_template(m);
+});
+static_assert(conv_tmpl != info{});
+static_assert(is_conversion_function_template(conv_tmpl));
+
+// ---- is_operator_function_template ----
+// free_tmpl_op 是普通函数模板，不是 operator → 为假
+static_assert(!is_operator_function_template(^^free_tmpl_op));
+static_assert(is_operator_function_template(^^op_ns::operator+)); // 自由 operator+
+// 成员 operator< 也只能通过谓词过滤拿到
+constexpr info op_mem_tmpl = find_if_member(^^TemplateFixture, [](info m) {
+  return is_operator_function_template(m);
+});
+static_assert(op_mem_tmpl != info{});
+static_assert(is_operator_function_template(op_mem_tmpl));
+
+// ---- is_literal_operator_template ----
+static_assert(is_literal_operator_template(^^operator""_tmpl));
+
+// ---- is_variable_template ----
+static_assert(is_variable_template(^^free_tmpl_var));
+static_assert(is_variable_template(^^TemplateFixture::s_tmpl_var));
+
+// ---- is_class_template ----
+static_assert(is_class_template(^^ClassTmpl));
+
+// ---- is_alias_template ----
+static_assert(is_alias_template(^^AliasTmpl));
+
+// ---- is_concept ----
+static_assert(is_concept(^^ConceptTmpl));
+
+// ---- is_template（宽泛版）----
+static_assert(is_template(^^free_tmpl_func));
+static_assert(is_template(^^ClassTmpl));
+static_assert(is_template(^^AliasTmpl));
+static_assert(is_template(^^VarTmpl));
+static_assert(is_template(^^ConceptTmpl));
+static_assert(!is_template(^^global_func));
+static_assert(!is_template(^^TestFunctions));
+
+// ---- 区分「模板本身」与「实例化后的函数」----
+static_assert(is_function_template(^^free_tmpl_op));          // 模板本身
+static_assert(!is_function_template(^^free_tmpl_op<int>));    // 实例化后
+static_assert(!is_function_template(^^free_tmpl_op<double>)); // 另一个实例化
+
+// ---- 模板参数分解 ----
+constexpr info inst = ^^free_tmpl_op<int>; // 一次实例化后的函数
+static_assert(has_template_arguments(inst));
+static_assert(template_of(inst) == ^^free_tmpl_op);
+static_assert(template_arguments_of(inst).size() == 1);
+static_assert(template_arguments_of(inst)[0] == ^^int);
+
 int main()
 {
     std::cout << "main done\n";
