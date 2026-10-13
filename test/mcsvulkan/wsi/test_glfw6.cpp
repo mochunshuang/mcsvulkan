@@ -1110,6 +1110,11 @@ class GestureArenaManager
         Up,
         DownMove,
     };
+    enum class KeyStatus : std::uint8_t
+    {
+        eRELEASE, // 释放
+        ePRESS,   // 按下
+    };
 
     enum class MouseButton : std::uint8_t
     {
@@ -1216,12 +1221,7 @@ class GestureArenaManager
         if constexpr (std::is_same_v<glfw_input_translation::mousebutton_event,
                                      event_type>)
         {
-            /*
-        eMOUSE_BUTTON_LAST,
-        eMOUSE_BUTTON_LEFT,
-        eMOUSE_BUTTON_RIGHT,
-        eMOUSE_BUTTON_MIDDLE,
-*/
+            mouse_button_event{gen_mouse_button(e)};
             // NOTE: 按下和抬起，确定开始和结束？
             if (glfw_input_translation::mousebutton_event{e}.press())
             {
@@ -1302,28 +1302,408 @@ struct gestures
     }
 };
 // NOTE: 落了下乘。
+enum class RecogState : std::uint8_t
+{
+    Idle,
+    Pending,
+    Won,
+    Lost
+};
 
+enum class MouseGesture : std::uint8_t
+{
+    Click,
+    DoubleClick,
+    LongPress,
+    Drag,
+    ScrollUp,
+    ScrollDown,
+    ScrollLeft,
+    ScrollRight,
+};
+
+struct GestureEvent
+{
+    MouseGesture kind;
+    MouseButtons button = MouseButtons::eUNDEFINED;
+    ModifierKey modifier = ModifierKey::None();
+    double x{}, y{};
+    double x0{}, y0{};
+};
+
+namespace std
+{
+    template <>
+    struct formatter<MouseGesture>
+    {
+        static constexpr auto parse(std::format_parse_context &ctx) noexcept
+        {
+            return ctx.begin();
+        }
+        static auto format(MouseGesture g, std::format_context &ctx)
+        {
+            auto n = [&] {
+                switch (g)
+                {
+                case MouseGesture::Click:
+                    return "Click";
+                case MouseGesture::DoubleClick:
+                    return "DoubleClick";
+                case MouseGesture::LongPress:
+                    return "LongPress";
+                case MouseGesture::Drag:
+                    return "Drag";
+                case MouseGesture::ScrollUp:
+                    return "ScrollUp";
+                case MouseGesture::ScrollDown:
+                    return "ScrollDown";
+                case MouseGesture::ScrollLeft:
+                    return "ScrollLeft";
+                case MouseGesture::ScrollRight:
+                    return "ScrollRight";
+                }
+                return "?";
+            }();
+            return std::format_to(ctx.out(), "{}", n);
+        }
+    };
+} // namespace std
 int main()
 try
 {
-
     surface window{};
     window.setup({.width = WIDTH, .height = HEIGHT}, TITLE); // NOLINT
-    // auto input = glfw_input{};
 
     glfw_input_translation input;
 
-    auto agg_receiver = make_aggregate<"TextBox">(
-        field<"time_point">(std::optional<std::chrono::steady_clock::time_point>{}),
-        method<"input_event">([]<class E>(auto &&self, E e) noexcept {
-            std::println("input_event: {} ", e);
-        }));
-    input.setReceiver(agg_receiver);
+    using clock = std::chrono::steady_clock;
+    using time_point = clock::time_point;
 
+    constexpr auto DBL_WINDOW = std::chrono::milliseconds(250);
+    constexpr auto LONG_PRESS = std::chrono::milliseconds(500);
+    constexpr double DRAG_SLOP_SQ = 16.0; // 4px 的平方
+
+    // ══════════════════════════════════════════════════════
+    // 角色 1：单击 —— 短按松手，进挂起，超 250ms 无第二击即胜
+    // ══════════════════════════════════════════════════════
+    auto click_recognizer = make_aggregate<"ClickRecognizer">(
+        field<"state">(RecogState::Idle),
+        field<"press_time">(std::optional<time_point>{}),
+        field<"pending_time">(std::optional<time_point>{}),
+
+        method<"input_event">([](auto &&self, const mousebutton_event &e) noexcept {
+            if (e.press())
+            {
+                self.press_time = clock::now();
+                if (self.state == RecogState::Pending)
+                    self.state = RecogState::Lost; // 第二击来了，不是单击
+                return;
+            }
+            // RELEASE
+            if (!self.press_time)
+                return; // 没有对应 PRESS，忽略
+            auto dur = clock::now() - *self.press_time;
+            self.press_time.reset();
+
+            if (dur >= std::chrono::milliseconds(500))
+            {
+                self.state = RecogState::Lost; // 长按，不是单击
+                return;
+            }
+            if (self.state != RecogState::Lost) // 短按 → 挂起
+            {
+                self.state = RecogState::Pending;
+                self.pending_time = clock::now();
+            }
+        }),
+
+        method<"tick">([](auto &&self) noexcept {
+            if (self.state == RecogState::Pending && self.pending_time &&
+                clock::now() - *self.pending_time > std::chrono::milliseconds(250))
+                self.state = RecogState::Won;
+        }),
+
+        method<"reset">([](auto &&self) noexcept {
+            self.state = RecogState::Idle;
+            self.press_time.reset();
+            self.pending_time.reset();
+        }));
+
+    // ══════════════════════════════════════════════════════
+    // 角色 2：双击 —— 250ms 内同键第二击即胜，超窗弃权
+    // ══════════════════════════════════════════════════════
+    auto dbl_recognizer = make_aggregate<"DoubleClickRecognizer">(
+        field<"state">(RecogState::Idle),
+        field<"last_press">(std::optional<time_point>{}),
+        field<"last_button">(MouseButtons::eUNDEFINED), field<"count">(std::uint8_t{0}),
+
+        method<"input_event">([](auto &&self, const mousebutton_event &e) noexcept {
+            if (!e.press())
+                return;
+            auto now = clock::now();
+            bool same_key = (self.last_button == e.button);
+            bool in_window = self.last_press &&
+                             now - *self.last_press < std::chrono::milliseconds(250);
+
+            if (self.state == RecogState::Pending && same_key && in_window)
+            {
+                if (++self.count >= 2)
+                    self.state = RecogState::Won;
+            }
+            else
+            {
+                self.state = RecogState::Pending;
+                self.count = 1;
+            }
+            self.last_press = now;
+            self.last_button = e.button;
+        }),
+
+        method<"tick">([](auto &&self) noexcept {
+            if (self.state == RecogState::Pending && self.last_press &&
+                clock::now() - *self.last_press > std::chrono::milliseconds(250))
+                self.state = RecogState::Lost;
+        }),
+
+        method<"reset">([](auto &&self) noexcept {
+            self.state = RecogState::Idle;
+            self.last_press.reset();
+            self.last_button = MouseButtons::eUNDEFINED;
+            self.count = 0;
+        }));
+
+    // ══════════════════════════════════════════════════════
+    // 角色 3：长按 —— 按住不动 ≥500ms 即胜；移动/松手过短即弃权
+    // ══════════════════════════════════════════════════════
+    auto longpress_recognizer = make_aggregate<"LongPressRecognizer">(
+        field<"state">(RecogState::Idle),
+        field<"press_time">(std::optional<time_point>{}), field<"cursor_x">(0.0),
+        field<"cursor_y">(0.0), field<"press_x">(0.0), field<"press_y">(0.0),
+
+        method<"input_event">(
+            []<class E>(auto &&self, E e) noexcept
+                requires(std::same_as<E, mousebutton_event> ||
+                         std::same_as<E, position2d_event>)
+            {
+                if constexpr (std::same_as<E, mousebutton_event>)
+                {
+                    if (e.press())
+                    {
+                        self.state = RecogState::Pending;
+                        self.press_time = clock::now();
+                        self.press_x = self.cursor_x;
+                        self.press_y = self.cursor_y;
+                    }
+                    else if (e.release() && self.state == RecogState::Pending)
+                    {
+                        auto dur = clock::now() - *self.press_time;
+                        self.state = (dur >= std::chrono::milliseconds(500))
+                                         ? RecogState::Won
+                                         : RecogState::Lost;
+                        self.press_time.reset();
+                    }
+                }
+                else // position2d
+                {
+                    self.cursor_x = e.xpos;
+                    self.cursor_y = e.ypos;
+                    if (self.state == RecogState::Pending)
+                    {
+                        double dx = self.cursor_x - self.press_x;
+                        double dy = self.cursor_y - self.press_y;
+                        if (dx * dx + dy * dy > 16.0)
+                        {
+                            self.state = RecogState::Lost; // 移动了 → 不是长按
+                            self.press_time.reset();
+                        }
+                    }
+                }
+            }),
+
+            method<"tick">([](auto &&self) noexcept {
+                if (self.state == RecogState::Pending && self.press_time &&
+                    clock::now() - *self.press_time >= std::chrono::milliseconds(500))
+                    self.state = RecogState::Won;
+            }),
+
+            method<"reset">([](auto &&self) noexcept {
+                self.state = RecogState::Idle;
+                self.press_time.reset();
+            }));
+
+    // ══════════════════════════════════════════════════════
+    // 角色 4：拖拽 —— 位移超 slop 立即胜，松手未动弃权
+    // ══════════════════════════════════════════════════════
+    auto drag_recognizer = make_aggregate<"DragRecognizer">(
+        field<"state">(RecogState::Idle),
+        field<"origin">(std::pair<double, double>{0.0, 0.0}),
+        field<"cursor">(std::pair<double, double>{0.0, 0.0}),
+
+        method<"input_event">(
+            []<class E>(auto &&self, E e) noexcept
+                requires(std::same_as<E, mousebutton_event> ||
+                         std::same_as<E, position2d_event>)
+            {
+                if constexpr (std::same_as<E, mousebutton_event>)
+                {
+                    if (e.press())
+                    {
+                        self.state = RecogState::Pending;
+                        self.origin = self.cursor;
+                    }
+                    else if (e.release() && self.state == RecogState::Pending)
+                    {
+                        self.state = RecogState::Lost;
+                    }
+                }
+                else
+                {
+                    self.cursor = {e.xpos, e.ypos};
+                    if (self.state == RecogState::Pending)
+                    {
+                        double dx = self.cursor.first - self.origin.first;
+                        double dy = self.cursor.second - self.origin.second;
+                        if (dx * dx + dy * dy > 16.0)
+                            self.state = RecogState::Won;
+                    }
+                }
+            }),
+
+            method<"tick">([](auto &&) noexcept {}),
+
+            method<"reset">([](auto &&self) noexcept { self.state = RecogState::Idle; }));
+
+    // ══════════════════════════════════════════════════════
+    // 竞技场：分发 + 记录上下文 + 仲裁 + 出口
+    // ══════════════════════════════════════════════════════
+    auto arena = make_aggregate<"MouseGestureArena">(
+        field<"click">(click_recognizer), field<"dbl">(dbl_recognizer),
+        field<"longpress">(longpress_recognizer), field<"drag">(drag_recognizer),
+
+        field<"cursor_x">(0.0), field<"cursor_y">(0.0), field<"press_x">(0.0),
+        field<"press_y">(0.0), field<"press_button">(MouseButtons::eUNDEFINED),
+        field<"press_mod">(ModifierKey::None()),
+
+        field<"winner">(std::optional<GestureEvent>{}),
+
+        method<"input_event">([]<class E>(auto &&self, E e) noexcept
+                                  requires(std::same_as<E, mousebutton_event> ||
+                                           std::same_as<E, position2d_event> ||
+                                           std::same_as<E, scroll_event>)
+                              {
+                                  if constexpr (std::same_as<E, scroll_event>)
+                                  {
+                                      GestureEvent g{};
+                                      if (e.yoffset > 0)
+                                          g.kind = MouseGesture::ScrollUp;
+                                      else if (e.yoffset < 0)
+                                          g.kind = MouseGesture::ScrollDown;
+                                      else if (e.xoffset > 0)
+                                          g.kind = MouseGesture::ScrollRight;
+                                      else if (e.xoffset < 0)
+                                          g.kind = MouseGesture::ScrollLeft;
+                                      else
+                                          return;
+                                      g.x = e.xoffset;
+                                      g.y = e.yoffset;
+                                      if (!self.winner)
+                                          self.winner = g;
+                                  }
+                                  else if constexpr (std::same_as<E, mousebutton_event>)
+                                  {
+                                      if (e.press())
+                                      {
+                                          self.press_x = self.cursor_x;
+                                          self.press_y = self.cursor_y;
+                                          self.press_button = e.button;
+                                          self.press_mod = e.modifier_key;
+                                      }
+                                      self.click.input_event(self.click, e);
+                                      self.dbl.input_event(self.dbl, e);
+                                      self.longpress.input_event(self.longpress, e);
+                                      self.drag.input_event(self.drag, e);
+                                  }
+                                  else // position2d
+                                  {
+                                      self.cursor_x = e.xpos;
+                                      self.cursor_y = e.ypos;
+                                      self.longpress.input_event(self.longpress, e);
+                                      self.drag.input_event(self.drag, e);
+                                  }
+                              }),
+
+                              method<"tick">([](auto &&self) noexcept {
+                                  self.click.tick(self.click);
+                                  self.dbl.tick(self.dbl);
+                                  self.longpress.tick(self.longpress);
+                                  self.drag.tick(self.drag);
+
+                                  // 仲裁优先级：Drag > LongPress > DoubleClick > Click
+                                  std::optional<MouseGesture> kind;
+                                  if (self.drag.state == RecogState::Won)
+                                      kind = MouseGesture::Drag;
+                                  else if (self.longpress.state == RecogState::Won)
+                                      kind = MouseGesture::LongPress;
+                                  else if (self.dbl.state == RecogState::Won)
+                                      kind = MouseGesture::DoubleClick;
+                                  else if (self.click.state == RecogState::Won)
+                                      kind = MouseGesture::Click;
+
+                                  if (kind && !self.winner)
+                                  {
+                                      GestureEvent g{};
+                                      g.kind = *kind;
+                                      g.button = self.press_button;
+                                      g.modifier = self.press_mod;
+                                      g.x = self.cursor_x;
+                                      g.y = self.cursor_y;
+                                      g.x0 = self.press_x;
+                                      g.y0 = self.press_y;
+                                      self.winner = g;
+
+                                      self.click.reset(self.click);
+                                      self.dbl.reset(self.dbl);
+                                      self.longpress.reset(self.longpress);
+                                      self.drag.reset(self.drag);
+                                  }
+                              }));
+    // 注意：没有 resume 方法。GCC -freflection 会把模板 lambda 提升成 immediate function，
+    // 导致 consteval 报错。直接从 arena.winner 读更稳。
+
+    input.setReceiver(arena);
+
+    // TODO: 长按确实应该在 RELEASE 时才产出，当前实现有偏差；当前的事件识别器之间确实没有真正的竞争机制，只是优先级仲裁
     while (window.shouldClose() == 0)
     {
-
         surface::pollEvents();
+
+        arena.tick(arena);
+
+        if (arena.winner)
+        {
+            const auto &ev = *arena.winner;
+            switch (ev.kind)
+            {
+            case MouseGesture::Click:
+            case MouseGesture::DoubleClick:
+            case MouseGesture::LongPress:
+                std::println("[gesture] {} button={} at ({:.0f},{:.0f}) mod={}", ev.kind,
+                             ev.button, ev.x, ev.y, ev.modifier);
+                break;
+            case MouseGesture::Drag:
+                std::println(
+                    "[gesture] {} button={} from ({:.0f},{:.0f}) to ({:.0f},{:.0f})",
+                    ev.kind, ev.button, ev.x0, ev.y0, ev.x, ev.y);
+                break;
+            case MouseGesture::ScrollUp:
+            case MouseGesture::ScrollDown:
+            case MouseGesture::ScrollLeft:
+            case MouseGesture::ScrollRight:
+                std::println("[gesture] {} delta=({:+.2f},{:+.2f})", ev.kind, ev.x, ev.y);
+                break;
+            }
+            arena.winner.reset();
+        }
     }
 
     std::cout << "main done\n";
@@ -1332,4 +1712,5 @@ try
 catch (std::exception &e)
 {
     std::println("main catch exception: {}", e.what());
-} // NOLINTEND
+}
+// NOLINTEND

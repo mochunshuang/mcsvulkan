@@ -20,6 +20,10 @@ add_vulkan_wsi_test(test_glfw3)
 add_vulkan_wsi_test(test_glfw4)
 add_vulkan_wsi_test(test_glfw5)
 add_vulkan_wsi_test(test_glfw6)
+add_vulkan_wsi_test(test_glfw7)
+add_vulkan_wsi_test(test_glfw8)
+add_vulkan_wsi_test(test_glfw9)
+
 
 # end
 unset(BASE_LIBS)

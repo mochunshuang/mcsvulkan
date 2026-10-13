@@ -1259,6 +1259,8 @@ try
         method<"input_event">([]<class E>(auto &&self, E e) noexcept {
             std::println("input_event: {} ", e);
         }));
+    static_assert(sizeof(agg_receiver) == sizeof(agg_receiver.time_point));
+
     input.setReceiver(agg_receiver);
 
     while (window.shouldClose() == 0)
