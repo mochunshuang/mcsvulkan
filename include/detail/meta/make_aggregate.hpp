@@ -112,9 +112,10 @@ namespace mcs::vulkan::meta
 
         template <static_string m_fn>
             requires(gen_type::find_name(m_fn) != -1)
-        decltype(auto) invoke(this auto &&self, auto &&...args) noexcept(noexcept(
-            self.[:members[m_index<m_fn>]:](std::forward<decltype(self)>(self),
-                                            std::forward<decltype(args)>(args)...)))
+        constexpr decltype(auto) invoke(this auto &&self, auto &&...args) noexcept(
+            noexcept(
+                self.[:members[m_index<m_fn>]:](std::forward<decltype(self)>(self),
+                                                std::forward<decltype(args)>(args)...)))
             requires requires() {
                 self.[:members[m_index<m_fn>]:](std::forward<decltype(self)>(self),
                                                 std::forward<decltype(args)>(args)...);
@@ -125,7 +126,7 @@ namespace mcs::vulkan::meta
         }
         template <static_string m_fn>
             requires(gen_type::find_name(m_fn) != -1)
-        decltype(auto) invoke_static(this auto &&self, auto... args) // NOLINT
+        constexpr decltype(auto) invoke_static(this auto &&self, auto... args) // NOLINT
             noexcept(noexcept(
                 self.[:members[m_index<m_fn>]:](std::forward<decltype(args)>(args)...)))
             requires requires() {

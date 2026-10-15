@@ -6,6 +6,7 @@
 #include <functional>
 #include <iostream>
 #include <exception>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -170,9 +171,70 @@ void test_no_unique_address()
                   static_cast<const void *>(std::addressof(b.e)));
 }
 
+using mcs::vulkan::meta::field;
+using mcs::vulkan::meta::method;
+void test_constexpr()
+{
+    constexpr auto obj = make_aggregate<"B">(method<"constexpr_method">(
+        [](auto &&self, int value) constexpr noexcept { return value; }));
+
+    static_assert(obj.constexpr_method(&obj, 2) == 2);
+    assert(obj.template invoke<"constexpr_method">(1) == 1);
+    static_assert(obj.template invoke<"constexpr_method">(1) == 1);
+}
+
+// NOTE: 检查编译期计算与否
+template <class Expr>
+consteval bool is_consteval(Expr)
+{
+    return requires { typename std::bool_constant<(Expr{}(), false)>; };
+}
+static_assert(is_consteval([] { constexpr int x = 42; })); // true
+static_assert(!is_consteval([] {
+    int x;
+    std::cin >> x;
+})); // false
+
+struct object
+{
+    constexpr auto func1()
+    {
+        return 1;
+    }
+    constexpr auto func2()
+    {
+        return std::string{"2"};
+    }
+};
+
+// 核心工具：检查一个表达式能否作为常量表达式求值
+template <class F>
+consteval bool can_constexpr_eval(F f)
+{
+    return requires { typename std::bool_constant<(f(), false)>; };
+}
+
+// 对象作为函数参数传进来，检查它的成员函数能否产生编译期的值
+template <class Obj>
+consteval bool test_func1(Obj obj)
+{
+    return requires { typename std::bool_constant<(obj.func1(), false)>; };
+}
+
+template <class Obj>
+consteval bool test_func2(Obj obj)
+{
+    return requires { typename std::bool_constant<(obj.func2(), false)>; };
+}
+
+static_assert(test_func1(object{})); // true：返回 int，可以编译期求值
+static_assert(test_func2(object{})); // C++17: false
+// C++20: true（std::string 在 C++20 起可 constexpr）
+
 int main()
 try
 {
+    test_constexpr();
 
     auto b = make_aggregate<"class", "x", "fn">(1, [](auto &&self, auto value) noexcept {
         return std::forward_like<decltype(self)>(self.x) + value;

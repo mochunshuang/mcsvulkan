@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>多击识别器</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 14px;
+        }
+
+        h1 {
+            font-size: 17px;
+            margin: 0;
+            color: #cbd5e1;
+            font-weight: 600;
+        }
+
+        #box {
+            width: 320px;
+            height: 180px;
+            background: linear-gradient(135deg, #1e293b, #334155);
+            border: 2px solid #475569;
+            border-radius: 16px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            color: #cbd5e1;
+            cursor: pointer;
+            user-select: none;
+            touch-action: none;
+            transition: border-color .15s, transform .08s, background .15s;
+        }
+
+        #box.pressed {
+            border-color: #38bdf8;
+            transform: scale(.99);
+        }
+
+        #box.dragging {
+            border-color: #f87171;
+            background: linear-gradient(135deg, #3f1d1d, #4c2626);
+        }
+
+        .panel {
+            width: 100%;
+            max-width: 400px;
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 12px;
+            padding: 12px 16px;
+            font-size: 13px;
+        }
+
+        .row {
+            display: flex;
+            justify-content: space-between;
+            padding: 3px 0;
+        }
+
+        .row span {
+            color: #94a3b8;
+        }
+
+        .row b {
+            color: #f1f5f9;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .controls {
+            width: 100%;
+            max-width: 400px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            font-size: 12px;
+            color: #94a3b8;
+        }
+
+        .controls label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .controls input[type=range] {
+            flex: 1;
+        }
+
+        .controls b {
+            min-width: 52px;
+            text-align: right;
+            color: #cbd5e1;
+        }
+
+        #log {
+            width: 100%;
+            max-width: 400px;
+            height: 240px;
+            overflow-y: auto;
+            background: #020617;
+            border: 1px solid #1e293b;
+            border-radius: 12px;
+            padding: 10px 12px;
+            font-family: ui-monospace, Menlo, Consolas, monospace;
+            font-size: 12px;
+            line-height: 1.55;
+        }
+
+        .log-line {
+            display: flex;
+            gap: 8px;
+            white-space: pre-wrap;
+        }
+
+        .log-line .ts {
+            color: #475569;
+            flex-shrink: 0;
+        }
+
+        .log-line .msg {
+            color: #cbd5e1;
+        }
+
+        .log-line.state .msg {
+            color: #94a3b8;
+        }
+
+        .log-line.click .msg {
+            color: #38bdf8;
+        }
+
+        .log-line.resolve .msg {
+            color: #4ade80;
+            font-weight: 700;
+        }
+
+        .log-line.drag .msg {
+            color: #f87171;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>多击识别器</h1>
+
+    <div id="box">点 / 连点 / 拖</div>
+
+    <div class="panel">
+        <div class="row"><span>状态</span><b id="s-state">Idle</b></div>
+        <div class="row"><span>当前连击计数</span><b id="s-count">0</b></div>
+        <div class="row"><span>最近 resolve</span><b id="s-action">—</b></div>
+        <div class="row"><span>窗口剩余</span><b id="s-cd">—</b></div>
+    </div>
+
+    <div class="controls">
+        <label>窗口 <input type="range" id="win" min="150" max="800" step="50" value="400"><b id="win-v">400ms</b></label>
+        <label>鼠标阈值 <input type="range" id="mt" min="0" max="20" step="1" value="5"><b id="mt-v">5px</b></label>
+        <label>触摸阈值 <input type="range" id="tt" min="0" max="30" step="1" value="12"><b id="tt-v">12px</b></label>
+    </div>
+
+    <div id="log"></div>
+
+    <script>
+        // ============================================================
+        // 状态机：Idle | Pressed | Dragging | WaitMulti
+        //
+        // Idle      + down                 → Pressed
+        // Pressed   + move > 阈值          → Dragging（先 resolve 未结算的 count）
+        // Pressed   + up                   → commit → WaitMulti
+        // Dragging  + up                   → Idle（dragEnd）
+        // Dragging  + cancel / blur        → Idle（dragEnd + discard）
+        // WaitMulti + timeout              → resolve(count) → Idle
+        // WaitMulti + down（窗口内同目标） → Pressed（count 保留）
+        // 任意      + cancel / blur        → discard → Idle
+        // ============================================================
+
+        const MultiTap = {
+            config: {
+                clickWindow: 400,
+                moveThresholdMouse: 5,
+                moveThresholdTouch: 12,
+            },
+
+            state: 'Idle',
+            count: 0,
+            timer: null,
+            seqTarget: null,
+            seqLastTime: 0,
+
+            pointerId: null,
+            downPos: null,
+
+            on: {},
+
+            setState(s) {
+                if (this.state === s) return;
+                this.state = s;
+                this.on.state && this.on.state(s);
+            },
+
+            _resolve() {
+                clearTimeout(this.timer);
+                this.timer = null;
+                const n = this.count;
+                this.count = 0;
+                this.seqTarget = null;
+                this.seqLastTime = 0;
+                if (n > 0) this.on.resolve && this.on.resolve(n);
+            },
+
+            _discard() {
+                clearTimeout(this.timer);
+                this.timer = null;
+                this.count = 0;
+                this.seqTarget = null;
+                this.seqLastTime = 0;
+            },
+
+            _onTimerExpire() {
+                this.timer = null;
+                if (this.state === 'WaitMulti') this.setState('Idle');
+                this._resolve();
+            },
+
+            onDown(e) {
+                if (this.state === 'Pressed' || this.state === 'Dragging') return;
+                if (e.pointerType === 'mouse' && e.button !== 0) return;
+
+                if (this.count > 0 && Date.now() - this.seqLastTime >= this.config.clickWindow) {
+                    this._resolve();
+                }
+
+                clearTimeout(this.timer);
+                this.timer = null;
+
+                this.pointerId = e.pointerId;
+                this.downPos = { x: e.clientX, y: e.clientY };
+                this.setState('Pressed');
+            },
+
+            onMove(e) {
+                if (e.pointerId !== this.pointerId) return;
+
+                if (this.state === 'Pressed') {
+                    const dx = e.clientX - this.downPos.x;
+                    const dy = e.clientY - this.downPos.y;
+                    const dist = Math.hypot(dx, dy);
+                    const th = e.pointerType === 'touch'
+                        ? this.config.moveThresholdTouch
+                        : this.config.moveThresholdMouse;
+
+                    if (dist > th) {
+                        this.setState('Dragging');
+                        this._resolve();
+                        this.on.dragStart && this.on.dragStart(e);
+                    }
+                } else if (this.state === 'Dragging') {
+                    this.on.dragMove && this.on.dragMove(e);
+                }
+            },
+
+            onUp(e) {
+                if (e.pointerId !== this.pointerId) return;
+                this.pointerId = null;
+
+                if (this.state === 'Pressed') {
+                    this._commitClick(e);
+                } else if (this.state === 'Dragging') {
+                    this.on.dragEnd && this.on.dragEnd(e);
+                    this.setState('Idle');
+                }
+            },
+
+            onCancel(e) {
+                if (this.pointerId !== null && e.pointerId !== this.pointerId) return;
+                this.pointerId = null;
+
+                if (this.state === 'Dragging') this.on.dragEnd && this.on.dragEnd(null);
+                this._discard();
+                this.setState('Idle');
+            },
+
+            onBlur() {
+                if (this.state === 'Dragging') this.on.dragEnd && this.on.dragEnd(null);
+                this.pointerId = null;
+                this._discard();
+                this.setState('Idle');
+            },
+
+            _commitClick(e) {
+                const now = Date.now();
+                const sameTarget = this.seqTarget === e.target;
+                const inWindow = (now - this.seqLastTime) < this.config.clickWindow;
+                const continuing = this.count > 0 && sameTarget && inWindow;
+
+                if (this.count > 0 && !continuing) this._resolve();
+
+                this.count = continuing ? this.count + 1 : 1;
+                this.seqTarget = e.target;
+                this.seqLastTime = now;
+
+                clearTimeout(this.timer);
+                this.timer = setTimeout(() => this._onTimerExpire(), this.config.clickWindow);
+
+                this.setState('WaitMulti');
+                this.on.click && this.on.click(this.count, e);
+            },
+        };
+
+
+        // ============================================================
+        // UI
+        // ============================================================
+
+        const el = {
+            box: document.getElementById('box'),
+            sState: document.getElementById('s-state'),
+            sCount: document.getElementById('s-count'),
+            sAction: document.getElementById('s-action'),
+            sCd: document.getElementById('s-cd'),
+            log: document.getElementById('log'),
+            win: document.getElementById('win'), winV: document.getElementById('win-v'),
+            mt: document.getElementById('mt'), mtV: document.getElementById('mt-v'),
+            tt: document.getElementById('tt'), ttV: document.getElementById('tt-v'),
+        };
+
+        function stamp() {
+            const d = new Date();
+            const p = (n, w = 2) => String(n).padStart(w, '0');
+            return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
+        }
+
+        function log(msg, cls = '') {
+            const line = document.createElement('div');
+            line.className = 'log-line ' + cls;
+            line.innerHTML = `<span class="ts">${stamp()}</span><span class="msg">${msg}</span>`;
+            el.log.appendChild(line);
+            el.log.scrollTop = el.log.scrollHeight;
+        }
+
+        MultiTap.on.state = s => {
+            el.sState.textContent = s;
+            el.box.classList.toggle('pressed', s === 'Pressed');
+            el.box.classList.toggle('dragging', s === 'Dragging');
+            log(`state → ${s}`, 'state');
+        };
+
+        MultiTap.on.click = (n, e) => {
+            log(`click  count=${n}  target=${e.target.tagName.toLowerCase()}`, 'click');
+        };
+
+        MultiTap.on.resolve = n => {
+            const name =
+                n === 1 ? '单击' :
+                    n === 2 ? '双击' :
+                        n === 3 ? '三击' : `${n} 连击`;
+            el.sAction.textContent = name;
+            log(`★ resolve(${n}) → ${name}`, 'resolve');
+        };
+
+        MultiTap.on.dragStart = () => log('dragStart', 'drag');
+        MultiTap.on.dragMove = () => { };
+        MultiTap.on.dragEnd = () => log('dragEnd', 'drag');
+
+        el.box.addEventListener('pointerdown', e => {
+            try { el.box.setPointerCapture(e.pointerId); } catch (_) { }
+            MultiTap.onDown(e);
+        });
+        el.box.addEventListener('pointermove', e => MultiTap.onMove(e));
+        el.box.addEventListener('pointerup', e => MultiTap.onUp(e));
+        el.box.addEventListener('pointercancel', e => MultiTap.onCancel(e));
+        window.addEventListener('blur', () => MultiTap.onBlur());
+        el.box.addEventListener('contextmenu', e => e.preventDefault());
+
+        el.win.addEventListener('input', () => {
+            MultiTap.config.clickWindow = +el.win.value;
+            el.winV.textContent = el.win.value + 'ms';
+        });
+        el.mt.addEventListener('input', () => {
+            MultiTap.config.moveThresholdMouse = +el.mt.value;
+            el.mtV.textContent = el.mt.value + 'px';
+        });
+        el.tt.addEventListener('input', () => {
+            MultiTap.config.moveThresholdTouch = +el.tt.value;
+            el.ttV.textContent = el.tt.value + 'px';
+        });
+
+        setInterval(() => {
+            el.sCount.textContent = MultiTap.count;
+            if (MultiTap.count > 0 && MultiTap.seqLastTime) {
+                const remain = Math.max(0, MultiTap.config.clickWindow - (Date.now() - MultiTap.seqLastTime));
+                el.sCd.textContent = remain + 'ms';
+            } else {
+                el.sCd.textContent = '—';
+            }
+        }, 30);
+
+        log('就绪。', 'state');
+    </script>
+
+</body>
+
+</html>
