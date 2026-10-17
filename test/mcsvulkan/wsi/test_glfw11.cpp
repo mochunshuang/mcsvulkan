@@ -467,6 +467,11 @@ enum class submit_flag : std::uint8_t
     lose,
     win,
 };
+enum class Disposition : std::uint8_t
+{
+    accepted, //表示识别器宣布获胜，认为自己已经识别出了对应手势
+    rejected, //：表示识别器承认失败，主动退出竞争。
+};
 
 using declare_interface = void (*)(void *obj, submit_flag flag, void *ctx,
                                    static_string declare_fn) noexcept;
@@ -561,164 +566,258 @@ struct Point2D
     }
 };
 
+// clang-format off
 namespace arena_event
 {
-    // ═══════════════════════════════════════════════════════════════
-    // 输入事件的语义模型
-    // ═══════════════════════════════════════════════════════════════
-    //
-    // 输入事件的三阶：
-    //   [一] 物理阶    平台原始信号
-    //   [二] 规范阶    平台无关的输入事件
-    //   [三] 语义阶    从规范阶序列解读出的用户意图
-    //
-    // 跨平台能力的落点：阶 [二] 是稳定边界。
-    // 应用只对接 [二] 和 [三]，永不对接 [一]。
-
-    // 指针设备类型。不是"鼠标/触摸屏"的分类，而是"手感"的分类——
-    // slop 阈值、精度、是否支持压力都由此决定。
+    // ───────── 设备 ─────────
     enum class PointerDevice : std::uint8_t
-    {
-        Unknown,
-        Touch,
-        Mouse,
-        Stylus,
-        InvertedStylus,
-        Trackpad,
-    };
+    { Unknown, Touch, Mouse, Stylus, InvertedStylus, Trackpad };
+
     struct PointerId
     {
         constexpr static std::uint32_t Invalid = static_cast<std::uint32_t>(~0);
-        std::uint32_t value;
+        std::uint32_t value{Invalid};
     };
-    enum class PointerPhase : std::uint8_t
-    {
-        None,
-        Hover,
-        Down,
-        Up,
-        DownMove,
-    };
-    enum class KeyStatus : std::uint8_t
-    {
-        eRELEASE, // 释放
-        ePRESS,   // 按下
-    };
+
+    // ───────── 标识（原样） ─────────
+    using Key = mcs::vulkan::event::Key;
 
     enum class MouseButton : std::uint8_t
     {
-        eUNDEFINED = 0xFF, //NOTE: 特别映射
-        eMOUSE_BUTTON_1 = 0,
-        eMOUSE_BUTTON_2 = 1,
-        eMOUSE_BUTTON_3 = 2,
-        eMOUSE_BUTTON_4 = 3,
-        eMOUSE_BUTTON_5 = 4,
-        eMOUSE_BUTTON_6 = 5,
-        eMOUSE_BUTTON_7 = 6,
-        eMOUSE_BUTTON_8 = 7,
-
-        // NOTE: 别名
-        eMOUSE_BUTTON_LAST = eMOUSE_BUTTON_8,   // = 7
-        eMOUSE_BUTTON_LEFT = eMOUSE_BUTTON_1,   // = 0
-        eMOUSE_BUTTON_RIGHT = eMOUSE_BUTTON_2,  // = 1
-        eMOUSE_BUTTON_MIDDLE = eMOUSE_BUTTON_3, // = 2
-
+        eUNDEFINED = 0xFF,
+        eMOUSE_BUTTON_1 = 0, eMOUSE_BUTTON_2 = 1, eMOUSE_BUTTON_3 = 2,
+        eMOUSE_BUTTON_4 = 3, eMOUSE_BUTTON_5 = 4, eMOUSE_BUTTON_6 = 5,
+        eMOUSE_BUTTON_7 = 6, eMOUSE_BUTTON_8 = 7,
+        eMOUSE_BUTTON_LAST   = eMOUSE_BUTTON_8,
+        eMOUSE_BUTTON_LEFT   = eMOUSE_BUTTON_1,
+        eMOUSE_BUTTON_RIGHT  = eMOUSE_BUTTON_2,
+        eMOUSE_BUTTON_MIDDLE = eMOUSE_BUTTON_3,
         eSIZE = static_cast<std::uint8_t>(eMOUSE_BUTTON_LAST) + 1
     };
-    static_assert(std::to_underlying(MouseButton::eSIZE) == 8);
-    static_assert(std::to_underlying(MouseButton{}) == 0);
 
-    template <class T>
-    [[nodiscard]] static constexpr auto gen_mouse_button(
-        typename T::mousebutton_event e) noexcept
+    // ───────── 三组严格分离的枚举 ─────────
+    enum class HeldState : std::uint8_t { Up, Down };
+    enum class Transition : std::uint8_t { Press, Release };
+    enum class PointerState : std::uint8_t { Outside, Hover, Down, DownMove };
+
+    // ═══════════ ① event_context：只装"现在仍成立"的东西 ═══════════
+    struct event_context
     {
-        using form = decltype(e.button);
-        using to = MouseButton;
+        std::array<HeldState, std::to_underlying(Key::eSIZE)> keys{};
+        std::array<HeldState, static_cast<std::size_t>(MouseButton::eSIZE)> buttons{};
+        ModifierKey modifier{};
 
-        switch (e.button)
+        PointerState  pointer_state  = PointerState::Outside;
+        PointerDevice pointer_device = PointerDevice::Unknown;
+        double        pointer_x      = 0.0;
+        double        pointer_y      = 0.0;
+        bool          pointer_position_valid = false;   // ★ 加
+
+        [[nodiscard]] decltype(auto) get_keyboard_event(this auto &&self, Key k) noexcept
+        { return std::forward_like<decltype(self)>(self.keys[std::to_underlying(k)]); }
+
+        [[nodiscard]] decltype(auto) get_mousebutton_event(this auto &&self, MouseButton b) noexcept
+        { return std::forward_like<decltype(self)>(self.buttons[std::to_underlying(b)]); }
+
+        [[nodiscard]] bool any_button_down() const noexcept
         {
-        case form::eMOUSE_BUTTON_LEFT:
-            return to::eMOUSE_BUTTON_LEFT;
-        case form::eMOUSE_BUTTON_RIGHT:
-            return to::eMOUSE_BUTTON_RIGHT;
-        case form::eMOUSE_BUTTON_MIDDLE:
-            return to::eMOUSE_BUTTON_MIDDLE;
-        case form::eMOUSE_BUTTON_4:
-            return to::eMOUSE_BUTTON_4;
-        case form::eMOUSE_BUTTON_5:
-            return to::eMOUSE_BUTTON_5;
-        case form::eMOUSE_BUTTON_6:
-            return to::eMOUSE_BUTTON_6;
-        case form::eMOUSE_BUTTON_7:
-            return to::eMOUSE_BUTTON_7;
-        case form::eMOUSE_BUTTON_LAST:
-            return to::eMOUSE_BUTTON_LAST;
-        default:
-            return to::eUNDEFINED;
+            for (auto s : buttons) if (s == HeldState::Down) return true;
+            return false;
+        }
+    };
+
+    // ═══════════ ② change_event：这一帧变成了什么 ═══════════
+    enum class ChangeType : std::uint8_t
+    { None, Key, PointerButton, PointerDownMove,PointerUpMove, Scroll, CursorEnter, Char };
+
+    struct key_change
+    {
+        Key        key{};
+        Transition transition{};
+    };
+    struct button_change
+    {
+        MouseButton button{};
+        Transition  transition{};
+    };
+    struct move_change
+    {
+        double x = 0.0, y = 0.0;   // 新位置
+        double dx = 0.0, dy = 0.0; // 相对 context.pointer 的位移
+    };
+
+    struct change_event
+    {
+        ChangeType  change     = ChangeType::None;
+        time_point  time_point{};
+        ModifierKey modifier{};       // 事件发生"之后"的修饰键
+
+        key_change            key{};
+        button_change         button{};
+        move_change           move{};
+        mcs::vulkan::event::scroll_event       scroll{};
+        mcs::vulkan::event::cursor_enter_event cursor_enter{};
+        unsigned              codepoint = 0;
+    };
+
+    // ═══════════ ③ input_frame：识别器唯一入参 ═══════════
+    struct input_frame
+    {
+        event_context context;  // 变化前的快照
+        change_event  change;   // 本帧变化
+    };
+
+    // ═══════════ 转换 1：平台事件 → change_event（只读 ctx） ═══════════
+    template <class PlatformButton>
+    constexpr MouseButton map_button(PlatformButton b) noexcept
+    {
+        using P = PlatformButton;
+        switch (b)
+        {
+        case P::eMOUSE_BUTTON_LEFT:   return MouseButton::eMOUSE_BUTTON_LEFT;
+        case P::eMOUSE_BUTTON_RIGHT:  return MouseButton::eMOUSE_BUTTON_RIGHT;
+        case P::eMOUSE_BUTTON_MIDDLE: return MouseButton::eMOUSE_BUTTON_MIDDLE;
+        case P::eMOUSE_BUTTON_4:      return MouseButton::eMOUSE_BUTTON_4;
+        case P::eMOUSE_BUTTON_5:      return MouseButton::eMOUSE_BUTTON_5;
+        case P::eMOUSE_BUTTON_6:      return MouseButton::eMOUSE_BUTTON_6;
+        case P::eMOUSE_BUTTON_7:      return MouseButton::eMOUSE_BUTTON_7;
+        case P::eMOUSE_BUTTON_8:      return MouseButton::eMOUSE_BUTTON_8;    // ← 加
+        case P::eMOUSE_BUTTON_LAST:   return MouseButton::eMOUSE_BUTTON_LAST; // 值不同，不冲突
+        default:                      return MouseButton::eUNDEFINED;
         }
     }
-    using mouse_button_value_type = std::underlying_type_t<MouseButtons>;
 
-    struct mouse_button_event
+    template <class Event>
+    inline change_event build_change(const event_context &ctx, const Event &e) noexcept
     {
-        [[nodiscard]] constexpr bool is_left() const noexcept
-        {
-            return value_ == std::to_underlying(MouseButtons::eMOUSE_BUTTON_LEFT);
-        }
-        [[nodiscard]] constexpr bool is_right() const noexcept
-        {
-            return value_ == std::to_underlying(MouseButtons::eMOUSE_BUTTON_RIGHT);
-        }
-        [[nodiscard]] constexpr bool is_middle() const noexcept
-        {
-            return value_ == std::to_underlying(MouseButtons::eMOUSE_BUTTON_MIDDLE);
-        }
-        [[nodiscard]] constexpr auto value() const noexcept
-        {
-            return value_;
-        }
+        using T = std::remove_cvref_t<Event>;
+        change_event ch{};
+        ch.time_point = Clock::now();
+        ch.modifier   = ctx.modifier;
 
-      private:
-        mouse_button_value_type value_;
-    };
+        if constexpr (std::is_same_v<T, mcs::vulkan::event::keyboard_event>)
+        {
+            ch.change          = ChangeType::Key;
+            ch.key.key         = e.key;
+            ch.key.transition  = (e.press() || e.repeat()) ? Transition::Press : Transition::Release;
+            ch.modifier        = e.modifier_key;   // ← 原来是 e.mods
+        }
+        else if constexpr (std::is_same_v<T, mcs::vulkan::event::mousebutton_event>)
+        {
+            ch.change             = ChangeType::PointerButton;
+            ch.button.button      = map_button(e.button);
+            ch.button.transition  = (e.press() || e.repeat()) ? Transition::Press : Transition::Release;
+            ch.modifier           = e.modifier_key;
+        }
+        else if constexpr (std::is_same_v<T, mcs::vulkan::event::position2d_event>)
+        {
+            ch.change = ctx.any_button_down() ? ChangeType::PointerDownMove
+                                            : ChangeType::PointerUpMove;
+            ch.move.x = e.xpos;
+            ch.move.y = e.ypos;
 
-    struct arena_pointer
+            if (ctx.pointer_position_valid)            // ★ 只有有效才算增量
+            {
+                ch.move.dx = e.xpos - ctx.pointer_x;
+                ch.move.dy = e.ypos - ctx.pointer_y;
+            }
+            // 无效时 dx/dy 保持 0，识别器看到 dx=0 就知道"这一帧没有真实增量"
+        }
+        else if constexpr (std::is_same_v<T, mcs::vulkan::event::scroll_event>)
+        {
+            ch.change = ChangeType::Scroll;        ch.scroll = e;
+        }
+        else if constexpr (std::is_same_v<T, mcs::vulkan::event::cursor_enter_event>)
+        {
+            ch.change = ChangeType::CursorEnter;   ch.cursor_enter = e;
+        }
+        else if constexpr (std::is_same_v<T, mcs::vulkan::event::char_event>)
+        {
+            ch.change = ChangeType::Char;          ch.codepoint = e.codepoint;
+        }
+        return ch;
+    }
+
+    // ═══════════ 转换 2：change_event → 写回 ctx（唯一迁移点） ═══════════
+    inline void apply_change(event_context &ctx, const change_event &ch) noexcept
     {
-        PointerDevice kind = PointerDevice::Unknown;
-        PointerPhase phase = PointerPhase::None;
+        switch (ch.change)
+        {
+        case ChangeType::Key:
+            ctx.keys[std::to_underlying(ch.key.key)] =
+                (ch.key.transition == Transition::Press) ? HeldState::Down : HeldState::Up;
+            ctx.modifier = ch.modifier;
+            break;
 
-        // clang-format off
-        // ---- phase 谓词 ----
-        [[nodiscard]] constexpr bool isNone() const noexcept
-        { return phase == PointerPhase::None; }
+        case ChangeType::PointerButton:
+            ctx.buttons[std::to_underlying(ch.button.button)] =
+                (ch.button.transition == Transition::Press) ? HeldState::Down : HeldState::Up;
+            // 多按钮场景下，第二个按钮按下 / 任一按钮抬起时，不能把 DownMove 打回 Down，否则"移动过"的历史丢失
+            if (ch.button.transition == Transition::Press)
+            {
+                ctx.pointer_device = PointerDevice::Mouse;
+                if (ctx.pointer_state != PointerState::DownMove)
+                    ctx.pointer_state = PointerState::Down;
+            }
+            else
+            {
+                if (ctx.any_button_down())
+                {
+                    if (ctx.pointer_state != PointerState::DownMove)
+                        ctx.pointer_state = PointerState::Down;
+                }
+                else
+                {
+                    ctx.pointer_state = (ctx.pointer_state == PointerState::Outside)
+                                        ? PointerState::Outside
+                                        : PointerState::Hover;
+                }
+            }
+            break;
 
-        [[nodiscard]] constexpr bool isHover() const noexcept
-        { return phase == PointerPhase::Hover; }
+        case ChangeType::PointerDownMove:
+        case ChangeType::PointerUpMove:
+            ctx.pointer_x = ch.move.x;
+            ctx.pointer_y = ch.move.y;
+            ctx.pointer_position_valid = true;         // ★
+            ctx.pointer_state = ctx.any_button_down()
+                ? PointerState::DownMove
+                : PointerState::Hover;
+            if (ctx.pointer_device == PointerDevice::Unknown)
+                ctx.pointer_device = PointerDevice::Mouse;
+            break;
 
-        [[nodiscard]] constexpr bool isDown() const noexcept
-        { return phase == PointerPhase::Down; }
+        /*
+        Outside ──Enter(true)──> Hover ──Press──> Down ──Move──> DownMove ──Release(全部)──> Hover
+                                        ▲                                  │
+                                        └──Enter(true)──────────────────────┘
+                                            （按着从窗外回来 → Down，不是 DownMove）
+        */
+        case ChangeType::CursorEnter:
+            if (ch.cursor_enter.value)
+            {
+                ctx.pointer_device = PointerDevice::Mouse;
+                ctx.pointer_state  = ctx.any_button_down() ? PointerState::Down : PointerState::Hover; // ← DownMove → Down
+                // ★ 不置 true：位置仍要靠第一次 move 更新
+            }
+            else
+            {
+                ctx.pointer_device         = PointerDevice::Unknown;
+                ctx.pointer_state          = PointerState::Outside;
+                ctx.pointer_position_valid = false;    // ★ 离开窗口位置失效
+            }
+            break;
 
-        [[nodiscard]] constexpr bool isUp() const noexcept
-        { return phase == PointerPhase::Up; }
-
-        [[nodiscard]] constexpr bool isDownMove() const noexcept
-        { return phase == PointerPhase::DownMove; }
-
-
-        // ---- device 谓词 ----
-        [[nodiscard]] constexpr bool isMouse() const noexcept
-        { return kind == PointerDevice::Mouse; }
-
-        [[nodiscard]] constexpr bool isTouch() const noexcept
-        { return kind == PointerDevice::Touch; }
-
-        [[nodiscard]] constexpr bool isStylus() const noexcept
-        { return kind == PointerDevice::Stylus ||
-                 kind == PointerDevice::InvertedStylus; }
-        // clang-format on
-    };
-
-}; // namespace arena_event
+        case ChangeType::Scroll:
+            // NOTE: ctx 不存储 Scroll 的值
+            break; 
+        case ChangeType::Char: // NOTE: ctx 不存储 Char 的值
+        case ChangeType::None:
+            break;
+        }
+    }
+}
+// clang-format on
 
 using join_arena_interface = void (*)(void *obj, submit_flag flag, void *ctx,
                                       static_string declare_fn) noexcept;
@@ -730,6 +829,8 @@ struct member_join_key
 template <typename... Ts>
 struct publish_types
 {
+    // 在当前 erased_ref::build(T&&) 的设计下，publish_types 必须是引用类型
+    static_assert((std::is_reference_v<Ts> && ...), "publish_types: 每项必须是引用类型");
     template <typename T>
     static constexpr bool has_type()
     {
@@ -743,9 +844,43 @@ consteval bool requires_type_from_self()
     return FT::template has_type<Data>();
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// 擦除句柄：void* + tag
+//   data 指向被引用对象本身，tag = type_of<T&&>（折叠后已编码 cv + 值类别）
+// ═══════════════════════════════════════════════════════════════════════
+/*
+层	    载体	    负责什么	    通用性
+数据层	void*	    搬地址	        完全通用，任意类型
+类型层	tag	编码    cv + 值类别	    只能编码引用类型
+路由层	白名单	    和 tag 空间同构	必须列引用
+*/
+struct erased_ref
+{
+    void *data = nullptr;
+    const void *tag = nullptr;
+    explicit operator bool() const noexcept
+    {
+        return tag != nullptr;
+    }
+    template <class T>
+    [[nodiscard]] T get() const noexcept
+    {
+        using U = std::remove_reference_t<T>;
+        return static_cast<T>(*static_cast<U *>(data));
+    }
+
+    template <typename T>
+    [[nodiscard]] static constexpr erased_ref build(T &&t) noexcept
+    {
+        using mcs::vulkan::runtime_type_v;
+        return {const_cast<void *>(static_cast<const void *>(std::addressof(t))),
+                runtime_type_v<T &&>};
+    }
+};
+
 struct member_registry
 {
-    using publish_fn = void (*)(void *member, const void *type, void *args) noexcept;
+    using publish_fn = void (*)(void *member, erased_ref ref) noexcept;
 
     struct entry
     {
@@ -794,7 +929,7 @@ struct member_registry
             }
     }
 
-    constexpr void publish_all(const void *type, void *data) noexcept
+    constexpr void publish_all(erased_ref ref) noexcept
     {
         const bool outer = !distributing_;
         if (outer)
@@ -802,7 +937,7 @@ struct member_registry
 
         for (const auto &item : callbacks_)
             if (item.valid)
-                item.publish(item.member, type, data);
+                item.publish(item.member, ref); // ← ref 原样传递
 
         if (outer)
         {
@@ -811,7 +946,6 @@ struct member_registry
                 if (item.valid)
                     callbacks_.push_back(std::move(item));
             pendingAdd_.clear();
-
             if (hasInvalid_)
             {
                 std::erase_if(callbacks_,
@@ -826,17 +960,14 @@ struct member_registry
     constexpr static entry make_entry(Member &member) noexcept
     {
         return entry{
-            &member, publish_fn{[](void *m, const void *type, void *p) noexcept {
+            &member, publish_fn{[](void *m, erased_ref ref) noexcept {
+                auto *obj = static_cast<Member *>(m);
                 [&]<class... Ts>(publish_types<Ts...> *) noexcept {
                     constexpr auto name = static_string{"publish"};
-                    auto *obj = static_cast<Member *>(m);
-                    auto invoke = [&](auto &d) noexcept {
-                        obj->template invoke<name>(std::move(d));
-                    };
                     using mcs::vulkan::runtime_type_v;
                     ((requires() { obj->template invoke<name>(std::declval<Ts>()); } &&
-                      type == runtime_type_v<Ts> &&
-                      (invoke(*static_cast<Ts *>(p)), true)) ||
+                      ref.tag == runtime_type_v<Ts> &&
+                      (obj->template invoke<name>(ref.template get<Ts>()), true)) ||
                      ...);
                 }(static_cast<decltype(std::declval<Arena>().publish_types())>(nullptr));
             }},
@@ -882,11 +1013,291 @@ enum class decision
 };
 
 // ═══════════════════════════════════════════════════════════════════════
+//  pointer_state 状态机测试（纯逻辑，不启动 GLFW）
+// ═══════════════════════════════════════════════════════════════════════
+//  记号：E+ = CursorEnter(true)   E- = CursorEnter(false)
+//        Lp/Lr = 左键 press/release   Rp/Rr = 右键 press/release
+//        M  = position2d_event       B_any = any_button_down()
+//
+//   ┌──────────┐  E+ / !B_any          ┌─────────┐
+//   │ Outside  │ ───────────────────>  │  Hover  │
+//   │          │ <───────────────────  │         │
+//   └────┬─────┘  E-  (任意状态)        └────┬────┘
+//        │                                    │ Lp
+//        │ E+ / B_any                         ▼
+//        │ （按着从窗外回来）             ┌─────────┐
+//        └────────────────────────────> │  Down   │
+//                                       └────┬────┘
+//                                            │ M
+//                                            ▼
+//                                        ┌──────────┐
+//                                        │ DownMove │ ── M ──> DownMove (stay)
+//                                        └────┬─────┘
+//                                             │ Lr / !B_any
+//                                             ▼
+//                                        ┌─────────┐
+//                                        │  Hover  │
+//                                        └─────────┘
+//  保护边（★ 多按钮不回退）：
+//    DownMove -- Bp(其他) --> DownMove
+//    DownMove -- Br(其他仍按) --> DownMove
+//
+//  不变量：
+//    (1) Outside    ⇒ position_valid == false
+//    (2) DownMove   ⇒ position_valid == true
+//    (3) Down       ∧ B_any
+//    (4) E- 从任意  → Outside ∧ position_valid == false
+// ═══════════════════════════════════════════════════════════════════════
+void test_pointer_state_machine()
+{
+    namespace ae = arena_event;
+    using mcs::vulkan::event::Action;
+    using mcs::vulkan::event::MouseButtons;
+
+    auto inject = [](ae::event_context &ctx, auto e) noexcept {
+        auto ch = ae::build_change(ctx, e);
+        ae::apply_change(ctx, ch);
+    };
+
+    constexpr cursor_enter_event E_on{true};
+    constexpr cursor_enter_event E_off{false};
+    constexpr mousebutton_event Lp{MouseButtons::eMOUSE_BUTTON_LEFT, Action::ePRESS};
+    constexpr mousebutton_event Lr{MouseButtons::eMOUSE_BUTTON_LEFT, Action::eRELEASE};
+    constexpr mousebutton_event Rp{MouseButtons::eMOUSE_BUTTON_RIGHT, Action::ePRESS};
+    constexpr mousebutton_event Rr{MouseButtons::eMOUSE_BUTTON_RIGHT, Action::eRELEASE};
+
+    // ─── 初始：Outside ─────────────────────────────────────────────
+    {
+        ae::event_context ctx;
+        assert(ctx.pointer_state == ae::PointerState::Outside);
+        assert(ctx.pointer_position_valid == false); // 不变量 (1)
+        assert(ctx.pointer_device == ae::PointerDevice::Unknown);
+    }
+
+    // ─── Outside --E+ / !B_any--> Hover ────────────────────────────
+    {
+        ae::event_context ctx;
+        inject(ctx, E_on);
+        assert(ctx.pointer_state == ae::PointerState::Hover);
+        assert(ctx.pointer_device == ae::PointerDevice::Mouse);
+        assert(ctx.pointer_position_valid == false); // 等首次 move
+    }
+
+    // ─── Hover --Lp--> Down ────────────────────────────────────────
+    {
+        ae::event_context ctx;
+        inject(ctx, E_on);
+        inject(ctx, Lp);
+        assert(ctx.pointer_state == ae::PointerState::Down);
+        assert(ctx.buttons[0] == ae::HeldState::Down); // 不变量 (3)
+    }
+
+    // ─── Down --M--> DownMove ──────────────────────────────────────
+    {
+        ae::event_context ctx;
+        inject(ctx, E_on);
+        inject(ctx, Lp);
+        inject(ctx, position2d_event{100.0, 200.0});
+        assert(ctx.pointer_state == ae::PointerState::DownMove);
+        assert(ctx.pointer_position_valid == true); // 不变量 (2)
+        assert(ctx.pointer_x == 100.0 && ctx.pointer_y == 200.0);
+    }
+
+    // ─── DownMove --M--> DownMove (stay) ───────────────────────────
+    {
+        ae::event_context ctx;
+        inject(ctx, E_on);
+        inject(ctx, Lp);
+        inject(ctx, position2d_event{100.0, 200.0});
+        inject(ctx, position2d_event{150.0, 260.0});
+        assert(ctx.pointer_state == ae::PointerState::DownMove);
+        assert(ctx.pointer_x == 150.0 && ctx.pointer_y == 260.0);
+    }
+
+    // ─── DownMove --Lr / !B_any--> Hover ───────────────────────────
+    {
+        ae::event_context ctx;
+        inject(ctx, E_on);
+        inject(ctx, Lp);
+        inject(ctx, position2d_event{100.0, 200.0});
+        inject(ctx, Lr);
+        assert(ctx.pointer_state == ae::PointerState::Hover);
+        assert(ctx.buttons[0] == ae::HeldState::Up);
+    }
+
+    // ─── Down --Rp(其他按钮)--> Down (stay) ────────────────────────
+    {
+        ae::event_context ctx;
+        inject(ctx, E_on);
+        inject(ctx, Lp);
+        inject(ctx, Rp);
+        assert(ctx.pointer_state == ae::PointerState::Down);
+        assert(ctx.buttons[0] == ae::HeldState::Down);
+        assert(ctx.buttons[1] == ae::HeldState::Down);
+    }
+
+    // ─── Down --Rr(其他仍按)--> Down (stay) ────────────────────────
+    {
+        ae::event_context ctx;
+        inject(ctx, E_on);
+        inject(ctx, Lp);
+        inject(ctx, Rp);
+        inject(ctx, Rr);
+        assert(ctx.pointer_state == ae::PointerState::Down);
+        assert(ctx.buttons[0] == ae::HeldState::Down);
+    }
+
+    // ─── DownMove --Rp(其他)--> DownMove (★ 保护) ──────────────────
+    {
+        ae::event_context ctx;
+        inject(ctx, E_on);
+        inject(ctx, Lp);
+        inject(ctx, position2d_event{10.0, 10.0});
+        inject(ctx, Rp);
+        assert(ctx.pointer_state == ae::PointerState::DownMove);
+    }
+
+    // ─── DownMove --Lr(其他仍按)--> DownMove (★ 保护) ──────────────
+    {
+        ae::event_context ctx;
+        inject(ctx, E_on);
+        inject(ctx, Lp);
+        inject(ctx, Rp);
+        inject(ctx, position2d_event{10.0, 10.0});
+        inject(ctx, Lr);
+        assert(ctx.pointer_state == ae::PointerState::DownMove);
+        assert(ctx.buttons[0] == ae::HeldState::Up);
+        assert(ctx.buttons[1] == ae::HeldState::Down);
+    }
+
+    // ─── DownMove --E- --> Outside (不变量 (4)) ────────────────────
+    {
+        ae::event_context ctx;
+        inject(ctx, E_on);
+        inject(ctx, Lp);
+        inject(ctx, position2d_event{10.0, 10.0});
+        inject(ctx, E_off);
+        assert(ctx.pointer_state == ae::PointerState::Outside);
+        assert(ctx.pointer_position_valid == false);
+        assert(ctx.pointer_device == ae::PointerDevice::Unknown);
+        // 平台事实：窗口外松开不通知，buttons 保持
+        assert(ctx.buttons[0] == ae::HeldState::Down);
+    }
+
+    // ─── Outside --E+ / B_any--> Down (不是 DownMove) ──────────────
+    {
+        ae::event_context ctx;
+        inject(ctx, E_on);
+        inject(ctx, Lp);
+        inject(ctx, position2d_event{10.0, 10.0});
+        inject(ctx, E_off); // 拖出去
+        inject(ctx, E_on);  // 按着回来
+        assert(ctx.pointer_state == ae::PointerState::Down);
+        assert(ctx.pointer_position_valid == false); // 等首次 move
+    }
+
+    // ─── Down --E- --> Outside (未移动就离开) ─────────────────────
+    {
+        ae::event_context ctx;
+        inject(ctx, E_on);
+        inject(ctx, Lp); // Hover → Down，没 move
+        assert(ctx.pointer_state == ae::PointerState::Down);
+        inject(ctx, E_off);
+        assert(ctx.pointer_state == ae::PointerState::Outside);
+        assert(ctx.pointer_position_valid == false);
+        assert(ctx.buttons[0] == ae::HeldState::Down); // 平台限制：仍持有
+    }
+    std::println("test_pointer_state_machine done");
+}
+// ═══════════════════════════════════════════════════════════════════════
+//  position_valid 语义 + 键盘 repeat + None 事件（纯逻辑）
+// ═══════════════════════════════════════════════════════════════════════
+//  规则：
+//    position_valid == false ⇒ build_change 产出 dx = dy = 0（无假位移）
+//    position_valid == true  ⇒ dx = e.xpos - ctx.pointer_x（真实帧间增量）
+//  路径：
+//    首次 move（进入窗口后第一次）  → dx = 0，apply 后 valid = true
+//    E-                             → valid = false
+//    E+                             → valid 不变（等 move 刷新）
+//    键盘 eREPEAT                   → keys[] 保持 Down（不掉键）
+//    未映射事件（window_size 等）    → ChangeType::None
+// ═══════════════════════════════════════════════════════════════════════
+void test_position_valid_and_edge_cases()
+{
+    namespace ae = arena_event;
+    using mcs::vulkan::event::Action;
+    using mcs::vulkan::event::Key;
+
+    auto inject = [](ae::event_context &ctx, auto e) noexcept {
+        auto ch = ae::build_change(ctx, e);
+        ae::apply_change(ctx, ch);
+    };
+
+    // ─── 首帧 move 无假位移 ─────────────────────────────────────────
+    {
+        ae::event_context ctx;
+        inject(ctx, cursor_enter_event{true});
+        auto ch = ae::build_change(ctx, position2d_event{500.0, 600.0});
+        assert(ch.move.dx == 0.0 && ch.move.dy == 0.0);
+        assert(ch.change == ae::ChangeType::PointerUpMove);
+        ae::apply_change(ctx, ch);
+        assert(ctx.pointer_position_valid == true);
+    }
+
+    // ─── 第二帧起为真实增量 ─────────────────────────────────────────
+    {
+        ae::event_context ctx;
+        inject(ctx, cursor_enter_event{true});
+        inject(ctx, position2d_event{500.0, 600.0});
+        auto ch = ae::build_change(ctx, position2d_event{510.0, 620.0});
+        assert(ch.move.dx == 10.0 && ch.move.dy == 20.0);
+    }
+
+    // ─── 离开窗口后，回来首帧仍无假位移 ─────────────────────────────
+    {
+        ae::event_context ctx;
+        inject(ctx, cursor_enter_event{true});
+        inject(ctx, position2d_event{500.0, 600.0});
+        inject(ctx, cursor_enter_event{false});
+        assert(ctx.pointer_position_valid == false);
+        // 旧坐标保留但不可信，识别器要靠 position_valid 判断
+        assert(ctx.pointer_x == 500.0 && ctx.pointer_y == 600.0);
+
+        inject(ctx, cursor_enter_event{true});
+        assert(ctx.pointer_position_valid == false);
+        auto ch = ae::build_change(ctx, position2d_event{800.0, 100.0});
+        assert(ch.move.dx == 0.0 && ch.move.dy == 0.0);
+    }
+
+    // ─── 键盘 eREPEAT 保持 Down，不掉键 ─────────────────────────────
+    {
+        ae::event_context ctx;
+        inject(ctx, keyboard_event{Key::eA, Action::ePRESS});
+        assert(ctx.keys[std::to_underlying(Key::eA)] == ae::HeldState::Down);
+        inject(ctx, keyboard_event{Key::eA, Action::eREPEAT});
+        assert(ctx.keys[std::to_underlying(Key::eA)] == ae::HeldState::Down);
+        inject(ctx, keyboard_event{Key::eA, Action::eRELEASE});
+        assert(ctx.keys[std::to_underlying(Key::eA)] == ae::HeldState::Up);
+    }
+
+    // ─── 未映射平台事件 → ChangeType::None ─────────────────────────
+    {
+        ae::event_context ctx;
+        auto ch = ae::build_change(ctx, mcs::vulkan::event::window_size_event{100, 100});
+        assert(ch.change == ae::ChangeType::None);
+    }
+    std::println("test_position_valid_and_edge_cases done");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // main
 // ═══════════════════════════════════════════════════════════════════════
 int main()
 try
 {
+    test_pointer_state_machine();
+    test_position_valid_and_edge_cases();
+
     {
         constexpr Point2D p{3.0, 4.0};
         constexpr Point2D q{1.0, 2.0};
@@ -899,33 +1310,30 @@ try
     surface window{};
     window.setup({.width = WIDTH, .height = HEIGHT}, TITLE);
 
-    using arena_data_tuple = publish_types<arena_event::arena_pointer>;
+    using arena_data_tuple =
+        publish_types<const arena_event::input_frame &, arena_event::input_frame &&>;
     auto arena = make_aggregate<"arena">(
-        field<"mermbers">(member_registry{}), //
+        field<"mermbers">(member_registry{}),                 //
+        field<"event_context">(arena_event::event_context{}), //
         method<"publish_types">(
             []() noexcept { return static_cast<arena_data_tuple *>(nullptr); }),
+        method<"publish">([](auto &self, auto &&data) noexcept {
+            self.mermbers.publish_all(
+                erased_ref::build(std::forward<decltype(data)>(data)));
+        }),
         method<"join">([]<class Self, class Member>(Self &self, Member &m) noexcept {
             self.mermbers.template add<Self>(m);
         }),
         method<"detach">(
             [](auto &self, void *member) noexcept { self.mermbers.detach(member); }),
         method<"input_event">([]<typename event_type>(auto &self, event_type e) noexcept {
-            // do something
             std::println("input_event: {}", e);
-            auto doPublish = [&](auto data) noexcept {
-                using mcs::vulkan::runtime_type_v;
-                self.mermbers.publish_all(runtime_type_v<decltype(data)>, &data);
-            };
-            if constexpr (std::same_as<event_type,
-                                       glfw_input_translation::mousebutton_event>)
-            {
-                if (glfw_input_translation::mousebutton_event{e}.press())
-                {
-                    arena_event::arena_pointer data{arena_event::PointerDevice::Mouse,
-                                                    arena_event::PointerPhase::Down};
-                    doPublish(data);
-                }
-            }
+            const auto ch = arena_event::build_change(self.event_context, e);
+            if (ch.change == arena_event::ChangeType::None)
+                return;
+            self.template invoke<"publish">(
+                arena_event::input_frame{self.event_context, ch}); // prvalue ✓
+            arena_event::apply_change(self.event_context, ch);     // 用局部 ch ✓
         }),
         method<"declare">([]<typename Self>(Self &self, submit_flag result, auto *ctx,
                                             static_string fn) noexcept {
@@ -978,11 +1386,28 @@ try
         field<"submit_click">(null_submit_ptr),
         field<"submit_double_click">(null_submit_ptr),
         field<"detach_key">(member_detach_key{}),
-        method<"publish">(
-            []<typename Self, typename Data>(Self &self, Data data) noexcept {
-                //
-                std::println("recognizer publish...");
-            }),
+        method<"publish">([]<typename Self, typename Frame>(Self &self,
+                                                            Frame &&frame) noexcept {
+            const auto &[ctx, ch] = frame; // ctx 查历史，ch 查变化
+            switch (ch.change)
+            {
+            case arena_event::ChangeType::PointerButton:
+                if (ch.button.button == arena_event::MouseButton::eMOUSE_BUTTON_LEFT &&
+                    ch.button.transition == arena_event::Transition::Release)
+                    self.template invoke<"click">(frame);
+                break;
+            case arena_event::ChangeType::PointerDownMove:
+                // 一定是"按着按钮在移动"→ drag
+                self.template invoke<"drag">(frame);
+                break;
+            case arena_event::ChangeType::PointerUpMove:
+                // 一定是"悬停移动"→ hover 高亮 / tooltip / 光标形状
+                self.template invoke<"hover">(frame);
+                break;
+            default:
+                break;
+            }
+        }),
         method<"bind_arena">(
             []<typename Self, typename Arena>(Self &self, Arena &arena) noexcept {
                 self.arena_ptr = &arena;
@@ -994,12 +1419,18 @@ try
                 self.detach_key = member_detach_key::build<Arena>();
             }),
         method<"click">([](auto &self, auto e) noexcept {
-            self.submit_click(self.arena_ptr, submit_flag::win, &self, "click");
+            // self.submit_click(self.arena_ptr, submit_flag::win, &self, "click");
+            std::println("recognizer click...");
         }),
         method<"double_click">([](auto &self, auto e) noexcept {
-            self.submit_double_click(self.arena_ptr, submit_flag::win, &self,
-                                     "double_click");
+            // self.submit_double_click(self.arena_ptr, submit_flag::win, &self,
+            //                          "double_click");
+            std::println("recognizer double_click...");
         }),
+        method<"drag">(
+            [](auto &self, auto e) noexcept { std::println("recognizer drag..."); }),
+        method<"hover">(
+            [](auto &self, auto e) noexcept { std::println("recognizer hover..."); }),
         method<"resolve">([](auto &self, auto e) noexcept {
 
         }),

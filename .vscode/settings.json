@@ -519,5 +519,6 @@
     ],
     // c-cpp-compile-run 的 debug 调试
     "c-cpp-compile-run.debugger-path": "E:/mysoftware/gcc-v16.1.0-mingw-v14.0.0-ucrt-x86_64/bin/gdb.exe",
-    "c-cpp-compile-run.debugger-mimode": "gdb"
+    "c-cpp-compile-run.debugger-mimode": "gdb",
+    "clangd.enable": false
 }
