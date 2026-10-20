@@ -25,6 +25,7 @@ add_vulkan_wsi_test(test_glfw8)
 add_vulkan_wsi_test(test_glfw9)
 add_vulkan_wsi_test(test_glfw10)
 add_vulkan_wsi_test(test_glfw11)
+add_vulkan_wsi_test(test_glfw12)
 
 
 # end
