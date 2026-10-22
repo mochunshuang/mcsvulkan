@@ -634,11 +634,18 @@ namespace arena_event
     {
         Key        key{};
         Transition transition{};
+        [[nodiscard]] bool is_press() const noexcept { return transition == Transition::Press; }
+        [[nodiscard]] bool is_pelease() const noexcept { return transition == Transition::Release; }
     };
     struct button_change
     {
         MouseButton button{};
         Transition  transition{};
+        [[nodiscard]] bool is_press() const noexcept { return transition == Transition::Press; }
+        [[nodiscard]] bool is_pelease() const noexcept { return transition == Transition::Release; }
+        [[nodiscard]] bool is_left() const noexcept { return button == MouseButton::eMOUSE_BUTTON_LEFT; }
+        [[nodiscard]] bool is_right() const noexcept { return button == MouseButton::eMOUSE_BUTTON_RIGHT; }
+        [[nodiscard]] bool is_middle() const noexcept { return button == MouseButton::eMOUSE_BUTTON_MIDDLE; }
     };
     struct move_change
     {
@@ -697,17 +704,14 @@ namespace arena_event
 
         if constexpr (std::is_same_v<T, mcs::vulkan::event::keyboard_event>)
         {
-            ch.change          = ChangeType::Key;
-            ch.key.key         = e.key;
-            ch.key.transition  = (e.press() || e.repeat()) ? Transition::Press : Transition::Release;
-            ch.modifier        = e.modifier_key;   // ← 原来是 e.mods
+            ch.change    = ChangeType::Key;
+            ch.key       = {.key = e.key, .transition  = (e.press() || e.repeat()) ? Transition::Press : Transition::Release};
+            ch.modifier  = e.modifier_key;   // ← 原来是 e.mods
         }
         else if constexpr (std::is_same_v<T, mcs::vulkan::event::mousebutton_event>)
         {
-            ch.change             = ChangeType::PointerButton;
-            ch.button.button      = map_button(e.button);
-            ch.button.transition  = (e.press() || e.repeat()) ? Transition::Press : Transition::Release;
-            ch.modifier           = e.modifier_key;
+            ch.change = ChangeType::PointerButton;
+            ch.button = {.button = map_button(e.button), .transition = (e.press() || e.repeat()) ? Transition::Press : Transition::Release};
         }
         else if constexpr (std::is_same_v<T, mcs::vulkan::event::position2d_event>)
         {
@@ -818,6 +822,35 @@ namespace arena_event
     }
 }
 // clang-format on
+
+// ──────────────────────────────────────────────────────
+// 反射：枚举 → 名字（P2996，通用，可复用）
+template <typename E, bool Enumerable = std::meta::is_enumerable_type(^^E)>
+    requires std::is_enum_v<E>
+constexpr std::string_view enum_to_string(E value)
+{
+    if constexpr (Enumerable)
+        template for (constexpr auto e :
+                      std::define_static_array(std::meta::enumerators_of(^^E)))
+        {
+            if (value == [:e:])
+                return std::meta::identifier_of(e);
+        }
+    return "<unnamed>";
+}
+
+// ──────────────────────────────────────────────────────
+// 特供：ChangeType 的 formatter —— 显式完全特化，合法且自动
+template <>
+struct std::formatter<arena_event::ChangeType, char>
+    : std::formatter<std::string_view, char> // 复用 string_view 的宽度/对齐/填充
+{
+    template <typename FormatContext>
+    auto format(arena_event::ChangeType v, FormatContext &ctx) const
+    {
+        return std::formatter<std::string_view, char>::format(enum_to_string(v), ctx);
+    }
+};
 
 using join_arena_interface = void (*)(void *obj, submit_flag flag, void *ctx,
                                       static_string declare_fn) noexcept;
@@ -1012,24 +1045,232 @@ enum class decision
     superseded
 };
 
+struct click_recognizer
+{
+    enum class state : std::uint8_t
+    {
+        idle,
+        pressed
+    };
+    state s = state::idle;
+
+    constexpr void identify(const arena_event::input_frame &frame) noexcept
+    {
+        const auto &ch = frame.change;
+        if (ch.change != arena_event::ChangeType::PointerButton)
+            return;
+
+        const bool left_btn =
+            ch.change == arena_event::ChangeType::PointerButton && ch.button.is_left();
+
+        switch (s)
+        {
+        case state::idle:
+            if (left_btn && ch.button.is_press())
+                s = state::pressed;
+            break;
+
+        case state::pressed:
+            if (left_btn && ch.button.is_pelease())
+            {
+                s = state::idle;
+                click(frame); //NOTE: 应该需要和识别器集成.这里是直接赢
+            }
+            break;
+        }
+    }
+
+    void click(const arena_event::input_frame &) noexcept
+    {
+        std::println("click_recognizer: click");
+    }
+};
+
+// [start,end]的时间范围
+struct claim_time_span
+{
+    time_point start;
+    time_point end;
+};
+struct double_click_recognizer
+{
+    // NOTE: 事件绑定的回调通道
+    using when_accept = void (*)() noexcept;
+    enum class state
+    {
+        idle,
+        pressed_first,
+        waiting_second,
+        pressed_second
+    };
+    state s = state::idle;
+    time_point deadline{};
+    static constexpr auto window = std::chrono::milliseconds(300);
+
+    // NOTE: 外界事件输入的通道
+    constexpr void identify(const arena_event::input_frame &frame) noexcept
+    {
+        const auto &ch = frame.change;
+        const auto now = ch.time_point;
+
+        if (ch.change != arena_event::ChangeType::PointerButton)
+            return;
+
+        // ① 窗口过期：任何事件到来先检查
+        if (s == state::waiting_second && now >= deadline)
+            s = state::idle;
+
+        const bool left_btn =
+            ch.change == arena_event::ChangeType::PointerButton &&
+            ch.button.button == arena_event::MouseButton::eMOUSE_BUTTON_LEFT;
+        const bool is_press =
+            left_btn && ch.button.transition == arena_event::Transition::Press;
+        const bool is_release =
+            left_btn && ch.button.transition == arena_event::Transition::Release;
+
+        switch (s)
+        {
+        case state::idle:
+            if (is_press)
+                s = state::pressed_first;
+            break;
+
+        case state::pressed_first:
+            if (is_release)
+            {
+                s = state::waiting_second;
+                deadline = now + window;
+            }
+            break;
+
+        case state::waiting_second:
+            if (is_press)
+                s = state::pressed_second;
+            // timeout 已在 ① 处理
+            break;
+
+        case state::pressed_second:
+            if (is_release)
+            {
+                s = state::idle;
+                double_click(frame);
+            }
+            break;
+        }
+    }
+    void double_click(const arena_event::input_frame &) noexcept
+    {
+        std::println("click_recognizer: double_click");
+    }
+
+    // NOTE: 状态访问的通过
+    constexpr bool complete() const noexcept
+    {
+        return s == state::pressed_second;
+    }
+    constexpr void tick(time_point) const noexcept
+    {
+        //
+    }
+};
+struct claim_object
+{
+    using invoke_type = void (*)(void *recognizer) noexcept;
+    template <typename Recognizer>
+    constexpr static auto build(Recognizer *recognizer) noexcept
+    {
+        return claim_object{recognizer, invoke_type{[](void *ptr) noexcept {
+                                auto *recognizer = static_cast<Recognizer>(ptr);
+                                // TODO
+                            }}};
+    }
+    constexpr void invoke() noexcept
+    {
+        invoke_(recognizer_);
+    }
+    constexpr claim_object(void *recognizer, invoke_type invoke) noexcept
+        : recognizer_{recognizer}, invoke_{invoke}
+    {
+    }
+
+  private:
+    void *recognizer_;
+    invoke_type invoke_;
+};
+
+// recognizer 是一个有状态的自动机。 输入是事件流，内部维护状态机，[输出是候选断言（claim）——"我认为识别出了语义事件 X"]。
+// recognizer 的输出不是事件，是候选。它没有资格直接 emit 用户事件，因为它不知道自己是不是最具体的解释。
+struct recognizer
+{
+    virtual void identify(const arena_event::input_frame &frame) noexcept = delete;
+};
+// arbitrator 是一个冲突解决器。 输入是 claim 集合 + 时间，输出是判决。它不产生语义事件，只产生判决（accepted / rejected / superseded / pending）。
+// 关键区分：arbitrator 判决的对象是 claim，不是 recognizer。同一个 recognizer 可以同时持有多个活跃 claim，它们独立仲裁
+struct arbitrator
+{
+    struct entry
+    {
+        recognizer *member;
+        bool valid;
+    };
+
+    constexpr void add(entry &entry) noexcept
+    {
+        if (distributing_)
+        {
+            for (auto &item : pendingAdd_)
+                if (item.member == entry.member)
+                {
+                    item = entry;
+                    return;
+                }
+            pendingAdd_.push_back(entry);
+            return;
+        }
+        for (auto &item : callbacks_)
+            if (item.member == entry.member)
+            {
+                item = entry;
+                return;
+            }
+        callbacks_.push_back(entry);
+    }
+
+    constexpr void detach(void *member) noexcept
+    {
+        for (auto &item : callbacks_)
+            if (item.member == member)
+            {
+                item.valid = false;
+                hasInvalid_ = true;
+            }
+        for (auto &item : pendingAdd_)
+            if (item.member == member)
+            {
+                item.valid = false;
+                hasInvalid_ = true;
+            }
+    }
+    std::vector<entry> callbacks_;
+    std::vector<entry> pendingAdd_;
+    bool distributing_ = false;
+    bool hasInvalid_ = false;
+};
+
+struct related_object
+{
+};
+
+struct related_timeline
+{
+};
+
 // ═══════════════════════════════════════════════════════════════════════
 // main
 // ═══════════════════════════════════════════════════════════════════════
 int main()
 try
 {
-    test_pointer_state_machine();
-    test_position_valid_and_edge_cases();
-
-    {
-        constexpr Point2D p{3.0, 4.0};
-        constexpr Point2D q{1.0, 2.0};
-        static_assert(p.distanceToXAxis() == 4);
-        static_assert(p.distanceToYAxis() == 3);
-        static_assert(p.distanceToOrigin() == 5);
-        static_assert(p.distanceTo(q) == std::sqrt(8));
-    }
-
     surface window{};
     window.setup({.width = WIDTH, .height = HEIGHT}, TITLE);
 
@@ -1109,28 +1350,27 @@ try
         field<"submit_click">(null_submit_ptr),
         field<"submit_double_click">(null_submit_ptr),
         field<"detach_key">(member_detach_key{}),
-        method<"publish">([]<typename Self, typename Frame>(Self &self,
-                                                            Frame &&frame) noexcept {
-            const auto &[ctx, ch] = frame; // ctx 查历史，ch 查变化
-            switch (ch.change)
-            {
-            case arena_event::ChangeType::PointerButton:
-                if (ch.button.button == arena_event::MouseButton::eMOUSE_BUTTON_LEFT &&
-                    ch.button.transition == arena_event::Transition::Release)
-                    self.template invoke<"click">(frame);
-                break;
-            case arena_event::ChangeType::PointerDownMove:
-                // 一定是"按着按钮在移动"→ drag
-                self.template invoke<"drag">(frame);
-                break;
-            case arena_event::ChangeType::PointerUpMove:
-                // 一定是"悬停移动"→ hover 高亮 / tooltip / 光标形状
-                self.template invoke<"hover">(frame);
-                break;
-            default:
-                break;
-            }
-        }),
+        field<"click_recognizer">(click_recognizer{}),
+        method<"publish">(
+            []<typename Self, typename Frame>(Self &self, Frame &&frame) noexcept {
+                const auto &[ctx, ch] = frame; // ctx 查历史，ch 查变化
+
+                std::println("Frame-change: {}", ch.change);
+                self.template invoke<"click">(frame);
+                switch (ch.change)
+                {
+                case arena_event::ChangeType::PointerDownMove:
+                    // 一定是"按着按钮在移动"→ drag
+                    self.template invoke<"drag">(frame);
+                    break;
+                case arena_event::ChangeType::PointerUpMove:
+                    // 一定是"悬停移动"→ hover 高亮 / tooltip / 光标形状
+                    self.template invoke<"hover">(frame);
+                    break;
+                default:
+                    break;
+                }
+            }),
         method<"bind_arena">(
             []<typename Self, typename Arena>(Self &self, Arena &arena) noexcept {
                 self.arena_ptr = &arena;
@@ -1143,7 +1383,8 @@ try
             }),
         method<"click">([](auto &self, auto e) noexcept {
             // self.submit_click(self.arena_ptr, submit_flag::win, &self, "click");
-            std::println("recognizer click...");
+            // std::println("recognizer click...");
+            self.click_recognizer.identify(e);
         }),
         method<"double_click">([](auto &self, auto e) noexcept {
             // self.submit_double_click(self.arena_ptr, submit_flag::win, &self,

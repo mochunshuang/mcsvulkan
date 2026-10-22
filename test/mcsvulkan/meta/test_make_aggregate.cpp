@@ -231,9 +231,66 @@ static_assert(test_func1(object{})); // true：返回 int，可以编译期求�
 static_assert(test_func2(object{})); // C++17: false
 // C++20: true（std::string 在 C++20 起可 constexpr）
 
+void test_make_aggregate_equiv()
+{
+    // ---- 1) 手写类型 ----
+    struct Counter
+    {
+        int base;
+        int step;
+        constexpr int next(int n) const noexcept
+        {
+            return base + step * n;
+        }
+    };
+
+    // ---- 2) 手写使用（constexpr 求值） ----
+    constexpr Counter c{100, 7};
+    static_assert(c.next(3) == 121);
+    static_assert(sizeof(Counter) == 2 * sizeof(int));
+    static_assert(alignof(Counter) == alignof(int));
+
+    // ---- 3) make_aggregate 等价写 ----
+    constexpr auto agg = make_aggregate<"Counter", "base", "step", "next">(
+        100, 7,
+        [](auto &&self, int n) constexpr noexcept { return self.base + self.step * n; });
+    using T = decltype(agg);
+
+    // ---- 4) 等价性 static_assert ----
+
+    // 4.1 名字
+    static_assert(T::class_name == "Counter");
+
+    // 4.2 成员数量
+    static_assert(T::members.size() == 3);
+
+    // 4.3 成员类型
+    static_assert(std::is_same_v<decltype(agg.base), int>);
+    static_assert(std::is_same_v<decltype(agg.step), int>);
+
+    // 4.4 大小 / 对齐（make_aggregate 用 EBO 继承函数成员，不占空间）
+    static_assert(sizeof(T) == sizeof(Counter));
+    static_assert(alignof(T) == alignof(Counter));
+
+    // 4.5 语义一致：invoke 与手写成员函数结果一致
+    static_assert(agg.template invoke<"next">(3) == c.next(3));
+
+    // 4.6 with + bind_member 抽取成员，同样保持等价
+    constexpr auto r = agg.template with(
+        []([[= bind_member{"base"}]] int b, int extra) constexpr { return b + extra; },
+        50);
+    static_assert(r == c.base + 50);
+
+    // ---- 5) 运行时断言（防止 constexpr 路径漏掉边界）----
+    assert(agg.base == c.base);
+    assert(agg.step == c.step);
+    assert(agg.template invoke<"next">(3) == c.next(3));
+}
+
 int main()
 try
 {
+    test_make_aggregate_equiv();
     test_constexpr();
 
     auto b = make_aggregate<"class", "x", "fn">(1, [](auto &&self, auto value) noexcept {

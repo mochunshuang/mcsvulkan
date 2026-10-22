@@ -115,9 +115,84 @@ constexpr meta::info r_ic = meta::substitute(^^std::integral_constant,
 using ICType = typename[:r_ic:];
 static_assert(ICType::value == 5u); // 验证值
 
+// ======================== 4. substitute 对模板参数包的自动展开 ========================
+// 验证：目标模板是 template <class... Ls> 时，
+// substitute 会把 reflection range 的每个元素依次绑定到 Ls...。
+// 即 sizeof...(Ls) == range.size()，且第 i 个元素对应第 i 个 Ls。
+
+namespace pack_expand_test
+{
+    // 纯参数包模板：记录展开后的数量、每个实参的反射、每个实参的类型
+    template <class... Ls>
+    struct shape
+    {
+        static constexpr std::size_t n = sizeof...(Ls);
+        static constexpr std::array<std::meta::info, sizeof...(Ls)> infos{^^Ls...};
+        using types = std::tuple<Ls...>;
+    };
+
+    // 模拟叶子类型（每个都带 machine 成员，与真实叶子形态一致）
+    struct L1
+    {
+        using machine = int;
+    };
+    struct L2
+    {
+        using machine = double;
+    };
+    struct L3
+    {
+        using machine = char;
+    };
+    struct L4
+    {
+        using machine = long;
+    };
+} // namespace pack_expand_test
+
 // ======================== 3. 入口 ========================
 int main()
 {
+    // NOTE: 反射和模板是两个语法
+    // 4.1 3 个元素 → Ls... 展开为 3 个类型，顺序一致
+    {
+        using S = typename[:std::meta::substitute(
+                                ^^pack_expand_test::shape,
+                                std::define_static_array(std::array{
+                                    ^^pack_expand_test::L1, ^^pack_expand_test::L2,
+                                    ^^pack_expand_test::L3})):];
+
+        static_assert(S::n == 3);                             // 参数包长度为 3
+        static_assert(S::infos[0] == ^^pack_expand_test::L1); // 顺序绑定
+        static_assert(S::infos[1] == ^^pack_expand_test::L2);
+        static_assert(S::infos[2] == ^^pack_expand_test::L3);
+        static_assert(std::is_same_v<std::tuple_element_t<0, typename S::types>,
+                                     pack_expand_test::L1>);
+        static_assert(std::is_same_v<std::tuple_element_t<2, typename S::types>,
+                                     pack_expand_test::L3>);
+    }
+
+    // 4.2 4 个元素 → 展开为 4 个类型（数量随 range 长度变化）
+    {
+        using S = typename[:std::meta::substitute(
+                                ^^pack_expand_test::shape,
+                                std::define_static_array(std::array{
+                                    ^^pack_expand_test::L1, ^^pack_expand_test::L2,
+                                    ^^pack_expand_test::L3, ^^pack_expand_test::L4})):];
+        static_assert(S::n == 4);
+        static_assert(std::is_same_v<std::tuple_element_t<3, typename S::types>,
+                                     pack_expand_test::L4>);
+    }
+
+    // 4.3 空 range → 展开为 0 个类型（边界）
+    {
+        using S =
+            typename[:std::meta::substitute(
+                          ^^pack_expand_test::shape,
+                          std::define_static_array(std::array<std::meta::info, 0>{})):];
+        static_assert(S::n == 0);
+    }
+
     std::cout << "All substitute / can_substitute tests passed.\n";
     return 0;
 }

@@ -122,6 +122,15 @@ void print3()
     std::println();
     // iota(a, b) 生成 [a, b)，所以 iota(1, N+1) 给 1..N。
 }
+void print4()
+{
+    std::print("\nprint4: ");
+    // template for (constexpr auto e : 4) // 不可以如此单纯
+    // {
+    //     std::print("{}", e);
+    // }
+    std::println();
+}
 
 void print()
 {
@@ -142,6 +151,7 @@ try
     {
         std::println("{}", e);
     }
+    print4();
     std::cout << "main done\n";
     return 0;
 }
