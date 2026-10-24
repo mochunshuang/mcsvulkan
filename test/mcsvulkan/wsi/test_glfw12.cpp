@@ -551,7 +551,6 @@ namespace uhi
         superseded // 让位
     };
 
-
     // ═══════════════════════════════════════════════════════════════════
     // 0.1 FSM：引擎只问这五个问题（答案全在这里，别处不再探成员）
     //
@@ -614,7 +613,9 @@ namespace uhi
         concept has_reset = requires(M &m) { m.reset(); };
 
         template <class M>
-        concept reset_ok = !has_reset<M> || requires(M &m) { { m.reset() } noexcept; };
+        concept reset_ok = !has_reset<M> || requires(M &m) {
+            { m.reset() } noexcept;
+        };
 
         template <class M>
         constexpr void reset(M &m) noexcept
@@ -768,22 +769,23 @@ namespace uhi
     //               多个 kind 可以共用同一个回调（比如都是 on_click，
     //               各自带不同 payload，由回调自己 if constexpr 分流）。
     //   不写 FnName 时就等于 Name：最简单的用法不用提它。
-    template <fsm::machine Fsm, static_string Name, std::uint64_t HoldMs = 0,
-              static_string FnName = Name>
+    template <fsm::machine Fsm>
     struct leaf
     {
-        using machine = Fsm;               // 叶子协议：我的状态机类型（反射靠它认出叶子）
-        static constexpr auto name = Name; // kind 的身份
-        static constexpr auto fn_name = FnName; // 回调的名字（invoke<fn_name>）
+        using machine = Fsm; // 叶子协议：我的状态机类型（反射靠它认出叶子）
+        static constexpr auto name = Fsm::name;       // kind 的身份
+        static constexpr auto fn_name = Fsm::fn_name; // 回调的名字（invoke<fn_name>）
+        static constexpr auto hold_ms = Fsm::hold_ms;
+
         // 兜底时限用无符号毫秒：不可能为负这件事写在类型里
         static constexpr std::chrono::nanoseconds hold =
             std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::milliseconds{static_cast<std::int64_t>(HoldMs)});
+                std::chrono::milliseconds{static_cast<std::int64_t>(hold_ms)});
 
         static consteval plan_data plan()
         {
             return plan_data{
-                .kinds = {{Name, FnName, detail::type_name<fsm::frame_t<Fsm>>(), hold}},
+                .kinds = {{name, fn_name, detail::type_name<fsm::frame_t<Fsm>>(), hold}},
                 .awaits = {},
                 .excl = {}};
         }
@@ -1338,7 +1340,6 @@ namespace uhi
             return m;
         }
 
-
         // 【新】裁决不再写在 stage 里：stage 只保留"对外展示"的四列（alive/pending/begin/end），
         //        它们是 run_arbiter 每帧从各 fsm 现问现算出来的投影，不是权威状态。
     };
@@ -1403,7 +1404,6 @@ namespace uhi
         }
     };
 
-
     // ═══════════════════════════════════════════════════════════════════
     // 9. ui：纯功能。一个坐标系装下全部
     //      fsms[i] / 现场第 i 位 / sinks[i] / names[i] / beats[i]
@@ -1421,15 +1421,15 @@ namespace uhi
         static constexpr std::size_t S = shape::n;
         using fsms_t = typename shape::fsms;
 
-        fsms_t fsms{};             // 识别器（声明序）
-        stage<Tree> st{};          // 现场表
+        fsms_t fsms{};               // 识别器（声明序）
+        stage<Tree> st{};            // 现场表
         std::array<sink, S> sinks{}; // 落地表
 
         // 判决落地（唯一副作用点）。Flat 是编译期常量。
         //   t 非空 ⇒ 顺带记一条事件（观测是"要就给、不要就零"）
         template <std::size_t Flat>
-        constexpr void on_verdict(bool accepted, time_point b, time_point e, time_point at,
-                                  trace *t) noexcept
+        constexpr void on_verdict(bool accepted, time_point b, time_point e,
+                                  time_point at, trace *t) noexcept
         {
             const void *p = nullptr;
             if constexpr (fsm::can_payload<std::tuple_element_t<Flat, fsms_t>>)
@@ -1438,7 +1438,8 @@ namespace uhi
                 sinks[Flat](p); // 载荷在 reset 之前取
             if (t != nullptr)
                 t->push(event{law::names[Flat].view(),
-                              accepted ? verdict::accepted : verdict::superseded, at, b, e});
+                              accepted ? verdict::accepted : verdict::superseded, at, b,
+                              e});
         }
 
         template <std::size_t Flat>
@@ -1501,8 +1502,8 @@ namespace uhi
         void run_arbiter(time_point now, trace *obs) noexcept
         {
             std::array<step_t, S> sig{};
-            template for (constexpr auto I : std::ranges::views::indices(S))
-                sig[I] = std::get<I>(fsms).step(); // ① 现问
+            template for (constexpr auto I : std::ranges::views::indices(S)) sig[I] =
+                std::get<I>(fsms).step(); // ① 现问
 
             // ①.5 收票：aborted = 放弃。必须复位识别器并退场；
             //     旧版把它当"非 idle ⇒ 还在场"，于是超时的 dbl/triple
@@ -1657,10 +1658,11 @@ namespace uhi
                 if (law::hold[i] != std::chrono::nanoseconds::zero())
                 {
                     out += "(hold ";
-                    put_num(out, static_cast<std::uint64_t>(
-                                     std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         law::hold[i])
-                                         .count()));
+                    put_num(out,
+                            static_cast<std::uint64_t>(
+                                std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    law::hold[i])
+                                    .count()));
                     out += "ms)";
                 }
             }
@@ -1682,7 +1684,6 @@ namespace uhi
 } // namespace uhi
 
 // ═══════════════════════════════════════════════════════════════════════════
-
 
 #include <cmath>
 #include <format>
@@ -1777,9 +1778,13 @@ namespace app
     };
 
     // ── 单击 ────────────────────────────────────────────────────────
+    template <static_string Name, std::uint64_t HoldMs = 0, static_string FnName = Name>
     struct single_click : fsm_state
     {
         using frame_type = mouse_frame;
+        static constexpr auto name = Name;
+        static constexpr auto hold_ms = HoldMs;
+        static constexpr auto fn_name = Name;
 
         struct payload_t
         {
@@ -1813,10 +1818,14 @@ namespace app
     // ── N 连击：连续 N 次有效单击，每两击之间独立计时 ────────────────
     //    所以间隔不必相同：只要每一档都 ≤ GapMs 就算。
     //    窗口一过就 aborted —— 把机会让给更简单的解释（单击）。
-    template <int N, std::int64_t GapMs>
+    template <int N, std::int64_t GapMs, static_string Name, std::uint64_t HoldMs = 0,
+              static_string FnName = Name>
     struct click_chain : fsm_state
     {
         using frame_type = mouse_frame;
+        static constexpr auto name = Name;
+        static constexpr auto hold_ms = HoldMs;
+        static constexpr auto fn_name = Name;
 
         struct payload_t
         {
@@ -1948,9 +1957,14 @@ namespace app
     };
 
     // 开始：一次按下只报一次
+    template <static_string Name, std::uint64_t HoldMs = 0, static_string FnName = Name>
     struct drag_begin : fsm_state
     {
         using frame_type = mouse_frame;
+        static constexpr auto name = Name;
+        static constexpr auto hold_ms = HoldMs;
+        static constexpr auto fn_name = Name;
+
         drag_payload payload{};
         drag_track t{};
         bool begun = false;
@@ -1990,9 +2004,14 @@ namespace app
     // 移动：越界之后每一次移动都报（流式）
     //   注意判据是"已经进入拖拽"这个**闩**，不是"这一帧离按下点够远"——
     //   否则拖回原处那一下就不报了。
+    template <static_string Name, std::uint64_t HoldMs = 0, static_string FnName = Name>
     struct drag_move : fsm_state
     {
         using frame_type = mouse_frame;
+        static constexpr auto name = Name;
+        static constexpr auto hold_ms = HoldMs;
+        static constexpr auto fn_name = Name;
+
         drag_payload payload{};
         drag_track t{};
         bool dragging = false; // 越过一次阈值就置位，直到松手
@@ -2033,9 +2052,14 @@ namespace app
     };
 
     // 释放：越界之后松手才报（没拖过就不报）
+    template <static_string Name, std::uint64_t HoldMs = 0, static_string FnName = Name>
     struct drag_end : fsm_state
     {
         using frame_type = mouse_frame;
+        static constexpr auto name = Name;
+        static constexpr auto hold_ms = HoldMs;
+        static constexpr auto fn_name = Name;
+
         drag_payload payload{};
         drag_track t{};
         bool past = false;
@@ -2074,9 +2098,14 @@ namespace app
     };
 
     // ── 悬停：指针进入窗口时报一次（离开不算事件）──────────────────
+    template <static_string Name, std::uint64_t HoldMs = 0, static_string FnName = Name>
     struct hover : fsm_state
     {
         using frame_type = mouse_frame;
+        static constexpr auto name = Name;
+        static constexpr auto hold_ms = HoldMs;
+        static constexpr auto fn_name = Name;
+
         uhi::step_t feed(const mouse_frame &f, uhi::time_point) noexcept
         {
             return f.what == mouse_frame::enter ? uhi::step_t::done : uhi::step_t::hold;
@@ -2084,9 +2113,14 @@ namespace app
     };
 
     // ── 滚轮：一格一次（delta 交给载荷）────────────────────────────
+    template <static_string Name, std::uint64_t HoldMs = 0, static_string FnName = Name>
     struct wheel : fsm_state
     {
         using frame_type = mouse_frame;
+        static constexpr auto name = Name;
+        static constexpr auto hold_ms = HoldMs;
+        static constexpr auto fn_name = Name;
+
         struct payload_t
         {
             int delta = 0;
@@ -2102,9 +2136,14 @@ namespace app
     };
 
     // ── 键盘 A ─────────────────────────────────────────────────────
+    template <static_string Name, std::uint64_t HoldMs = 0, static_string FnName = Name>
     struct key_a : fsm_state
     {
         using frame_type = kb_frame;
+        static constexpr auto name = Name;
+        static constexpr auto hold_ms = HoldMs;
+        static constexpr auto fn_name = Name;
+
         uhi::step_t feed(const kb_frame &f, uhi::time_point) noexcept
         {
             return (f.press && f.key == 'A') ? uhi::step_t::done : uhi::step_t::hold;
@@ -2113,15 +2152,15 @@ namespace app
 
     // ── 叶子：name 是 kind 的身份（进日志）；最后一个参数是回调名 ───
     //    拖拽三段名字不同（日志能分开），但回调名都叫 on_drag（共用一个处理器）。
-    using l_click = uhi::leaf<single_click, "on_click">;
-    using l_dbl = uhi::leaf<click_chain<2, dbl_gap_ms>, "on_dbl">;
-    using l_triple = uhi::leaf<click_chain<3, triple_gap_ms>, "on_triple">;
-    using l_drag_begin = uhi::leaf<drag_begin, "on_drag_begin", 0, "on_drag">;
-    using l_drag_move = uhi::leaf<drag_move, "on_drag_move", 0, "on_drag">;
-    using l_drag_end = uhi::leaf<drag_end, "on_drag_end", 0, "on_drag">;
-    using l_hover = uhi::leaf<hover, "on_hover">;
-    using l_wheel = uhi::leaf<wheel, "on_wheel">;
-    using l_key = uhi::leaf<key_a, "on_key_A">;
+    using l_click = uhi::leaf<single_click<"on_click">>;
+    using l_dbl = uhi::leaf<click_chain<2, dbl_gap_ms, "on_dbl">>;
+    using l_triple = uhi::leaf<click_chain<3, triple_gap_ms, "on_triple">>;
+    using l_drag_begin = uhi::leaf<drag_begin<"on_drag_begin", 0, "on_drag">>;
+    using l_drag_move = uhi::leaf<drag_move<"on_drag_move", 0, "on_drag">>;
+    using l_drag_end = uhi::leaf<drag_end<"on_drag_end", 0, "on_drag">>;
+    using l_hover = uhi::leaf<hover<"on_hover">>;
+    using l_wheel = uhi::leaf<wheel<"on_wheel">>;
+    using l_key = uhi::leaf<key_a<"on_key_A">>;
 
     // ── 树：只声明"谁比谁具体"，不写任何顺序 ───────────────────────
     //    refines<A, B> 读作"A 等 B" ⇒ **B 更具体，B 赢**（第二个参数才是细的）。
@@ -2193,29 +2232,26 @@ namespace app
             field<"frames">(0u),             //
 
             // ── 赢家落地：参数个数要和载荷对得上 ──
-            method<"on_click">([](auto &self, const single_click::payload_t &p) noexcept {
+            method<"on_click">([](auto &self, auto &&p) noexcept {
                 ++self.tally.click;
                 self.tally.x = p.x;
                 self.tally.y = p.y;
                 std::println("  >>> 单击    (x={:.1f}, y={:.1f})", p.x, p.y);
             }),
-            method<"on_dbl">(
-                [](auto &self, const click_chain<2, dbl_gap_ms>::payload_t &p) noexcept {
-                    ++self.tally.dbl;
-                    self.tally.x = p.x;
-                    self.tally.y = p.y;
-                    std::println("  >>> 双击    (x={:.1f}, y={:.1f}, 共 {} 次)", p.x, p.y,
-                                 p.count);
-                }),
-            method<"on_triple">(
-                [](auto &self,
-                   const click_chain<3, triple_gap_ms>::payload_t &p) noexcept {
-                    ++self.tally.triple;
-                    self.tally.x = p.x;
-                    self.tally.y = p.y;
-                    std::println("  >>> 三击    (x={:.1f}, y={:.1f}, 共 {} 次)", p.x, p.y,
-                                 p.count);
-                }),
+            method<"on_dbl">([](auto &self, auto &&p) noexcept {
+                ++self.tally.dbl;
+                self.tally.x = p.x;
+                self.tally.y = p.y;
+                std::println("  >>> 双击    (x={:.1f}, y={:.1f}, 共 {} 次)", p.x, p.y,
+                             p.count);
+            }),
+            method<"on_triple">([](auto &self, auto &&p) noexcept {
+                ++self.tally.triple;
+                self.tally.x = p.x;
+                self.tally.y = p.y;
+                std::println("  >>> 三击    (x={:.1f}, y={:.1f}, 共 {} 次)", p.x, p.y,
+                             p.count);
+            }),
             // 拖拽三段共用的回调：p 用 auto&& 接，引擎按叶子的载荷类型转发
             method<"on_drag">([](auto &self, auto &&p) noexcept {
                 using pt = drag_payload::phase_t;
@@ -2245,7 +2281,7 @@ namespace app
                 ++self.tally.hover;
                 std::println("  >>> 悬停    进入窗口");
             }),
-            method<"on_wheel">([](auto &self, const wheel::payload_t &p) noexcept {
+            method<"on_wheel">([](auto &self, auto &&p) noexcept {
                 ++self.tally.wheel;
                 self.tally.delta = p.delta;
                 std::println("  >>> 滚轮    (delta={})", p.delta);
