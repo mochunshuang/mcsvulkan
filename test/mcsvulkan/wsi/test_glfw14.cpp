@@ -531,7 +531,7 @@ namespace uhi
 
         template <class M>
         concept machine = std::default_initializable<M> && requires(M &m, time_point t) {
-            typename M::consume_t; // 我吃哪些原始事件：Tree 的 frame_types 由它算
+            typename M::consume_t; // 我处理哪些 arena_event change
             { m.tick(t) } noexcept -> std::same_as<step_t>;
             { m.win() } noexcept -> std::same_as<step_t>;
             { m.lose() } noexcept -> std::same_as<step_t>;
@@ -1023,21 +1023,18 @@ namespace uhi
             using type = typename merge_all<L, typename Fs::consume_t...>::type;
         };
 
-        template <template <class> class FrameOf, class L>
-        struct map_frames;
-
-        template <template <class> class FrameOf, class... Es>
-        struct map_frames<FrameOf, type_list<Es...>>
-        {
-            using type = std::tuple<FrameOf<Es>...>;
-        };
-
         template <class Tree>
-        using events_of =
+        using change_types_of =
             typename union_consume<type_list<>, typename shape_of<Tree>::fsms>::type;
 
-        template <class Tree, template <class> class FrameOf>
-        using frames_of = typename map_frames<FrameOf, events_of<Tree>>::type;
+        template <class L>
+        struct as_tuple;
+
+        template <class... Ts>
+        struct as_tuple<type_list<Ts...>>
+        {
+            using type = std::tuple<Ts...>;
+        };
     } // namespace detail
 
     // 结构的公开自查数字
@@ -1116,21 +1113,22 @@ namespace uhi
     //    构造完断言对角线为空 ⇒ 矩阵是**严格偏序** ⇒ 极大元唯一
     //    ⇒ 下面的选择律与"谁先被看"无关。这就是自然选择。
     // ═══════════════════════════════════════════════════════════════════
-    template <class Tree, template <class> class FrameOf>
+    template <class Tree>
     struct law_of
     {
         using shape = detail::shape_of<Tree>;
         using fsms_t = typename shape::fsms;
-        using frame_types = detail::frames_of<Tree, FrameOf>;
+        using change_types = typename detail::as_tuple<
+            typename detail::union_consume<detail::type_list<>, fsms_t>::type>::type;
         static constexpr std::size_t S = leaf_count_v<Tree>;
-        static constexpr std::size_t F = std::tuple_size_v<frame_types>;
+        static constexpr std::size_t C = std::tuple_size_v<change_types>;
 
         // 上限先断言：S 超过 max_kinds 就别往下算了（理由见 max_kinds 的注释）
         static_assert(S >= 1, "一片叶子都没有的树没有意义");
         static_assert(S <= max_kinds,
                       "叶子太多：上限见 uhi::max_kinds（=64）。"
                       "位图放得下，是 validate 的 Kahn 会撞编译期运算上限");
-        static_assert(F >= 1, "frame_types 不能为空");
+        static_assert(C >= 1, "change_types 不能为空");
 
         // 行：i 打得赢谁
         static constexpr std::array<bset<S>, S> beats = []() consteval {
@@ -1150,27 +1148,26 @@ namespace uhi
                 if (m[i].has(i))
                     throw "beats 有环：refines / one_of 互相指向，结构不成立";
 
-            // 每个 kind 能吃哪些 frame：不手写，直接问 feed 重载。
-            // 两个 kind 能冲突 ⇔ 它们的 accepted-frame 集合有交集。
-            std::array<bset<F>, S> frames{};
+            // 每个 kind 消费哪些 change：来自它自己的 consume_t。
+            std::array<bset<C>, S> consumes{};
             template for (constexpr auto I : std::ranges::views::indices(S))
             {
                 using M = std::tuple_element_t<I, fsms_t>;
-                template for (constexpr auto J : std::ranges::views::indices(F))
+                template for (constexpr auto J : std::ranges::views::indices(C))
                 {
-                    using Fr = std::tuple_element_t<J, frame_types>;
-                    if constexpr (fsm::can_step<M, Fr>)
-                        frames[I].set(J);
+                    using Ch = std::tuple_element_t<J, change_types>;
+                    if constexpr (detail::in_tuple<Ch, typename M::consume_t>::value)
+                        consumes[I].set(J);
                 }
-                if (frames[I].none())
-                    throw "kind 不接受 frame_types 里的任何帧（检查 feed 重载）";
+                if (consumes[I].none())
+                    throw "kind 不消费任何 arena_event change";
             }
 
             // 关系两端必须能相遇：否则这条边是数据/实现不匹配，编译期就拒绝。
             for (index_t i = 0; i < S; ++i)
                 for (index_t j = 0; j < S; ++j)
-                    if (m[i].has(j) && (frames[i] & frames[j]).none())
-                        throw "beats 跨 frame：关系两端没有任何共同帧";
+                    if (m[i].has(j) && (consumes[i] & consumes[j]).none())
+                        throw "beats 跨 change：关系两端没有共同变化类型";
             return m;
         }();
 
@@ -1197,7 +1194,7 @@ namespace uhi
     //          beats[N]（编译期静态表）
     //    输出：win / lose 两个位图
     //
-    //    它不知道 Frame、input_context、payload、span、识别器类型，
+    //    它不知道 Frame、arena_event、payload、span、识别器类型，
     //    也不调用任何识别器。调用 win/lose 是 session 的事。
     // ═══════════════════════════════════════════════════════════════════
     template <std::size_t S>
@@ -1245,12 +1242,11 @@ namespace uhi
     //
     //    识别器不认识表，裁决器不认识识别器；session 是组合根。
     // ═══════════════════════════════════════════════════════════════════
-    template <class Tree, template <class> class FrameOf>
+    template <class Tree>
     struct ui
     {
         using shape = detail::shape_of<Tree>;
-        using law = law_of<Tree, FrameOf>;
-        using frame_types = typename law::frame_types;
+        using law = law_of<Tree>;
         static constexpr std::size_t S = shape::n;
         using fsms_t = typename shape::fsms;
 
@@ -1267,13 +1263,9 @@ namespace uhi
         }
 
         // 推进一帧：只有能接受这个 Frame 的识别器被推进，其余保留上一次上报。
-        // 不在 frame_types 里的帧直接丢弃：它没有被编译期校验过，不能进裁决。
         template <class Frame>
         constexpr void feed(const Frame &f, time_point now, trace *obs = nullptr) noexcept
         {
-            if constexpr (!detail::in_tuple<Frame, frame_types>::value)
-                return;
-
             constexpr bset<S> scope = scope_of<Tree, Frame>();
             if constexpr (scope.none())
                 return;
@@ -1330,12 +1322,12 @@ namespace uhi
     //   这一层是"用户代码"：记录 trace。删掉它，第 1–9 节照样编译、照样跑。
     //   它不改变判决：只是把 ui 产生的 verdict 顺手抄一份。
     // ═══════════════════════════════════════════════════════════════════
-    template <class Tree, template <class> class FrameOf>
-    struct debug_ui : ui<Tree, FrameOf>
+    template <class Tree>
+    struct debug_ui : ui<Tree>
     {
-        using law = law_of<Tree, FrameOf>;
+        using law = law_of<Tree>;
         static constexpr std::size_t S = law::S;
-        using ui_type = ui<Tree, FrameOf>;
+        using ui_type = ui<Tree>;
 
         trace obs{};
 
@@ -1372,6 +1364,303 @@ namespace uhi
 } // namespace uhi
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  arena_event：GLFW 与识别器之间的跨平台中间层
+//    event_context：变化前仍成立的全部状态（keys / buttons / modifier / pointer）
+//    input_frame<T>：context + 本帧变化 T（T 是具体的 change 类型）
+//  FSM 只看 arena_event::input_frame<T>，不看 GLFW 事件。
+// ═══════════════════════════════════════════════════════════════════════════
+namespace arena_event
+{
+    enum class PointerDevice : std::uint8_t
+    {
+        Unknown,
+        Touch,
+        Mouse,
+        Stylus,
+        InvertedStylus,
+        Trackpad
+    };
+
+    struct PointerId
+    {
+        constexpr static std::uint32_t Invalid = static_cast<std::uint32_t>(~0);
+        std::uint32_t value{Invalid};
+    };
+
+    using Key = mcs::vulkan::event::Key;
+    using scroll_event = mcs::vulkan::event::scroll_event;
+    using cursor_enter_event = mcs::vulkan::event::cursor_enter_event;
+
+    enum class MouseButton : std::uint8_t
+    {
+        eUNDEFINED = 0xFF,
+        eMOUSE_BUTTON_1 = 0,
+        eMOUSE_BUTTON_2 = 1,
+        eMOUSE_BUTTON_3 = 2,
+        eMOUSE_BUTTON_4 = 3,
+        eMOUSE_BUTTON_5 = 4,
+        eMOUSE_BUTTON_6 = 5,
+        eMOUSE_BUTTON_7 = 6,
+        eMOUSE_BUTTON_8 = 7,
+        eMOUSE_BUTTON_LAST = eMOUSE_BUTTON_8,
+        eMOUSE_BUTTON_LEFT = eMOUSE_BUTTON_1,
+        eMOUSE_BUTTON_RIGHT = eMOUSE_BUTTON_2,
+        eMOUSE_BUTTON_MIDDLE = eMOUSE_BUTTON_3,
+        eSIZE = static_cast<std::uint8_t>(eMOUSE_BUTTON_LAST) + 1
+    };
+
+    enum class HeldState : std::uint8_t
+    {
+        Up,
+        Down
+    };
+    enum class Transition : std::uint8_t
+    {
+        Press,
+        Release
+    };
+    enum class PointerState : std::uint8_t
+    {
+        Outside,
+        Hover,
+        Down,
+        DownMove
+    };
+
+    struct event_context
+    {
+        std::array<HeldState, std::to_underlying(Key::eSIZE)> keys{};
+        std::array<HeldState, static_cast<std::size_t>(MouseButton::eSIZE)> buttons{};
+        ModifierKey modifier{};
+
+        PointerState pointer_state = PointerState::Outside;
+        PointerDevice pointer_device = PointerDevice::Unknown;
+        double pointer_x = 0.0;
+        double pointer_y = 0.0;
+        bool pointer_position_valid = false;
+
+        decltype(auto) get_keyboard_event(this auto &&self, Key k) noexcept
+        {
+            return std::forward_like<decltype(self)>(self.keys[std::to_underlying(k)]);
+        }
+
+        decltype(auto) get_mousebutton_event(this auto &&self, MouseButton b) noexcept
+        {
+            return std::forward_like<decltype(self)>(self.buttons[std::to_underlying(b)]);
+        }
+
+        bool any_button_down() const noexcept
+        {
+            for (auto s : buttons)
+                if (s == HeldState::Down)
+                    return true;
+            return false;
+        }
+    };
+
+    struct key_change
+    {
+        Key key{};
+        Transition transition{};
+        bool repeat{};
+        ModifierKey modifier{};
+    };
+
+    struct button_change
+    {
+        MouseButton button{};
+        Transition transition{};
+        bool repeat{};
+        ModifierKey modifier{};
+    };
+
+    struct move_change
+    {
+        double x = 0.0, y = 0.0;
+        double dx = 0.0, dy = 0.0;
+    };
+
+    struct char_change
+    {
+        unsigned codepoint = 0;
+    };
+
+    template <class T>
+    struct input_frame
+    {
+        event_context context;
+        T change;
+    };
+
+    template <class T>
+    inline constexpr bool is_change =
+        std::same_as<T, key_change> || std::same_as<T, button_change> ||
+        std::same_as<T, move_change> ||
+        std::same_as<T, mcs::vulkan::event::scroll_event> ||
+        std::same_as<T, mcs::vulkan::event::cursor_enter_event> ||
+        std::same_as<T, char_change>;
+
+    template <class Tuple>
+    struct only_changes;
+
+    template <class... Ts>
+    struct only_changes<std::tuple<Ts...>> : std::bool_constant<(is_change<Ts> && ...)>
+    {
+    };
+
+    template <class... Ts>
+    struct changes_checked
+    {
+        static_assert((is_change<Ts> && ...),
+                      "consume_t 只允许 arena_event 的 change 类型");
+        using type = std::tuple<Ts...>;
+    };
+
+    template <class... Ts>
+    using changes = typename changes_checked<Ts...>::type;
+
+    template <class PlatformButton>
+    static constexpr MouseButton map_button(PlatformButton b) noexcept
+    {
+        using P = PlatformButton;
+        switch (b)
+        {
+        case P::eMOUSE_BUTTON_LEFT:
+            return MouseButton::eMOUSE_BUTTON_LEFT;
+        case P::eMOUSE_BUTTON_RIGHT:
+            return MouseButton::eMOUSE_BUTTON_RIGHT;
+        case P::eMOUSE_BUTTON_MIDDLE:
+            return MouseButton::eMOUSE_BUTTON_MIDDLE;
+        case P::eMOUSE_BUTTON_4:
+            return MouseButton::eMOUSE_BUTTON_4;
+        case P::eMOUSE_BUTTON_5:
+            return MouseButton::eMOUSE_BUTTON_5;
+        case P::eMOUSE_BUTTON_6:
+            return MouseButton::eMOUSE_BUTTON_6;
+        case P::eMOUSE_BUTTON_7:
+            return MouseButton::eMOUSE_BUTTON_7;
+        case P::eMOUSE_BUTTON_8:
+            return MouseButton::eMOUSE_BUTTON_8;
+        case P::eMOUSE_BUTTON_LAST:
+            return MouseButton::eMOUSE_BUTTON_LAST;
+        default:
+            return MouseButton::eUNDEFINED;
+        }
+    }
+
+    template <class Event>
+    static constexpr auto build_change(const event_context &ctx, const Event &e) noexcept
+    {
+        using T = std::remove_cvref_t<Event>;
+
+        if constexpr (std::same_as<T, mcs::vulkan::event::keyboard_event>)
+        {
+            return input_frame<key_change>{ctx, key_change{e.key,
+                                                           (e.press() || e.repeat())
+                                                               ? Transition::Press
+                                                               : Transition::Release,
+                                                           e.repeat(), e.modifier_key}};
+        }
+        else if constexpr (std::same_as<T, mcs::vulkan::event::mousebutton_event>)
+        {
+            return input_frame<button_change>{
+                ctx, button_change{map_button(e.button),
+                                   (e.press() || e.repeat()) ? Transition::Press
+                                                             : Transition::Release,
+                                   e.repeat(), e.modifier_key}};
+        }
+        else if constexpr (std::same_as<T, mcs::vulkan::event::position2d_event>)
+        {
+            const double dx = ctx.pointer_position_valid ? e.xpos - ctx.pointer_x : 0.0;
+            const double dy = ctx.pointer_position_valid ? e.ypos - ctx.pointer_y : 0.0;
+            return input_frame<move_change>{ctx, move_change{e.xpos, e.ypos, dx, dy}};
+        }
+        else if constexpr (std::same_as<T, mcs::vulkan::event::scroll_event>)
+        {
+            return input_frame<mcs::vulkan::event::scroll_event>{ctx, e};
+        }
+        else if constexpr (std::same_as<T, mcs::vulkan::event::cursor_enter_event>)
+        {
+            return input_frame<mcs::vulkan::event::cursor_enter_event>{ctx, e};
+        }
+        else if constexpr (std::same_as<T, mcs::vulkan::event::char_event>)
+        {
+            return input_frame<char_change>{ctx, char_change{e.codepoint}};
+        }
+        // 其余事件没有 return：auto 推导为 void，调用方不转发。
+    }
+
+    template <class T>
+    static constexpr void apply_change(event_context &ctx,
+                                       const input_frame<T> &f) noexcept
+    {
+        using U = std::remove_cvref_t<T>;
+
+        if constexpr (std::same_as<U, key_change>)
+        {
+            ctx.keys[std::to_underlying(f.change.key)] =
+                f.change.transition == Transition::Press ? HeldState::Down
+                                                         : HeldState::Up;
+            ctx.modifier = f.change.modifier;
+        }
+        else if constexpr (std::same_as<U, button_change>)
+        {
+            ctx.buttons[std::to_underlying(f.change.button)] =
+                f.change.transition == Transition::Press ? HeldState::Down
+                                                         : HeldState::Up;
+            ctx.modifier = f.change.modifier;
+
+            if (f.change.transition == Transition::Press)
+            {
+                ctx.pointer_device = PointerDevice::Mouse;
+                if (ctx.pointer_state != PointerState::DownMove)
+                    ctx.pointer_state = PointerState::Down;
+            }
+            else
+            {
+                if (ctx.any_button_down())
+                {
+                    if (ctx.pointer_state != PointerState::DownMove)
+                        ctx.pointer_state = PointerState::Down;
+                }
+                else
+                {
+                    ctx.pointer_state = (ctx.pointer_state == PointerState::Outside)
+                                            ? PointerState::Outside
+                                            : PointerState::Hover;
+                }
+            }
+        }
+        else if constexpr (std::same_as<U, move_change>)
+        {
+            ctx.pointer_x = f.change.x;
+            ctx.pointer_y = f.change.y;
+            ctx.pointer_position_valid = true;
+            ctx.pointer_state =
+                ctx.any_button_down() ? PointerState::DownMove : PointerState::Hover;
+            if (ctx.pointer_device == PointerDevice::Unknown)
+                ctx.pointer_device = PointerDevice::Mouse;
+        }
+        else if constexpr (std::same_as<U, mcs::vulkan::event::cursor_enter_event>)
+        {
+            if (f.change.value)
+            {
+                ctx.pointer_device = PointerDevice::Mouse;
+                ctx.pointer_state =
+                    ctx.any_button_down() ? PointerState::Down : PointerState::Hover;
+            }
+            else
+            {
+                ctx.pointer_device = PointerDevice::Unknown;
+                ctx.pointer_state = PointerState::Outside;
+                ctx.pointer_position_valid = false;
+            }
+        }
+        // scroll / char：不改变 ctx
+    }
+} // namespace arena_event
+
+// ═══════════════════════════════════════════════════════════════════════════
 
 #include <cmath>
 #include <format>
@@ -1381,9 +1670,10 @@ namespace uhi
 //
 //    glfw 回调
 //      └─ glfw_input_translation            （不动）
-//           └─ arena.input_event(e)         ← 平台事件（本案例只写这一层翻译）
-//                └─ ui.feed(input_context<Event>, now)
-//                     └─ 每个识别器 feed/tick → idle/hold/ready
+//           └─ arena.input_event(e)         ← 平台事件（本案例只写这层翻译）
+//                └─ input_frame<T> { context, change }
+//                     └─ ui.feed(input_frame<T>, now)
+//                          └─ 每个识别器 feed/tick → idle/hold/ready
 //                          └─ 矩阵裁决（库内部，位运算）
 //                               ├─ ready 且未被挡 → win()  → 发射这一帧的事件
 //                               └─ 被赢家压掉     → lose() → 丢弃这次 claim
@@ -1396,14 +1686,6 @@ namespace uhi
 // ═══════════════════════════════════════════════════════════════════════════
 namespace app
 {
-    // 输入层的帧：原始事件 + 当前光标。它属于 app，不属于 uhi。
-    template <class Event>
-    struct input_context
-    {
-        Event event;
-        double x{}, y{};
-    };
-
     // ── 识别器的全部状态：一条 claim 的三态 ──────────────────────────
     //    cur：这一拍我对裁决器说的话（idle / hold / ready）。
     //    win 只发射当前事件；claim 是否结束由识别器自己决定。
@@ -1440,7 +1722,7 @@ namespace app
         }
     };
 
-    // ── 帧就是 input_context<Event>：原始事件 + 当前光标。
+    // ── 帧就是 arena_event::input_frame<T>：完整快照 + 本帧变化。
     //    过滤（左键/按键 A）和事件分派都在 FSM 内部。
 
     // ── 参数：一个地方调 ────────────────────────────────────────────
@@ -1458,27 +1740,31 @@ namespace app
 
         //  0 = 无关帧   1 = 按下   2 = 有效松开   -1 = 无效松开
         //  过滤（只认左键）在 FSM 内部，不在 input_event 里。
-        int operator()(const input_context<mousebutton_event> &c,
+        int operator()(const arena_event::input_frame<arena_event::button_change> &f,
                        uhi::time_point now) noexcept
         {
-            const auto &e = c.event;
-            if (e.button != MouseButtons::eMOUSE_BUTTON_LEFT)
+            const auto &b = f.change;
+            if (b.button != arena_event::MouseButton::eMOUSE_BUTTON_LEFT)
                 return 0;
-            if (e.press())
+            if (b.transition == arena_event::Transition::Press)
             {
+                if (b.repeat)
+                    return 0;
                 down = true;
                 down_at = now;
-                down_x = c.x;
-                down_y = c.y;
+                down_x = f.context.pointer_x;
+                down_y = f.context.pointer_y;
                 return 1;
             }
-            if (e.release())
+            if (b.transition == arena_event::Transition::Release)
             {
                 if (!down)
                     return 0;
                 down = false;
                 const bool quick = now - down_at <= uhi::time_point{click_max_ms};
-                const bool still = std::hypot(c.x - down_x, c.y - down_y) <= drag_slop_px;
+                const bool still =
+                    std::hypot(f.context.pointer_x - down_x,
+                               f.context.pointer_y - down_y) <= drag_slop_px;
                 return (quick && still) ? 2 : -1;
             }
             return 0;
@@ -1495,7 +1781,7 @@ namespace app
     {
         static constexpr auto name = Name;
         static constexpr auto fn_name = FnName;
-        using consume_t = std::tuple<mousebutton_event>;
+        using consume_t = arena_event::changes<arena_event::button_change>;
 
         struct payload_t
         {
@@ -1503,19 +1789,18 @@ namespace app
         } payload{};
 
         press_watch watch{};
-        template <class Event>
-            requires(uhi::detail::in_tuple<Event, consume_t>::value)
-        uhi::step_t feed(const input_context<Event> &c, uhi::time_point now) noexcept
+        uhi::step_t feed(const arena_event::input_frame<arena_event::button_change> &f,
+                         uhi::time_point now) noexcept
         {
-            switch (watch(c, now))
+            switch (watch(f, now))
             {
             case 1:
                 return claim(uhi::step_t::hold);
             case 2:
                 if (cur != uhi::step_t::ready) // 挂起的那一条不拿新坐标覆盖
                 {
-                    payload.x = c.x;
-                    payload.y = c.y;
+                    payload.x = f.context.pointer_x;
+                    payload.y = f.context.pointer_y;
                 }
                 return claim(uhi::step_t::ready);
             case -1: // 不是单击：这次交互作废
@@ -1561,7 +1846,7 @@ namespace app
     {
         static constexpr auto name = Name;
         static constexpr auto fn_name = FnName;
-        using consume_t = std::tuple<mousebutton_event>;
+        using consume_t = arena_event::changes<arena_event::button_change>;
 
         struct payload_t
         {
@@ -1574,9 +1859,8 @@ namespace app
         uhi::time_point last{}; // 上一次松开的时刻
         bool armed = false;     // 正在窗口里等下一击
 
-        template <class Event>
-            requires(uhi::detail::in_tuple<Event, consume_t>::value)
-        uhi::step_t feed(const input_context<Event> &c, uhi::time_point now) noexcept
+        uhi::step_t feed(const arena_event::input_frame<arena_event::button_change> &f,
+                         uhi::time_point now) noexcept
         {
             if (armed && now - last > uhi::time_point{GapMs})
             {
@@ -1588,7 +1872,7 @@ namespace app
                 claim(uhi::step_t::idle);
             }
 
-            switch (watch(c, now))
+            switch (watch(f, now))
             {
             case 1:
                 return claim(uhi::step_t::hold);
@@ -1598,8 +1882,8 @@ namespace app
                 last = now;
                 if (cur != uhi::step_t::ready) // 挂起的那一条保留原载荷/跨度
                 {
-                    payload.x = c.x;
-                    payload.y = c.y;
+                    payload.x = f.context.pointer_x;
+                    payload.y = f.context.pointer_y;
                     payload.count = clicks;
                 }
                 if (clicks >= N)
@@ -1740,76 +2024,81 @@ namespace app
     {
         static constexpr auto name = Name;
         static constexpr auto fn_name = FnName;
-        using consume_t = std::tuple<mousebutton_event, position2d_event>;
+        using consume_t =
+            arena_event::changes<arena_event::button_change, arena_event::move_change>;
 
         drag_payload payload{};
         drag_track t{};
         bool dragging = false;
         bool ending = false;
 
-        template <class Event>
-            requires(uhi::detail::in_tuple<Event, consume_t>::value)
-        uhi::step_t feed(const input_context<Event> &c, uhi::time_point now) noexcept
+        uhi::step_t feed(const arena_event::input_frame<arena_event::button_change> &f,
+                         uhi::time_point now) noexcept
         {
-            if constexpr (std::is_same_v<Event, mousebutton_event>)
-            {
-                if (c.event.button != MouseButtons::eMOUSE_BUTTON_LEFT)
-                    return claim(cur);
-                if (c.event.press())
-                    return drag_start(c, now);
-                if (c.event.release())
-                    return drag_end(c, now);
+            if (f.change.button != arena_event::MouseButton::eMOUSE_BUTTON_LEFT)
                 return claim(cur);
+            if (f.change.transition == arena_event::Transition::Press)
+            {
+                if (f.change.repeat)
+                    return claim(cur);
+                return drag_start(f, now);
             }
-            else
-                return drag_move(c, now);
+            return drag_end(f, now);
         }
 
-        uhi::step_t drag_start(const input_context<mousebutton_event> &c,
-                               uhi::time_point now) noexcept
+        uhi::step_t feed(const arena_event::input_frame<arena_event::move_change> &f,
+                         uhi::time_point now) noexcept
+        {
+            return drag_move(f, now);
+        }
+
+        uhi::step_t drag_start(
+            const arena_event::input_frame<arena_event::button_change> &f,
+            uhi::time_point now) noexcept
         {
             if (cur != uhi::step_t::idle) // 上一条 claim 还没结束：先收掉
                 settle_claim();
-            t.press(c.x, c.y);
+            t.press(f.context.pointer_x, f.context.pointer_y);
             dragging = false;
             ending = false;
             return claim(uhi::step_t::hold);
         }
 
-        uhi::step_t drag_move(const input_context<position2d_event> &c,
+        uhi::step_t drag_move(const arena_event::input_frame<arena_event::move_change> &f,
                               uhi::time_point now) noexcept
         {
-            const auto &e = c.event;
+            const auto &m = f.change;
             if (!t.down)
                 return claim(uhi::step_t::idle);
             if (!dragging)
             {
-                if (!t.past_slop(e.xpos, e.ypos))
+                if (!t.past_slop(m.x, m.y))
                 {
-                    t.last(e.xpos, e.ypos);
+                    t.last(m.x, m.y);
                     return claim(uhi::step_t::hold);
                 }
                 dragging = true;
                 // 这一帧的坐标就是这一帧的事件。
-                payload = t.make(drag_payload::phase_t::begin, e.xpos, e.ypos, 0, 0);
-                t.last(e.xpos, e.ypos);
+                payload = t.make(drag_payload::phase_t::begin, m.x, m.y, 0, 0);
+                t.last(m.x, m.y);
                 return claim(uhi::step_t::ready);
             }
-            payload = t.make(drag_payload::phase_t::move, e.xpos, e.ypos,
-                             e.xpos - t.last_x, e.ypos - t.last_y);
-            t.last(e.xpos, e.ypos);
+            payload = t.make(drag_payload::phase_t::move, m.x, m.y, m.dx, m.dy);
+            t.last(m.x, m.y);
             return claim(uhi::step_t::ready);
         }
 
-        uhi::step_t drag_end(const input_context<mousebutton_event> &c,
-                             uhi::time_point now) noexcept
+        uhi::step_t drag_end(
+            const arena_event::input_frame<arena_event::button_change> &f,
+            uhi::time_point now) noexcept
         {
             t.release();
             if (!dragging)
                 return claim(uhi::step_t::idle); // 没拖过：claim 结束
             dragging = false;
             ending = true;
-            payload = t.make(drag_payload::phase_t::end, c.x, c.y, 0, 0);
+            payload = t.make(drag_payload::phase_t::end, f.context.pointer_x,
+                             f.context.pointer_y, 0, 0);
             return claim(uhi::step_t::ready);
         }
 
@@ -1855,13 +2144,13 @@ namespace app
     {
         static constexpr auto name = Name;
         static constexpr auto fn_name = FnName;
-        using consume_t = std::tuple<cursor_enter_event>;
+        using consume_t = arena_event::changes<arena_event::cursor_enter_event>;
 
-        template <class Event>
-            requires(uhi::detail::in_tuple<Event, consume_t>::value)
-        uhi::step_t feed(const input_context<Event> &c, uhi::time_point now) noexcept
+        uhi::step_t feed(
+            const arena_event::input_frame<arena_event::cursor_enter_event> &f,
+            uhi::time_point now) noexcept
         {
-            if (c.event.value)
+            if (f.change.value)
                 return claim(uhi::step_t::ready);
             return claim(cur); // 离开不产生事件
         }
@@ -1897,18 +2186,17 @@ namespace app
     {
         static constexpr auto name = Name;
         static constexpr auto fn_name = FnName;
-        using consume_t = std::tuple<scroll_event>;
+        using consume_t = arena_event::changes<arena_event::scroll_event>;
 
         struct payload_t
         {
             int delta = 0;
         } payload{};
 
-        template <class Event>
-            requires(uhi::detail::in_tuple<Event, consume_t>::value)
-        uhi::step_t feed(const input_context<Event> &c, uhi::time_point now) noexcept
+        uhi::step_t feed(const arena_event::input_frame<arena_event::scroll_event> &f,
+                         uhi::time_point now) noexcept
         {
-            payload.delta = static_cast<int>(c.event.yoffset);
+            payload.delta = static_cast<int>(f.change.yoffset);
             return claim(uhi::step_t::ready);
         }
         void *receiver_{};
@@ -1944,13 +2232,13 @@ namespace app
     {
         static constexpr auto name = Name;
         static constexpr auto fn_name = FnName;
-        using consume_t = std::tuple<keyboard_event>;
+        using consume_t = arena_event::changes<arena_event::key_change>;
 
-        template <class Event>
-            requires(uhi::detail::in_tuple<Event, consume_t>::value)
-        uhi::step_t feed(const input_context<Event> &c, uhi::time_point now) noexcept
+        uhi::step_t feed(const arena_event::input_frame<arena_event::key_change> &f,
+                         uhi::time_point now) noexcept
         {
-            if (c.event.press() && c.event.key == Key::eA)
+            if (f.change.transition == arena_event::Transition::Press &&
+                !f.change.repeat && f.change.key == Key::eA)
                 return claim(uhi::step_t::ready);
             return claim(cur); // 不改变申报
         }
@@ -2000,12 +2288,9 @@ namespace app
         l_wheel,                                                                   //
         l_key>;
 
-    // 事件 -> Frame 的唯一映射。事件清单不写：Tree 里每个 FSM 的
-    // consume_t 并集就是 frame_types；这里只声明“原始事件怎么包成 Frame”。
-    template <class Event>
-    using frame_of = input_context<Event>;
-
-    using ui_type = uhi::debug_ui<Tree, frame_of>;
+    // Frame 的裁剪由 FSM 的 feed(input_frame<T>) 重载完成；
+    // ui 不需要 FrameOf，也不需要全局 frame_types。
+    using ui_type = uhi::debug_ui<Tree>;
 
     // 回调打到哪儿：自检要靠它验证 sink 那一路确实通了
     struct tally
@@ -2049,14 +2334,13 @@ namespace app
     inline auto make_arena()
     {
         return make_aggregate<"arena">(
-            field<"ui">(ui_type{}),          //
-            field<"tally">(tally{}),         // 回调写这里，自检读这里
-            field<"cursor_x">(0.0),          //
-            field<"cursor_y">(0.0),          //
-            field<"now">(uhi::time_point{}), // 逻辑时间
-            field<"fake_clock">(false),      // 自检：时间由测试喂
-            field<"keep_events">(false),     // 自检：tick 后不清空播报
-            field<"frames">(0u),             //
+            field<"ui">(ui_type{}),  //
+            field<"tally">(tally{}), // 回调写这里，自检读这里
+            field<"event_context">(arena_event::event_context{}), // 变化前的快照
+            field<"now">(uhi::time_point{}),                      // 逻辑时间
+            field<"fake_clock">(false),                           // 自检：时间由测试喂
+            field<"keep_events">(false), // 自检：tick 后不清空播报
+            field<"frames">(0u),         //
 
             // ── 赢家落地：参数个数要和载荷对得上 ──
             method<"on_click">([](auto &self, auto &&p) noexcept {
@@ -2139,18 +2423,20 @@ namespace app
                 ++self.frames;
             }),
 
-            // 平台事件 → input_context<Event>：唯一的适配层。
+            // 平台事件 → arena_event::input_frame<T>：唯一的适配层。
             // 过滤（左键/按键 A）和事件分派都在 FSM 内部。
             method<"input_event">([]<class Self, class E>(Self &self, E e) noexcept {
-                using T = std::remove_cvref_t<E>;
                 const auto now = now_of(self);
                 self.now = now;
-                if constexpr (std::is_same_v<T, position2d_event>)
+
+                using frame_t =
+                    decltype(arena_event::build_change(self.event_context, e));
+                if constexpr (!std::is_void_v<frame_t>)
                 {
-                    self.cursor_x = e.xpos;
-                    self.cursor_y = e.ypos;
+                    auto f = arena_event::build_change(self.event_context, e);
+                    self.ui.feed(f, now);
+                    arena_event::apply_change(self.event_context, f);
                 }
-                self.ui.feed(frame_of<T>{e, self.cursor_x, self.cursor_y}, now);
             }));
     }
 
