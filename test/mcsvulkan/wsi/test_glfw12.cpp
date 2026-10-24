@@ -568,12 +568,7 @@ namespace uhi
     // ═══════════════════════════════════════════════════════════════════
     namespace fsm
     {
-        // ⑤ 你吃哪种帧
-        template <class M>
-        concept has_frame = requires { typename M::frame_type; };
-
-        template <class M>
-        using frame_t = typename M::frame_type;
+        // ⑤ 你吃哪种帧 //NOTE: 可能很多个，不应该约束。比如drag 不仅吃掉鼠标 还吃 位置
 
         // ① 一帧说一句话：必须，正好回 step_t，且 noexcept
         //   （stage 的整条判决链是 noexcept 的，会抛的 step 只会变成 terminate，
@@ -641,8 +636,7 @@ namespace uhi
         // 一个 FSM = 默认构造 + 说了吃哪种帧 + 那种帧能 step（noexcept）
         //            + 可选的 tick / reset 若存在也必须 noexcept
         template <class M>
-        concept machine = std::default_initializable<M> && has_frame<M> &&
-                          can_step<M, frame_t<M>> && tick_ok<M> && reset_ok<M>;
+        concept machine = std::default_initializable<M> && tick_ok<M> && reset_ok<M>;
     } // namespace fsm
 
     // 判决的两种结果，打印用（和 event 做邻居）
@@ -776,6 +770,7 @@ namespace uhi
         static constexpr auto name = Fsm::name;       // kind 的身份
         static constexpr auto fn_name = Fsm::fn_name; // 回调的名字（invoke<fn_name>）
         static constexpr auto hold_ms = Fsm::hold_ms;
+        using frame_type = Fsm::frame_type;
 
         // 兜底时限用无符号毫秒：不可能为负这件事写在类型里
         static constexpr std::chrono::nanoseconds hold =
@@ -785,7 +780,7 @@ namespace uhi
         static consteval plan_data plan()
         {
             return plan_data{
-                .kinds = {{name, fn_name, detail::type_name<fsm::frame_t<Fsm>>(), hold}},
+                .kinds = {{name, fn_name, detail::type_name<frame_type>(), hold}},
                 .awaits = {},
                 .excl = {}};
         }
@@ -1253,58 +1248,6 @@ namespace uhi
     };
 
     // ═══════════════════════════════════════════════════════════════════
-    // 5.5 裁决代数：三个纯函数，只吃位图
-    //
-    //      blocked = ∪ 行(活着的 ∧ 本帧)
-    //      winners = 候选 ∖ blocked
-    //      prey    = ∪ 行(winners) ∧ 活着的 ∧ 本帧 ∖ winners
-    //
-    //    "自然选择"就是这三行。它们不含时间、不含状态、不碰回调，
-    //    所以可以脱离树、脱离 ui、脱离帧，单独喂位图测（见 test B10）。
-    //    stage 只负责按帧的节奏把它们串起来。
-    // ═══════════════════════════════════════════════════════════════════
-    template <class Tree>
-    using tree_bset = bset<leaf_count_v<Tree>>;
-
-    // 谁被挡住：活着的、本帧看得见的那些人的行并起来
-    template <class Tree>
-    constexpr tree_bset<Tree> blocked_by(const tree_bset<Tree> &alive,
-                                         const tree_bset<Tree> &scope) noexcept
-    {
-        using law = law_of<Tree>;
-        tree_bset<Tree> b{};
-        for (index_t j = 0; j < law::S; ++j)
-            if (alive.has(j) && scope.has(j))
-                b |= law::beats[j];
-        return b;
-    }
-
-    // 谁能落地：候选里没被挡住的那些（矩阵是严格偏序 ⇒ 这就是极大元集）
-    template <class Tree>
-    constexpr tree_bset<Tree> winners_of(const tree_bset<Tree> &cand,
-                                         const tree_bset<Tree> &alive,
-                                         const tree_bset<Tree> &scope) noexcept
-    {
-        return cand & ~blocked_by<Tree>(alive, scope);
-    }
-
-    // 谁被吃掉：赢家的行 ∧ 活着的 ∧ 本帧 ∖ 赢家自己
-    template <class Tree>
-    constexpr tree_bset<Tree> prey_of(const tree_bset<Tree> &winners,
-                                      const tree_bset<Tree> &alive,
-                                      const tree_bset<Tree> &scope) noexcept
-    {
-        using law = law_of<Tree>;
-        tree_bset<Tree> p{};
-        for (index_t i = 0; i < law::S; ++i)
-            if (winners.has(i))
-                p |= law::beats[i];
-        p &= alive & scope;
-        p &= ~winners;
-        return p;
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
     // 6. 现场表：一列一个 kind。运行期唯一的可变状态。
     //      alive    ：活着（有假设，或已有结论还没落地）
     //      pending  ：有结论、但被更强的挡着（挂起，下一帧再试）
@@ -1729,8 +1672,9 @@ namespace app
         } payload{};
 
         press_watch watch{};
-
-        uhi::step_t feed(const mouse_frame &f, uhi::time_point now) noexcept
+        template <class Frame>
+            requires(std::is_same_v<frame_type, std::remove_cvref_t<Frame>>)
+        uhi::step_t feed(Frame &&f, uhi::time_point now) noexcept
         {
             switch (watch(f, now))
             {
@@ -1793,7 +1737,9 @@ namespace app
         uhi::time_point last{}; // 上一次松开的时刻
         bool armed = false;     // 正在窗口里等下一击
 
-        uhi::step_t feed(const mouse_frame &f, uhi::time_point now) noexcept
+        template <class Frame>
+            requires(std::is_same_v<frame_type, std::remove_cvref_t<Frame>>)
+        uhi::step_t feed(Frame &&f, uhi::time_point now) noexcept
         {
             if (armed && now - last > uhi::time_point{GapMs})
             {
@@ -1943,7 +1889,9 @@ namespace app
         drag_track t{};
         bool begun = false;
 
-        uhi::step_t feed(const mouse_frame &f, uhi::time_point) noexcept
+        template <class Frame>
+            requires(std::is_same_v<frame_type, std::remove_cvref_t<Frame>>)
+        uhi::step_t feed(Frame &&f, uhi::time_point now) noexcept
         {
             switch (f.what)
             {
@@ -2009,7 +1957,9 @@ namespace app
         drag_track t{};
         bool dragging = false; // 越过一次阈值就置位，直到松手
 
-        uhi::step_t feed(const mouse_frame &f, uhi::time_point) noexcept
+        template <class Frame>
+            requires(std::is_same_v<frame_type, std::remove_cvref_t<Frame>>)
+        uhi::step_t feed(Frame &&f, uhi::time_point now) noexcept
         {
             switch (f.what)
             {
@@ -2073,7 +2023,9 @@ namespace app
         drag_track t{};
         bool past = false;
 
-        uhi::step_t feed(const mouse_frame &f, uhi::time_point) noexcept
+        template <class Frame>
+            requires(std::is_same_v<frame_type, std::remove_cvref_t<Frame>>)
+        uhi::step_t feed(Frame &&f, uhi::time_point now) noexcept
         {
             switch (f.what)
             {
@@ -2133,7 +2085,9 @@ namespace app
         static constexpr auto hold_ms = HoldMs;
         static constexpr auto fn_name = FnName;
 
-        uhi::step_t feed(const mouse_frame &f, uhi::time_point) noexcept
+        template <class Frame>
+            requires(std::is_same_v<frame_type, std::remove_cvref_t<Frame>>)
+        uhi::step_t feed(Frame &&f, uhi::time_point now) noexcept
         {
             return f.what == mouse_frame::enter ? uhi::step_t::done : uhi::step_t::hold;
         }
@@ -2170,7 +2124,9 @@ namespace app
             int delta = 0;
         } payload{};
 
-        uhi::step_t feed(const mouse_frame &f, uhi::time_point) noexcept
+        template <class Frame>
+            requires(std::is_same_v<frame_type, std::remove_cvref_t<Frame>>)
+        uhi::step_t feed(Frame &&f, uhi::time_point now) noexcept
         {
             if (f.what != mouse_frame::wheel)
                 return uhi::step_t::hold;
@@ -2206,7 +2162,9 @@ namespace app
         static constexpr auto hold_ms = HoldMs;
         static constexpr auto fn_name = FnName;
 
-        uhi::step_t feed(const kb_frame &f, uhi::time_point) noexcept
+        template <class Frame>
+            requires(std::is_same_v<frame_type, std::remove_cvref_t<Frame>>)
+        uhi::step_t feed(Frame &&f, uhi::time_point now) noexcept
         {
             return (f.press && f.key == 'A') ? uhi::step_t::done : uhi::step_t::hold;
         }
