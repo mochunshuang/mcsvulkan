@@ -1784,7 +1784,7 @@ namespace app
         using frame_type = mouse_frame;
         static constexpr auto name = Name;
         static constexpr auto hold_ms = HoldMs;
-        static constexpr auto fn_name = Name;
+        static constexpr auto fn_name = FnName;
 
         struct payload_t
         {
@@ -1825,7 +1825,7 @@ namespace app
         using frame_type = mouse_frame;
         static constexpr auto name = Name;
         static constexpr auto hold_ms = HoldMs;
-        static constexpr auto fn_name = Name;
+        static constexpr auto fn_name = FnName;
 
         struct payload_t
         {
@@ -1963,7 +1963,7 @@ namespace app
         using frame_type = mouse_frame;
         static constexpr auto name = Name;
         static constexpr auto hold_ms = HoldMs;
-        static constexpr auto fn_name = Name;
+        static constexpr auto fn_name = FnName;
 
         drag_payload payload{};
         drag_track t{};
@@ -2010,7 +2010,7 @@ namespace app
         using frame_type = mouse_frame;
         static constexpr auto name = Name;
         static constexpr auto hold_ms = HoldMs;
-        static constexpr auto fn_name = Name;
+        static constexpr auto fn_name = FnName;
 
         drag_payload payload{};
         drag_track t{};
@@ -2058,7 +2058,7 @@ namespace app
         using frame_type = mouse_frame;
         static constexpr auto name = Name;
         static constexpr auto hold_ms = HoldMs;
-        static constexpr auto fn_name = Name;
+        static constexpr auto fn_name = FnName;
 
         drag_payload payload{};
         drag_track t{};
@@ -2104,7 +2104,7 @@ namespace app
         using frame_type = mouse_frame;
         static constexpr auto name = Name;
         static constexpr auto hold_ms = HoldMs;
-        static constexpr auto fn_name = Name;
+        static constexpr auto fn_name = FnName;
 
         uhi::step_t feed(const mouse_frame &f, uhi::time_point) noexcept
         {
@@ -2119,7 +2119,7 @@ namespace app
         using frame_type = mouse_frame;
         static constexpr auto name = Name;
         static constexpr auto hold_ms = HoldMs;
-        static constexpr auto fn_name = Name;
+        static constexpr auto fn_name = FnName;
 
         struct payload_t
         {
@@ -2142,7 +2142,7 @@ namespace app
         using frame_type = kb_frame;
         static constexpr auto name = Name;
         static constexpr auto hold_ms = HoldMs;
-        static constexpr auto fn_name = Name;
+        static constexpr auto fn_name = FnName;
 
         uhi::step_t feed(const kb_frame &f, uhi::time_point) noexcept
         {
