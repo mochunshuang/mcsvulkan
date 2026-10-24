@@ -47,6 +47,7 @@ using mcs::vulkan::meta::method;
 using mcs::vulkan::meta::static_string;
 using mcs::vulkan::meta::name_spec;
 using mcs::vulkan::meta::class_utils;
+using mcs::vulkan::meta::template_args;
 
 using mcs::vulkan::runtime_type_v;
 using mcs::vulkan::ring_buffer;
@@ -938,103 +939,50 @@ namespace uhi
         {
             static constexpr std::size_t n = sizeof...(Ls);
             using fsms = std::tuple<typename Ls::machine...>;
+
+            // 所有 leaf 的 consume_t 并集，按第一次出现的顺序去重。
+            static consteval auto consume_args()
+            {
+                std::vector<std::meta::info> out;
+                auto add = [&out]<class L>() {
+                    for (auto a : template_args<typename L::machine::consume_t>())
+                    {
+                        bool seen = false;
+                        for (auto b : out)
+                            if (a == b)
+                            {
+                                seen = true;
+                                break;
+                            }
+                        if (!seen)
+                            out.push_back(a);
+                    }
+                };
+                (add.template operator()<Ls>(), ...);
+                return out;
+            }
+
+            using consume_t =
+                typename[:std::meta::substitute(^^std::tuple, consume_args()):];
+
+            // 第 I 个 leaf 自己的 consume_t：不去重，用来和 I 对账。
+            template <std::size_t I>
+            using consume_of = typename std::tuple_element_t<I, fsms>::consume_t;
         };
 
         template <class Tree>
         using shape_of = typename[:std::meta::substitute(^^shape, leaf_infos(^^Tree)):];
 
-        // Frame 是否在输入域里：这是唯一允许进入裁决的帧集合。
+        // T 是否在 Tuple 的模板实参里
         template <class T, class Tuple>
-        struct in_tuple : std::false_type
+        static consteval bool in_tuple() noexcept
         {
-        };
+            for (auto a : template_args<Tuple>())
+                if (std::meta::dealias(a) == std::meta::dealias(^^T))
+                    return true;
+            return false;
+        }
 
-        template <class T, class... Ts>
-        struct in_tuple<T, std::tuple<Ts...>>
-            : std::bool_constant<(std::is_same_v<T, Ts> || ...)>
-        {
-        };
-
-        // 每个 FSM 的 consume_t 是唯一真源；Tree 的输入域是它们的并集。
-        template <class... Ts>
-        struct type_list
-        {
-        };
-
-        template <class T, class L>
-        struct contains;
-
-        template <class T, class... Ts>
-        struct contains<T, type_list<Ts...>>
-            : std::bool_constant<(std::is_same_v<T, Ts> || ...)>
-        {
-        };
-
-        template <class L, class T>
-        struct push;
-
-        template <class... Ts, class T>
-        struct push<type_list<Ts...>, T>
-        {
-            using type = std::conditional_t<contains<T, type_list<Ts...>>::value,
-                                            type_list<Ts...>, type_list<Ts..., T>>;
-        };
-
-        template <class L, class... Ts>
-        struct merge_impl
-        {
-            using type = L;
-        };
-
-        template <class L, class T, class... Ts>
-        struct merge_impl<L, T, Ts...>
-        {
-            using type = typename merge_impl<typename push<L, T>::type, Ts...>::type;
-        };
-
-        template <class L, class Tuple>
-        struct merge_tuple;
-
-        template <class L, class... Ts>
-        struct merge_tuple<L, std::tuple<Ts...>>
-        {
-            using type = typename merge_impl<L, Ts...>::type;
-        };
-
-        template <class L, class... Tuples>
-        struct merge_all
-        {
-            using type = L;
-        };
-
-        template <class L, class T, class... Ts>
-        struct merge_all<L, T, Ts...>
-        {
-            using type =
-                typename merge_all<typename merge_tuple<L, T>::type, Ts...>::type;
-        };
-
-        template <class L, class Fsms>
-        struct union_consume;
-
-        template <class L, class... Fs>
-        struct union_consume<L, std::tuple<Fs...>>
-        {
-            using type = typename merge_all<L, typename Fs::consume_t...>::type;
-        };
-
-        template <class Tree>
-        using change_types_of =
-            typename union_consume<type_list<>, typename shape_of<Tree>::fsms>::type;
-
-        template <class L>
-        struct as_tuple;
-
-        template <class... Ts>
-        struct as_tuple<type_list<Ts...>>
-        {
-            using type = std::tuple<Ts...>;
-        };
     } // namespace detail
 
     // 结构的公开自查数字
@@ -1117,9 +1065,7 @@ namespace uhi
     struct law_of
     {
         using shape = detail::shape_of<Tree>;
-        using fsms_t = typename shape::fsms;
-        using change_types = typename detail::as_tuple<
-            typename detail::union_consume<detail::type_list<>, fsms_t>::type>::type;
+        using change_types = typename shape::consume_t;
         static constexpr std::size_t S = leaf_count_v<Tree>;
         static constexpr std::size_t C = std::tuple_size_v<change_types>;
 
@@ -1148,15 +1094,15 @@ namespace uhi
                 if (m[i].has(i))
                     throw "beats 有环：refines / one_of 互相指向，结构不成立";
 
-            // 每个 kind 消费哪些 change：来自它自己的 consume_t。
+            // 每个 kind 消费哪些 change：来自它自己的 consume_t（不去重）。
             std::array<bset<C>, S> consumes{};
             template for (constexpr auto I : std::ranges::views::indices(S))
             {
-                using M = std::tuple_element_t<I, fsms_t>;
+                using owned = typename shape::template consume_of<I>;
                 template for (constexpr auto J : std::ranges::views::indices(C))
                 {
                     using Ch = std::tuple_element_t<J, change_types>;
-                    if constexpr (detail::in_tuple<Ch, typename M::consume_t>::value)
+                    if constexpr (detail::in_tuple<Ch, owned>())
                         consumes[I].set(J);
                 }
                 if (consumes[I].none())
@@ -1686,349 +1632,363 @@ namespace arena_event
 // ═══════════════════════════════════════════════════════════════════════════
 namespace app
 {
-    // ── 识别器的全部状态：一条 claim 的三态 ──────────────────────────
-    //    cur：这一拍我对裁决器说的话（idle / hold / ready）。
-    //    win 只发射当前事件；claim 是否结束由识别器自己决定。
-    struct fsm_state
-    {
-        uhi::step_t cur{uhi::step_t::idle};
-
-        uhi::step_t claim(uhi::step_t s) noexcept
-        {
-            // 已经 ready、还没裁决的 claim，新帧不能把它降回 hold。
-            if (cur == uhi::step_t::ready && s != uhi::step_t::idle)
-                s = uhi::step_t::ready;
-            cur = s;
-            return s;
-        }
-
-        // 默认：时间不改变状态（窗口需要过期的识别器自己覆盖 tick）
-        uhi::step_t tick(uhi::time_point) noexcept
-        {
-            return claim(cur);
-        }
-
-        // 长 claim 发射完一个事件：claim 继续活着，等下一个事件
-        void consume_event() noexcept
-        {
-            if (cur == uhi::step_t::ready)
-                cur = uhi::step_t::hold;
-        }
-
-        // 一次性手势/让位：claim 结束
-        void settle_claim() noexcept
-        {
-            cur = uhi::step_t::idle;
-        }
-    };
-
-    // ── 帧就是 arena_event::input_frame<T>：完整快照 + 本帧变化。
-    //    过滤（左键/按键 A）和事件分派都在 FSM 内部。
-
     // ── 参数：一个地方调 ────────────────────────────────────────────
     inline constexpr std::int64_t click_max_ms = 250;  // 按下到松开，超时不算单击
     inline constexpr std::int64_t dbl_gap_ms = 300;    // 双击：两击之间的空档
     inline constexpr std::int64_t triple_gap_ms = 250; // 三击：每档更严一点
     inline constexpr double drag_slop_px = 4.0;        // 越过它就算拖拽
 
-    // ── 复用的"一次按下→松开算不算一次有效单击"：限时 + 限位 ────────
-    struct press_watch
+    namespace detail
     {
-        uhi::time_point down_at{};
-        double down_x = 0, down_y = 0;
-        bool down = false;
-
-        //  0 = 无关帧   1 = 按下   2 = 有效松开   -1 = 无效松开
-        //  过滤（只认左键）在 FSM 内部，不在 input_event 里。
-        int operator()(const arena_event::input_frame<arena_event::button_change> &f,
-                       uhi::time_point now) noexcept
+        // ── 识别器的全部状态：一条 claim 的三态 ──────────────────────────
+        //    cur：这一拍我对裁决器说的话（idle / hold / ready）。
+        //    win 只发射当前事件；claim 是否结束由识别器自己决定。
+        struct fsm_state
         {
-            const auto &b = f.change;
-            if (b.button != arena_event::MouseButton::eMOUSE_BUTTON_LEFT)
+            uhi::step_t cur{uhi::step_t::idle};
+
+            uhi::step_t claim(uhi::step_t s) noexcept
+            {
+                // 已经 ready、还没裁决的 claim，新帧不能把它降回 hold。
+                if (cur == uhi::step_t::ready && s != uhi::step_t::idle)
+                    s = uhi::step_t::ready;
+                cur = s;
+                return s;
+            }
+
+            // 默认：时间不改变状态（窗口需要过期的识别器自己覆盖 tick）
+            uhi::step_t tick(uhi::time_point) noexcept
+            {
+                return claim(cur);
+            }
+
+            // 长 claim 发射完一个事件：claim 继续活着，等下一个事件
+            void consume_event() noexcept
+            {
+                if (cur == uhi::step_t::ready)
+                    cur = uhi::step_t::hold;
+            }
+
+            // 一次性手势/让位：claim 结束
+            void settle_claim() noexcept
+            {
+                cur = uhi::step_t::idle;
+            }
+        };
+
+        // ── 帧就是 arena_event::input_frame<T>：完整快照 + 本帧变化。
+        //    过滤（左键/按键 A）和事件分派都在 FSM 内部。
+
+        // ── 复用的"一次按下→松开算不算一次有效单击"：限时 + 限位 ────────
+        struct press_watch
+        {
+            uhi::time_point down_at{};
+            double down_x = 0, down_y = 0;
+            bool down = false;
+
+            //  0 = 无关帧   1 = 按下   2 = 有效松开   -1 = 无效松开
+            //  过滤（只认左键）在 FSM 内部，不在 input_event 里。
+            int operator()(const arena_event::input_frame<arena_event::button_change> &f,
+                           uhi::time_point now) noexcept
+            {
+                const auto &b = f.change;
+                if (b.button != arena_event::MouseButton::eMOUSE_BUTTON_LEFT)
+                    return 0;
+                if (b.transition == arena_event::Transition::Press)
+                {
+                    if (b.repeat)
+                        return 0;
+                    down = true;
+                    down_at = now;
+                    down_x = f.context.pointer_x;
+                    down_y = f.context.pointer_y;
+                    return 1;
+                }
+                if (b.transition == arena_event::Transition::Release)
+                {
+                    if (!down)
+                        return 0;
+                    down = false;
+                    const bool quick = now - down_at <= uhi::time_point{click_max_ms};
+                    const bool still =
+                        std::hypot(f.context.pointer_x - down_x,
+                                   f.context.pointer_y - down_y) <= drag_slop_px;
+                    return (quick && still) ? 2 : -1;
+                }
                 return 0;
-            if (b.transition == arena_event::Transition::Press)
-            {
-                if (b.repeat)
-                    return 0;
-                down = true;
-                down_at = now;
-                down_x = f.context.pointer_x;
-                down_y = f.context.pointer_y;
-                return 1;
             }
-            if (b.transition == arena_event::Transition::Release)
+            void reset() noexcept
             {
-                if (!down)
-                    return 0;
                 down = false;
-                const bool quick = now - down_at <= uhi::time_point{click_max_ms};
-                const bool still =
-                    std::hypot(f.context.pointer_x - down_x,
-                               f.context.pointer_y - down_y) <= drag_slop_px;
-                return (quick && still) ? 2 : -1;
             }
-            return 0;
-        }
-        void reset() noexcept
-        {
-            down = false;
-        }
-    };
+        };
 
-    // ── 单击 ────────────────────────────────────────────────────────
-    template <static_string Name, static_string FnName = Name>
-    struct single_click : fsm_state
-    {
-        static constexpr auto name = Name;
-        static constexpr auto fn_name = FnName;
-        using consume_t = arena_event::changes<arena_event::button_change>;
-
-        struct payload_t
+        // ── 单击 ────────────────────────────────────────────────────────
+        template <static_string Name, static_string FnName = Name>
+        struct single_click : fsm_state
         {
-            double x = 0, y = 0;
-        } payload{};
+            static constexpr auto name = Name;
+            static constexpr auto fn_name = FnName;
+            using consume_t = arena_event::changes<arena_event::button_change>;
 
-        press_watch watch{};
-        uhi::step_t feed(const arena_event::input_frame<arena_event::button_change> &f,
-                         uhi::time_point now) noexcept
-        {
-            switch (watch(f, now))
+            struct payload_t
             {
-            case 1:
-                return claim(uhi::step_t::hold);
-            case 2:
-                if (cur != uhi::step_t::ready) // 挂起的那一条不拿新坐标覆盖
+                double x = 0, y = 0;
+            } payload{};
+
+            press_watch watch{};
+            uhi::step_t feed(
+                const arena_event::input_frame<arena_event::button_change> &f,
+                uhi::time_point now) noexcept
+            {
+                switch (watch(f, now))
                 {
-                    payload.x = f.context.pointer_x;
-                    payload.y = f.context.pointer_y;
+                case 1:
+                    return claim(uhi::step_t::hold);
+                case 2:
+                    if (cur != uhi::step_t::ready) // 挂起的那一条不拿新坐标覆盖
+                    {
+                        payload.x = f.context.pointer_x;
+                        payload.y = f.context.pointer_y;
+                    }
+                    return claim(uhi::step_t::ready);
+                case -1: // 不是单击：这次交互作废
+                    return claim(uhi::step_t::idle);
+                default:
+                    // 挂起中（ready）就继续申辩；否则按下算 hold，其余算 idle。
+                    return claim(watch.down ? uhi::step_t::hold : cur);
                 }
-                return claim(uhi::step_t::ready);
-            case -1: // 不是单击：这次交互作废
-                return claim(uhi::step_t::idle);
-            default:
-                // 挂起中（ready）就继续申辩；否则按下算 hold，其余算 idle。
-                return claim(watch.down ? uhi::step_t::hold : cur);
             }
-        }
-        void *receiver_{};
-        using invoke_type = void (*)(void *self) noexcept;
-        invoke_type invoke_{};
-        template <class Receiver>
-        constexpr void bind(Receiver &ptr) noexcept
-        {
-            receiver_ = &ptr;
-            invoke_ = invoke_type{[](void *ptr) noexcept {
-                auto *self = static_cast<single_click *>(ptr);
-                static_cast<Receiver *>(self->receiver_)
-                    ->template invoke<fn_name>(self->payload);
-            }};
-        }
-        constexpr uhi::step_t win() noexcept
-        {
-            assert(invoke_ != nullptr);
-            invoke_(this);
-            settle_claim(); // 投递完，这条申报结束
-            return cur;
-        }
-        uhi::step_t lose() noexcept
-        {
-            watch.reset(); // 被更具体的赢了：这次交互丢掉
-            settle_claim();
-            return cur;
-        }
-    };
-
-    // ── N 连击：连续 N 次有效单击，每两击之间独立计时 ────────────────
-    //    所以间隔不必相同：只要每一档都 ≤ GapMs 就算。
-    //    窗口一过就回 idle —— 把机会让给更简单的解释（单击）。
-    template <int N, std::int64_t GapMs, static_string Name, static_string FnName = Name>
-    struct click_chain : fsm_state
-    {
-        static constexpr auto name = Name;
-        static constexpr auto fn_name = FnName;
-        using consume_t = arena_event::changes<arena_event::button_change>;
-
-        struct payload_t
-        {
-            double x = 0, y = 0;
-            int count = 0;
-        } payload{};
-
-        press_watch watch{};
-        int clicks = 0;         // 已经完成的单击数
-        uhi::time_point last{}; // 上一次松开的时刻
-        bool armed = false;     // 正在窗口里等下一击
-
-        uhi::step_t feed(const arena_event::input_frame<arena_event::button_change> &f,
-                         uhi::time_point now) noexcept
-        {
-            if (armed && now - last > uhi::time_point{GapMs})
+            void *receiver_{};
+            using invoke_type = void (*)(void *self) noexcept;
+            invoke_type invoke_{};
+            template <class Receiver>
+            constexpr void bind(Receiver &ptr) noexcept
             {
-                // 窗口过了：这一次放弃，但**这一帧照常处理** ——
-                // 它可能正是新交互的按下。先显式清掉旧申报。
-                clicks = 0;
-                armed = false;
-                watch.reset();
-                claim(uhi::step_t::idle);
+                receiver_ = &ptr;
+                invoke_ = invoke_type{[](void *ptr) noexcept {
+                    auto *self = static_cast<single_click *>(ptr);
+                    static_cast<Receiver *>(self->receiver_)
+                        ->template invoke<fn_name>(self->payload);
+                }};
             }
-
-            switch (watch(f, now))
+            constexpr uhi::step_t win() noexcept
             {
-            case 1:
-                return claim(uhi::step_t::hold);
-            case 2:
-                ++clicks;
-                armed = true;
-                last = now;
-                if (cur != uhi::step_t::ready) // 挂起的那一条保留原载荷/跨度
+                assert(invoke_ != nullptr);
+                invoke_(this);
+                settle_claim(); // 投递完，这条申报结束
+                return cur;
+            }
+            uhi::step_t lose() noexcept
+            {
+                watch.reset(); // 被更具体的赢了：这次交互丢掉
+                settle_claim();
+                return cur;
+            }
+        };
+
+        // ── N 连击：连续 N 次有效单击，每两击之间独立计时 ────────────────
+        //    所以间隔不必相同：只要每一档都 ≤ GapMs 就算。
+        //    窗口一过就回 idle —— 把机会让给更简单的解释（单击）。
+        template <int N, std::int64_t GapMs, static_string Name,
+                  static_string FnName = Name>
+        struct click_chain : fsm_state
+        {
+            static constexpr auto name = Name;
+            static constexpr auto fn_name = FnName;
+            using consume_t = arena_event::changes<arena_event::button_change>;
+
+            struct payload_t
+            {
+                double x = 0, y = 0;
+                int count = 0;
+            } payload{};
+
+            press_watch watch{};
+            int clicks = 0;         // 已经完成的单击数
+            uhi::time_point last{}; // 上一次松开的时刻
+            bool armed = false;     // 正在窗口里等下一击
+
+            uhi::step_t feed(
+                const arena_event::input_frame<arena_event::button_change> &f,
+                uhi::time_point now) noexcept
+            {
+                if (armed && now - last > uhi::time_point{GapMs})
                 {
-                    payload.x = f.context.pointer_x;
-                    payload.y = f.context.pointer_y;
-                    payload.count = clicks;
+                    // 窗口过了：这一次放弃，但**这一帧照常处理** ——
+                    // 它可能正是新交互的按下。先显式清掉旧申报。
+                    clicks = 0;
+                    armed = false;
+                    watch.reset();
+                    claim(uhi::step_t::idle);
                 }
-                if (clicks >= N)
+
+                switch (watch(f, now))
+                {
+                case 1:
+                    return claim(uhi::step_t::hold);
+                case 2:
+                    ++clicks;
+                    armed = true;
+                    last = now;
+                    if (cur != uhi::step_t::ready) // 挂起的那一条保留原载荷/跨度
+                    {
+                        payload.x = f.context.pointer_x;
+                        payload.y = f.context.pointer_y;
+                        payload.count = clicks;
+                    }
+                    if (clicks >= N)
+                    {
+                        clicks = 0;
+                        armed = false;
+                        return claim(uhi::step_t::ready);
+                    }
+                    return claim(uhi::step_t::hold);
+                case -1: // 这一次不是有效单击
+                    clicks = 0;
+                    armed = false;
+                    return claim(uhi::step_t::idle);
+                default:
+                    // 按下、等着、挂起，都算在场；纯路过才是 idle。
+                    return claim((armed || clicks > 0 || watch.down) ? uhi::step_t::hold
+                                                                     : cur);
+                }
+            }
+            // 时间窗只靠"喂帧"是过不去的：必须由 tick 推动。
+            // 但 tick 不再从旁边改 cur —— 它回同一句话，引擎照常裁决。
+            uhi::step_t tick(uhi::time_point now) noexcept
+            {
+                if (armed && now - last > uhi::time_point{GapMs})
                 {
                     clicks = 0;
                     armed = false;
-                    return claim(uhi::step_t::ready);
+                    watch.reset();
+                    return claim(uhi::step_t::idle);
                 }
-                return claim(uhi::step_t::hold);
-            case -1: // 这一次不是有效单击
+                return claim(cur);
+            }
+
+            void *receiver_{};
+            using invoke_type = void (*)(void *self) noexcept;
+            invoke_type invoke_{};
+            template <class Receiver>
+            constexpr void bind(Receiver &ptr) noexcept
+            {
+                receiver_ = &ptr;
+                invoke_ = invoke_type{[](void *ptr) noexcept {
+                    auto *self = static_cast<click_chain *>(ptr);
+                    static_cast<Receiver *>(self->receiver_)
+                        ->template invoke<fn_name>(self->payload);
+                }};
+            }
+            constexpr uhi::step_t win() noexcept
+            {
+                assert(invoke_ != nullptr);
+                invoke_(this);
                 clicks = 0;
                 armed = false;
-                return claim(uhi::step_t::idle);
-            default:
-                // 按下、等着、挂起，都算在场；纯路过才是 idle。
-                return claim((armed || clicks > 0 || watch.down) ? uhi::step_t::hold
-                                                                 : cur);
+                watch.reset();
+                settle_claim();
+                return cur;
             }
-        }
-        // 时间窗只靠"喂帧"是过不去的：必须由 tick 推动。
-        // 但 tick 不再从旁边改 cur —— 它回同一句话，引擎照常裁决。
-        uhi::step_t tick(uhi::time_point now) noexcept
-        {
-            if (armed && now - last > uhi::time_point{GapMs})
+            uhi::step_t lose() noexcept
             {
                 clicks = 0;
                 armed = false;
                 watch.reset();
-                return claim(uhi::step_t::idle);
+                settle_claim();
+                return cur;
             }
-            return claim(cur);
-        }
+        };
 
-        void *receiver_{};
-        using invoke_type = void (*)(void *self) noexcept;
-        invoke_type invoke_{};
-        template <class Receiver>
-        constexpr void bind(Receiver &ptr) noexcept
+        // ═══════════════════════════════════════════════════════════════
+        //  拖拽：一个 kind，一个长 claim，三个相位事件
+        //    begin  第一次越过阈值
+        //    move   之后每一次移动（每帧最多一个事件）
+        //    end    松手
+        //  同一个 on_drag 回调，payload.phase 分流。
+        //
+        //  长 claim：begin/move/end 都是同一个 claim 的 ready，win 只发射
+        //  当前事件；claim 一直活着，直到 end 发完或被 lose。
+        //  没有队列，也没有 streaming 标志。
+        // ═══════════════════════════════════════════════════════════════
+        struct drag_payload
         {
-            receiver_ = &ptr;
-            invoke_ = invoke_type{[](void *ptr) noexcept {
-                auto *self = static_cast<click_chain *>(ptr);
-                static_cast<Receiver *>(self->receiver_)
-                    ->template invoke<fn_name>(self->payload);
-            }};
-        }
-        constexpr uhi::step_t win() noexcept
-        {
-            assert(invoke_ != nullptr);
-            invoke_(this);
-            clicks = 0;
-            armed = false;
-            watch.reset();
-            settle_claim();
-            return cur;
-        }
-        uhi::step_t lose() noexcept
-        {
-            clicks = 0;
-            armed = false;
-            watch.reset();
-            settle_claim();
-            return cur;
-        }
-    };
+            enum class phase_t
+            {
+                begin,
+                move,
+                end
+            } phase{phase_t::begin};
 
-    // ═══════════════════════════════════════════════════════════════
-    //  拖拽：一个 kind，一个长 claim，三个相位事件
-    //    begin  第一次越过阈值
-    //    move   之后每一次移动（每帧最多一个事件）
-    //    end    松手
-    //  同一个 on_drag 回调，payload.phase 分流。
-    //
-    //  长 claim：begin/move/end 都是同一个 claim 的 ready，win 只发射
-    //  当前事件；claim 一直活着，直到 end 发完或被 lose。
-    //  没有队列，也没有 streaming 标志。
-    // ═══════════════════════════════════════════════════════════════
-    struct drag_payload
-    {
-        enum class phase_t
-        {
-            begin,
-            move,
-            end
-        } phase{phase_t::begin};
+            double x{}, y{};               // 当前点
+            double dx{}, dy{};             // 相对上一帧
+            double total_dx{}, total_dy{}; // 相对按下点
+        };
 
-        double x{}, y{};               // 当前点
-        double dx{}, dy{};             // 相对上一帧
-        double total_dx{}, total_dy{}; // 相对按下点
-    };
+        // 三段共用的记账：按下点 / 上一帧位置 / 是否还按着
+        struct drag_track
+        {
+            double down_x = 0, down_y = 0;
+            double last_x = 0, last_y = 0;
+            bool down = false;
 
-    // 三段共用的记账：按下点 / 上一帧位置 / 是否还按着
-    struct drag_track
-    {
-        double down_x = 0, down_y = 0;
-        double last_x = 0, last_y = 0;
-        bool down = false;
+            void press(double x, double y) noexcept
+            {
+                down = true;
+                down_x = last_x = x;
+                down_y = last_y = y;
+            }
+            void last(double x, double y) noexcept
+            {
+                last_x = x;
+                last_y = y;
+            }
+            void release() noexcept
+            {
+                down = false;
+            }
+            [[nodiscard]] bool past_slop(double x, double y) const noexcept
+            {
+                return std::hypot(x - down_x, y - down_y) > drag_slop_px;
+            }
+            [[nodiscard]] double total_dx(double x) const noexcept
+            {
+                return x - down_x;
+            }
+            [[nodiscard]] double total_dy(double y) const noexcept
+            {
+                return y - down_y;
+            }
+            [[nodiscard]] drag_payload make(drag_payload::phase_t ph, double x, double y,
+                                            double dx, double dy) const noexcept
+            {
+                return {ph, x, y, dx, dy, total_dx(x), total_dy(y)};
+            }
+        };
 
-        void press(double x, double y) noexcept
-        {
-            down = true;
-            down_x = last_x = x;
-            down_y = last_y = y;
-        }
-        void last(double x, double y) noexcept
-        {
-            last_x = x;
-            last_y = y;
-        }
-        void release() noexcept
-        {
-            down = false;
-        }
-        [[nodiscard]] bool past_slop(double x, double y) const noexcept
-        {
-            return std::hypot(x - down_x, y - down_y) > drag_slop_px;
-        }
-        [[nodiscard]] double total_dx(double x) const noexcept
-        {
-            return x - down_x;
-        }
-        [[nodiscard]] double total_dy(double y) const noexcept
-        {
-            return y - down_y;
-        }
-        [[nodiscard]] drag_payload make(drag_payload::phase_t ph, double x, double y,
-                                        double dx, double dy) const noexcept
-        {
-            return {ph, x, y, dx, dy, total_dx(x), total_dy(y)};
-        }
-    };
+    } // namespace detail
+
+    // 对外的 FSM 就这四个名字；模板实现放在 detail。
+    using click = detail::single_click<"on_click">;
+    using double_click = detail::click_chain<2, dbl_gap_ms, "on_dbl">;
+    using triple_click = detail::click_chain<3, triple_gap_ms, "on_triple">;
 
     // 一个长 claim：begin/move/end 都是同一个 claim 的 ready。
     // 按钮事件给 press/release，position2d_event 给 move —— 两个 feed
     // 重载，不再有 frame_type 的单类型限制。
-    template <static_string Name, static_string FnName = Name>
-    struct drag : fsm_state
+    struct drag : detail::fsm_state
     {
-        static constexpr auto name = Name;
-        static constexpr auto fn_name = FnName;
+        static constexpr auto name = static_string{"on_drag"};
+        static constexpr auto fn_name = name;
         using consume_t =
             arena_event::changes<arena_event::button_change, arena_event::move_change>;
+        using payload_t = detail::drag_payload;
+        using track_t = detail::drag_track;
+        using phase_t = payload_t::phase_t;
 
-        drag_payload payload{};
-        drag_track t{};
+        payload_t payload{};
+        track_t t{};
         bool dragging = false;
         bool ending = false;
 
@@ -2079,11 +2039,11 @@ namespace app
                 }
                 dragging = true;
                 // 这一帧的坐标就是这一帧的事件。
-                payload = t.make(drag_payload::phase_t::begin, m.x, m.y, 0, 0);
+                payload = t.make(phase_t::begin, m.x, m.y, 0, 0);
                 t.last(m.x, m.y);
                 return claim(uhi::step_t::ready);
             }
-            payload = t.make(drag_payload::phase_t::move, m.x, m.y, m.dx, m.dy);
+            payload = t.make(phase_t::move, m.x, m.y, m.dx, m.dy);
             t.last(m.x, m.y);
             return claim(uhi::step_t::ready);
         }
@@ -2097,8 +2057,8 @@ namespace app
                 return claim(uhi::step_t::idle); // 没拖过：claim 结束
             dragging = false;
             ending = true;
-            payload = t.make(drag_payload::phase_t::end, f.context.pointer_x,
-                             f.context.pointer_y, 0, 0);
+            payload =
+                t.make(phase_t::end, f.context.pointer_x, f.context.pointer_y, 0, 0);
             return claim(uhi::step_t::ready);
         }
 
@@ -2139,11 +2099,10 @@ namespace app
     };
 
     // ── 悬停：指针进入窗口时报一次（离开不算事件）──────────────────
-    template <static_string Name, static_string FnName = Name>
-    struct hover : fsm_state
+    struct hover : detail::fsm_state
     {
-        static constexpr auto name = Name;
-        static constexpr auto fn_name = FnName;
+        static constexpr auto name = static_string{"on_hover"};
+        static constexpr auto fn_name = name;
         using consume_t = arena_event::changes<arena_event::cursor_enter_event>;
 
         uhi::step_t feed(
@@ -2181,11 +2140,10 @@ namespace app
     };
 
     // ── 滚轮：一格一次（delta 交给载荷）────────────────────────────
-    template <static_string Name, static_string FnName = Name>
-    struct wheel : fsm_state
+    struct wheel : detail::fsm_state
     {
-        static constexpr auto name = Name;
-        static constexpr auto fn_name = FnName;
+        static constexpr auto name = static_string{"on_wheel"};
+        static constexpr auto fn_name = name;
         using consume_t = arena_event::changes<arena_event::scroll_event>;
 
         struct payload_t
@@ -2227,11 +2185,10 @@ namespace app
     };
 
     // ── 键盘 A ─────────────────────────────────────────────────────
-    template <static_string Name, static_string FnName = Name>
-    struct key_a : fsm_state
+    struct key_a : detail::fsm_state
     {
-        static constexpr auto name = Name;
-        static constexpr auto fn_name = FnName;
+        static constexpr auto name = static_string{"on_key_A"};
+        static constexpr auto fn_name = name;
         using consume_t = arena_event::changes<arena_event::key_change>;
 
         uhi::step_t feed(const arena_event::input_frame<arena_event::key_change> &f,
@@ -2270,13 +2227,13 @@ namespace app
     };
 
     // ── 叶子：name 是 kind 的身份（进日志）；最后一个参数是回调名 ───
-    using l_click = uhi::leaf<single_click<"on_click">>;
-    using l_dbl = uhi::leaf<click_chain<2, dbl_gap_ms, "on_dbl">>;
-    using l_triple = uhi::leaf<click_chain<3, triple_gap_ms, "on_triple">>;
-    using l_drag = uhi::leaf<drag<"on_drag">>;
-    using l_hover = uhi::leaf<hover<"on_hover">>;
-    using l_wheel = uhi::leaf<wheel<"on_wheel">>;
-    using l_key = uhi::leaf<key_a<"on_key_A">>;
+    using l_click = uhi::leaf<click>;
+    using l_dbl = uhi::leaf<double_click>;
+    using l_triple = uhi::leaf<triple_click>;
+    using l_drag = uhi::leaf<drag>;
+    using l_hover = uhi::leaf<hover>;
+    using l_wheel = uhi::leaf<wheel>;
+    using l_key = uhi::leaf<key_a>;
 
     // ── 树：只声明"谁比谁具体"，不写任何顺序 ───────────────────────
     //    refines<A, B> 读作"A 等 B" ⇒ **B 更具体，B 赢**（第二个参数才是细的）。
@@ -2293,16 +2250,19 @@ namespace app
     using ui_type = uhi::debug_ui<Tree>;
 
     // 回调打到哪儿：自检要靠它验证 sink 那一路确实通了
-    struct tally
+    namespace detail
     {
-        int click{}, dbl{}, triple{}, hover{}, wheel{}, key_a{};
-        int drag_begin{}, drag_move{}, drag_end{};
-        double x{}, y{}, dx{}, dy{}, total_dx{}, total_dy{};
-        double move_x{}, move_y{}, move_dx{}, move_dy{};
-        int delta{};
+        struct tally
+        {
+            int click{}, dbl{}, triple{}, hover{}, wheel{}, key_a{};
+            int drag_begin{}, drag_move{}, drag_end{};
+            double x{}, y{}, dx{}, dy{}, total_dx{}, total_dy{};
+            double move_x{}, move_y{}, move_dx{}, move_dy{};
+            int delta{};
 
-        friend constexpr bool operator==(const tally &, const tally &) = default;
-    };
+            friend constexpr bool operator==(const tally &, const tally &) = default;
+        };
+    } // namespace detail
 
     // 事件时刻：正常情况取墙上时钟；自检时用 arena.now 给的逻辑时间
     inline uhi::time_point now_ms() noexcept
@@ -2334,8 +2294,8 @@ namespace app
     inline auto make_arena()
     {
         return make_aggregate<"arena">(
-            field<"ui">(ui_type{}),  //
-            field<"tally">(tally{}), // 回调写这里，自检读这里
+            field<"ui">(ui_type{}),          //
+            field<"tally">(detail::tally{}), // 回调写这里，自检读这里
             field<"event_context">(arena_event::event_context{}), // 变化前的快照
             field<"now">(uhi::time_point{}),                      // 逻辑时间
             field<"fake_clock">(false),                           // 自检：时间由测试喂
@@ -2365,7 +2325,7 @@ namespace app
             }),
             // 拖拽三段共用的回调：p 用 auto&& 接，引擎按叶子的载荷类型转发
             method<"on_drag">([](auto &self, auto &&p) noexcept {
-                using pt = drag_payload::phase_t;
+                using pt = detail::drag_payload::phase_t;
                 switch (p.phase)
                 {
                 case pt::begin:
