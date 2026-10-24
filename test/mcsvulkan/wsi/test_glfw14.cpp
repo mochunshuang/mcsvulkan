@@ -560,7 +560,6 @@ namespace uhi
         static constexpr std::size_t capacity = 64;
         std::array<event, capacity> buf{};
         std::size_t n = 0, dropped_n = 0;
-        bool in_feed_;
 
         constexpr void push(const event &e) noexcept
         {
@@ -583,25 +582,10 @@ namespace uhi
         }
     };
 
-    namespace detail
+    // 无观测版本：编译期被 if constexpr 剪掉，不产生任何记录。
+    struct null_trace
     {
-        // 重入闸：只有断言用，feed/tick 各一行
-        struct feed_guard
-        {
-            bool *flag = nullptr;
-            explicit feed_guard(bool *f) : flag(f)
-            {
-                assert(!*flag && "feed/tick 不可重入：handler 里不要再喂");
-                *flag = true;
-            }
-            constexpr ~feed_guard() noexcept
-            {
-                *flag = false;
-            }
-            feed_guard(const feed_guard &) = delete;
-            feed_guard &operator=(const feed_guard &) = delete;
-        };
-    } // namespace detail
+    };
 
     // ═══════════════════════════════════════════════════════════════════
     // 1. plan：编译期的声明表（L1 同态律）
@@ -611,7 +595,7 @@ namespace uhi
     // ═══════════════════════════════════════════════════════════════════
     struct kind_desc
     {
-        static_string name{};    // kind 的身份：日志、蓝图都用它（要求唯一）
+        static_string name{};    // 日志标签：不参与查找/分发，不要求唯一
         static_string fn_name{}; // 回调的名字：invoke<fn_name>，可以多个 kind 共用一个
 
         friend constexpr bool operator==(const kind_desc &, const kind_desc &) = default;
@@ -737,20 +721,14 @@ namespace uhi
     //
     //    “关系两端能不能相遇”不在这里：那要看 feed 重载，是
     //    law_of 里按 accepted-frame 集合做的编译期检查。
-    //    查重只查 kind 的 name（它是身份）。
-    //    fn_name（回调名）**不查重** —— 多个 kind 共用一个回调是合法用法。
+    //    name 只是日志标签，不参与查找/分发，所以**不要求唯一**；
+    //    fn_name 是回调名，也不查重 —— 多个 kind 共用一个回调是合法用法。
+    //    真正的结构约束是“同一个 FSM 类型不能在同一棵树里出现两次”，
+    //    那个在 shape 里查。
     // ═══════════════════════════════════════════════════════════════════
     consteval void validate(const plan_data &p)
     {
         const std::size_t n = p.kinds.size(); // 多少个 kind：这是长度
-        auto kind = [&](index_t i) -> const kind_desc & {
-            return p.kinds[i];
-        };
-
-        for (index_t i = 0; i < n; ++i)
-            for (index_t j = i + 1; j < n; ++j)
-                if (kind(i).name.view() == kind(j).name.view())
-                    throw "dup kind name";
 
         for (auto [i, j] : p.awaits)
             if (i == j)
@@ -793,12 +771,12 @@ namespace uhi
     //      law::beats[i]   第 j 位 = "i 打得赢 j"      （行 = 我赢谁）
     //      live          第 i 位 = "第 i 个 kind 有活着的 claim"
     //      ready         第 i 位 = "本拍有事件"
-    //      scope         第 i 位 = "本拍被这一帧推进过"
+    //      advance       第 i 位 = "本拍被这一帧推进过"
     //
     //    ── 为什么是它：裁决的每一步都是集合运算，一一对应 ──
     //      blocked = ∪ 行(活着的)        →  for j: blocked |= beats[j]
-    //      winners = cand ∖ blocked      →  cand & ~blocked
-    //      prey    = ∪ 行(赢家) ∩ live   →  for i: prey |= beats[i]; prey &= live
+    //      win     = ready ∖ blocked     →  ready & ~blocked
+    //      lose    = ∪ 行(赢家) ∩ live   →  for i: lose |= beats[i]; lose &= live
     //    "谁赢 i"没有单独存：用行并回答（∪行(j) 就是"能赢这些人的全体"），
     //    所以 blocked 只需要行，不需要转置表。
     //
@@ -832,7 +810,7 @@ namespace uhi
         // 同一个函数在三种角色上意思不同，由上下文给：
         //   law::beats[i].has(j)  → i 打得赢 j 吗
         //   live.has(i)           → 第 i 个 kind 有活着的 claim 吗
-        //   scope.has(i)          → 本帧喂到这一列了吗
+        //   advance.has(i)        → 本帧推进了这一列吗
         constexpr bool has(index_t i) const noexcept
         {
             return (w[i / 64] >> (i % 64)) & 1;
@@ -880,11 +858,14 @@ namespace uhi
     // ═══════════════════════════════════════════════════════════════════
     // 4. 树的形状（shape）—— 树只是类型，不产生任何对象
     //
-    //    一个类型说清三件事，全部是编译期：
-    //      n          : 几片叶子
-    //      fsms       : 它们的状态机元组（声明序）
+    //    一个类型说清几件事，全部是编译期：
+    //      n              : 几片叶子
+    //      fsms           : 它们的状态机元组（声明序）
+    //      consume_t      : 所有 leaf consume_t 的去重并集
+    //      consume_of<I>  : 第 I 片叶子自己的 consume_t（不去重）
+    //      unique_machines: 同一个 FSM 类型没有出现两次
     //
-    //    "这棵树认不认识帧 F"不在这里另开一个成员：用 scope_of<Tree,F>() 回答，
+    //    "这棵树认不认识帧 F"不在这里另开一个成员：用 advance_mask<Tree,F>() 回答，
     //    它就是"哪些列认识 F"的位图，空就是不认识（见下面 4.3）。
     // ═══════════════════════════════════════════════════════════════════
     namespace detail
@@ -940,6 +921,19 @@ namespace uhi
             static constexpr std::size_t n = sizeof...(Ls);
             using fsms = std::tuple<typename Ls::machine...>;
 
+            // 同一个 FSM 类型出现两次 ⇒ 两个无法区分的 claim；这是结构错误。
+            // name 是日志标签，不承担这个约束。
+            static constexpr bool unique_machines = []() consteval {
+                constexpr std::size_t N = sizeof...(Ls);
+                std::array<std::meta::info, N> m{^^typename Ls::machine...};
+                for (std::size_t i = 0; i < N; ++i)
+                    for (std::size_t j = i + 1; j < N; ++j)
+                        if (m[i] == m[j])
+                            return false;
+                return true;
+            }();
+            static_assert(unique_machines, "同一个 FSM 类型不能在同一棵树里出现两次");
+
             // 所有 leaf 的 consume_t 并集，按第一次出现的顺序去重。
             static consteval auto consume_args()
             {
@@ -964,6 +958,8 @@ namespace uhi
 
             using consume_t =
                 typename[:std::meta::substitute(^^std::tuple, consume_args()):];
+            // consume_t 只用于编译期校验（关系两端有没有共同 change）；
+            // 它不是运行期路由表，路由由 feed(input_frame<T>) 的重载完成。
 
             // 第 I 个 leaf 自己的 consume_t：不去重，用来和 I 对账。
             template <std::size_t I>
@@ -990,14 +986,18 @@ namespace uhi
     inline constexpr std::size_t leaf_count_v = detail::shape_of<Tree>::n;
 
     // ═══════════════════════════════════════════════════════════════════
-    // 4.3 scope_of<Tree, Frame>()：这一帧会**推进**哪些列
+    // 4.3 advance_mask<Tree, Frame>()：这一帧会**推进**哪些列
     //
-    //    这一帧推进哪些列，是**按 feed 重载在编译期算出来的**：
-    //    哪片叶子的 machine 有对应重载，就置哪一位。
-    //    没走到的列不推进，session 保留它们上一次上报的 report[i]。
+    //    裁剪的全部规则只有一句：
+    //      有 feed(Frame) 重载的列推进，其余列不动。
+    //    判据是 fsm::can_step，编译期算成 bitset；运行期没有 tag/映射表。
+    //
+    //    没推进的列保留上一次 report[i]，但它们**仍然参与裁决**。
+    //    所以 position 帧只推进 drag，click 的活 claim 还在 report 里；
+    //    drag 赢的时候照样能把 click lose 掉。
     // ═══════════════════════════════════════════════════════════════════
     template <class Tree, class Frame>
-    consteval bset<leaf_count_v<Tree>> scope_of() noexcept
+    consteval bset<leaf_count_v<Tree>> advance_mask() noexcept
     {
         using fsms_t = typename detail::shape_of<Tree>::fsms;
         constexpr std::size_t S = leaf_count_v<Tree>;
@@ -1065,6 +1065,7 @@ namespace uhi
     struct law_of
     {
         using shape = detail::shape_of<Tree>;
+        // 所有 leaf 的 consume_t 去重并集；运行期裁决只读 beats，不读它。
         using change_types = typename shape::consume_t;
         static constexpr std::size_t S = leaf_count_v<Tree>;
         static constexpr std::size_t C = std::tuple_size_v<change_types>;
@@ -1095,6 +1096,8 @@ namespace uhi
                     throw "beats 有环：refines / one_of 互相指向，结构不成立";
 
             // 每个 kind 消费哪些 change：来自它自己的 consume_t（不去重）。
+            // consumes 只在编译期用，不参与运行期裁决；运行期路由是
+            // feed(input_frame<T>) 的重载。这里只回答一条边两端有没有共同 change。
             std::array<bset<C>, S> consumes{};
             template for (constexpr auto I : std::ranges::views::indices(S))
             {
@@ -1144,36 +1147,58 @@ namespace uhi
     //    也不调用任何识别器。调用 win/lose 是 session 的事。
     // ═══════════════════════════════════════════════════════════════════
     template <std::size_t S>
-    struct verdicts
+    struct decision
     {
-        bset<S> win{}, lose{};
+        bset<S> win{}, lose{}; // 不相交；win 是反链
     };
 
+    // 裁决 = 在 live claim 里取 ready 的极大元。四步：
+    //
+    //   ① live   = report != idle      （hold + ready；hold 仍然挡人）
+    //      ready  = report == ready     （这一拍想说话）
+    //
+    //   ② blocked = ∪ beats[j], j∈live
+    //      任何活着的 claim 打得赢的全体。hold 也要算进来：
+    //      一个还没 ready 的 superior 仍然压住下面的人。
+    //
+    //   ③ win = ready ∖ blocked
+    //      真正能说话的。beats 是严格偏序，所以 win 一定是反链
+    //      （两个赢家不可能互相打得赢）。
+    //
+    //   ④ lose = (∪ beats[i], i∈win) ∩ live ∖ win
+    //      被赢家压掉的活 claim；先让位，再放行。
+    //
+    //    没进 win/lose 的 ready 是 pending：被 hold 的 superior 挡住，
+    //    report 保持 ready，下一拍继续申辩。
     template <std::size_t S>
-    constexpr verdicts<S> arbitrate(const std::array<step_t, S> &report,
+    constexpr decision<S> arbitrate(const std::array<step_t, S> &report,
                                     const std::array<bset<S>, S> &beats) noexcept
     {
-        bset<S> in_play{}, want{};
+        // ① 谁还活着 / 谁这一拍想说话
+        bset<S> live{}, ready{};
         for (index_t i = 0; i < S; ++i)
         {
             if (report[i] != step_t::idle)
-                in_play.set(i);
+                live.set(i);
             if (report[i] == step_t::ready)
-                want.set(i);
+                ready.set(i);
         }
 
+        // ② 活着的 claim 能压住谁
         bset<S> blocked{};
         for (index_t j = 0; j < S; ++j)
-            if (in_play.has(j))
+            if (live.has(j))
                 blocked |= beats[j];
 
-        const bset<S> win = want & ~blocked;
+        // ③ ready 里的极大元
+        const bset<S> win = ready & ~blocked;
 
+        // ④ 赢家的猎物：仍然活着、但被赢家压掉的 claim
         bset<S> lose{};
         for (index_t i = 0; i < S; ++i)
             if (win.has(i))
                 lose |= beats[i];
-        lose &= in_play & ~win;
+        lose &= live & ~win;
 
         return {win, lose};
     }
@@ -1182,11 +1207,14 @@ namespace uhi
     // 9. session：识别器和裁决器的唯一接线处
     //
     //    它拥有识别器和 report（最近一次上报）；每拍：
-    //      1. 把帧/时间交给能接受的识别器，更新 report
-    //      2. 调纯函数 arbitrate(report, law::beats)
-    //      3. 把 win/lose 交给识别器
+    //      1. 裁剪：只推进能接受该 Frame 的列
+    //      2. 裁决：arbitrate(report, law::beats) -> decision
+    //      3. 落地：先 lose（让位），再 win（放行）
     //
-    //    识别器不认识表，裁决器不认识识别器；session 是组合根。
+    //    feed/tick 各有两个版本：
+    //      feed(frame, now)                  主 ui：不观测
+    //      feed<Frame, Trace>(frame, now, t) 子类 debug 用：Trace 是模板参数
+    //    Trace 不是指针，不进 ui 的成员/ABI，也没有虚函数。
     // ═══════════════════════════════════════════════════════════════════
     template <class Tree>
     struct ui
@@ -1208,89 +1236,103 @@ namespace uhi
                     .bind(a);
         }
 
-        // 推进一帧：只有能接受这个 Frame 的识别器被推进，其余保留上一次上报。
+        // 无观测版本
         template <class Frame>
-        constexpr void feed(const Frame &f, time_point now, trace *obs = nullptr) noexcept
+        void feed(const Frame &f, time_point now) noexcept
         {
-            constexpr bset<S> scope = scope_of<Tree, Frame>();
-            if constexpr (scope.none())
-                return;
+            null_trace t{};
+            feed<Frame, null_trace>(f, now, t);
+        }
+
+        // 带 Trace 模板参数的版本：由 debug_ui 调用
+        template <class Frame, class Trace>
+        void feed(const Frame &f, time_point now, Trace &t) noexcept
+        {
+            constexpr bset<S> advance = advance_mask<Tree, Frame>();
+            if constexpr (advance.none())
+                return; // 没有列接受这个 Frame：不推进，也不再裁决
 
             template for (constexpr auto I : std::ranges::views::indices(S))
             {
-                if constexpr (scope.has(static_cast<index_t>(I)))
+                if constexpr (advance.has(static_cast<index_t>(I)))
                     report[I] = std::get<I>(fsms).feed(f, now);
             }
-            settle(now, obs);
+            resolve(now, t);
         }
 
-        // 推进时间：每个识别器都回答；挂起的 ready 重新申辩。
-        void tick(time_point now, trace *obs = nullptr) noexcept
+        // 无观测版本
+        void tick(time_point now) noexcept
         {
-            template for (constexpr auto I : std::ranges::views::indices(S)) report[I] =
-                std::get<I>(fsms).tick(now);
-            settle(now, obs);
+            null_trace t{};
+            tick<null_trace>(now, t);
+        }
+
+        // 带 Trace 模板参数的版本：由 debug_ui 调用
+        template <class Trace>
+        void tick(time_point now, Trace &t) noexcept
+        {
+            template for (constexpr auto I : std::ranges::views::indices(S))
+            {
+                report[I] = std::get<I>(fsms).tick(now);
+            }
+            resolve(now, t);
         }
 
       private:
-        void settle(time_point now, trace *t) noexcept
+        // report -> verdict -> 落地。先让位，再放行。
+        template <class Trace>
+        void resolve(time_point now, Trace &t) noexcept
         {
-            const auto v = arbitrate(report, law::beats);
+            const auto d = arbitrate(report, law::beats);
 
             template for (constexpr auto I : std::ranges::views::indices(S))
             {
-                if (v.lose.has(I))
-                    apply<I>(false, now, t);
+                if (d.lose.has(I))
+                    deliver<I>(false, now, t);
             }
             template for (constexpr auto I : std::ranges::views::indices(S))
             {
-                if (v.win.has(I))
-                    apply<I>(true, now, t);
+                if (d.win.has(I))
+                    deliver<I>(true, now, t);
             }
         }
 
-        template <std::size_t Flat>
-        constexpr void apply(bool won, time_point at, trace *t) noexcept
+        // 唯一副作用点：win/lose 返回“裁决之后我是什么状态”，
+        // 立刻写回 report；下一拍不会拿旧的 ready 再判一次。
+        template <std::size_t Flat, class Trace>
+        void deliver(bool won, time_point at, Trace &t) noexcept
         {
             auto &m = std::get<Flat>(fsms);
-            // win/lose 返回“裁决之后我是什么状态”，session 立刻刷新 report，
-            // 这样下一拍不会拿旧的 ready 再判一次。
             report[Flat] = won ? m.win() : m.lose();
-            if (t != nullptr)
-                t->push({law::names[Flat].view(),
-                         won ? verdict::accepted : verdict::superseded, at});
+
+            if constexpr (!std::is_same_v<Trace, null_trace>)
+                t.push({law::names[Flat].view(),
+                        won ? verdict::accepted : verdict::superseded, at});
         }
     };
 
     // ═══════════════════════════════════════════════════════════════════
     // 10. debug_ui：ui + 观测
     //
-    //   这一层是"用户代码"：记录 trace。删掉它，第 1–9 节照样编译、照样跑。
-    //   它不改变判决：只是把 ui 产生的 verdict 顺手抄一份。
+    //   只覆盖 feed/tick 的无观测版本，显式把 trace 作为模板参数传下去。
+    //   主 ui 没有 trace 成员、没有虚函数；删掉 debug_ui，第 1–9 节照样跑。
     // ═══════════════════════════════════════════════════════════════════
     template <class Tree>
     struct debug_ui : ui<Tree>
     {
         using law = law_of<Tree>;
-        static constexpr std::size_t S = law::S;
-        using ui_type = ui<Tree>;
 
         trace obs{};
 
-        // 转发：喂一帧的同时记一份
         template <class Frame>
-        constexpr void feed(const Frame &f, time_point now) noexcept
+        void feed(const Frame &f, time_point now) noexcept
         {
-            if constexpr (requires() { detail::feed_guard{&obs.in_feed_}; })
-                detail::feed_guard guard{&obs.in_feed_};
-            ui_type::feed(f, now, &obs);
+            ui<Tree>::template feed<Frame, trace>(f, now, obs);
         }
 
         void tick(time_point now) noexcept
         {
-            if constexpr (requires() { detail::feed_guard{&obs.in_feed_}; })
-                detail::feed_guard guard{&obs.in_feed_};
-            ui_type::tick(now, &obs);
+            ui<Tree>::template tick<trace>(now, obs);
         }
 
         std::span<const event> events() const noexcept
