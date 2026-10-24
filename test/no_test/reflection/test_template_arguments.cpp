@@ -186,6 +186,18 @@ static_assert(test_fun2::test<1>());
 static_assert(test_fun2::test<0>());
 static_assert(not test_fun2::test<3>());
 
+template <class Tuple>
+consteval auto tuple_args()
+{
+    return std::meta::template_arguments_of(std::meta::dealias(^^Tuple));
+}
+
+static_assert(tuple_args<std::tuple<int, double, char>>().size() == 3);
+static_assert(tuple_args<std::tuple<int, double, char>>()[0] == ^^int);
+static_assert(tuple_args<std::tuple<int, double, char>>()[1] == ^^double);
+static_assert(tuple_args<std::tuple<int, double, char>>()[2] == ^^char);
+static_assert(tuple_args<std::tuple<>>().empty());
+
 int main()
 {
     std::cout << "main done\n";
