@@ -50,12 +50,13 @@ namespace idx
     constexpr int click = 0, dbl = 1, triple = 2, long_press = 3, drag = 4;
     constexpr int right_click = 5;
     constexpr int key_a = 6, combo = 7;
-    constexpr int tap = 8, dbl_tap = 9, sw_l = 10, sw_r = 11, sw_u = 12, sw_d = 13, long_tap = 14;
+    constexpr int tap = 8, dbl_tap = 9, sw_l = 10, sw_r = 11, sw_u = 12, sw_d = 13,
+                  long_tap = 14;
     constexpr int count = 15;
-    constexpr const char *names[count] = {"click",   "dbl",     "triple", "long_press", "drag",
-                                          "right_click", "key_A", "combo_ctrl_s", "tap",
-                                          "dbl_tap", "swipe_left", "swipe_right", "swipe_up",
-                                          "swipe_down", "long_tap"};
+    constexpr const char *names[count] = {
+        "click",       "dbl",         "triple",       "long_press", "drag",
+        "right_click", "key_A",       "combo_ctrl_s", "tap",        "dbl_tap",
+        "swipe_left",  "swipe_right", "swipe_up",     "swipe_down", "long_tap"};
 } // namespace idx
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -64,12 +65,12 @@ namespace idx
 struct click_event
 {
     double x = 0.0, y = 0.0;
-    int    count = 0; // 第几次（1/2/3）
+    int count = 0; // 第几次（1/2/3）
 };
 struct hold_event
 {
     double x = 0.0, y = 0.0;
-    int    ms = 0;
+    int ms = 0;
 };
 struct drag_event
 {
@@ -82,17 +83,17 @@ struct key_event
 struct combo_event
 {
     int mods = 0; // bit0 ctrl, bit1 shift
-    int key  = 0;
+    int key = 0;
 };
 struct tap_event
 {
     double x = 0.0, y = 0.0;
-    int    id = 0;
+    int id = 0;
 };
 struct swipe_event
 {
     double dx = 0.0, dy = 0.0, dist = 0.0;
-    int    id = 0;
+    int id = 0;
 };
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -106,12 +107,14 @@ namespace fsm
     inline bool left_press(const input_frame &f) noexcept
     {
         const auto &c = f.change;
-        return c.change == ChangeType::PointerButton && c.button.is_left() && c.button.is_press();
+        return c.change == ChangeType::PointerButton && c.button.is_left() &&
+               c.button.is_press();
     }
     inline bool left_release(const input_frame &f) noexcept
     {
         const auto &c = f.change;
-        return c.change == ChangeType::PointerButton && c.button.is_left() && c.button.is_pelease();
+        return c.change == ChangeType::PointerButton && c.button.is_left() &&
+               c.button.is_pelease();
     }
     inline bool left_move(const input_frame &f) noexcept
     {
@@ -134,11 +137,11 @@ namespace fsm
     template <int N>
     struct multi_click
     {
-        int           count = 0;
-        bool          armed = false; // 只有 release 之后才开始计时
-        time_point    deadline{};
-        click_event   payload{};
-        step_t        step(const input_frame &f, time_point now) noexcept
+        int count = 0;
+        bool armed = false; // 只有 release 之后才开始计时
+        time_point deadline{};
+        click_event payload{};
+        step_t step(const input_frame &f, time_point now) noexcept
         {
             if (armed && now >= deadline) // 窗口过期，数还不够
             {
@@ -149,8 +152,8 @@ namespace fsm
             if (left_press(f))
             {
                 ++count;
-                payload.x     = f.context.pointer_x;
-                payload.y     = f.context.pointer_y;
+                payload.x = f.context.pointer_x;
+                payload.y = f.context.pointer_y;
                 payload.count = count;
                 return step_t::active;
             }
@@ -163,7 +166,7 @@ namespace fsm
                     return step_t::done;
                 }
                 deadline = now + click_window;
-                armed    = true;
+                armed = true;
                 return step_t::active;
             }
             return count > 0 ? step_t::active : step_t::idle;
@@ -189,93 +192,122 @@ namespace fsm
     template <int Ms>
     struct long_press
     {
-        bool        down = false;
-        time_point  t0{};
-        hold_event  payload{};
-        step_t      step(const input_frame &f, time_point now) noexcept
+        bool down = false;
+        time_point t0{};
+        hold_event payload{};
+        step_t step(const input_frame &f, time_point now) noexcept
         {
             if (left_press(f))
             {
-                down          = true;
-                t0            = now;
-                payload.x     = f.context.pointer_x;
-                payload.y     = f.context.pointer_y;
-                payload.ms    = 0;
+                down = true;
+                t0 = now;
+                payload.x = f.context.pointer_x;
+                payload.y = f.context.pointer_y;
+                payload.ms = 0;
                 return step_t::active;
             }
-            if (!down) return step_t::idle;
-            if (left_move(f) || left_release(f)) { down = false; return step_t::aborted; }
+            if (!down)
+                return step_t::idle;
+            if (left_move(f) || left_release(f))
+            {
+                down = false;
+                return step_t::aborted;
+            }
             return step_t::active;
         }
         step_t tick(time_point now) noexcept
         {
-            if (!down) return step_t::hold;
-            const auto held = std::chrono::duration_cast<std::chrono::milliseconds>(now - t0);
+            if (!down)
+                return step_t::hold;
+            const auto held =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - t0);
             if (held.count() >= Ms)
             {
-                down       = false;
+                down = false;
                 payload.ms = static_cast<int>(held.count());
                 return step_t::done;
             }
             return step_t::hold;
         }
-        void reset() noexcept { down = false; }
+        void reset() noexcept
+        {
+            down = false;
+        }
     };
 
     // 拖拽：按住移动超过 px
     template <int Px>
     struct drag
     {
-        bool       down = false;
+        bool down = false;
         drag_event payload{};
-        step_t     step(const input_frame &f, time_point) noexcept
+        step_t step(const input_frame &f, time_point) noexcept
         {
             if (left_press(f))
             {
-                down    = true;
+                down = true;
                 payload = {};
                 return step_t::active;
             }
             if (left_release(f))
             {
-                if (down) { down = false; return step_t::aborted; }
+                if (down)
+                {
+                    down = false;
+                    return step_t::aborted;
+                }
                 return step_t::idle;
             }
-            if (!down) return step_t::idle;
+            if (!down)
+                return step_t::idle;
             if (left_move(f))
             {
                 payload.dx += f.change.move.dx;
                 payload.dy += f.change.move.dy;
                 payload.dist = (payload.dx < 0 ? -payload.dx : payload.dx) +
                                (payload.dy < 0 ? -payload.dy : payload.dy);
-                if (payload.dist >= Px) { down = false; return step_t::done; }
+                if (payload.dist >= Px)
+                {
+                    down = false;
+                    return step_t::done;
+                }
             }
             return step_t::active;
         }
-        void reset() noexcept { down = false; }
+        void reset() noexcept
+        {
+            down = false;
+        }
     };
 
     // 右键单击
     struct right_click
     {
-        bool        down = false;
+        bool down = false;
         click_event payload{};
-        step_t      step(const input_frame &f, time_point) noexcept
+        step_t step(const input_frame &f, time_point) noexcept
         {
             const auto &c = f.change;
             if (c.change != ChangeType::PointerButton || c.button.is_left())
                 return down ? step_t::active : step_t::idle;
             if (c.button.is_press())
             {
-                down      = true;
+                down = true;
                 payload.x = f.context.pointer_x;
                 payload.y = f.context.pointer_y;
                 return step_t::active;
             }
-            if (down) { down = false; return step_t::done; }
+            if (down)
+            {
+                down = false;
+                return step_t::done;
+            }
             return step_t::idle;
         }
-        void reset() noexcept { down = false; }
+        void reset() noexcept
+        {
+            down = false;
+        }
     };
 
     // 单键
@@ -283,7 +315,7 @@ namespace fsm
     struct key_press
     {
         key_event payload{};
-        step_t    step(const input_frame &f, time_point) noexcept
+        step_t step(const input_frame &f, time_point) noexcept
         {
             const auto &c = f.change;
             if (c.change == ChangeType::Key && c.key.key == K && c.key.is_press())
@@ -301,13 +333,15 @@ namespace fsm
     struct combo
     {
         combo_event payload{};
-        step_t      step(const input_frame &f, time_point) noexcept
+        step_t step(const input_frame &f, time_point) noexcept
         {
             const auto &c = f.change;
-            if (c.change != ChangeType::Key || c.key.key != K || !c.key.is_press()) return step_t::idle;
-            if (f.context.keys[std::to_underlying(Mod)] != ae::HeldState::Down) return step_t::idle;
+            if (c.change != ChangeType::Key || c.key.key != K || !c.key.is_press())
+                return step_t::idle;
+            if (f.context.keys[std::to_underlying(Mod)] != ae::HeldState::Down)
+                return step_t::idle;
             payload.mods = 1; // ctrl
-            payload.key  = static_cast<int>(K);
+            payload.key = static_cast<int>(K);
             return step_t::done;
         }
         void reset() noexcept {}
@@ -331,20 +365,21 @@ namespace fsm
 
     struct tap
     {
-        double    down_x = 0.0, down_y = 0.0;
+        double down_x = 0.0, down_y = 0.0;
         tap_event payload{};
-        bool      down = false;
-        step_t    step(const input_frame &f, time_point) noexcept
+        bool down = false;
+        step_t step(const input_frame &f, time_point) noexcept
         {
-                        if (t_down(f))
+            if (t_down(f))
             {
-                down     = true;
-                down_x   = f.context.pointer_x;
-                down_y   = f.context.pointer_y;
-                payload  = {down_x, down_y, 0};
+                down = true;
+                down_x = f.context.pointer_x;
+                down_y = f.context.pointer_y;
+                payload = {down_x, down_y, 0};
                 return step_t::active;
             }
-            if (!down) return step_t::idle;
+            if (!down)
+                return step_t::idle;
             if (t_move(f))
             {
                 const auto dx = f.change.move.dx, dy = f.change.move.dy;
@@ -355,114 +390,171 @@ namespace fsm
                 }
                 return step_t::active;
             }
-            if (t_up(f)) { down = false; return step_t::done; }
+            if (t_up(f))
+            {
+                down = false;
+                return step_t::done;
+            }
             return step_t::active;
         }
-        void reset() noexcept { down = false; }
+        void reset() noexcept
+        {
+            down = false;
+        }
     };
 
     // 双击（触摸）：两下之内
     struct dbl_tap
     {
-        int       taps = 0;
-        bool      armed = false;
+        int taps = 0;
+        bool armed = false;
         time_point deadline{};
         tap_event payload{};
-        bool      down = false;
-        step_t    step(const input_frame &f, time_point now) noexcept
+        bool down = false;
+        step_t step(const input_frame &f, time_point now) noexcept
         {
-            if (armed && now >= deadline) { taps = 0; armed = false; return step_t::aborted; }
+            if (armed && now >= deadline)
+            {
+                taps = 0;
+                armed = false;
+                return step_t::aborted;
+            }
             if (t_down(f))
             {
                 ++taps;
-                down    = true;
+                down = true;
                 payload = {f.context.pointer_x, f.context.pointer_y, 0};
                 return taps >= 1 ? step_t::active : step_t::idle;
             }
             if (t_up(f) && down)
             {
                 down = false;
-                if (taps >= 2) { taps = 0; armed = false; return step_t::done; }
+                if (taps >= 2)
+                {
+                    taps = 0;
+                    armed = false;
+                    return step_t::done;
+                }
                 deadline = now + click_window;
-                armed    = true;
+                armed = true;
                 return step_t::active;
             }
             return taps > 0 ? step_t::active : step_t::idle;
         }
         step_t tick(time_point now) noexcept
         {
-                        if (armed && now >= deadline) { taps = 0; armed = false; return step_t::aborted; }
+            if (armed && now >= deadline)
+            {
+                taps = 0;
+                armed = false;
+                return step_t::aborted;
+            }
             return step_t::hold;
         }
-        void reset() noexcept { taps = 0; armed = false; }
+        void reset() noexcept
+        {
+            taps = 0;
+            armed = false;
+        }
     };
 
-    enum class dir : std::uint8_t { l, r, u, d };
+    enum class dir : std::uint8_t
+    {
+        l,
+        r,
+        u,
+        d
+    };
 
     // 滑动：主方向 + 距离
     template <dir D>
     struct swipe
     {
-        bool        down = false;
-        double      ax = 0.0, ay = 0.0;
+        bool down = false;
+        double ax = 0.0, ay = 0.0;
         swipe_event payload{};
-        step_t      step(const input_frame &f, time_point) noexcept
+        step_t step(const input_frame &f, time_point) noexcept
         {
             if (t_down(f))
             {
-                down    = true;
+                down = true;
                 ax = ay = 0.0;
                 payload = {0, 0, 0, 0};
                 return step_t::active;
             }
-            if (!down) return step_t::idle;
-            if (t_up(f)) { down = false; return step_t::aborted; }
+            if (!down)
+                return step_t::idle;
+            if (t_up(f))
+            {
+                down = false;
+                return step_t::aborted;
+            }
             if (t_move(f))
             {
                 ax += f.change.move.dx;
                 ay += f.change.move.dy;
                 payload = {ax, ay, (ax < 0 ? -ax : ax) + (ay < 0 ? -ay : ay), 0};
                 const auto axx = ax < 0 ? -ax : ax, ayy = ay < 0 ? -ay : ay;
-                const bool hit =
-                    D == dir::l ? (ax < 0 && axx >= 40 && axx >= ayy)
-                    : D == dir::r ? (ax > 0 && axx >= 40 && axx >= ayy)
-                    : D == dir::u ? (ay < 0 && ayy >= 40 && ayy > axx)
-                                  : (ay > 0 && ayy >= 40 && ayy > axx);
-                if (hit) { down = false; return step_t::done; }
+                const bool hit = D == dir::l   ? (ax < 0 && axx >= 40 && axx >= ayy)
+                                 : D == dir::r ? (ax > 0 && axx >= 40 && axx >= ayy)
+                                 : D == dir::u ? (ay < 0 && ayy >= 40 && ayy > axx)
+                                               : (ay > 0 && ayy >= 40 && ayy > axx);
+                if (hit)
+                {
+                    down = false;
+                    return step_t::done;
+                }
             }
             return step_t::active;
         }
-        void reset() noexcept { down = false; }
+        void reset() noexcept
+        {
+            down = false;
+        }
     };
 
     // 长按（触摸）
     template <int Ms>
     struct long_tap
     {
-        bool      down = false;
+        bool down = false;
         time_point t0{};
         tap_event payload{};
-        step_t    step(const input_frame &f, time_point now) noexcept
+        step_t step(const input_frame &f, time_point now) noexcept
         {
             if (t_down(f))
             {
-                down    = true;
-                t0      = now;
+                down = true;
+                t0 = now;
                 payload = {f.context.pointer_x, f.context.pointer_y, 0};
                 return step_t::active;
             }
-            if (!down) return step_t::idle;
-            if (t_up(f) || t_move(f)) { down = false; return step_t::aborted; }
+            if (!down)
+                return step_t::idle;
+            if (t_up(f) || t_move(f))
+            {
+                down = false;
+                return step_t::aborted;
+            }
             return step_t::active;
         }
         step_t tick(time_point now) noexcept
         {
-            if (!down) return step_t::hold;
-            const auto held = std::chrono::duration_cast<std::chrono::milliseconds>(now - t0);
-            if (held.count() >= Ms) { down = false; return step_t::done; }
+            if (!down)
+                return step_t::hold;
+            const auto held =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - t0);
+            if (held.count() >= Ms)
+            {
+                down = false;
+                return step_t::done;
+            }
             return step_t::hold;
         }
-        void reset() noexcept { down = false; }
+        void reset() noexcept
+        {
+            down = false;
+        }
     };
 } // namespace fsm
 
@@ -472,32 +564,38 @@ namespace fsm
 using ml = uhi::source_t<"mouse.left">;
 using mr = uhi::source_t<"mouse.right">;
 using kb_src = uhi::source_t<"keyboard">;
-using tsrc   = uhi::source_t<"touch">;
+using tsrc = uhi::source_t<"touch">;
 
-using g_click  = uhi::leaf<uhi::kind_t<"click", click_event>, ml, fsm::multi_click<1>>;
-using g_dbl    = uhi::leaf<uhi::kind_t<"dbl", click_event>, ml, fsm::multi_click<2>>;
+using g_click = uhi::leaf<uhi::kind_t<"click", click_event>, ml, fsm::multi_click<1>>;
+using g_dbl = uhi::leaf<uhi::kind_t<"dbl", click_event>, ml, fsm::multi_click<2>>;
 using g_triple = uhi::leaf<uhi::kind_t<"triple", click_event>, ml, fsm::multi_click<3>>;
-using g_long   = uhi::leaf<uhi::kind_t<"long_press", hold_event>, ml, fsm::long_press<600>, 2000>;
-using g_drag   = uhi::leaf<uhi::kind_t<"drag", drag_event>, ml, fsm::drag<30>, 5000>;
+using g_long =
+    uhi::leaf<uhi::kind_t<"long_press", hold_event>, ml, fsm::long_press<600>, 2000>;
+using g_drag = uhi::leaf<uhi::kind_t<"drag", drag_event>, ml, fsm::drag<30>, 5000>;
 
 using g_rclick = uhi::leaf<uhi::kind_t<"right_click", click_event>, mr, fsm::right_click>;
 
-using g_key_a = uhi::leaf<uhi::kind_t<"key_A", key_event>, kb_src, fsm::key_press<ae::Key::eA>>;
-using g_combo =
-    uhi::leaf<uhi::kind_t<"combo_ctrl_s", combo_event>, kb_src,
-              fsm::combo<ae::Key::eLEFT_CONTROL, ae::Key::eS>>;
+using g_key_a =
+    uhi::leaf<uhi::kind_t<"key_A", key_event>, kb_src, fsm::key_press<ae::Key::eA>>;
+using g_combo = uhi::leaf<uhi::kind_t<"combo_ctrl_s", combo_event>, kb_src,
+                          fsm::combo<ae::Key::eLEFT_CONTROL, ae::Key::eS>>;
 
-using g_tap   = uhi::leaf<uhi::kind_t<"tap", tap_event>, tsrc, fsm::tap>;
-using g_dtap  = uhi::leaf<uhi::kind_t<"dbl_tap", tap_event>, tsrc, fsm::dbl_tap>;
-using g_sl    = uhi::leaf<uhi::kind_t<"swipe_left", swipe_event>, tsrc, fsm::swipe<fsm::dir::l>>;
-using g_sr    = uhi::leaf<uhi::kind_t<"swipe_right", swipe_event>, tsrc, fsm::swipe<fsm::dir::r>>;
-using g_su    = uhi::leaf<uhi::kind_t<"swipe_up", swipe_event>, tsrc, fsm::swipe<fsm::dir::u>>;
-using g_sd    = uhi::leaf<uhi::kind_t<"swipe_down", swipe_event>, tsrc, fsm::swipe<fsm::dir::d>>;
-using g_ltap  = uhi::leaf<uhi::kind_t<"long_tap", tap_event>, tsrc, fsm::long_tap<500>, 2000>;
+using g_tap = uhi::leaf<uhi::kind_t<"tap", tap_event>, tsrc, fsm::tap>;
+using g_dtap = uhi::leaf<uhi::kind_t<"dbl_tap", tap_event>, tsrc, fsm::dbl_tap>;
+using g_sl =
+    uhi::leaf<uhi::kind_t<"swipe_left", swipe_event>, tsrc, fsm::swipe<fsm::dir::l>>;
+using g_sr =
+    uhi::leaf<uhi::kind_t<"swipe_right", swipe_event>, tsrc, fsm::swipe<fsm::dir::r>>;
+using g_su =
+    uhi::leaf<uhi::kind_t<"swipe_up", swipe_event>, tsrc, fsm::swipe<fsm::dir::u>>;
+using g_sd =
+    uhi::leaf<uhi::kind_t<"swipe_down", swipe_event>, tsrc, fsm::swipe<fsm::dir::d>>;
+using g_ltap =
+    uhi::leaf<uhi::kind_t<"long_tap", tap_event>, tsrc, fsm::long_tap<500>, 2000>;
 
 // 鼠标左键那一格：三级链 + 两个对手
-using mouse_cell = uhi::one_of<refines<refines<g_click, g_dbl>, g_triple>,
-                               uhi::one_of<g_long, g_drag>>;
+using mouse_cell =
+    uhi::one_of<refines<refines<g_click, g_dbl>, g_triple>, uhi::one_of<g_long, g_drag>>;
 // 鼠标右键：单点
 // 键盘：两个互不相干
 using key_cell = uhi::all_of<g_key_a, g_combo>;
@@ -526,22 +624,16 @@ static_assert(has(uhi::ui<touch_cell>::blueprint.view(), "swipe_left~swipe_down"
 static_assert(has(uhi::ui<touch_cell>::blueprint.view(), "cells: touch{arbitrate:"));
 #endif
 
-
 // ═══════════════════════════════════════════════════════════════════════
 // ④ arena
 // ═══════════════════════════════════════════════════════════════════════
 inline auto make_arena()
 {
     return make_aggregate<"arena">(
-        field<"now">(time_point{}),
-        field<"ctx">(ae::event_context{}),
-        field<"ui">(uhi::ui<desktop_tree>{}),
-        field<"touch">(uhi::pool<touch_cell, 2>{}),
-        field<"n">(std::array<int, idx::count>{}),
-        field<"lx">(double{}),
-        field<"ly">(double{}),
-        field<"ldist">(double{}),
-        field<"lcombo">(int{}),
+        field<"now">(time_point{}), field<"ctx">(ae::event_context{}),
+        field<"ui">(uhi::ui<desktop_tree>{}), field<"touch">(uhi::pool<touch_cell, 2>{}),
+        field<"n">(std::array<int, idx::count>{}), field<"lx">(double{}),
+        field<"ly">(double{}), field<"ldist">(double{}), field<"lcombo">(int{}),
         field<"ldir">(int{}),
 
         method<"on_click">([](auto &self, const click_event &e) noexcept {
@@ -570,7 +662,8 @@ inline auto make_arena()
             ++self.n[idx::right_click];
             self.lx = e.x;
         }),
-        method<"on_key_A">([](auto &self, const key_event &) noexcept { ++self.n[idx::key_a]; }),
+        method<"on_key_A">(
+            [](auto &self, const key_event &) noexcept { ++self.n[idx::key_a]; }),
         method<"on_combo_ctrl_s">([](auto &self, const combo_event &e) noexcept {
             ++self.n[idx::combo];
             self.lcombo = e.mods;
@@ -611,12 +704,14 @@ inline auto make_arena()
         }),
         method<"input_event">([](auto &self, auto e) noexcept {
             auto ch = ae::build_change(self.ctx, e);
-            if (ch.change == ae::ChangeType::None) return;
+            if (ch.change == ae::ChangeType::None)
+                return;
             ch.time_point = self.now;
             self.ui.feed(ae::input_frame{self.ctx, ch});
             ae::apply_change(self.ctx, ch);
         }),
-        method<"touch_event">([](auto &self, const ae::input_frame &f) noexcept { self.touch.feed(f); }),
+        method<"touch_event">(
+            [](auto &self, const ae::input_frame &f) noexcept { self.touch.feed(f); }),
         method<"tick">([](auto &self, time_point t) noexcept {
             self.now = t;
             self.ui.tick(t);
@@ -641,13 +736,16 @@ inline void pump()
     for (std::size_t k = 0; k < arena.touch.lanes.size(); ++k)
     {
         const auto text = uhi::to_string(arena.touch[k].events());
-        if (text.empty()) continue;
-        if (!s.empty()) s += ", ";
+        if (text.empty())
+            continue;
+        if (!s.empty())
+            s += ", ";
         s += "[" + std::to_string(k) + "] " + text;
     }
     last = std::move(s);
     arena.ui.clear_events();
-    for (auto &l : arena.touch.lanes) l.clear_events();
+    for (auto &l : arena.touch.lanes)
+        l.clear_events();
 }
 
 template <class E>
@@ -677,18 +775,18 @@ inline ae::input_frame tou(ae::change_event ch, const ae::event_context &ctx = {
 inline ae::change_event t_button(bool press, double /*x*/, double /*y*/, int ms)
 {
     ae::change_event ch{};
-    ch.change     = ae::ChangeType::PointerButton;
+    ch.change = ae::ChangeType::PointerButton;
     ch.time_point = at(ms);
-    ch.button     = {ae::MouseButton::eMOUSE_BUTTON_LEFT,
-                     press ? ae::Transition::Press : ae::Transition::Release};
+    ch.button = {ae::MouseButton::eMOUSE_BUTTON_LEFT,
+                 press ? ae::Transition::Press : ae::Transition::Release};
     return ch;
 }
 inline ae::change_event t_move(double dx, double dy, int ms)
 {
     ae::change_event ch{};
-    ch.change     = ae::ChangeType::PointerDownMove;
+    ch.change = ae::ChangeType::PointerDownMove;
     ch.time_point = at(ms);
-    ch.move       = {300 + dx, 300 + dy, dx, dy};
+    ch.move = {300 + dx, 300 + dy, dx, dy};
     return ch;
 }
 
@@ -697,14 +795,16 @@ inline ae::change_event t_move(double dx, double dy, int ms)
 // ═══════════════════════════════════════════════════════════════════════
 inline void want_has(std::string_view sub, const char *where)
 {
-    if (last.find(sub) != std::string::npos) return;
+    if (last.find(sub) != std::string::npos)
+        return;
     std::print(stderr, "{}:\n  got  [{}]\n  must contain [{}]\n", where, last, sub);
     assert(false && "unexpected trace");
 }
 
 inline void want(std::string_view w, const char *where)
 {
-    if (last == w) return;
+    if (last == w)
+        return;
     std::print(stderr, "{}:\n  got  [{}]\n  want [{}]\n", where, last, w);
     assert(false && "unexpected trace");
 }
@@ -757,7 +857,8 @@ int main()
     tick(1600);
     assert(last.empty());
     tick(1900); // 700ms > 600
-    want("triple:sup@1900, drag:sup@1900, dbl:sup@1900, click:sup@1900, long_press:acc@1900",
+    want("triple:sup@1900, drag:sup@1900, dbl:sup@1900, click:sup@1900, "
+         "long_press:acc@1900",
          "4 long_press");
     post(1950, mb{L, RELEASE}); // 抬起不该补一个 click
     want("", "4b 抬起无事件");
@@ -810,7 +911,7 @@ int main()
     std::println("10 dbl_tap        {}", last);
 
     // 11~14) 四方向滑动：方向决定谁赢
-    const char  *snames[4] = {"swipe_left", "swipe_right", "swipe_up", "swipe_down"};
+    const char *snames[4] = {"swipe_left", "swipe_right", "swipe_up", "swipe_down"};
     const double sx[4] = {-100.0, 100.0, 0.0, 0.0};
     const double sy[4] = {0.0, 0.0, -100.0, 100.0};
     [[maybe_unused]] const int skey[4] = {idx::sw_l, idx::sw_r, idx::sw_u, idx::sw_d};
@@ -834,8 +935,8 @@ int main()
     std::println("15 long_tap       {}", last);
     // ── P16 反例：缺一个必要条件就不能触发（必要 ≠ 充分）──
     {
-        [[maybe_unused]] const int before[4] = {arena.n[idx::combo], arena.n[idx::drag], arena.n[idx::dbl],
-                               arena.n[idx::dbl_tap]};
+        [[maybe_unused]] const int before[4] = {arena.n[idx::combo], arena.n[idx::drag],
+                                                arena.n[idx::dbl], arena.n[idx::dbl_tap]};
 
         // a) 先松开 Ctrl（P8 里一直按着），再只按 S ⇒ 没有 combo_ctrl_s
         post(5450, kb{ae::Key::eLEFT_CONTROL, RELEASE});
@@ -845,7 +946,8 @@ int main()
 
         // b) 按着移动但没超过阈值（<30px）⇒ 不是 drag，抬手后是 click
         post(5600, mb{L, PRESS});
-        post(5620, p2{arena.ctx.pointer_x + 10.0, arena.ctx.pointer_y}); // 只移动 10px（相对当前位置）
+        post(5620, p2{arena.ctx.pointer_x + 10.0,
+                      arena.ctx.pointer_y}); // 只移动 10px（相对当前位置）
         assert(arena.n[idx::drag] == before[1]);
         post(5640, mb{L, RELEASE});
         tick(5940); // click 的窗口
@@ -870,14 +972,19 @@ int main()
     {
         total += arena.n[i];
         std::print("{}={} ", idx::names[i], arena.n[i]);
-        if (i % 5 == 4) std::println("");
+        if (i % 5 == 4)
+            std::println("");
     }
     std::println("共 {} 种，触发 {} 次", idx::count, total);
     // click 三次：P1 单击、P6 左键那次、P16 小移动那次
     assert(arena.n[idx::click] == 3);
     // tap 两次：P9、P16d
-    assert(arena.n[idx::tap] == 2); // P1 的单击 + P6 左键那次（刻意留着）`r`n    for (int i = 1; i <= idx::combo; ++i) if (i != idx::click) assert(arena.n[i] == 1);
-    for (int i = idx::tap; i < idx::count; ++i) if (i != idx::tap) assert(arena.n[i] == 1);
+    assert(
+        arena.n[idx::tap] ==
+        2); // P1 的单击 + P6 左键那次（刻意留着）`r`n    for (int i = 1; i <= idx::combo; ++i) if (i != idx::click) assert(arena.n[i] == 1);
+    for (int i = idx::tap; i < idx::count; ++i)
+        if (i != idx::tap)
+            assert(arena.n[i] == 1);
 
     std::println("\n=== 15 种 UI 事件全部生成 ===");
     return 0;
