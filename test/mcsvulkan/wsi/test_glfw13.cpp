@@ -718,6 +718,7 @@ namespace uhi
         using machine = Fsm; // 叶子协议：我的状态机类型（反射靠它认出叶子）
         static constexpr auto name = Fsm::name;       // kind 的身份
         static constexpr auto fn_name = Fsm::fn_name; // 回调的名字（invoke<fn_name>）
+        using consume_t = Fsm::consume_t;
 
         static consteval plan_data plan()
         {
@@ -747,11 +748,12 @@ namespace uhi
 
         static consteval plan_data plan()
         {
-            constexpr std::size_t K = sizeof...(Rs); // 几个孩子：这是"多少个"
-            std::array<plan_data, K> parts{};
+            constexpr std::size_t K = sizeof...(Rs);
+            std::array<plan_data, K> parts{}; //收集每个子树的 plan_data
             index_t k = 0;
             ((parts[k++] = Rs::plan()), ...);
 
+            // 前缀和 off 与拼接 p
             plan_data p;
             std::array<index_t, K + 1> off{};
             for (std::size_t i = 0; i < K; ++i)
@@ -759,6 +761,12 @@ namespace uhi
                 off[i + 1] = off[i] + static_cast<index_t>(parts[i].kinds.size());
                 p = p + parts[i];
             }
+            /*
+            外层 (a, b)：枚举所有不同的子树对，并且强制 a < b（按声明序，a 在前）。
+            内层 (x, y)：x 遍历子树 a 的所有叶子下标，y 遍历子树 b 的所有叶子下标。
+            把每一对 (x, y) 加入 excl
+            */
+            // NOTE: 任意两个不同子树之间的叶子两两互斥
             for (index_t a = 0; a < K; ++a)
                 for (index_t b = a + 1; b < K; ++b)
                     for (index_t x = off[a]; x < off[a + 1]; ++x)
@@ -1068,7 +1076,8 @@ namespace uhi
         template <class L, class T, class... Ts>
         struct merge_all<L, T, Ts...>
         {
-            using type = typename merge_all<typename merge_tuple<L, T>::type, Ts...>::type;
+            using type =
+                typename merge_all<typename merge_tuple<L, T>::type, Ts...>::type;
         };
 
         template <class L, class Fsms>
@@ -1319,7 +1328,8 @@ namespace uhi
         constexpr void bind(Arena &a) noexcept
         {
             template for (constexpr auto I : std::ranges::views::indices(S))
-                std::get<I>(fsms).bind(a);
+                std::get<I>(fsms)
+                    .bind(a);
         }
 
         // 推进一帧：只有能接受这个 Frame 的识别器被推进，其余保留上一次上报。
@@ -1345,8 +1355,8 @@ namespace uhi
         // 推进时间：每个识别器都回答；挂起的 ready 重新申辩。
         void tick(time_point now, trace *obs = nullptr) noexcept
         {
-            template for (constexpr auto I : std::ranges::views::indices(S))
-                report[I] = std::get<I>(fsms).tick(now);
+            template for (constexpr auto I : std::ranges::views::indices(S)) report[I] =
+                std::get<I>(fsms).tick(now);
             settle(now, obs);
         }
 
@@ -1671,8 +1681,8 @@ namespace app
                 return claim(uhi::step_t::idle);
             default:
                 // 按下、等着、挂起，都算在场；纯路过才是 idle。
-                return claim(
-                    (armed || clicks > 0 || watch.down) ? uhi::step_t::hold : cur);
+                return claim((armed || clicks > 0 || watch.down) ? uhi::step_t::hold
+                                                                 : cur);
             }
         }
         // 时间窗只靠"喂帧"是过不去的：必须由 tick 推动。
@@ -2330,8 +2340,7 @@ namespace app
         check("双击：挂起的 click 让位一次",
               count("on_click", uhi::verdict::superseded) == 1);
         const auto *d1 = nth("on_dbl", uhi::verdict::accepted, 0);
-        check("双击：at = triple 超时后放行",
-              d1 != nullptr && ms(d1->at) == 951);
+        check("双击：at = triple 超时后放行", d1 != nullptr && ms(d1->at) == 951);
 
         // ── C. 拖拽：一个长 claim。
         //       越过阈值那一帧 begin → win；下一帧 move → win；松手 end → win。
@@ -2366,8 +2375,7 @@ namespace app
 
         check("拖拽结束后单击恢复", arena.tally.click == 2);
         const auto *c2 = nth("on_click", uhi::verdict::accepted, 1);
-        check("恢复后的单击：at = 1561",
-              c2 != nullptr && ms(c2->at) == 1561);
+        check("恢复后的单击：at = 1561", c2 != nullptr && ms(c2->at) == 1561);
 
         // ── E. 其它通道：悬停 / 滚轮 / 键盘，各一次，互不排队。
         const auto before_other = accepted_total();
