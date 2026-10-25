@@ -224,86 +224,6 @@ struct glfw_input_translation
         proxy_class_type fn_;
     };
 
-    template <typename... event_type>
-    struct SubscriptionForwarder
-    {
-        using callback_type = void (*)(void *self, event_type...);
-
-        struct value_type
-        {
-            void *ctx;
-            callback_type callback;
-            bool valid;
-        };
-        SubscriptionForwarder() = default;
-        SubscriptionForwarder(const SubscriptionForwarder &) = delete;
-        SubscriptionForwarder(SubscriptionForwarder &&) = delete;
-        SubscriptionForwarder &operator=(const SubscriptionForwarder &) = delete;
-        SubscriptionForwarder &operator=(SubscriptionForwarder &&) = delete;
-        ~SubscriptionForwarder() = default;
-
-        constexpr void subscribe(void *ctx, callback_type cb)
-        {
-            if (distributing_)
-            {
-                pendingAdd_.push_back({ctx, cb, true});
-                return;
-            }
-            callbacks_.push_back({ctx, cb, true});
-        }
-
-        constexpr void unsubscribe(void *ctx, callback_type cb)
-        {
-            for (auto &item : callbacks_)
-                if (item.ctx == ctx && item.callback == cb)
-                {
-                    item.valid = false;
-                    hasInvalid_ = true;
-                }
-            for (auto &item : pendingAdd_)
-                if (item.ctx == ctx && item.callback == cb)
-                {
-                    item.valid = false;
-                    hasInvalid_ = true;
-                }
-        }
-
-        constexpr void distribute(event_type... event)
-        {
-            const bool outer = !distributing_;
-            if (outer)
-                distributing_ = true;
-
-            for (const auto &item : callbacks_)
-                if (item.valid)
-                    (item.callback)(item.ctx, event...);
-
-            if (outer)
-            {
-                distributing_ = false;
-                if (!pendingAdd_.empty())
-                {
-                    callbacks_.insert(callbacks_.end(),
-                                      std::make_move_iterator(pendingAdd_.begin()),
-                                      std::make_move_iterator(pendingAdd_.end()));
-                    pendingAdd_.clear();
-                }
-                if (hasInvalid_)
-                {
-                    std::erase_if(callbacks_,
-                                  [](const value_type &v) noexcept { return !v.valid; });
-                    hasInvalid_ = false;
-                }
-            }
-        }
-
-      private:
-        std::vector<value_type> callbacks_;
-        std::vector<value_type> pendingAdd_;
-        bool distributing_ = false;
-        bool hasInvalid_ = false;
-    };
-
     template <typename event_type>
     constexpr static void forwarding(void *self, event_type e) noexcept
     {
@@ -405,7 +325,7 @@ struct glfw_input_translation
 //  库：矩阵裁决引擎（单文件，整块拷进来）
 //
 //    它自带一个 demo main；改个名字搬进来，不参与本文件的链接。
-//    引擎只规定"帧 → step_t"，帧和识别器都由本案例自己写（见下）。
+//    引擎只规定"帧 → claim_state"，帧和识别器都由本案例自己写（见下）。
 // ═══════════════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════════
 //  矩阵裁决引擎 —— 已内联进本文件（不再是 include，直接在这里改）
@@ -481,7 +401,7 @@ namespace uhi
     //
     // 没有 done / aborted / reset：帧不改变 claim 时，识别器把当前状态
     // 原样再说一遍；自己放弃就回 idle（放弃不是判决，不产生事件）。
-    enum class step_t : std::uint8_t
+    enum class claim_state : std::uint8_t
     {
         idle,
         hold,
@@ -501,7 +421,7 @@ namespace uhi
     //     ① idle / hold / ready —— 我现在是什么
     //     ② 吃哪种帧            —— 编译期由 feed 重载决定；law_of 用它算 accepted-frame 集合
     //
-    //   session → 识别器（裁决之后，只可能调一个）：
+    //   arbiter → 识别器（裁决之后，只可能调一个）：
     //     ③ win()  —— 允许发射这一帧的事件；是否结束 claim 由识别器决定
     //     ④ lose() —— 更具体的赢了：丢掉并结束这条 claim
     //
@@ -521,23 +441,23 @@ namespace uhi
     //   R6 事件消费：win 之后不得对同一个事件再次 ready；下一个 ready 必须
     //      是新事件。长 claim 可以多次 ready，但每次都是不同事件。
     // ═══════════════════════════════════════════════════════════════════
-    namespace fsm
+    namespace recognizer
     {
         // 识别器只做三件事：吃帧、过时间、投递/退休。
-        // 裁决器只吃 step_t 数组，不认识 Frame、payload、span。
+        // 裁决器只吃 claim_state 数组，不认识 Frame、payload、span。
         template <class M, class Frame>
         concept can_step = requires(M &m, const Frame &f, time_point t) {
-            { m.feed(f, t) } noexcept -> std::same_as<step_t>;
+            { m.feed(f, t) } noexcept -> std::same_as<claim_state>;
         };
 
         template <class M>
-        concept machine = std::default_initializable<M> && requires(M &m, time_point t) {
+        concept protocol = std::default_initializable<M> && requires(M &m, time_point t) {
             typename M::consume_t; // 我处理哪些 arena_event change
-            { m.tick(t) } noexcept -> std::same_as<step_t>;
-            { m.win() } noexcept -> std::same_as<step_t>;
-            { m.lose() } noexcept -> std::same_as<step_t>;
+            { m.tick(t) } noexcept -> std::same_as<claim_state>;
+            { m.win() } noexcept -> std::same_as<claim_state>;
+            { m.lose() } noexcept -> std::same_as<claim_state>;
         };
-    } // namespace fsm
+    } // namespace recognizer
 
     // 判决的两种结果，打印用（和 event 做邻居）
     constexpr std::string_view to_string(verdict v) noexcept
@@ -546,7 +466,7 @@ namespace uhi
     }
 
     // 一条观测记录（定长、可拷贝、不分配）
-    struct event
+    struct observation
     {
         std::string_view name{};
         verdict v{};
@@ -558,17 +478,17 @@ namespace uhi
     struct trace
     {
         static constexpr std::size_t capacity = 64;
-        std::array<event, capacity> buf{};
+        std::array<observation, capacity> buf{};
         std::size_t n = 0, dropped_n = 0;
 
-        constexpr void push(const event &e) noexcept
+        constexpr void push(const observation &e) noexcept
         {
             if (n < capacity)
                 buf[n++] = e;
             else
                 ++dropped_n;
         }
-        constexpr std::span<const event> events() const noexcept
+        constexpr std::span<const observation> events() const noexcept
         {
             return {buf.data(), n};
         }
@@ -631,10 +551,10 @@ namespace uhi
     //               多个 kind 可以共用同一个回调。
     //   “能吃哪些帧”不再手写：由 feed 重载在 law_of 里编译期算出来，
     //   关系两端能不能相遇也由这个集合决定，不靠 channel 字符串。
-    template <fsm::machine Fsm>
+    template <recognizer::protocol Fsm>
     struct leaf
     {
-        using machine = Fsm; // 叶子协议：我的状态机类型（反射靠它认出叶子）
+        using protocol = Fsm; // 叶子协议：我的状态机类型（反射靠它认出叶子）
         static constexpr auto name = Fsm::name;       // kind 的身份
         static constexpr auto fn_name = Fsm::fn_name; // 回调的名字（invoke<fn_name>）
         using consume_t = Fsm::consume_t;
@@ -741,25 +661,41 @@ namespace uhi
                 if ((i == x && j == y) || (i == y && j == x))
                     throw "refines x excl conflict";
 
-        // awaits 无环：按等待数做 Kahn。计数用 size_t，用 done 表代替 -1 哨兵。
-        std::vector<std::size_t> indeg(n, 0); // 等待数：计数，不是下标
-        std::vector<bool> done(n, false);
+        // awaits 无环检查（拓扑排序 / Kahn）。
+        //
+        // 语义：awaits 里的 (i, j) 读作「i 在等 j」。
+        // 有环 ⇔ 存在一组节点互相等待（死锁），细化关系不成立 → throw。
+        //
+        // 做法（三句话）：
+        //   1. indeg[i] = 「i 还欠几个人没等到」（不是图论入度，名字别较真）
+        //   2. 反复找 indeg == 0 的节点（谁也不欠 → 自由），完成它，
+        //      再让所有「在等它」的节点少欠一个（--indeg）
+        //   3. 某一轮一个自由的都没找到 → 剩下的互相等 → 有环
+        //
+        // 复杂度 O(n² · |awaits|)：每完成一个节点就重扫整张 awaits 表。
+        // max_kinds = 64 的注释里说「爆点在 validate 的 Kahn」就是指这里。
+        std::vector<std::size_t> indeg(n, 0); // indeg[i] = i 还欠几个"等"
         for (auto [i, j] : p.awaits)
-            ++indeg[i];
-        for (std::size_t left = n; left > 0;)
+            ++indeg[i]; // i 等 j：i 欠一个
+
+        std::vector<bool> done(n, false);     // done[i]  = i 是否已完成
+        for (std::size_t left = n; left > 0;) // left = 还没完成的节点数
         {
-            bool prog = false;
+            bool prog = false; // 本轮是否至少完成了一个
             for (index_t i = 0; i < n; ++i)
-                if (!done[i] && indeg[i] == 0)
+                if (!done[i] && indeg[i] == 0) // 不欠任何人了 → 自由
                 {
                     done[i] = true;
                     --left;
                     prog = true;
+                    // 完成 i 之后，所有"在等 i"的 x 都少欠一个。
+                    // (x, y) 且 y == i 就是「x 在等 i」。
                     for (auto [x, y] : p.awaits)
                         if (y == i)
                             --indeg[x];
+                    // 注意：内层 for 不 break，本轮内新变自由的节点会顺手处理。
                 }
-            if (!prog)
+            if (!prog) // 一轮下来没人自由 → 死锁 → 有环
                 throw "refines cycle";
         }
     }
@@ -896,14 +832,14 @@ namespace uhi
             return {};
         }
 
-        // 按声明序收集叶子（叶子 = 声明了 machine 的节点）
+        // 按声明序收集叶子（叶子 = 声明了 protocol 的节点）
         consteval std::vector<std::meta::info> leaf_infos(std::meta::info node)
         {
             constexpr auto ctx = std::meta::access_context::current();
             std::vector<std::meta::info> out;
             for (auto m : std::meta::members_of(node, ctx))
                 if (std::meta::has_identifier(m) &&
-                    std::meta::identifier_of(m) == "machine")
+                    std::meta::identifier_of(m) == "protocol")
                 {
                     out.push_back(node);
                     return out;
@@ -918,14 +854,14 @@ namespace uhi
         template <class... Ls>
         struct shape
         {
-            static constexpr std::size_t n = sizeof...(Ls);
-            using fsms = std::tuple<typename Ls::machine...>;
+            static constexpr std::size_t leaf_count = sizeof...(Ls);
+            using recognizers = std::tuple<typename Ls::protocol...>;
 
             // 同一个 FSM 类型出现两次 ⇒ 两个无法区分的 claim；这是结构错误。
             // name 是日志标签，不承担这个约束。
             static constexpr bool unique_machines = []() consteval {
                 constexpr std::size_t N = sizeof...(Ls);
-                std::array<std::meta::info, N> m{^^typename Ls::machine...};
+                std::array<std::meta::info, N> m{^^typename Ls::protocol...};
                 for (std::size_t i = 0; i < N; ++i)
                     for (std::size_t j = i + 1; j < N; ++j)
                         if (m[i] == m[j])
@@ -939,7 +875,7 @@ namespace uhi
             {
                 std::vector<std::meta::info> out;
                 auto add = [&out]<class L>() {
-                    for (auto a : template_args<typename L::machine::consume_t>())
+                    for (auto a : template_args<typename L::protocol::consume_t>())
                     {
                         bool seen = false;
                         for (auto b : out)
@@ -963,7 +899,7 @@ namespace uhi
 
             // 第 I 个 leaf 自己的 consume_t：不去重，用来和 I 对账。
             template <std::size_t I>
-            using consume_of = typename std::tuple_element_t<I, fsms>::consume_t;
+            using consume_of = typename std::tuple_element_t<I, recognizers>::consume_t;
         };
 
         template <class Tree>
@@ -981,10 +917,6 @@ namespace uhi
 
     } // namespace detail
 
-    // 结构的公开自查数字
-    template <class Tree>
-    inline constexpr std::size_t leaf_count_v = detail::shape_of<Tree>::n;
-
     // ═══════════════════════════════════════════════════════════════════
     // 4.3 advance_mask<Tree, Frame>()：这一帧会**推进**哪些列
     //
@@ -997,14 +929,16 @@ namespace uhi
     //    drag 赢的时候照样能把 click lose 掉。
     // ═══════════════════════════════════════════════════════════════════
     template <class Tree, class Frame>
-    consteval bset<leaf_count_v<Tree>> advance_mask() noexcept
+    consteval auto advance_mask() noexcept
     {
-        using fsms_t = typename detail::shape_of<Tree>::fsms;
-        constexpr std::size_t S = leaf_count_v<Tree>;
+        using Shape = typename detail::shape_of<Tree>;
+        using Recognizers = Shape::recognizers;
+        constexpr std::size_t S = Shape::leaf_count;
         bset<S> m{};
         template for (constexpr auto I : std::ranges::views::indices(S))
         {
-            if constexpr (fsm::can_step<std::tuple_element_t<I, fsms_t>, Frame>)
+            if constexpr (recognizer::can_step<std::tuple_element_t<I, Recognizers>,
+                                               Frame>)
                 m.set(static_cast<index_t>(I));
         }
         return m;
@@ -1026,14 +960,6 @@ namespace uhi
     //   再把这个数调大。
     // ═══════════════════════════════════════════════════════════════════
     inline constexpr std::size_t max_kinds = 64;
-
-    // 上限与索引类型的关系（两者必须一起看）：
-    //   S ≤ max_kinds，而 max_kinds 必须塞得进 index_t。
-    //   现在 index_t = size_t（64 位）、max_kinds = 64，远够。
-    //   哪天要把 index_t 收窄成 uint8/uint16，这条断言会先拦住；
-    //   改 max_kinds 时同理。两者是一个"对"，不该分开动。
-    static_assert(max_kinds <= std::numeric_limits<index_t>::max(),
-                  "max_kinds 超过 index_t 的容量：索引类型和上限必须一起改");
 
     // ═══════════════════════════════════════════════════════════════════
     // 4.5 传递闭包（位行 Warshall）：i→k、k→j ⇒ i→j
@@ -1067,7 +993,7 @@ namespace uhi
         using shape = detail::shape_of<Tree>;
         // 所有 leaf 的 consume_t 去重并集；运行期裁决只读 beats，不读它。
         using change_types = typename shape::consume_t;
-        static constexpr std::size_t S = leaf_count_v<Tree>;
+        static constexpr std::size_t S = shape::leaf_count;
         static constexpr std::size_t C = std::tuple_size_v<change_types>;
 
         // 上限先断言：S 超过 max_kinds 就别往下算了（理由见 max_kinds 的注释）
@@ -1130,10 +1056,6 @@ namespace uhi
                 r[i] = p.kinds[i].name;
             return r;
         }();
-
-        // 连通块（cell）只是 beats 的无向连通分量：部分之间没有边，
-        // 所以运行期不需要 cell 循环，全局 bitset 就是各块的乘积。
-        // 它留在编译期/文档里，不作为运行期状态。
     };
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1144,7 +1066,7 @@ namespace uhi
     //    输出：win / lose 两个位图
     //
     //    它不知道 Frame、arena_event、payload、span、识别器类型，
-    //    也不调用任何识别器。调用 win/lose 是 session 的事。
+    //    也不调用任何识别器。调用 win/lose 是 arbiter 的事。
     // ═══════════════════════════════════════════════════════════════════
     template <std::size_t S>
     struct decision
@@ -1171,16 +1093,16 @@ namespace uhi
     //    没进 win/lose 的 ready 是 pending：被 hold 的 superior 挡住，
     //    report 保持 ready，下一拍继续申辩。
     template <std::size_t S>
-    constexpr decision<S> arbitrate(const std::array<step_t, S> &report,
+    constexpr decision<S> arbitrate(const std::array<claim_state, S> &report,
                                     const std::array<bset<S>, S> &beats) noexcept
     {
         // ① 谁还活着 / 谁这一拍想说话
         bset<S> live{}, ready{};
         for (index_t i = 0; i < S; ++i)
         {
-            if (report[i] != step_t::idle)
+            if (report[i] != claim_state::idle)
                 live.set(i);
-            if (report[i] == step_t::ready)
+            if (report[i] == claim_state::ready)
                 ready.set(i);
         }
 
@@ -1204,7 +1126,7 @@ namespace uhi
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // 9. session：识别器和裁决器的唯一接线处
+    // 9. arbiter：识别器和裁决器的唯一接线处
     //
     //    它拥有识别器和 report（最近一次上报）；每拍：
     //      1. 裁剪：只推进能接受该 Frame 的列
@@ -1214,39 +1136,39 @@ namespace uhi
     //    feed/tick 各有两个版本：
     //      feed(frame, now)                  主 ui：不观测
     //      feed<Frame, Trace>(frame, now, t) 子类 debug 用：Trace 是模板参数
-    //    Trace 不是指针，不进 ui 的成员/ABI，也没有虚函数。
+    //    Trace 不是指针，不进 arbiter 的成员/ABI，也没有虚函数。
     // ═══════════════════════════════════════════════════════════════════
     template <class Tree>
-    struct ui
+    struct arbiter
     {
         using shape = detail::shape_of<Tree>;
         using law = law_of<Tree>;
-        static constexpr std::size_t S = shape::n;
-        using fsms_t = typename shape::fsms;
+        static constexpr std::size_t S = shape::leaf_count;
+        using Recognizers = typename shape::recognizers;
 
-        fsms_t fsms{};
-        std::array<step_t, S> report{}; // 最近一次上报；裁决器唯一输入
+        Recognizers recognizers{};
+        std::array<claim_state, S> reports{}; // 最近一次上报；裁决器唯一输入
 
         // 延迟绑定：只用叶子的类型（名字 + 载荷类型），不用对象。
         template <class Arena>
         constexpr void bind(Arena &a) noexcept
         {
             template for (constexpr auto I : std::ranges::views::indices(S))
-                std::get<I>(fsms)
+                std::get<I>(recognizers)
                     .bind(a);
         }
 
         // 无观测版本
         template <class Frame>
-        void feed(const Frame &f, time_point now) noexcept
+        constexpr void feed(const Frame &f, time_point now) noexcept
         {
             null_trace t{};
             feed<Frame, null_trace>(f, now, t);
         }
 
-        // 带 Trace 模板参数的版本：由 debug_ui 调用
+        // 带 Trace 模板参数的版本：由 debug_arbiter 调用
         template <class Frame, class Trace>
-        void feed(const Frame &f, time_point now, Trace &t) noexcept
+        constexpr void feed(const Frame &f, time_point now, Trace &t) noexcept
         {
             constexpr bset<S> advance = advance_mask<Tree, Frame>();
             if constexpr (advance.none())
@@ -1255,25 +1177,25 @@ namespace uhi
             template for (constexpr auto I : std::ranges::views::indices(S))
             {
                 if constexpr (advance.has(static_cast<index_t>(I)))
-                    report[I] = std::get<I>(fsms).feed(f, now);
+                    reports[I] = std::get<I>(recognizers).feed(f, now);
             }
             resolve(now, t);
         }
 
         // 无观测版本
-        void tick(time_point now) noexcept
+        constexpr void tick(time_point now) noexcept
         {
             null_trace t{};
             tick<null_trace>(now, t);
         }
 
-        // 带 Trace 模板参数的版本：由 debug_ui 调用
+        // 带 Trace 模板参数的版本：由 debug_arbiter 调用
         template <class Trace>
-        void tick(time_point now, Trace &t) noexcept
+        constexpr void tick(time_point now, Trace &t) noexcept
         {
             template for (constexpr auto I : std::ranges::views::indices(S))
             {
-                report[I] = std::get<I>(fsms).tick(now);
+                reports[I] = std::get<I>(recognizers).tick(now);
             }
             resolve(now, t);
         }
@@ -1281,9 +1203,9 @@ namespace uhi
       private:
         // report -> verdict -> 落地。先让位，再放行。
         template <class Trace>
-        void resolve(time_point now, Trace &t) noexcept
+        constexpr void resolve(time_point now, Trace &t) noexcept
         {
-            const auto d = arbitrate(report, law::beats);
+            const auto d = arbitrate(reports, law::beats);
 
             template for (constexpr auto I : std::ranges::views::indices(S))
             {
@@ -1300,10 +1222,10 @@ namespace uhi
         // 唯一副作用点：win/lose 返回“裁决之后我是什么状态”，
         // 立刻写回 report；下一拍不会拿旧的 ready 再判一次。
         template <std::size_t Flat, class Trace>
-        void deliver(bool won, time_point at, Trace &t) noexcept
+        constexpr void deliver(bool won, time_point at, Trace &t) noexcept
         {
-            auto &m = std::get<Flat>(fsms);
-            report[Flat] = won ? m.win() : m.lose();
+            auto &m = std::get<Flat>(recognizers);
+            reports[Flat] = won ? m.win() : m.lose();
 
             if constexpr (!std::is_same_v<Trace, null_trace>)
                 t.push({law::names[Flat].view(),
@@ -1315,37 +1237,44 @@ namespace uhi
     // 10. debug_ui：ui + 观测
     //
     //   只覆盖 feed/tick 的无观测版本，显式把 trace 作为模板参数传下去。
-    //   主 ui 没有 trace 成员、没有虚函数；删掉 debug_ui，第 1–9 节照样跑。
+    //   主 arbiter 没有 trace 成员、没有虚函数；删掉 debug_ui，第 1–9 节照样跑。
     // ═══════════════════════════════════════════════════════════════════
-    template <class Tree>
-    struct debug_ui : ui<Tree>
+    template <class Tree, class Trace = trace>
+    struct debug_arbiter : arbiter<Tree>
     {
         using law = law_of<Tree>;
+        using base = arbiter<Tree>;
 
-        trace obs{};
+        Trace obs{};
 
         template <class Frame>
-        void feed(const Frame &f, time_point now) noexcept
+        constexpr void feed(const Frame &f, time_point now) noexcept
         {
-            ui<Tree>::template feed<Frame, trace>(f, now, obs);
+            base::template feed<Frame, Trace>(f, now, obs);
         }
 
-        void tick(time_point now) noexcept
+        constexpr void tick(time_point now) noexcept
         {
-            ui<Tree>::template tick<trace>(now, obs);
+            base::template tick<Trace>(now, obs);
         }
 
-        std::span<const event> events() const noexcept
+        template <class Self>
+        constexpr decltype(auto) events(this Self &&self) noexcept
+            requires(requires() { std::forward_like<Self>(self.obs).events(); })
         {
-            return obs.events();
+            return std::forward_like<Self>(self.obs).events();
         }
-        void clear_events() noexcept
+        template <class Self>
+        constexpr void clear_events(this Self &&self) noexcept
+            requires(requires() { std::forward_like<Self>(self.obs).clear(); })
         {
-            obs.clear();
+            std::forward_like<Self>(self.obs).clear();
         }
-        std::size_t dropped() const noexcept
+        template <class Self>
+        constexpr decltype(auto) dropped(this Self &&self) noexcept
+            requires(requires() { std::forward_like<Self>(self.obs).dropped(); })
         {
-            return obs.dropped();
+            return std::forward_like<Self>(self.obs).dropped();
         }
     };
 
@@ -1427,17 +1356,18 @@ namespace arena_event
         double pointer_y = 0.0;
         bool pointer_position_valid = false;
 
-        decltype(auto) get_keyboard_event(this auto &&self, Key k) noexcept
+        constexpr decltype(auto) get_keyboard_event(this auto &&self, Key k) noexcept
         {
             return std::forward_like<decltype(self)>(self.keys[std::to_underlying(k)]);
         }
 
-        decltype(auto) get_mousebutton_event(this auto &&self, MouseButton b) noexcept
+        constexpr decltype(auto) get_mousebutton_event(this auto &&self,
+                                                       MouseButton b) noexcept
         {
             return std::forward_like<decltype(self)>(self.buttons[std::to_underlying(b)]);
         }
 
-        bool any_button_down() const noexcept
+        constexpr bool any_button_down() const noexcept
         {
             for (auto s : buttons)
                 if (s == HeldState::Down)
@@ -1480,6 +1410,7 @@ namespace arena_event
         T change;
     };
 
+    // NOTE: 枚举转发到下游的全部类型
     template <class T>
     inline constexpr bool is_change =
         std::same_as<T, key_change> || std::same_as<T, button_change> ||
@@ -1487,14 +1418,6 @@ namespace arena_event
         std::same_as<T, mcs::vulkan::event::scroll_event> ||
         std::same_as<T, mcs::vulkan::event::cursor_enter_event> ||
         std::same_as<T, char_change>;
-
-    template <class Tuple>
-    struct only_changes;
-
-    template <class... Ts>
-    struct only_changes<std::tuple<Ts...>> : std::bool_constant<(is_change<Ts> && ...)>
-    {
-    };
 
     template <class... Ts>
     struct changes_checked
@@ -1687,19 +1610,19 @@ namespace app
         //    win 只发射当前事件；claim 是否结束由识别器自己决定。
         struct fsm_state
         {
-            uhi::step_t cur{uhi::step_t::idle};
+            uhi::claim_state cur{uhi::claim_state::idle};
 
-            uhi::step_t claim(uhi::step_t s) noexcept
+            uhi::claim_state claim(uhi::claim_state s) noexcept
             {
                 // 已经 ready、还没裁决的 claim，新帧不能把它降回 hold。
-                if (cur == uhi::step_t::ready && s != uhi::step_t::idle)
-                    s = uhi::step_t::ready;
+                if (cur == uhi::claim_state::ready && s != uhi::claim_state::idle)
+                    s = uhi::claim_state::ready;
                 cur = s;
                 return s;
             }
 
             // 默认：时间不改变状态（窗口需要过期的识别器自己覆盖 tick）
-            uhi::step_t tick(uhi::time_point) noexcept
+            uhi::claim_state tick(uhi::time_point) noexcept
             {
                 return claim(cur);
             }
@@ -1707,14 +1630,14 @@ namespace app
             // 长 claim 发射完一个事件：claim 继续活着，等下一个事件
             void consume_event() noexcept
             {
-                if (cur == uhi::step_t::ready)
-                    cur = uhi::step_t::hold;
+                if (cur == uhi::claim_state::ready)
+                    cur = uhi::claim_state::hold;
             }
 
             // 一次性手势/让位：claim 结束
             void settle_claim() noexcept
             {
-                cur = uhi::step_t::idle;
+                cur = uhi::claim_state::idle;
             }
         };
 
@@ -1779,26 +1702,26 @@ namespace app
             } payload{};
 
             press_watch watch{};
-            uhi::step_t feed(
+            uhi::claim_state feed(
                 const arena_event::input_frame<arena_event::button_change> &f,
                 uhi::time_point now) noexcept
             {
                 switch (watch(f, now))
                 {
                 case 1:
-                    return claim(uhi::step_t::hold);
+                    return claim(uhi::claim_state::hold);
                 case 2:
-                    if (cur != uhi::step_t::ready) // 挂起的那一条不拿新坐标覆盖
+                    if (cur != uhi::claim_state::ready) // 挂起的那一条不拿新坐标覆盖
                     {
                         payload.x = f.context.pointer_x;
                         payload.y = f.context.pointer_y;
                     }
-                    return claim(uhi::step_t::ready);
+                    return claim(uhi::claim_state::ready);
                 case -1: // 不是单击：这次交互作废
-                    return claim(uhi::step_t::idle);
+                    return claim(uhi::claim_state::idle);
                 default:
                     // 挂起中（ready）就继续申辩；否则按下算 hold，其余算 idle。
-                    return claim(watch.down ? uhi::step_t::hold : cur);
+                    return claim(watch.down ? uhi::claim_state::hold : cur);
                 }
             }
             void *receiver_{};
@@ -1814,14 +1737,14 @@ namespace app
                         ->template invoke<fn_name>(self->payload);
                 }};
             }
-            constexpr uhi::step_t win() noexcept
+            constexpr uhi::claim_state win() noexcept
             {
                 assert(invoke_ != nullptr);
                 invoke_(this);
                 settle_claim(); // 投递完，这条申报结束
                 return cur;
             }
-            uhi::step_t lose() noexcept
+            uhi::claim_state lose() noexcept
             {
                 watch.reset(); // 被更具体的赢了：这次交互丢掉
                 settle_claim();
@@ -1851,7 +1774,7 @@ namespace app
             uhi::time_point last{}; // 上一次松开的时刻
             bool armed = false;     // 正在窗口里等下一击
 
-            uhi::step_t feed(
+            uhi::claim_state feed(
                 const arena_event::input_frame<arena_event::button_change> &f,
                 uhi::time_point now) noexcept
             {
@@ -1862,18 +1785,18 @@ namespace app
                     clicks = 0;
                     armed = false;
                     watch.reset();
-                    claim(uhi::step_t::idle);
+                    claim(uhi::claim_state::idle);
                 }
 
                 switch (watch(f, now))
                 {
                 case 1:
-                    return claim(uhi::step_t::hold);
+                    return claim(uhi::claim_state::hold);
                 case 2:
                     ++clicks;
                     armed = true;
                     last = now;
-                    if (cur != uhi::step_t::ready) // 挂起的那一条保留原载荷/跨度
+                    if (cur != uhi::claim_state::ready) // 挂起的那一条保留原载荷/跨度
                     {
                         payload.x = f.context.pointer_x;
                         payload.y = f.context.pointer_y;
@@ -1883,29 +1806,30 @@ namespace app
                     {
                         clicks = 0;
                         armed = false;
-                        return claim(uhi::step_t::ready);
+                        return claim(uhi::claim_state::ready);
                     }
-                    return claim(uhi::step_t::hold);
+                    return claim(uhi::claim_state::hold);
                 case -1: // 这一次不是有效单击
                     clicks = 0;
                     armed = false;
-                    return claim(uhi::step_t::idle);
+                    return claim(uhi::claim_state::idle);
                 default:
                     // 按下、等着、挂起，都算在场；纯路过才是 idle。
-                    return claim((armed || clicks > 0 || watch.down) ? uhi::step_t::hold
-                                                                     : cur);
+                    return claim((armed || clicks > 0 || watch.down)
+                                     ? uhi::claim_state::hold
+                                     : cur);
                 }
             }
             // 时间窗只靠"喂帧"是过不去的：必须由 tick 推动。
             // 但 tick 不再从旁边改 cur —— 它回同一句话，引擎照常裁决。
-            uhi::step_t tick(uhi::time_point now) noexcept
+            uhi::claim_state tick(uhi::time_point now) noexcept
             {
                 if (armed && now - last > uhi::time_point{GapMs})
                 {
                     clicks = 0;
                     armed = false;
                     watch.reset();
-                    return claim(uhi::step_t::idle);
+                    return claim(uhi::claim_state::idle);
                 }
                 return claim(cur);
             }
@@ -1923,7 +1847,7 @@ namespace app
                         ->template invoke<fn_name>(self->payload);
                 }};
             }
-            constexpr uhi::step_t win() noexcept
+            constexpr uhi::claim_state win() noexcept
             {
                 assert(invoke_ != nullptr);
                 invoke_(this);
@@ -1933,7 +1857,7 @@ namespace app
                 settle_claim();
                 return cur;
             }
-            uhi::step_t lose() noexcept
+            uhi::claim_state lose() noexcept
             {
                 clicks = 0;
                 armed = false;
@@ -2034,8 +1958,9 @@ namespace app
         bool dragging = false;
         bool ending = false;
 
-        uhi::step_t feed(const arena_event::input_frame<arena_event::button_change> &f,
-                         uhi::time_point now) noexcept
+        uhi::claim_state feed(
+            const arena_event::input_frame<arena_event::button_change> &f,
+            uhi::time_point now) noexcept
         {
             if (f.change.button != arena_event::MouseButton::eMOUSE_BUTTON_LEFT)
                 return claim(cur);
@@ -2048,60 +1973,61 @@ namespace app
             return drag_end(f, now);
         }
 
-        uhi::step_t feed(const arena_event::input_frame<arena_event::move_change> &f,
-                         uhi::time_point now) noexcept
+        uhi::claim_state feed(const arena_event::input_frame<arena_event::move_change> &f,
+                              uhi::time_point now) noexcept
         {
             return drag_move(f, now);
         }
 
-        uhi::step_t drag_start(
+        uhi::claim_state drag_start(
             const arena_event::input_frame<arena_event::button_change> &f,
             uhi::time_point now) noexcept
         {
-            if (cur != uhi::step_t::idle) // 上一条 claim 还没结束：先收掉
+            if (cur != uhi::claim_state::idle) // 上一条 claim 还没结束：先收掉
                 settle_claim();
             t.press(f.context.pointer_x, f.context.pointer_y);
             dragging = false;
             ending = false;
-            return claim(uhi::step_t::hold);
+            return claim(uhi::claim_state::hold);
         }
 
-        uhi::step_t drag_move(const arena_event::input_frame<arena_event::move_change> &f,
-                              uhi::time_point now) noexcept
+        uhi::claim_state drag_move(
+            const arena_event::input_frame<arena_event::move_change> &f,
+            uhi::time_point now) noexcept
         {
             const auto &m = f.change;
             if (!t.down)
-                return claim(uhi::step_t::idle);
+                return claim(uhi::claim_state::idle);
             if (!dragging)
             {
                 if (!t.past_slop(m.x, m.y))
                 {
                     t.last(m.x, m.y);
-                    return claim(uhi::step_t::hold);
+                    return claim(uhi::claim_state::hold);
                 }
                 dragging = true;
                 // 这一帧的坐标就是这一帧的事件。
                 payload = t.make(phase_t::begin, m.x, m.y, 0, 0);
                 t.last(m.x, m.y);
-                return claim(uhi::step_t::ready);
+                return claim(uhi::claim_state::ready);
             }
             payload = t.make(phase_t::move, m.x, m.y, m.dx, m.dy);
             t.last(m.x, m.y);
-            return claim(uhi::step_t::ready);
+            return claim(uhi::claim_state::ready);
         }
 
-        uhi::step_t drag_end(
+        uhi::claim_state drag_end(
             const arena_event::input_frame<arena_event::button_change> &f,
             uhi::time_point now) noexcept
         {
             t.release();
             if (!dragging)
-                return claim(uhi::step_t::idle); // 没拖过：claim 结束
+                return claim(uhi::claim_state::idle); // 没拖过：claim 结束
             dragging = false;
             ending = true;
             payload =
                 t.make(phase_t::end, f.context.pointer_x, f.context.pointer_y, 0, 0);
-            return claim(uhi::step_t::ready);
+            return claim(uhi::claim_state::ready);
         }
 
         void *receiver_{};
@@ -2117,7 +2043,7 @@ namespace app
                     ->template invoke<fn_name>(self->payload);
             }};
         }
-        constexpr uhi::step_t win() noexcept
+        constexpr uhi::claim_state win() noexcept
         {
             assert(invoke_ != nullptr);
             invoke_(this);
@@ -2130,7 +2056,7 @@ namespace app
                 consume_event(); // claim 继续，等下一个事件
             return cur;
         }
-        uhi::step_t lose() noexcept
+        uhi::claim_state lose() noexcept
         {
             t = {};
             dragging = false;
@@ -2147,12 +2073,12 @@ namespace app
         static constexpr auto fn_name = name;
         using consume_t = arena_event::changes<arena_event::cursor_enter_event>;
 
-        uhi::step_t feed(
+        uhi::claim_state feed(
             const arena_event::input_frame<arena_event::cursor_enter_event> &f,
             uhi::time_point now) noexcept
         {
             if (f.change.value)
-                return claim(uhi::step_t::ready);
+                return claim(uhi::claim_state::ready);
             return claim(cur); // 离开不产生事件
         }
         void *receiver_{};
@@ -2167,14 +2093,14 @@ namespace app
                 static_cast<Receiver *>(self->receiver_)->template invoke<fn_name>();
             }};
         }
-        constexpr uhi::step_t win() noexcept
+        constexpr uhi::claim_state win() noexcept
         {
             assert(invoke_ != nullptr);
             invoke_(this);
             settle_claim();
             return cur;
         }
-        uhi::step_t lose() noexcept
+        uhi::claim_state lose() noexcept
         {
             settle_claim();
             return cur;
@@ -2193,11 +2119,12 @@ namespace app
             int delta = 0;
         } payload{};
 
-        uhi::step_t feed(const arena_event::input_frame<arena_event::scroll_event> &f,
-                         uhi::time_point now) noexcept
+        uhi::claim_state feed(
+            const arena_event::input_frame<arena_event::scroll_event> &f,
+            uhi::time_point now) noexcept
         {
             payload.delta = static_cast<int>(f.change.yoffset);
-            return claim(uhi::step_t::ready);
+            return claim(uhi::claim_state::ready);
         }
         void *receiver_{};
         using invoke_type = void (*)(void *self) noexcept;
@@ -2212,14 +2139,14 @@ namespace app
                     ->template invoke<fn_name>(self->payload);
             }};
         }
-        constexpr uhi::step_t win() noexcept
+        constexpr uhi::claim_state win() noexcept
         {
             assert(invoke_ != nullptr);
             invoke_(this);
             settle_claim();
             return cur;
         }
-        uhi::step_t lose() noexcept
+        uhi::claim_state lose() noexcept
         {
             settle_claim();
             return cur;
@@ -2233,13 +2160,13 @@ namespace app
         static constexpr auto fn_name = name;
         using consume_t = arena_event::changes<arena_event::key_change>;
 
-        uhi::step_t feed(const arena_event::input_frame<arena_event::key_change> &f,
-                         uhi::time_point now) noexcept
+        uhi::claim_state feed(const arena_event::input_frame<arena_event::key_change> &f,
+                              uhi::time_point) noexcept
         {
             if (f.change.transition == arena_event::Transition::Press &&
                 !f.change.repeat && f.change.key == Key::eA)
-                return claim(uhi::step_t::ready);
-            return claim(cur); // 不改变申报
+                return claim(uhi::claim_state::ready);
+            return claim(cur);
         }
 
         using invoke_type = void (*)(void *self) noexcept;
@@ -2254,14 +2181,207 @@ namespace app
                 static_cast<Receiver *>(m->receiver_)->template invoke<fn_name>();
             }};
         }
-        constexpr uhi::step_t win() noexcept
+        constexpr uhi::claim_state win() noexcept
         {
             assert(invoke_ != nullptr);
             invoke_(this);
             settle_claim();
             return cur;
         }
-        uhi::step_t lose() noexcept
+        uhi::claim_state lose() noexcept
+        {
+            settle_claim();
+            return cur;
+        }
+    };
+
+    // ── 键盘 C：普通输入，和快捷键竞争 ───────────────────────────
+    struct key_c : detail::fsm_state
+    {
+        static constexpr auto name = static_string{"on_key_C"};
+        static constexpr auto fn_name = name;
+        using consume_t = arena_event::changes<arena_event::key_change>;
+
+        uhi::claim_state feed(const arena_event::input_frame<arena_event::key_change> &f,
+                              uhi::time_point) noexcept
+        {
+            if (f.change.transition == arena_event::Transition::Press &&
+                !f.change.repeat && f.change.key == Key::eC)
+                return claim(uhi::claim_state::ready);
+            return claim(cur);
+        }
+
+        using invoke_type = void (*)(void *self) noexcept;
+        void *receiver_{};
+        invoke_type invoke_{};
+        template <class Receiver>
+        constexpr void bind(Receiver &ptr) noexcept
+        {
+            receiver_ = &ptr;
+            invoke_ = invoke_type{[](void *self) noexcept {
+                auto *m = static_cast<key_c *>(self);
+                static_cast<Receiver *>(m->receiver_)->template invoke<fn_name>();
+            }};
+        }
+        constexpr uhi::claim_state win() noexcept
+        {
+            assert(invoke_ != nullptr);
+            invoke_(this);
+            settle_claim();
+            return cur;
+        }
+        uhi::claim_state lose() noexcept
+        {
+            settle_claim();
+            return cur;
+        }
+    };
+
+    // ── 快捷键：一个识别器 + 一张表；一次匹配可带多个 command ─────
+    enum class command : std::uint8_t
+    {
+        copy,
+        copy_plain,
+        paste,
+        save,
+        notify
+    };
+
+    constexpr std::string_view command_name(command c) noexcept
+    {
+        switch (c)
+        {
+        case command::copy:
+            return "copy";
+        case command::copy_plain:
+            return "copy_plain";
+        case command::paste:
+            return "paste";
+        case command::save:
+            return "save";
+        case command::notify:
+            return "notify";
+        }
+        return "?";
+    }
+
+    struct shortcut : detail::fsm_state
+    {
+        static constexpr auto name = static_string{"on_shortcut"};
+        static constexpr auto fn_name = name;
+        using consume_t = arena_event::changes<arena_event::key_change>;
+
+        struct payload_t
+        {
+            std::array<command, 2> items{};
+            int n = 0;
+        } payload{};
+
+        uhi::claim_state feed(const arena_event::input_frame<arena_event::key_change> &f,
+                              uhi::time_point) noexcept
+        {
+            const auto &c = f.change;
+            if (c.transition != arena_event::Transition::Press || c.repeat)
+                return claim(cur);
+
+            const bool ctrl = c.modifier.hasAll(ModifierKey::Control());
+            const bool shift = c.modifier.hasAll(ModifierKey::Shift());
+            const bool alt = c.modifier.hasAll(ModifierKey::Alt());
+            if (!ctrl || alt)
+                return claim(cur);
+
+            if (c.key == Key::eC)
+            {
+                payload.items[0] = shift ? command::copy_plain : command::copy;
+                payload.n = 1;
+                return claim(uhi::claim_state::ready);
+            }
+            if (c.key == Key::eS)
+            {
+                payload.items[0] = command::save;
+                payload.items[1] = command::notify;
+                payload.n = 2;
+                return claim(uhi::claim_state::ready);
+            }
+            if (c.key == Key::eV)
+            {
+                payload.items[0] = command::paste;
+                payload.n = 1;
+                return claim(uhi::claim_state::ready);
+            }
+            return claim(cur);
+        }
+
+        using invoke_type = void (*)(void *self) noexcept;
+        void *receiver_{};
+        invoke_type invoke_{};
+        template <class Receiver>
+        constexpr void bind(Receiver &ptr) noexcept
+        {
+            receiver_ = &ptr;
+            invoke_ = invoke_type{[](void *self) noexcept {
+                auto *m = static_cast<shortcut *>(self);
+                static_cast<Receiver *>(m->receiver_)
+                    ->template invoke<fn_name>(m->payload);
+            }};
+        }
+        constexpr uhi::claim_state win() noexcept
+        {
+            assert(invoke_ != nullptr);
+            invoke_(this);
+            settle_claim();
+            return cur;
+        }
+        uhi::claim_state lose() noexcept
+        {
+            settle_claim();
+            return cur;
+        }
+    };
+
+    // ── 键盘 HUD：独立观察者，和动作/快捷键同帧并行 ──────────────
+    struct key_hud : detail::fsm_state
+    {
+        static constexpr auto name = static_string{"on_key_HUD"};
+        static constexpr auto fn_name = name;
+        using consume_t = arena_event::changes<arena_event::key_change>;
+
+        struct payload_t
+        {
+            Key key{};
+            arena_event::Transition transition{};
+        } payload{};
+
+        uhi::claim_state feed(const arena_event::input_frame<arena_event::key_change> &f,
+                              uhi::time_point) noexcept
+        {
+            if (f.change.repeat)
+                return claim(cur);
+            payload = {f.change.key, f.change.transition};
+            return claim(uhi::claim_state::ready);
+        }
+
+        using invoke_type = void (*)(void *self) noexcept;
+        void *receiver_{};
+        invoke_type invoke_{};
+        template <class Receiver>
+        constexpr void bind(Receiver &ptr) noexcept
+        {
+            receiver_ = &ptr;
+            invoke_ = invoke_type{[](void *self) noexcept {
+                auto *m = static_cast<key_hud *>(self);
+                static_cast<Receiver *>(m->receiver_)
+                    ->template invoke<fn_name>(m->payload);
+            }};
+        }
+        constexpr uhi::claim_state win() noexcept
+        {
+            assert(invoke_ != nullptr);
+            invoke_(this);
+            settle_claim();
+            return cur;
+        }
+        uhi::claim_state lose() noexcept
         {
             settle_claim();
             return cur;
@@ -2276,27 +2396,36 @@ namespace app
     using l_hover = uhi::leaf<hover>;
     using l_wheel = uhi::leaf<wheel>;
     using l_key = uhi::leaf<key_a>;
+    using l_key_c = uhi::leaf<key_c>;
+    using l_shortcut = uhi::leaf<shortcut>;
+    using l_hud = uhi::leaf<key_hud>;
 
     // ── 树：只声明"谁比谁具体"，不写任何顺序 ───────────────────────
     //    refines<A, B> 读作"A 等 B" ⇒ **B 更具体，B 赢**（第二个参数才是细的）。
     //      拖拽 > 单击、双击 > 单击、三击 > 双击 > 单击
     //    拖拽和双击/三击之间没有边 —— 免得"刚点完一下"的挂起双击把拖拽挡住。
+    //
+    //    快捷键 > 普通 C：Ctrl+C 时 shortcut 赢，key_c 让位。
+    //    HUD 和它们都没有边：一个 C 事件可以同时产生 C/快捷键 + HUD 两个 emit。
     using Tree = uhi::all_of<
         uhi::refines<l_click, uhi::all_of<l_drag, uhi::refines<l_dbl, l_triple>>>, //
         l_hover,                                                                   //
         l_wheel,                                                                   //
-        l_key>;
+        uhi::refines<l_key_c, l_shortcut>,                                         //
+        l_key,                                                                     //
+        l_hud>;
 
     // Frame 的裁剪由 FSM 的 feed(input_frame<T>) 重载完成；
     // ui 不需要 FrameOf，也不需要全局 frame_types。
-    using ui_type = uhi::debug_ui<Tree>;
+    using ui_type = uhi::debug_arbiter<Tree>;
 
     // 回调打到哪儿：自检要靠它验证 sink 那一路确实通了
     namespace detail
     {
         struct tally
         {
-            int click{}, dbl{}, triple{}, hover{}, wheel{}, key_a{};
+            int click{}, dbl{}, triple{}, hover{}, wheel{}, key_a{}, key_c{};
+            int shortcut{}, hud{}, commands{};
             int drag_begin{}, drag_move{}, drag_end{};
             double x{}, y{}, dx{}, dy{}, total_dx{}, total_dy{};
             double move_x{}, move_y{}, move_dx{}, move_dy{};
@@ -2410,6 +2539,24 @@ namespace app
                 ++self.tally.key_a;
                 std::println("  >>> 键盘 A");
             }),
+            method<"on_key_C">([](auto &self) noexcept {
+                ++self.tally.key_c;
+                std::println("  >>> 键盘 C");
+            }),
+            method<"on_shortcut">([](auto &self, auto &&p) noexcept {
+                ++self.tally.shortcut;
+                self.tally.commands += p.n;
+                std::print("  >>> 快捷键");
+                for (int i = 0; i < p.n; ++i)
+                    std::print(" {}", command_name(p.items[i]));
+                std::println("");
+            }),
+            method<"on_key_HUD">([](auto &self, auto &&p) noexcept {
+                ++self.tally.hud;
+                std::println("  >>> HUD key={} {}", static_cast<int>(p.key),
+                             p.transition == arena_event::Transition::Press ? "down"
+                                                                            : "up");
+            }),
 
             // 绑定：把 sinks 接到上面那些回调上（只需要一次）
             method<"bind">([](auto &self) noexcept { self.ui.bind(self); }),
@@ -2449,7 +2596,73 @@ namespace app
     // ═══════════════════════════════════════════════════════════════════
     inline int selftest()
     {
-        return 1;
+        auto arena = make_arena();
+        arena.fake_clock = true;
+        arena.keep_events = true;
+        arena.invoke<"bind">();
+
+        int fails = 0;
+        auto check = [&](std::string_view what, bool ok) {
+            std::println("  {} {}", ok ? "✓" : "✗", what);
+            if (!ok)
+                ++fails;
+        };
+        auto key = [&](Key k, Action a, ModifierKey mods, std::int64_t ms) {
+            arena.now = uhi::time_point{ms};
+            arena.invoke<"input_event">(keyboard_event{k, a, mods});
+        };
+        auto count = [&](std::string_view name, std::int64_t at) {
+            int n = 0;
+            for (const auto &e : arena.ui.events())
+                if (e.name == name && e.v == uhi::verdict::accepted && e.at.count() == at)
+                    ++n;
+            return n;
+        };
+
+        // 1) 普通 C：key_c + HUD 并行，两个 emit
+        key(Key::eC, Action::ePRESS, ModifierKey::None(), 0);
+        check("plain C -> on_key_C", arena.tally.key_c == 1);
+        check("plain C -> HUD 同时 emit",
+              count("on_key_C", 0) == 1 && count("on_key_HUD", 0) == 1);
+
+        // 2) Ctrl+C：shortcut > key_c；HUD 仍然并行
+        key(Key::eLEFT_CONTROL, Action::ePRESS, ModifierKey::Control(), 10);
+        key(Key::eC, Action::ePRESS, ModifierKey::Control(), 20);
+        check("Ctrl+C -> shortcut", arena.tally.shortcut == 1);
+        check("Ctrl+C -> key_c 被压掉", count("on_key_C", 20) == 0);
+        check("Ctrl+C -> shortcut + HUD 两个 emit",
+              count("on_shortcut", 20) == 1 && count("on_key_HUD", 20) == 1);
+        check("Ctrl+C 只带一个 command", arena.tally.commands == 1);
+        key(Key::eC, Action::eRELEASE, ModifierKey::Control(), 30);
+        key(Key::eLEFT_CONTROL, Action::eRELEASE, ModifierKey::None(), 40);
+
+        // 3) Ctrl+Shift+C：更具体的快捷键
+        key(Key::eLEFT_CONTROL, Action::ePRESS, ModifierKey::Control(), 45);
+        key(Key::eLEFT_SHIFT, Action::ePRESS, ModifierKey::CtrlShift(), 46);
+        key(Key::eC, Action::ePRESS, ModifierKey::CtrlShift(), 50);
+        check("Ctrl+Shift+C -> copy_plain",
+              count("on_shortcut", 50) == 1 && arena.tally.shortcut == 2);
+        check("Ctrl+Shift+C -> key_c 被压掉", count("on_key_C", 50) == 0);
+        key(Key::eC, Action::eRELEASE, ModifierKey::CtrlShift(), 55);
+        key(Key::eLEFT_SHIFT, Action::eRELEASE, ModifierKey::Control(), 56);
+        key(Key::eLEFT_CONTROL, Action::eRELEASE, ModifierKey::None(), 57);
+
+        // 4) Ctrl+S：一次快捷键带两个 command（save + notify）
+        key(Key::eLEFT_CONTROL, Action::ePRESS, ModifierKey::Control(), 60);
+        key(Key::eS, Action::ePRESS, ModifierKey::Control(), 70);
+        check("Ctrl+S -> 一个 shortcut，两个 command",
+              count("on_shortcut", 70) == 1 && arena.tally.commands == 4);
+        key(Key::eS, Action::eRELEASE, ModifierKey::Control(), 75);
+        key(Key::eLEFT_CONTROL, Action::eRELEASE, ModifierKey::None(), 76);
+
+        // 5) 普通 S：没有 key_s，也没有 shortcut；只有 HUD
+        const int before = arena.tally.shortcut;
+        key(Key::eS, Action::ePRESS, ModifierKey::None(), 90);
+        check("plain S -> 没有快捷键，只有 HUD",
+              arena.tally.shortcut == before && count("on_shortcut", 90) == 0);
+
+        std::println("自检：{} 条失败", fails);
+        return fails == 0 ? 0 : 1;
     }
 } // namespace app
 
@@ -2470,7 +2683,8 @@ try
     glfw_input_translation input;
     input.setReceiver(arena); // glfw 事件 → arena.input_event
 
-    std::println("就绪：单击 / 双击 / 三击 / 拖拽 / 滚轮 / 键盘 A；关窗口退出。");
+    std::println("就绪：单击 / 双击 / 三击 / 拖拽 / 滚轮 / A / C / Ctrl+C / Ctrl+Shift+C "
+                 "/ Ctrl+S / HUD；关窗口退出。");
     std::println("参数：点击 ≤ {}ms，双击空档 ≤ {}ms，三击空档 ≤ {}ms，拖拽阈值 {:.0f}px",
                  app::click_max_ms, app::dbl_gap_ms, app::triple_gap_ms,
                  app::drag_slop_px);
