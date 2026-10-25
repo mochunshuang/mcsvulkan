@@ -2581,29 +2581,6 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
         std::move(pickingAttachments));
 }
 
-// ================= id -> 对象：统一实体访问 =================
-// 按 type_id 找到 store，把具体 store 类型交给 visitor（一次实现，取代各处成员遍历分派）
-// 已删除 UI 相关的所有 Trait，因此以下函数不再需要，但为保持编译，保留空实现（或可直接删除）
-static constexpr auto visit_store(auto &soaCtx, uint32_t type_id, auto &&visitor)
-{
-    // 无任何 store，直接抛出或返回空
-    throw std::out_of_range{"visit_store: no stores available"};
-}
-
-static constexpr auto inputController(auto &world, auto &inputCtx, auto &soaCtx)
-{
-    // 无 UI 组件，无需处理
-}
-static constexpr auto update(auto &world, auto &inputCtx, auto &soaCtx,
-                             uint32_t currentFrame) noexcept
-{
-    // 无 UI 组件更新
-}
-static constexpr auto model_update(auto &world, auto &inputCtx, auto &soaCtx) noexcept
-{
-    // 无 UI 组件更新
-}
-
 //diff: [test_dod22] start
 constexpr auto &hoverPool() noexcept
 {

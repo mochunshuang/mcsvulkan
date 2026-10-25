@@ -192,5 +192,8 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_viewport test_sdf.vert test_sdf.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
+add_std_glsl_target(test_intent test_dod24.vert test_dod24.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
 # end
 std_glsl_env_destroy()
