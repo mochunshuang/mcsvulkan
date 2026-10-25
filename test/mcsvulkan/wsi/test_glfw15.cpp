@@ -329,7 +329,7 @@ struct glfw_input_translation
 // ═══════════════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════════
 //  矩阵裁决引擎 —— 已内联进本文件（不再是 include，直接在这里改）
-//    这一整段原本是 uhi/v3/src/uhi_matrix.cpp 的第 1–9 节（引擎，不含 demo main）。
+//    这一整段原本是 intent/v3/src/uhi_matrix.cpp 的第 1–9 节（引擎，不含 demo main）。
 //    改动顺序建议：先动 ui 的投递口，再动 fsm 协议，最后动矩阵。
 // ═══════════════════════════════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════════════════════════════
@@ -374,7 +374,7 @@ struct glfw_input_translation
 
 #include "../../../include/detail/meta/make_aggregate.hpp"
 
-namespace uhi
+namespace intent
 {
     using mcs::vulkan::meta::static_string;
     using time_point = std::chrono::milliseconds;
@@ -452,7 +452,7 @@ namespace uhi
 
         template <class M>
         concept protocol = std::default_initializable<M> && requires(M &m, time_point t) {
-            typename M::consume_t; // 我处理哪些 arena_event change
+            typename M::consume_t; // 我处理哪些 input_frame change
             { m.tick(t) } noexcept -> std::same_as<claim_state>;
             { m.win() } noexcept -> std::same_as<claim_state>;
             { m.lose() } noexcept -> std::same_as<claim_state>;
@@ -895,7 +895,7 @@ namespace uhi
             using consume_t =
                 typename[:std::meta::substitute(^^std::tuple, consume_args()):];
             // consume_t 只用于编译期校验（关系两端有没有共同 change）；
-            // 它不是运行期路由表，路由由 feed(input_frame<T>) 的重载完成。
+            // 它不是运行期路由表，路由由 feed(frame<T>) 的重载完成。
 
             // 第 I 个 leaf 自己的 consume_t：不去重，用来和 I 对账。
             template <std::size_t I>
@@ -999,7 +999,7 @@ namespace uhi
         // 上限先断言：S 超过 max_kinds 就别往下算了（理由见 max_kinds 的注释）
         static_assert(S >= 1, "一片叶子都没有的树没有意义");
         static_assert(S <= max_kinds,
-                      "叶子太多：上限见 uhi::max_kinds（=64）。"
+                      "叶子太多：上限见 intent::max_kinds（=64）。"
                       "位图放得下，是 validate 的 Kahn 会撞编译期运算上限");
         static_assert(C >= 1, "change_types 不能为空");
 
@@ -1023,7 +1023,7 @@ namespace uhi
 
             // 每个 kind 消费哪些 change：来自它自己的 consume_t（不去重）。
             // consumes 只在编译期用，不参与运行期裁决；运行期路由是
-            // feed(input_frame<T>) 的重载。这里只回答一条边两端有没有共同 change。
+            // feed(frame<T>) 的重载。这里只回答一条边两端有没有共同 change。
             std::array<bset<C>, S> consumes{};
             template for (constexpr auto I : std::ranges::views::indices(S))
             {
@@ -1035,7 +1035,7 @@ namespace uhi
                         consumes[I].set(J);
                 }
                 if (consumes[I].none())
-                    throw "kind 不消费任何 arena_event change";
+                    throw "kind 不消费任何 input_frame change";
             }
 
             // 关系两端必须能相遇：否则这条边是数据/实现不匹配，编译期就拒绝。
@@ -1278,15 +1278,15 @@ namespace uhi
         }
     };
 
-} // namespace uhi
+} // namespace intent
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  arena_event：GLFW 与识别器之间的跨平台中间层
 //    event_context：变化前仍成立的全部状态（keys / buttons / modifier / pointer）
-//    input_frame<T>：context + 本帧变化 T（T 是具体的 change 类型）
-//  FSM 只看 arena_event::input_frame<T>，不看 GLFW 事件。
+//    frame<T>：context + 本帧变化 T（T 是具体的 change 类型）
+//  FSM 只看 input_frame::frame<T>，不看 GLFW 事件。
 // ═══════════════════════════════════════════════════════════════════════════
-namespace arena_event
+struct input_frame
 {
     enum class PointerDevice : std::uint8_t
     {
@@ -1404,7 +1404,7 @@ namespace arena_event
     };
 
     template <class T>
-    struct input_frame
+    struct frame
     {
         event_context context;
         T change;
@@ -1412,18 +1412,20 @@ namespace arena_event
 
     // NOTE: 枚举转发到下游的全部类型
     template <class T>
-    inline constexpr bool is_change =
-        std::same_as<T, key_change> || std::same_as<T, button_change> ||
-        std::same_as<T, move_change> ||
-        std::same_as<T, mcs::vulkan::event::scroll_event> ||
-        std::same_as<T, mcs::vulkan::event::cursor_enter_event> ||
-        std::same_as<T, char_change>;
+    static consteval bool is_change()
+    {
+        return std::same_as<T, key_change> || std::same_as<T, button_change> ||
+               std::same_as<T, move_change> ||
+               std::same_as<T, mcs::vulkan::event::scroll_event> ||
+               std::same_as<T, mcs::vulkan::event::cursor_enter_event> ||
+               std::same_as<T, char_change>;
+    }
 
     template <class... Ts>
     struct changes_checked
     {
-        static_assert((is_change<Ts> && ...),
-                      "consume_t 只允许 arena_event 的 change 类型");
+        static_assert((is_change<Ts>() && ...),
+                      "consume_t 只允许 input_frame 的 change 类型");
         using type = std::tuple<Ts...>;
     };
 
@@ -1466,44 +1468,43 @@ namespace arena_event
 
         if constexpr (std::same_as<T, mcs::vulkan::event::keyboard_event>)
         {
-            return input_frame<key_change>{ctx, key_change{e.key,
+            return frame<key_change>{ctx, key_change{e.key,
+                                                     (e.press() || e.repeat())
+                                                         ? Transition::Press
+                                                         : Transition::Release,
+                                                     e.repeat(), e.modifier_key}};
+        }
+        else if constexpr (std::same_as<T, mcs::vulkan::event::mousebutton_event>)
+        {
+            return frame<button_change>{ctx, button_change{map_button(e.button),
                                                            (e.press() || e.repeat())
                                                                ? Transition::Press
                                                                : Transition::Release,
                                                            e.repeat(), e.modifier_key}};
         }
-        else if constexpr (std::same_as<T, mcs::vulkan::event::mousebutton_event>)
-        {
-            return input_frame<button_change>{
-                ctx, button_change{map_button(e.button),
-                                   (e.press() || e.repeat()) ? Transition::Press
-                                                             : Transition::Release,
-                                   e.repeat(), e.modifier_key}};
-        }
         else if constexpr (std::same_as<T, mcs::vulkan::event::position2d_event>)
         {
             const double dx = ctx.pointer_position_valid ? e.xpos - ctx.pointer_x : 0.0;
             const double dy = ctx.pointer_position_valid ? e.ypos - ctx.pointer_y : 0.0;
-            return input_frame<move_change>{ctx, move_change{e.xpos, e.ypos, dx, dy}};
+            return frame<move_change>{ctx, move_change{e.xpos, e.ypos, dx, dy}};
         }
         else if constexpr (std::same_as<T, mcs::vulkan::event::scroll_event>)
         {
-            return input_frame<mcs::vulkan::event::scroll_event>{ctx, e};
+            return frame<mcs::vulkan::event::scroll_event>{ctx, e};
         }
         else if constexpr (std::same_as<T, mcs::vulkan::event::cursor_enter_event>)
         {
-            return input_frame<mcs::vulkan::event::cursor_enter_event>{ctx, e};
+            return frame<mcs::vulkan::event::cursor_enter_event>{ctx, e};
         }
         else if constexpr (std::same_as<T, mcs::vulkan::event::char_event>)
         {
-            return input_frame<char_change>{ctx, char_change{e.codepoint}};
+            return frame<char_change>{ctx, char_change{e.codepoint}};
         }
         // 其余事件没有 return：auto 推导为 void，调用方不转发。
     }
 
     template <class T>
-    static constexpr void apply_change(event_context &ctx,
-                                       const input_frame<T> &f) noexcept
+    static constexpr void apply_change(event_context &ctx, const frame<T> &f) noexcept
     {
         using U = std::remove_cvref_t<T>;
 
@@ -1569,7 +1570,7 @@ namespace arena_event
         }
         // scroll / char：不改变 ctx
     }
-} // namespace arena_event
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1582,8 +1583,8 @@ namespace arena_event
 //    glfw 回调
 //      └─ glfw_input_translation            （不动）
 //           └─ arena.input_event(e)         ← 平台事件（本案例只写这层翻译）
-//                └─ input_frame<T> { context, change }
-//                     └─ ui.feed(input_frame<T>, now)
+//                └─ frame<T> { context, change }
+//                     └─ ui.feed(frame<T>, now)
 //                          └─ 每个识别器 feed/tick → idle/hold/ready
 //                          └─ 矩阵裁决（库内部，位运算）
 //                               ├─ ready 且未被挡 → win()  → 发射这一帧的事件
@@ -1610,19 +1611,19 @@ namespace app
         //    win 只发射当前事件；claim 是否结束由识别器自己决定。
         struct fsm_state
         {
-            uhi::claim_state cur{uhi::claim_state::idle};
+            intent::claim_state cur{intent::claim_state::idle};
 
-            uhi::claim_state claim(uhi::claim_state s) noexcept
+            intent::claim_state claim(intent::claim_state s) noexcept
             {
                 // 已经 ready、还没裁决的 claim，新帧不能把它降回 hold。
-                if (cur == uhi::claim_state::ready && s != uhi::claim_state::idle)
-                    s = uhi::claim_state::ready;
+                if (cur == intent::claim_state::ready && s != intent::claim_state::idle)
+                    s = intent::claim_state::ready;
                 cur = s;
                 return s;
             }
 
             // 默认：时间不改变状态（窗口需要过期的识别器自己覆盖 tick）
-            uhi::claim_state tick(uhi::time_point) noexcept
+            intent::claim_state tick(intent::time_point) noexcept
             {
                 return claim(cur);
             }
@@ -1630,36 +1631,36 @@ namespace app
             // 长 claim 发射完一个事件：claim 继续活着，等下一个事件
             void consume_event() noexcept
             {
-                if (cur == uhi::claim_state::ready)
-                    cur = uhi::claim_state::hold;
+                if (cur == intent::claim_state::ready)
+                    cur = intent::claim_state::hold;
             }
 
             // 一次性手势/让位：claim 结束
             void settle_claim() noexcept
             {
-                cur = uhi::claim_state::idle;
+                cur = intent::claim_state::idle;
             }
         };
 
-        // ── 帧就是 arena_event::input_frame<T>：完整快照 + 本帧变化。
+        // ── 帧就是 input_frame::frame<T>：完整快照 + 本帧变化。
         //    过滤（左键/按键 A）和事件分派都在 FSM 内部。
 
         // ── 复用的"一次按下→松开算不算一次有效单击"：限时 + 限位 ────────
         struct press_watch
         {
-            uhi::time_point down_at{};
+            intent::time_point down_at{};
             double down_x = 0, down_y = 0;
             bool down = false;
 
             //  0 = 无关帧   1 = 按下   2 = 有效松开   -1 = 无效松开
             //  过滤（只认左键）在 FSM 内部，不在 input_event 里。
-            int operator()(const arena_event::input_frame<arena_event::button_change> &f,
-                           uhi::time_point now) noexcept
+            int operator()(const input_frame::frame<input_frame::button_change> &f,
+                           intent::time_point now) noexcept
             {
                 const auto &b = f.change;
-                if (b.button != arena_event::MouseButton::eMOUSE_BUTTON_LEFT)
+                if (b.button != input_frame::MouseButton::eMOUSE_BUTTON_LEFT)
                     return 0;
-                if (b.transition == arena_event::Transition::Press)
+                if (b.transition == input_frame::Transition::Press)
                 {
                     if (b.repeat)
                         return 0;
@@ -1669,12 +1670,12 @@ namespace app
                     down_y = f.context.pointer_y;
                     return 1;
                 }
-                if (b.transition == arena_event::Transition::Release)
+                if (b.transition == input_frame::Transition::Release)
                 {
                     if (!down)
                         return 0;
                     down = false;
-                    const bool quick = now - down_at <= uhi::time_point{click_max_ms};
+                    const bool quick = now - down_at <= intent::time_point{click_max_ms};
                     const bool still =
                         std::hypot(f.context.pointer_x - down_x,
                                    f.context.pointer_y - down_y) <= drag_slop_px;
@@ -1694,7 +1695,7 @@ namespace app
         {
             static constexpr auto name = Name;
             static constexpr auto fn_name = FnName;
-            using consume_t = arena_event::changes<arena_event::button_change>;
+            using consume_t = input_frame::changes<input_frame::button_change>;
 
             struct payload_t
             {
@@ -1702,26 +1703,26 @@ namespace app
             } payload{};
 
             press_watch watch{};
-            uhi::claim_state feed(
-                const arena_event::input_frame<arena_event::button_change> &f,
-                uhi::time_point now) noexcept
+            intent::claim_state feed(
+                const input_frame::frame<input_frame::button_change> &f,
+                intent::time_point now) noexcept
             {
                 switch (watch(f, now))
                 {
                 case 1:
-                    return claim(uhi::claim_state::hold);
+                    return claim(intent::claim_state::hold);
                 case 2:
-                    if (cur != uhi::claim_state::ready) // 挂起的那一条不拿新坐标覆盖
+                    if (cur != intent::claim_state::ready) // 挂起的那一条不拿新坐标覆盖
                     {
                         payload.x = f.context.pointer_x;
                         payload.y = f.context.pointer_y;
                     }
-                    return claim(uhi::claim_state::ready);
+                    return claim(intent::claim_state::ready);
                 case -1: // 不是单击：这次交互作废
-                    return claim(uhi::claim_state::idle);
+                    return claim(intent::claim_state::idle);
                 default:
                     // 挂起中（ready）就继续申辩；否则按下算 hold，其余算 idle。
-                    return claim(watch.down ? uhi::claim_state::hold : cur);
+                    return claim(watch.down ? intent::claim_state::hold : cur);
                 }
             }
             void *receiver_{};
@@ -1737,14 +1738,14 @@ namespace app
                         ->template invoke<fn_name>(self->payload);
                 }};
             }
-            constexpr uhi::claim_state win() noexcept
+            constexpr intent::claim_state win() noexcept
             {
                 assert(invoke_ != nullptr);
                 invoke_(this);
                 settle_claim(); // 投递完，这条申报结束
                 return cur;
             }
-            uhi::claim_state lose() noexcept
+            intent::claim_state lose() noexcept
             {
                 watch.reset(); // 被更具体的赢了：这次交互丢掉
                 settle_claim();
@@ -1761,7 +1762,7 @@ namespace app
         {
             static constexpr auto name = Name;
             static constexpr auto fn_name = FnName;
-            using consume_t = arena_event::changes<arena_event::button_change>;
+            using consume_t = input_frame::changes<input_frame::button_change>;
 
             struct payload_t
             {
@@ -1770,33 +1771,33 @@ namespace app
             } payload{};
 
             press_watch watch{};
-            int clicks = 0;         // 已经完成的单击数
-            uhi::time_point last{}; // 上一次松开的时刻
-            bool armed = false;     // 正在窗口里等下一击
+            int clicks = 0;            // 已经完成的单击数
+            intent::time_point last{}; // 上一次松开的时刻
+            bool armed = false;        // 正在窗口里等下一击
 
-            uhi::claim_state feed(
-                const arena_event::input_frame<arena_event::button_change> &f,
-                uhi::time_point now) noexcept
+            intent::claim_state feed(
+                const input_frame::frame<input_frame::button_change> &f,
+                intent::time_point now) noexcept
             {
-                if (armed && now - last > uhi::time_point{GapMs})
+                if (armed && now - last > intent::time_point{GapMs})
                 {
                     // 窗口过了：这一次放弃，但**这一帧照常处理** ——
                     // 它可能正是新交互的按下。先显式清掉旧申报。
                     clicks = 0;
                     armed = false;
                     watch.reset();
-                    claim(uhi::claim_state::idle);
+                    claim(intent::claim_state::idle);
                 }
 
                 switch (watch(f, now))
                 {
                 case 1:
-                    return claim(uhi::claim_state::hold);
+                    return claim(intent::claim_state::hold);
                 case 2:
                     ++clicks;
                     armed = true;
                     last = now;
-                    if (cur != uhi::claim_state::ready) // 挂起的那一条保留原载荷/跨度
+                    if (cur != intent::claim_state::ready) // 挂起的那一条保留原载荷/跨度
                     {
                         payload.x = f.context.pointer_x;
                         payload.y = f.context.pointer_y;
@@ -1806,30 +1807,30 @@ namespace app
                     {
                         clicks = 0;
                         armed = false;
-                        return claim(uhi::claim_state::ready);
+                        return claim(intent::claim_state::ready);
                     }
-                    return claim(uhi::claim_state::hold);
+                    return claim(intent::claim_state::hold);
                 case -1: // 这一次不是有效单击
                     clicks = 0;
                     armed = false;
-                    return claim(uhi::claim_state::idle);
+                    return claim(intent::claim_state::idle);
                 default:
                     // 按下、等着、挂起，都算在场；纯路过才是 idle。
                     return claim((armed || clicks > 0 || watch.down)
-                                     ? uhi::claim_state::hold
+                                     ? intent::claim_state::hold
                                      : cur);
                 }
             }
             // 时间窗只靠"喂帧"是过不去的：必须由 tick 推动。
             // 但 tick 不再从旁边改 cur —— 它回同一句话，引擎照常裁决。
-            uhi::claim_state tick(uhi::time_point now) noexcept
+            intent::claim_state tick(intent::time_point now) noexcept
             {
-                if (armed && now - last > uhi::time_point{GapMs})
+                if (armed && now - last > intent::time_point{GapMs})
                 {
                     clicks = 0;
                     armed = false;
                     watch.reset();
-                    return claim(uhi::claim_state::idle);
+                    return claim(intent::claim_state::idle);
                 }
                 return claim(cur);
             }
@@ -1847,7 +1848,7 @@ namespace app
                         ->template invoke<fn_name>(self->payload);
                 }};
             }
-            constexpr uhi::claim_state win() noexcept
+            constexpr intent::claim_state win() noexcept
             {
                 assert(invoke_ != nullptr);
                 invoke_(this);
@@ -1857,7 +1858,7 @@ namespace app
                 settle_claim();
                 return cur;
             }
-            uhi::claim_state lose() noexcept
+            intent::claim_state lose() noexcept
             {
                 clicks = 0;
                 armed = false;
@@ -1948,7 +1949,7 @@ namespace app
         static constexpr auto name = static_string{"on_drag"};
         static constexpr auto fn_name = name;
         using consume_t =
-            arena_event::changes<arena_event::button_change, arena_event::move_change>;
+            input_frame::changes<input_frame::button_change, input_frame::move_change>;
         using payload_t = detail::drag_payload;
         using track_t = detail::drag_track;
         using phase_t = payload_t::phase_t;
@@ -1958,13 +1959,12 @@ namespace app
         bool dragging = false;
         bool ending = false;
 
-        uhi::claim_state feed(
-            const arena_event::input_frame<arena_event::button_change> &f,
-            uhi::time_point now) noexcept
+        intent::claim_state feed(const input_frame::frame<input_frame::button_change> &f,
+                                 intent::time_point now) noexcept
         {
-            if (f.change.button != arena_event::MouseButton::eMOUSE_BUTTON_LEFT)
+            if (f.change.button != input_frame::MouseButton::eMOUSE_BUTTON_LEFT)
                 return claim(cur);
-            if (f.change.transition == arena_event::Transition::Press)
+            if (f.change.transition == input_frame::Transition::Press)
             {
                 if (f.change.repeat)
                     return claim(cur);
@@ -1973,61 +1973,61 @@ namespace app
             return drag_end(f, now);
         }
 
-        uhi::claim_state feed(const arena_event::input_frame<arena_event::move_change> &f,
-                              uhi::time_point now) noexcept
+        intent::claim_state feed(const input_frame::frame<input_frame::move_change> &f,
+                                 intent::time_point now) noexcept
         {
             return drag_move(f, now);
         }
 
-        uhi::claim_state drag_start(
-            const arena_event::input_frame<arena_event::button_change> &f,
-            uhi::time_point now) noexcept
+        intent::claim_state drag_start(
+            const input_frame::frame<input_frame::button_change> &f,
+            intent::time_point now) noexcept
         {
-            if (cur != uhi::claim_state::idle) // 上一条 claim 还没结束：先收掉
+            if (cur != intent::claim_state::idle) // 上一条 claim 还没结束：先收掉
                 settle_claim();
             t.press(f.context.pointer_x, f.context.pointer_y);
             dragging = false;
             ending = false;
-            return claim(uhi::claim_state::hold);
+            return claim(intent::claim_state::hold);
         }
 
-        uhi::claim_state drag_move(
-            const arena_event::input_frame<arena_event::move_change> &f,
-            uhi::time_point now) noexcept
+        intent::claim_state drag_move(
+            const input_frame::frame<input_frame::move_change> &f,
+            intent::time_point now) noexcept
         {
             const auto &m = f.change;
             if (!t.down)
-                return claim(uhi::claim_state::idle);
+                return claim(intent::claim_state::idle);
             if (!dragging)
             {
                 if (!t.past_slop(m.x, m.y))
                 {
                     t.last(m.x, m.y);
-                    return claim(uhi::claim_state::hold);
+                    return claim(intent::claim_state::hold);
                 }
                 dragging = true;
                 // 这一帧的坐标就是这一帧的事件。
                 payload = t.make(phase_t::begin, m.x, m.y, 0, 0);
                 t.last(m.x, m.y);
-                return claim(uhi::claim_state::ready);
+                return claim(intent::claim_state::ready);
             }
             payload = t.make(phase_t::move, m.x, m.y, m.dx, m.dy);
             t.last(m.x, m.y);
-            return claim(uhi::claim_state::ready);
+            return claim(intent::claim_state::ready);
         }
 
-        uhi::claim_state drag_end(
-            const arena_event::input_frame<arena_event::button_change> &f,
-            uhi::time_point now) noexcept
+        intent::claim_state drag_end(
+            const input_frame::frame<input_frame::button_change> &f,
+            intent::time_point now) noexcept
         {
             t.release();
             if (!dragging)
-                return claim(uhi::claim_state::idle); // 没拖过：claim 结束
+                return claim(intent::claim_state::idle); // 没拖过：claim 结束
             dragging = false;
             ending = true;
             payload =
                 t.make(phase_t::end, f.context.pointer_x, f.context.pointer_y, 0, 0);
-            return claim(uhi::claim_state::ready);
+            return claim(intent::claim_state::ready);
         }
 
         void *receiver_{};
@@ -2043,7 +2043,7 @@ namespace app
                     ->template invoke<fn_name>(self->payload);
             }};
         }
-        constexpr uhi::claim_state win() noexcept
+        constexpr intent::claim_state win() noexcept
         {
             assert(invoke_ != nullptr);
             invoke_(this);
@@ -2056,7 +2056,7 @@ namespace app
                 consume_event(); // claim 继续，等下一个事件
             return cur;
         }
-        uhi::claim_state lose() noexcept
+        intent::claim_state lose() noexcept
         {
             t = {};
             dragging = false;
@@ -2071,14 +2071,14 @@ namespace app
     {
         static constexpr auto name = static_string{"on_hover"};
         static constexpr auto fn_name = name;
-        using consume_t = arena_event::changes<arena_event::cursor_enter_event>;
+        using consume_t = input_frame::changes<input_frame::cursor_enter_event>;
 
-        uhi::claim_state feed(
-            const arena_event::input_frame<arena_event::cursor_enter_event> &f,
-            uhi::time_point now) noexcept
+        intent::claim_state feed(
+            const input_frame::frame<input_frame::cursor_enter_event> &f,
+            intent::time_point now) noexcept
         {
             if (f.change.value)
-                return claim(uhi::claim_state::ready);
+                return claim(intent::claim_state::ready);
             return claim(cur); // 离开不产生事件
         }
         void *receiver_{};
@@ -2093,14 +2093,14 @@ namespace app
                 static_cast<Receiver *>(self->receiver_)->template invoke<fn_name>();
             }};
         }
-        constexpr uhi::claim_state win() noexcept
+        constexpr intent::claim_state win() noexcept
         {
             assert(invoke_ != nullptr);
             invoke_(this);
             settle_claim();
             return cur;
         }
-        uhi::claim_state lose() noexcept
+        intent::claim_state lose() noexcept
         {
             settle_claim();
             return cur;
@@ -2112,19 +2112,18 @@ namespace app
     {
         static constexpr auto name = static_string{"on_wheel"};
         static constexpr auto fn_name = name;
-        using consume_t = arena_event::changes<arena_event::scroll_event>;
+        using consume_t = input_frame::changes<input_frame::scroll_event>;
 
         struct payload_t
         {
             int delta = 0;
         } payload{};
 
-        uhi::claim_state feed(
-            const arena_event::input_frame<arena_event::scroll_event> &f,
-            uhi::time_point now) noexcept
+        intent::claim_state feed(const input_frame::frame<input_frame::scroll_event> &f,
+                                 intent::time_point now) noexcept
         {
             payload.delta = static_cast<int>(f.change.yoffset);
-            return claim(uhi::claim_state::ready);
+            return claim(intent::claim_state::ready);
         }
         void *receiver_{};
         using invoke_type = void (*)(void *self) noexcept;
@@ -2139,14 +2138,14 @@ namespace app
                     ->template invoke<fn_name>(self->payload);
             }};
         }
-        constexpr uhi::claim_state win() noexcept
+        constexpr intent::claim_state win() noexcept
         {
             assert(invoke_ != nullptr);
             invoke_(this);
             settle_claim();
             return cur;
         }
-        uhi::claim_state lose() noexcept
+        intent::claim_state lose() noexcept
         {
             settle_claim();
             return cur;
@@ -2158,14 +2157,14 @@ namespace app
     {
         static constexpr auto name = static_string{"on_key_A"};
         static constexpr auto fn_name = name;
-        using consume_t = arena_event::changes<arena_event::key_change>;
+        using consume_t = input_frame::changes<input_frame::key_change>;
 
-        uhi::claim_state feed(const arena_event::input_frame<arena_event::key_change> &f,
-                              uhi::time_point) noexcept
+        intent::claim_state feed(const input_frame::frame<input_frame::key_change> &f,
+                                 intent::time_point) noexcept
         {
-            if (f.change.transition == arena_event::Transition::Press &&
+            if (f.change.transition == input_frame::Transition::Press &&
                 !f.change.repeat && f.change.key == Key::eA)
-                return claim(uhi::claim_state::ready);
+                return claim(intent::claim_state::ready);
             return claim(cur);
         }
 
@@ -2181,14 +2180,14 @@ namespace app
                 static_cast<Receiver *>(m->receiver_)->template invoke<fn_name>();
             }};
         }
-        constexpr uhi::claim_state win() noexcept
+        constexpr intent::claim_state win() noexcept
         {
             assert(invoke_ != nullptr);
             invoke_(this);
             settle_claim();
             return cur;
         }
-        uhi::claim_state lose() noexcept
+        intent::claim_state lose() noexcept
         {
             settle_claim();
             return cur;
@@ -2200,14 +2199,14 @@ namespace app
     {
         static constexpr auto name = static_string{"on_key_C"};
         static constexpr auto fn_name = name;
-        using consume_t = arena_event::changes<arena_event::key_change>;
+        using consume_t = input_frame::changes<input_frame::key_change>;
 
-        uhi::claim_state feed(const arena_event::input_frame<arena_event::key_change> &f,
-                              uhi::time_point) noexcept
+        intent::claim_state feed(const input_frame::frame<input_frame::key_change> &f,
+                                 intent::time_point) noexcept
         {
-            if (f.change.transition == arena_event::Transition::Press &&
+            if (f.change.transition == input_frame::Transition::Press &&
                 !f.change.repeat && f.change.key == Key::eC)
-                return claim(uhi::claim_state::ready);
+                return claim(intent::claim_state::ready);
             return claim(cur);
         }
 
@@ -2223,14 +2222,14 @@ namespace app
                 static_cast<Receiver *>(m->receiver_)->template invoke<fn_name>();
             }};
         }
-        constexpr uhi::claim_state win() noexcept
+        constexpr intent::claim_state win() noexcept
         {
             assert(invoke_ != nullptr);
             invoke_(this);
             settle_claim();
             return cur;
         }
-        uhi::claim_state lose() noexcept
+        intent::claim_state lose() noexcept
         {
             settle_claim();
             return cur;
@@ -2269,7 +2268,7 @@ namespace app
     {
         static constexpr auto name = static_string{"on_shortcut"};
         static constexpr auto fn_name = name;
-        using consume_t = arena_event::changes<arena_event::key_change>;
+        using consume_t = input_frame::changes<input_frame::key_change>;
 
         struct payload_t
         {
@@ -2277,11 +2276,11 @@ namespace app
             int n = 0;
         } payload{};
 
-        uhi::claim_state feed(const arena_event::input_frame<arena_event::key_change> &f,
-                              uhi::time_point) noexcept
+        intent::claim_state feed(const input_frame::frame<input_frame::key_change> &f,
+                                 intent::time_point) noexcept
         {
             const auto &c = f.change;
-            if (c.transition != arena_event::Transition::Press || c.repeat)
+            if (c.transition != input_frame::Transition::Press || c.repeat)
                 return claim(cur);
 
             const bool ctrl = c.modifier.hasAll(ModifierKey::Control());
@@ -2294,20 +2293,20 @@ namespace app
             {
                 payload.items[0] = shift ? command::copy_plain : command::copy;
                 payload.n = 1;
-                return claim(uhi::claim_state::ready);
+                return claim(intent::claim_state::ready);
             }
             if (c.key == Key::eS)
             {
                 payload.items[0] = command::save;
                 payload.items[1] = command::notify;
                 payload.n = 2;
-                return claim(uhi::claim_state::ready);
+                return claim(intent::claim_state::ready);
             }
             if (c.key == Key::eV)
             {
                 payload.items[0] = command::paste;
                 payload.n = 1;
-                return claim(uhi::claim_state::ready);
+                return claim(intent::claim_state::ready);
             }
             return claim(cur);
         }
@@ -2325,14 +2324,14 @@ namespace app
                     ->template invoke<fn_name>(m->payload);
             }};
         }
-        constexpr uhi::claim_state win() noexcept
+        constexpr intent::claim_state win() noexcept
         {
             assert(invoke_ != nullptr);
             invoke_(this);
             settle_claim();
             return cur;
         }
-        uhi::claim_state lose() noexcept
+        intent::claim_state lose() noexcept
         {
             settle_claim();
             return cur;
@@ -2344,21 +2343,21 @@ namespace app
     {
         static constexpr auto name = static_string{"on_key_HUD"};
         static constexpr auto fn_name = name;
-        using consume_t = arena_event::changes<arena_event::key_change>;
+        using consume_t = input_frame::changes<input_frame::key_change>;
 
         struct payload_t
         {
             Key key{};
-            arena_event::Transition transition{};
+            input_frame::Transition transition{};
         } payload{};
 
-        uhi::claim_state feed(const arena_event::input_frame<arena_event::key_change> &f,
-                              uhi::time_point) noexcept
+        intent::claim_state feed(const input_frame::frame<input_frame::key_change> &f,
+                                 intent::time_point) noexcept
         {
             if (f.change.repeat)
                 return claim(cur);
             payload = {f.change.key, f.change.transition};
-            return claim(uhi::claim_state::ready);
+            return claim(intent::claim_state::ready);
         }
 
         using invoke_type = void (*)(void *self) noexcept;
@@ -2374,14 +2373,14 @@ namespace app
                     ->template invoke<fn_name>(m->payload);
             }};
         }
-        constexpr uhi::claim_state win() noexcept
+        constexpr intent::claim_state win() noexcept
         {
             assert(invoke_ != nullptr);
             invoke_(this);
             settle_claim();
             return cur;
         }
-        uhi::claim_state lose() noexcept
+        intent::claim_state lose() noexcept
         {
             settle_claim();
             return cur;
@@ -2389,16 +2388,16 @@ namespace app
     };
 
     // ── 叶子：name 是 kind 的身份（进日志）；最后一个参数是回调名 ───
-    using l_click = uhi::leaf<click>;
-    using l_dbl = uhi::leaf<double_click>;
-    using l_triple = uhi::leaf<triple_click>;
-    using l_drag = uhi::leaf<drag>;
-    using l_hover = uhi::leaf<hover>;
-    using l_wheel = uhi::leaf<wheel>;
-    using l_key = uhi::leaf<key_a>;
-    using l_key_c = uhi::leaf<key_c>;
-    using l_shortcut = uhi::leaf<shortcut>;
-    using l_hud = uhi::leaf<key_hud>;
+    using l_click = intent::leaf<click>;
+    using l_dbl = intent::leaf<double_click>;
+    using l_triple = intent::leaf<triple_click>;
+    using l_drag = intent::leaf<drag>;
+    using l_hover = intent::leaf<hover>;
+    using l_wheel = intent::leaf<wheel>;
+    using l_key = intent::leaf<key_a>;
+    using l_key_c = intent::leaf<key_c>;
+    using l_shortcut = intent::leaf<shortcut>;
+    using l_hud = intent::leaf<key_hud>;
 
     // ── 树：只声明"谁比谁具体"，不写任何顺序 ───────────────────────
     //    refines<A, B> 读作"A 等 B" ⇒ **B 更具体，B 赢**（第二个参数才是细的）。
@@ -2407,17 +2406,18 @@ namespace app
     //
     //    快捷键 > 普通 C：Ctrl+C 时 shortcut 赢，key_c 让位。
     //    HUD 和它们都没有边：一个 C 事件可以同时产生 C/快捷键 + HUD 两个 emit。
-    using Tree = uhi::all_of<
-        uhi::refines<l_click, uhi::all_of<l_drag, uhi::refines<l_dbl, l_triple>>>, //
+    using Tree = intent::all_of<
+        intent::refines<l_click,
+                        intent::all_of<l_drag, intent::refines<l_dbl, l_triple>>>, //
         l_hover,                                                                   //
         l_wheel,                                                                   //
-        uhi::refines<l_key_c, l_shortcut>,                                         //
+        intent::refines<l_key_c, l_shortcut>,                                      //
         l_key,                                                                     //
         l_hud>;
 
-    // Frame 的裁剪由 FSM 的 feed(input_frame<T>) 重载完成；
+    // Frame 的裁剪由 FSM 的 feed(frame<T>) 重载完成；
     // ui 不需要 FrameOf，也不需要全局 frame_types。
-    using ui_type = uhi::debug_arbiter<Tree>;
+    using ui_type = intent::debug_arbiter<Tree>;
 
     // 回调打到哪儿：自检要靠它验证 sink 那一路确实通了
     namespace detail
@@ -2436,14 +2436,14 @@ namespace app
     } // namespace detail
 
     // 事件时刻：正常情况取墙上时钟；自检时用 arena.now 给的逻辑时间
-    inline uhi::time_point now_ms() noexcept
+    inline intent::time_point now_ms() noexcept
     {
         static const auto t0 = std::chrono::steady_clock::now();
-        return std::chrono::duration_cast<uhi::time_point>(
+        return std::chrono::duration_cast<intent::time_point>(
             std::chrono::steady_clock::now() - t0);
     }
     template <class Self>
-    inline uhi::time_point now_of(Self &self) noexcept
+    inline intent::time_point now_of(Self &self) noexcept
     {
         return self.fake_clock ? self.now : now_ms();
     }
@@ -2457,7 +2457,7 @@ namespace app
             if (e.name == "on_hover" || e.name == "on_drag")
                 continue;
             std::println("  [t={:>6}ms] {:<14} {:<3}", e.at.count(), e.name,
-                         uhi::to_string(e.v));
+                         intent::to_string(e.v));
         }
     }
 
@@ -2467,8 +2467,8 @@ namespace app
         return make_aggregate<"arena">(
             field<"ui">(ui_type{}),          //
             field<"tally">(detail::tally{}), // 回调写这里，自检读这里
-            field<"event_context">(arena_event::event_context{}), // 变化前的快照
-            field<"now">(uhi::time_point{}),                      // 逻辑时间
+            field<"event_context">(input_frame::event_context{}), // 变化前的快照
+            field<"now">(intent::time_point{}),                   // 逻辑时间
             field<"fake_clock">(false),                           // 自检：时间由测试喂
             field<"keep_events">(false), // 自检：tick 后不清空播报
             field<"frames">(0u),         //
@@ -2554,7 +2554,7 @@ namespace app
             method<"on_key_HUD">([](auto &self, auto &&p) noexcept {
                 ++self.tally.hud;
                 std::println("  >>> HUD key={} {}", static_cast<int>(p.key),
-                             p.transition == arena_event::Transition::Press ? "down"
+                             p.transition == input_frame::Transition::Press ? "down"
                                                                             : "up");
             }),
 
@@ -2572,19 +2572,19 @@ namespace app
                 ++self.frames;
             }),
 
-            // 平台事件 → arena_event::input_frame<T>：唯一的适配层。
+            // 平台事件 → input_frame::frame<T>：唯一的适配层。
             // 过滤（左键/按键 A）和事件分派都在 FSM 内部。
             method<"input_event">([]<class Self, class E>(Self &self, E e) noexcept {
                 const auto now = now_of(self);
                 self.now = now;
 
                 using frame_t =
-                    decltype(arena_event::build_change(self.event_context, e));
+                    decltype(input_frame::build_change(self.event_context, e));
                 if constexpr (!std::is_void_v<frame_t>)
                 {
-                    auto f = arena_event::build_change(self.event_context, e);
+                    auto f = input_frame::build_change(self.event_context, e);
                     self.ui.feed(f, now);
-                    arena_event::apply_change(self.event_context, f);
+                    input_frame::apply_change(self.event_context, f);
                 }
             }));
     }
@@ -2608,13 +2608,14 @@ namespace app
                 ++fails;
         };
         auto key = [&](Key k, Action a, ModifierKey mods, std::int64_t ms) {
-            arena.now = uhi::time_point{ms};
+            arena.now = intent::time_point{ms};
             arena.invoke<"input_event">(keyboard_event{k, a, mods});
         };
         auto count = [&](std::string_view name, std::int64_t at) {
             int n = 0;
             for (const auto &e : arena.ui.events())
-                if (e.name == name && e.v == uhi::verdict::accepted && e.at.count() == at)
+                if (e.name == name && e.v == intent::verdict::accepted &&
+                    e.at.count() == at)
                     ++n;
             return n;
         };
