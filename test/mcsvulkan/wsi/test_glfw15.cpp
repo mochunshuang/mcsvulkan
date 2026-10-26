@@ -55,7 +55,8 @@ using mcs::vulkan::ring_buffer;
 // ═══════════════════════════════════════════════════════════════════════
 // 【原样保留】事件系统
 // ═══════════════════════════════════════════════════════════════════════
-struct invoke_member_help
+template <typename... Extra>
+struct proxy_class_invoke
 {
     static consteval std::optional<std::meta::info> find_function(std::meta::info cls,
                                                                   static_string name)
@@ -78,59 +79,6 @@ struct invoke_member_help
             std::meta::access_context::current());
     }
 
-    template <static_string fn_name, class T>
-    static consteval std::meta::info resolve_callable()
-    {
-        if (auto f = find_function(^^T, fn_name); f.has_value())
-            return *f;
-        if (auto d = find_nonstatic_data_member(^^T, fn_name); d.has_value())
-            return *d;
-        return std::meta::info{};
-    }
-
-    template <static_string fn_name, class Obj, class... Args>
-    static constexpr bool can_noexcept_invoke() noexcept
-    {
-        using T = std::remove_cvref_t<Obj>;
-
-        if constexpr (requires(T &o, Args &&...as) {
-                          {
-                              o.template invoke<fn_name>(std::forward<Args>(as)...)
-                          } noexcept;
-                      })
-            return true;
-
-        constexpr auto callable = resolve_callable<fn_name, T>();
-        if constexpr (callable == std::meta::info{})
-            return false;
-        else
-            return requires(T &o, Args &&...as) {
-                { o.[:callable:](std::forward<Args>(as)...) } noexcept;
-            } || requires(T &o, Args &&...as) {
-                { o.template[:callable:](std::forward<Args>(as)...) } noexcept;
-            };
-    }
-
-    template <static_string fn_name, class Obj, class... Args>
-        requires(can_noexcept_invoke<fn_name, std::remove_cvref_t<Obj>, Args...>())
-    static constexpr decltype(auto) invoke_member(Obj &obj, Args &&...args) noexcept
-    {
-        using T = std::remove_cvref_t<Obj>;
-        constexpr auto m = resolve_callable<fn_name, T>();
-
-        if constexpr (requires { obj.[:m:](std::forward<Args>(args)...); })
-            return obj.[:m:](std::forward<Args>(args)...);
-        else if constexpr (requires { obj.template[:m:](std::forward<Args>(args)...); })
-            return obj.template[:m:](std::forward<Args>(args)...);
-        else
-            static_assert(sizeof(Obj) == 0,
-                          "invoke_member: member exists but not callable");
-    }
-};
-template <typename... Extra>
-struct proxy_class_invoke : invoke_member_help
-{
-
     using invoke_type = void (*)(void *ptr, const void *type, void *data,
                                  Extra...) noexcept;
     constexpr void invoke(void *ptr, const void *type, void *data, Extra... e) noexcept
@@ -144,19 +92,71 @@ struct proxy_class_invoke : invoke_member_help
     {
     }
 
+    template <class Obj, static_string name>
+    struct invoke_type_info
+    {
+        constexpr static bool in_function = find_function(^^Obj, name).has_value();
+        constexpr static bool in_data_member =
+            find_nonstatic_data_member(^^Obj, name).has_value();
+
+        template <class... Args>
+        static consteval auto can_noexcept_invoke()
+        {
+            // NOTE: 默认反射的是当前的类型，而不是从父类继承下来的
+            if constexpr (requires(Obj &&obj, Args &&...args) {
+                              {
+                                  obj.template invoke<name>(std::forward<Args>(args)...)
+                              } noexcept;
+                          })
+                return true;
+            else if constexpr (in_function || in_data_member)
+            {
+                constexpr auto m = in_function ? *find_function(^^Obj, name)
+                                               : *find_nonstatic_data_member(^^Obj, name);
+                return requires(Obj &&obj, Args &&...args) {
+                    { obj.[:m:](std::forward<Args>(args)...) } noexcept;
+                } || requires(Obj &&obj, Args &&...args) {
+                    { obj.template[:m:](std::forward<Args>(args)...) } noexcept;
+                };
+            }
+            else
+                return false;
+        }
+    };
+
     template <static_string name, typename Obj, typename... Ts>
     static constexpr void dispach_invoke(Obj *ptr, std::tuple<Ts...> *, const void *type,
-                                         void *p, Extra... e) noexcept
+                                         void *p, Extra &&...e) noexcept
+        requires(
+            (invoke_type_info<Obj, name>::template can_noexcept_invoke<Ts, Extra...>() ||
+             ...))
     {
+        using Info = invoke_type_info<Obj, name>;
         using mcs::vulkan::runtime_type_v;
-        auto invoke = [&](auto &d) noexcept {
-            if constexpr (requires() { ptr->template invoke<name>(d, e...); })
-                ptr->template invoke<name>(d, e...);
-            else if constexpr (requires() { invoke_member<name>(*ptr, d, e...); })
-                invoke_member<name>(*ptr, d, e...);
+        auto &obj = *ptr;
+        auto invoke = [&]<typename... Args>(Args &&...args) noexcept {
+            if constexpr (requires() {
+                              {
+                                  obj.template invoke<name>(std::forward<Args>(args)...)
+                              } noexcept;
+                          })
+                obj.template invoke<name>(std::forward<Args>(args)...);
+            else
+            {
+                constexpr auto m = Info::in_function
+                                       ? *find_function(^^Obj, name)
+                                       : *find_nonstatic_data_member(^^Obj, name);
+                if constexpr (requires() {
+                                  { obj.[:m:](std::forward<Args>(args)...) } noexcept;
+                              })
+                    obj.[:m:](std::forward<Args>(args)...);
+                else
+                    obj.template[:m:](std::forward<Args>(args)...);
+            }
         };
-        ((can_noexcept_invoke<name, Obj, Ts, Extra...> && type == runtime_type_v<Ts> &&
-          (invoke(*static_cast<Ts *>(p)), true)) ||
+        ((Info::template can_noexcept_invoke<Ts, Extra...>() &&
+          type == runtime_type_v<Ts> &&
+          (invoke(*static_cast<Ts *>(p), std::forward<Extra>(e)...), true)) ||
          ...);
     }
 
@@ -446,7 +446,7 @@ namespace intent
         // 识别器只做三件事：吃帧、过时间、投递/退休。
         // 裁决器只吃 claim_state 数组，不认识 Frame、payload、span。
         template <class M, class Frame>
-        concept can_step = requires(M &m, const Frame &f, time_point t) {
+        concept can_feed = requires(M &m, const Frame &f, time_point t) {
             { m.feed(f, t) } noexcept -> std::same_as<claim_state>;
         };
 
@@ -458,12 +458,6 @@ namespace intent
             { m.lose() } noexcept -> std::same_as<claim_state>;
         };
     } // namespace recognizer
-
-    // 判决的两种结果，打印用（和 event 做邻居）
-    constexpr std::string_view to_string(verdict v) noexcept
-    {
-        return v == verdict::accepted ? "acc" : "sup";
-    }
 
     // 一条观测记录（定长、可拷贝、不分配）
     struct observation
@@ -937,7 +931,7 @@ namespace intent
         bset<S> m{};
         template for (constexpr auto I : std::ranges::views::indices(S))
         {
-            if constexpr (recognizer::can_step<std::tuple_element_t<I, Recognizers>,
+            if constexpr (recognizer::can_feed<std::tuple_element_t<I, Recognizers>,
                                                Frame>)
                 m.set(static_cast<index_t>(I));
         }
@@ -2448,6 +2442,12 @@ namespace app
         return self.fake_clock ? self.now : now_ms();
     }
 
+    // 判决的两种结果，打印用（和 event 做邻居）
+    constexpr std::string_view to_string(intent::verdict v) noexcept
+    {
+        return v == intent::verdict::accepted ? "acc" : "sup";
+    }
+
     // 把这一帧的播报打出来（name = kind / verdict / at）
     //   拖拽的相位由 on_drag 回调打印，trace 里不重复刷屏；悬停同理。
     inline void report(const ui_type &u) noexcept
@@ -2457,7 +2457,7 @@ namespace app
             if (e.name == "on_hover" || e.name == "on_drag")
                 continue;
             std::println("  [t={:>6}ms] {:<14} {:<3}", e.at.count(), e.name,
-                         intent::to_string(e.v));
+                         to_string(e.v));
         }
     }
 
