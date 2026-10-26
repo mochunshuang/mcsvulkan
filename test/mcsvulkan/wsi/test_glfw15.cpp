@@ -56,7 +56,7 @@ using mcs::vulkan::ring_buffer;
 // 【原样保留】事件系统
 // ═══════════════════════════════════════════════════════════════════════
 template <typename... Extra>
-struct proxy_class_invoke
+struct type_erased_invoker
 {
     static consteval std::optional<std::meta::info> find_function(std::meta::info cls,
                                                                   static_string name)
@@ -87,8 +87,8 @@ struct proxy_class_invoke
         invoke_(ptr, type, data, e...);
     }
 
-    proxy_class_invoke() = default;
-    constexpr explicit proxy_class_invoke(invoke_type invoke) noexcept : invoke_{invoke}
+    type_erased_invoker() = default;
+    constexpr explicit type_erased_invoker(invoke_type invoke) noexcept : invoke_{invoke}
     {
     }
 
@@ -125,8 +125,8 @@ struct proxy_class_invoke
     };
 
     template <static_string name, typename Obj, typename... Ts>
-    static constexpr void dispach_invoke(Obj *ptr, std::tuple<Ts...> *, const void *type,
-                                         void *p, Extra &&...e) noexcept
+    static constexpr void dispatch_invoke(Obj *ptr, std::tuple<Ts...> *, const void *type,
+                                          void *p, Extra &&...e) noexcept
         requires(
             (invoke_type_info<Obj, name>::template can_noexcept_invoke<Ts, Extra...>() ||
              ...))
@@ -164,10 +164,10 @@ struct proxy_class_invoke
     static constexpr auto build() noexcept
     {
         using object_type = std::remove_cvref_t<T>;
-        return proxy_class_invoke{invoke_type{
+        return type_erased_invoker{invoke_type{
             [](void *ptr, const void *type, void *data, Extra... args) noexcept {
                 auto *obj = static_cast<object_type *>(ptr);
-                dispach_invoke<callable_name, object_type>(
+                dispatch_invoke<callable_name, object_type>(
                     obj, static_cast<data_tuple *>(nullptr), type, data, args...);
             }}};
     }
@@ -201,7 +201,7 @@ struct glfw_input_translation
                    cursor_enter_event, char_event, drop_event, window_focus_event,
                    window_pos_event, window_size_event, window_iconify_event,
                    window_maximize_event, framebuffer_size_event>;
-    using proxy_class_type = proxy_class_invoke<>;
+    using proxy_class_type = type_erased_invoker<>;
 
     struct receiver
     {
