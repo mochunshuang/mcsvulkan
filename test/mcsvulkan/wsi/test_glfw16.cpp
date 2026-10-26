@@ -445,17 +445,9 @@ namespace intent
     {
         // 识别器只做三件事：吃帧、过时间、投递/退休。
         // 裁决器只吃 claim_state 数组，不认识 Frame、payload、span。
-        template <class M, class Frame>
-        concept can_feed = requires(M &m, const Frame &f, time_point t) {
-            { m.feed(f, t) } noexcept -> std::same_as<claim_state>;
-        };
-
-        template <class M>
-        concept protocol = std::default_initializable<M> && requires(M &m, time_point t) {
-            typename M::consume_t; // 我处理哪些 input_frame change
-            { m.tick(t) } noexcept -> std::same_as<claim_state>;
-            { m.win() } noexcept -> std::same_as<claim_state>;
-            { m.lose() } noexcept -> std::same_as<claim_state>;
+        template <class M, class Self, class Frame>
+        concept can_feed = requires(M &m, Self &self, const Frame &f, time_point t) {
+            { m.feed(self, f, t) } noexcept -> std::same_as<claim_state>;
         };
     } // namespace recognizer
 
@@ -545,7 +537,7 @@ namespace intent
     //               多个 kind 可以共用同一个回调。
     //   “能吃哪些帧”不再手写：由 feed 重载在 law_of 里编译期算出来，
     //   关系两端能不能相遇也由这个集合决定，不靠 channel 字符串。
-    template <recognizer::protocol Fsm>
+    template <class Fsm>
     struct leaf
     {
         using protocol = Fsm; // 叶子协议：我的状态机类型（反射靠它认出叶子）
@@ -922,7 +914,7 @@ namespace intent
     //    所以 position 帧只推进 drag，click 的活 claim 还在 report 里；
     //    drag 赢的时候照样能把 click lose 掉。
     // ═══════════════════════════════════════════════════════════════════
-    template <class Tree, class Frame>
+    template <class Tree, class Self, class Frame>
     consteval auto advance_mask() noexcept
     {
         using Shape = typename detail::shape_of<Tree>;
@@ -931,7 +923,7 @@ namespace intent
         bset<S> m{};
         template for (constexpr auto I : std::ranges::views::indices(S))
         {
-            if constexpr (recognizer::can_feed<std::tuple_element_t<I, Recognizers>,
+            if constexpr (recognizer::can_feed<std::tuple_element_t<I, Recognizers>, Self,
                                                Frame>)
                 m.set(static_cast<index_t>(I));
         }
@@ -1143,83 +1135,75 @@ namespace intent
         Recognizers recognizers{};
         std::array<claim_state, S> reports{}; // 最近一次上报；裁决器唯一输入
 
-        // 延迟绑定：只用叶子的类型（名字 + 载荷类型），不用对象。
-        template <class Arena>
-        constexpr void bind(Arena &a) noexcept
-        {
-            template for (constexpr auto I : std::ranges::views::indices(S))
-                std::get<I>(recognizers)
-                    .bind(a);
-        }
-
         // 无观测版本
-        template <class Frame>
-        constexpr void feed(const Frame &f, time_point now) noexcept
+        template <class Self, class Frame>
+        constexpr void feed(Self &self, const Frame &f, time_point now) noexcept
         {
             null_trace t{};
-            feed<Frame, null_trace>(f, now, t);
+            feed<Self, Frame, null_trace>(self, f, now, t);
         }
 
         // 带 Trace 模板参数的版本：由 debug_arbiter 调用
-        template <class Frame, class Trace>
-        constexpr void feed(const Frame &f, time_point now, Trace &t) noexcept
+        template <class Self, class Frame, class Trace>
+        constexpr void feed(Self &self, const Frame &f, time_point now, Trace &t) noexcept
         {
-            constexpr bset<S> advance = advance_mask<Tree, Frame>();
+            constexpr bset<S> advance = advance_mask<Tree, Self, Frame>();
             if constexpr (advance.none())
                 return; // 没有列接受这个 Frame：不推进，也不再裁决
 
             template for (constexpr auto I : std::ranges::views::indices(S))
             {
                 if constexpr (advance.has(static_cast<index_t>(I)))
-                    reports[I] = std::get<I>(recognizers).feed(f, now);
+                    reports[I] = std::get<I>(recognizers).feed(self, f, now);
             }
-            resolve(now, t);
+            resolve(self, now, t);
         }
 
         // 无观测版本
-        constexpr void tick(time_point now) noexcept
+        template <class Self>
+        constexpr void tick(Self &self, time_point now) noexcept
         {
             null_trace t{};
-            tick<null_trace>(now, t);
+            tick<Self, null_trace>(self, now, t);
         }
 
         // 带 Trace 模板参数的版本：由 debug_arbiter 调用
-        template <class Trace>
-        constexpr void tick(time_point now, Trace &t) noexcept
+        template <class Self, class Trace>
+        constexpr void tick(Self &self, time_point now, Trace &t) noexcept
         {
             template for (constexpr auto I : std::ranges::views::indices(S))
             {
-                reports[I] = std::get<I>(recognizers).tick(now);
+                reports[I] = std::get<I>(recognizers).tick(self, now);
             }
-            resolve(now, t);
+            resolve(self, now, t);
         }
 
       private:
         // report -> verdict -> 落地。先让位，再放行。
-        template <class Trace>
-        constexpr void resolve(time_point now, Trace &t) noexcept
+        template <class Self, class Trace>
+        constexpr void resolve(Self &self, time_point now, Trace &t) noexcept
         {
             const auto d = arbitrate(reports, law::beats);
 
             template for (constexpr auto I : std::ranges::views::indices(S))
             {
                 if (d.lose.has(I))
-                    deliver<I>(false, now, t);
+                    deliver<I>(self, false, now, t);
             }
             template for (constexpr auto I : std::ranges::views::indices(S))
             {
                 if (d.win.has(I))
-                    deliver<I>(true, now, t);
+                    deliver<I>(self, true, now, t);
             }
         }
 
         // 唯一副作用点：win/lose 返回“裁决之后我是什么状态”，
         // 立刻写回 report；下一拍不会拿旧的 ready 再判一次。
-        template <std::size_t Flat, class Trace>
-        constexpr void deliver(bool won, time_point at, Trace &t) noexcept
+        template <std::size_t Flat, class Self, class Trace>
+        constexpr void deliver(Self &self, bool won, time_point at, Trace &t) noexcept
         {
             auto &m = std::get<Flat>(recognizers);
-            reports[Flat] = won ? m.win() : m.lose();
+            reports[Flat] = won ? m.win(self) : m.lose(self);
 
             if constexpr (!std::is_same_v<Trace, null_trace>)
                 t.push({law::names[Flat].view(),
@@ -1241,15 +1225,16 @@ namespace intent
 
         Trace obs{};
 
-        template <class Frame>
-        constexpr void feed(const Frame &f, time_point now) noexcept
+        template <class Self, class Frame>
+        constexpr void feed(Self &self, const Frame &f, time_point now) noexcept
         {
-            base::template feed<Frame, Trace>(f, now, obs);
+            base::template feed<Self, Frame, Trace>(self, f, now, obs);
         }
 
-        constexpr void tick(time_point now) noexcept
+        template <class Self>
+        constexpr void tick(Self &self, time_point now) noexcept
         {
-            base::template tick<Trace>(now, obs);
+            base::template tick<Self, Trace>(self, now, obs);
         }
 
         template <class Self>
@@ -1590,1016 +1575,1106 @@ struct input_frame
 //
 //    时间：主循环每转一圈调一次 arena.tick()。挂起的候选靠它落地或超时。
 // ═══════════════════════════════════════════════════════════════════════════
-namespace app
+// ═══════════════════════════════════════════════════════════════════════
+//  gesture —— 识别器库（无继承；Trait 是 config + data + handler）
+// ═══════════════════════════════════════════════════════════════════════
+namespace gesture
 {
-    // ── 参数：一个地方调 ────────────────────────────────────────────
-    inline constexpr std::int64_t click_max_ms = 250;  // 按下到松开，超时不算单击
-    inline constexpr std::int64_t dbl_gap_ms = 300;    // 双击：两击之间的空档
-    inline constexpr std::int64_t triple_gap_ms = 250; // 三击：每档更严一点
-    inline constexpr double drag_slop_px = 4.0;        // 越过它就算拖拽
+    using intent::claim_state;
+    using intent::time_point;
 
-    namespace detail
+    struct none_payload
     {
-        // ── 识别器的全部状态：一条 claim 的三态 ──────────────────────────
-        //    cur：这一拍我对裁决器说的话（idle / hold / ready）。
-        //    win 只发射当前事件；claim 是否结束由识别器自己决定。
-        struct fsm_state
+        friend constexpr bool operator==(none_payload, none_payload) = default;
+    };
+
+    template <class T>
+    inline constexpr bool is_none_payload = std::is_same_v<T, none_payload>;
+
+    namespace state
+    {
+        constexpr claim_state latch(claim_state &cur, claim_state s) noexcept
         {
-            intent::claim_state cur{intent::claim_state::idle};
-
-            intent::claim_state claim(intent::claim_state s) noexcept
-            {
-                // 已经 ready、还没裁决的 claim，新帧不能把它降回 hold。
-                if (cur == intent::claim_state::ready && s != intent::claim_state::idle)
-                    s = intent::claim_state::ready;
-                cur = s;
-                return s;
-            }
-
-            // 默认：时间不改变状态（窗口需要过期的识别器自己覆盖 tick）
-            intent::claim_state tick(intent::time_point) noexcept
-            {
-                return claim(cur);
-            }
-
-            // 长 claim 发射完一个事件：claim 继续活着，等下一个事件
-            void consume_event() noexcept
-            {
-                if (cur == intent::claim_state::ready)
-                    cur = intent::claim_state::hold;
-            }
-
-            // 一次性手势/让位：claim 结束
-            void settle_claim() noexcept
-            {
-                cur = intent::claim_state::idle;
-            }
-        };
-
-        // ── 帧就是 input_frame::frame<T>：完整快照 + 本帧变化。
-        //    过滤（左键/按键 A）和事件分派都在 FSM 内部。
-
-        // ── 复用的"一次按下→松开算不算一次有效单击"：限时 + 限位 ────────
-        struct press_watch
+            if (cur == claim_state::ready && s != claim_state::idle)
+                s = claim_state::ready;
+            cur = s;
+            return s;
+        }
+        constexpr claim_state hold(claim_state &cur) noexcept
         {
-            intent::time_point down_at{};
-            double down_x = 0, down_y = 0;
-            bool down = false;
+            return latch(cur, claim_state::hold);
+        }
+        constexpr claim_state idle(claim_state &cur) noexcept
+        {
+            return latch(cur, claim_state::idle);
+        }
+        constexpr claim_state ready(claim_state &cur) noexcept
+        {
+            return latch(cur, claim_state::ready);
+        }
+        constexpr claim_state keep(claim_state &cur) noexcept
+        {
+            return latch(cur, cur);
+        }
+    } // namespace state
 
-            //  0 = 无关帧   1 = 按下   2 = 有效松开   -1 = 无效松开
-            //  过滤（只认左键）在 FSM 内部，不在 input_event 里。
-            int operator()(const input_frame::frame<input_frame::button_change> &f,
-                           intent::time_point now) noexcept
-            {
-                const auto &b = f.change;
-                if (b.button != input_frame::MouseButton::eMOUSE_BUTTON_LEFT)
-                    return 0;
-                if (b.transition == input_frame::Transition::Press)
-                {
-                    if (b.repeat)
-                        return 0;
-                    down = true;
-                    down_at = now;
-                    down_x = f.context.pointer_x;
-                    down_y = f.context.pointer_y;
-                    return 1;
-                }
-                if (b.transition == input_frame::Transition::Release)
-                {
-                    if (!down)
-                        return 0;
-                    down = false;
-                    const bool quick = now - down_at <= intent::time_point{click_max_ms};
-                    const bool still =
-                        std::hypot(f.context.pointer_x - down_x,
-                                   f.context.pointer_y - down_y) <= drag_slop_px;
-                    return (quick && still) ? 2 : -1;
-                }
+    // 非局部 base：name / fn_name / policy / payload_t 都在库里
+    template <class Payload, static_string Name, static_string Fn, class Policy>
+    struct trait_base
+    {
+        using payload_t = Payload;
+        static constexpr auto name = Name;
+        static constexpr auto fn_name = Fn;
+        using policy = Policy;
+    };
+
+    // 数据槽：只有 data；none_payload 时为空
+    template <class Trait, bool = is_none_payload<typename Trait::payload_t>>
+    struct slot;
+
+    template <class Trait>
+    struct slot<Trait, false>
+    {
+        using payload_t = typename Trait::payload_t;
+        [[no_unique_address]] payload_t data{};
+
+        template <class Event>
+        constexpr void collect(time_point t, const Event &e) noexcept
+        {
+            Trait::collect(t, data, e);
+        }
+    };
+
+    template <class Trait>
+    struct slot<Trait, true>
+    {
+        template <class... Args>
+        constexpr void collect(Args &&...) noexcept
+        {
+        }
+    };
+
+    template <class Policy>
+    struct press_watch
+    {
+        bool down{};
+        time_point down_at{};
+        double down_x{};
+        double down_y{};
+
+        constexpr int operator()(const input_frame::frame<input_frame::button_change> &f,
+                                 time_point now) noexcept
+        {
+            const auto &b = f.change;
+            if (b.button != Policy::button)
                 return 0;
-            }
-            void reset() noexcept
+            if (b.transition == input_frame::Transition::Press)
             {
-                down = false;
-            }
-        };
-
-        // ── 单击 ────────────────────────────────────────────────────────
-        template <static_string Name, static_string FnName = Name>
-        struct single_click : fsm_state
-        {
-            static constexpr auto name = Name;
-            static constexpr auto fn_name = FnName;
-            using consume_t = input_frame::changes<input_frame::button_change>;
-
-            struct payload_t
-            {
-                double x = 0, y = 0;
-            } payload{};
-
-            press_watch watch{};
-            intent::claim_state feed(
-                const input_frame::frame<input_frame::button_change> &f,
-                intent::time_point now) noexcept
-            {
-                switch (watch(f, now))
-                {
-                case 1:
-                    return claim(intent::claim_state::hold);
-                case 2:
-                    if (cur != intent::claim_state::ready) // 挂起的那一条不拿新坐标覆盖
-                    {
-                        payload.x = f.context.pointer_x;
-                        payload.y = f.context.pointer_y;
-                    }
-                    return claim(intent::claim_state::ready);
-                case -1: // 不是单击：这次交互作废
-                    return claim(intent::claim_state::idle);
-                default:
-                    // 挂起中（ready）就继续申辩；否则按下算 hold，其余算 idle。
-                    return claim(watch.down ? intent::claim_state::hold : cur);
-                }
-            }
-            void *receiver_{};
-            using invoke_type = void (*)(void *self) noexcept;
-            invoke_type invoke_{};
-            template <class Receiver>
-            constexpr void bind(Receiver &ptr) noexcept
-            {
-                receiver_ = &ptr;
-                invoke_ = invoke_type{[](void *ptr) noexcept {
-                    auto *self = static_cast<single_click *>(ptr);
-                    static_cast<Receiver *>(self->receiver_)
-                        ->template invoke<fn_name>(self->payload);
-                }};
-            }
-            constexpr intent::claim_state win() noexcept
-            {
-                assert(invoke_ != nullptr);
-                invoke_(this);
-                settle_claim(); // 投递完，这条申报结束
-                return cur;
-            }
-            intent::claim_state lose() noexcept
-            {
-                watch.reset(); // 被更具体的赢了：这次交互丢掉
-                settle_claim();
-                return cur;
-            }
-        };
-
-        // ── N 连击：连续 N 次有效单击，每两击之间独立计时 ────────────────
-        //    所以间隔不必相同：只要每一档都 ≤ GapMs 就算。
-        //    窗口一过就回 idle —— 把机会让给更简单的解释（单击）。
-        template <int N, std::int64_t GapMs, static_string Name,
-                  static_string FnName = Name>
-        struct click_chain : fsm_state
-        {
-            static constexpr auto name = Name;
-            static constexpr auto fn_name = FnName;
-            using consume_t = input_frame::changes<input_frame::button_change>;
-
-            struct payload_t
-            {
-                double x = 0, y = 0;
-                int count = 0;
-            } payload{};
-
-            press_watch watch{};
-            int clicks = 0;            // 已经完成的单击数
-            intent::time_point last{}; // 上一次松开的时刻
-            bool armed = false;        // 正在窗口里等下一击
-
-            intent::claim_state feed(
-                const input_frame::frame<input_frame::button_change> &f,
-                intent::time_point now) noexcept
-            {
-                if (armed && now - last > intent::time_point{GapMs})
-                {
-                    // 窗口过了：这一次放弃，但**这一帧照常处理** ——
-                    // 它可能正是新交互的按下。先显式清掉旧申报。
-                    clicks = 0;
-                    armed = false;
-                    watch.reset();
-                    claim(intent::claim_state::idle);
-                }
-
-                switch (watch(f, now))
-                {
-                case 1:
-                    return claim(intent::claim_state::hold);
-                case 2:
-                    ++clicks;
-                    armed = true;
-                    last = now;
-                    if (cur != intent::claim_state::ready) // 挂起的那一条保留原载荷/跨度
-                    {
-                        payload.x = f.context.pointer_x;
-                        payload.y = f.context.pointer_y;
-                        payload.count = clicks;
-                    }
-                    if (clicks >= N)
-                    {
-                        clicks = 0;
-                        armed = false;
-                        return claim(intent::claim_state::ready);
-                    }
-                    return claim(intent::claim_state::hold);
-                case -1: // 这一次不是有效单击
-                    clicks = 0;
-                    armed = false;
-                    return claim(intent::claim_state::idle);
-                default:
-                    // 按下、等着、挂起，都算在场；纯路过才是 idle。
-                    return claim((armed || clicks > 0 || watch.down)
-                                     ? intent::claim_state::hold
-                                     : cur);
-                }
-            }
-            // 时间窗只靠"喂帧"是过不去的：必须由 tick 推动。
-            // 但 tick 不再从旁边改 cur —— 它回同一句话，引擎照常裁决。
-            intent::claim_state tick(intent::time_point now) noexcept
-            {
-                if (armed && now - last > intent::time_point{GapMs})
-                {
-                    clicks = 0;
-                    armed = false;
-                    watch.reset();
-                    return claim(intent::claim_state::idle);
-                }
-                return claim(cur);
-            }
-
-            void *receiver_{};
-            using invoke_type = void (*)(void *self) noexcept;
-            invoke_type invoke_{};
-            template <class Receiver>
-            constexpr void bind(Receiver &ptr) noexcept
-            {
-                receiver_ = &ptr;
-                invoke_ = invoke_type{[](void *ptr) noexcept {
-                    auto *self = static_cast<click_chain *>(ptr);
-                    static_cast<Receiver *>(self->receiver_)
-                        ->template invoke<fn_name>(self->payload);
-                }};
-            }
-            constexpr intent::claim_state win() noexcept
-            {
-                assert(invoke_ != nullptr);
-                invoke_(this);
-                clicks = 0;
-                armed = false;
-                watch.reset();
-                settle_claim();
-                return cur;
-            }
-            intent::claim_state lose() noexcept
-            {
-                clicks = 0;
-                armed = false;
-                watch.reset();
-                settle_claim();
-                return cur;
-            }
-        };
-
-        // ═══════════════════════════════════════════════════════════════
-        //  拖拽：一个 kind，一个长 claim，三个相位事件
-        //    begin  第一次越过阈值
-        //    move   之后每一次移动（每帧最多一个事件）
-        //    end    松手
-        //  同一个 on_drag 回调，payload.phase 分流。
-        //
-        //  长 claim：begin/move/end 都是同一个 claim 的 ready，win 只发射
-        //  当前事件；claim 一直活着，直到 end 发完或被 lose。
-        //  没有队列，也没有 streaming 标志。
-        // ═══════════════════════════════════════════════════════════════
-        struct drag_payload
-        {
-            enum class phase_t
-            {
-                begin,
-                move,
-                end
-            } phase{phase_t::begin};
-
-            double x{}, y{};               // 当前点
-            double dx{}, dy{};             // 相对上一帧
-            double total_dx{}, total_dy{}; // 相对按下点
-        };
-
-        // 三段共用的记账：按下点 / 上一帧位置 / 是否还按着
-        struct drag_track
-        {
-            double down_x = 0, down_y = 0;
-            double last_x = 0, last_y = 0;
-            bool down = false;
-
-            void press(double x, double y) noexcept
-            {
+                if (b.repeat)
+                    return 0;
                 down = true;
-                down_x = last_x = x;
-                down_y = last_y = y;
+                down_at = now;
+                down_x = f.context.pointer_x;
+                down_y = f.context.pointer_y;
+                return 1;
             }
-            void last(double x, double y) noexcept
-            {
-                last_x = x;
-                last_y = y;
-            }
-            void release() noexcept
-            {
-                down = false;
-            }
-            [[nodiscard]] bool past_slop(double x, double y) const noexcept
-            {
-                return std::hypot(x - down_x, y - down_y) > drag_slop_px;
-            }
-            [[nodiscard]] double total_dx(double x) const noexcept
-            {
-                return x - down_x;
-            }
-            [[nodiscard]] double total_dy(double y) const noexcept
-            {
-                return y - down_y;
-            }
-            [[nodiscard]] drag_payload make(drag_payload::phase_t ph, double x, double y,
-                                            double dx, double dy) const noexcept
-            {
-                return {ph, x, y, dx, dy, total_dx(x), total_dy(y)};
-            }
-        };
+            if (!down)
+                return 0;
+            down = false;
+            const bool quick = now - down_at <= time_point{Policy::tap_max_ms};
+            const bool still =
+                std::hypot(f.context.pointer_x - down_x, f.context.pointer_y - down_y) <=
+                Policy::slop_px;
+            return (quick && still) ? 2 : -1;
+        }
 
-    } // namespace detail
+        constexpr void clear() noexcept
+        {
+            down = false;
+        }
+    };
 
-    // 对外的 FSM 就这四个名字；模板实现放在 detail。
-    using click = detail::single_click<"on_click">;
-    using double_click = detail::click_chain<2, dbl_gap_ms, "on_dbl">;
-    using triple_click = detail::click_chain<3, triple_gap_ms, "on_triple">;
-
-    // 一个长 claim：begin/move/end 都是同一个 claim 的 ready。
-    // 按钮事件给 press/release，position2d_event 给 move —— 两个 feed
-    // 重载，不再有 frame_type 的单类型限制。
-    struct drag : detail::fsm_state
+    // ── 语义事件 ────────────────────────────────────────────────────
+    struct click_event
     {
-        static constexpr auto name = static_string{"on_drag"};
-        static constexpr auto fn_name = name;
+        double x{}, y{};
+        time_point at{};
+    };
+    struct multi_click_event
+    {
+        double x{}, y{};
+        int count{};
+        time_point at{};
+    };
+    enum class drag_phase : std::uint8_t
+    {
+        begin,
+        move,
+        end
+    };
+    struct drag_event
+    {
+        drag_phase phase{};
+        double x{}, y{}, dx{}, dy{};
+        double total_dx{}, total_dy{};
+        time_point at{};
+        ModifierKey modifier{};
+    };
+    struct wheel_event
+    {
+        int delta{};
+        time_point at{};
+    };
+    struct key_event
+    {
+        Key key{};
+        input_frame::Transition transition{};
+        time_point at{};
+    };
+
+    // ── click_template ──────────────────────────────────────────────
+    template <class Trait>
+    struct click_template
+    {
+        using policy = typename Trait::policy;
+        static constexpr auto name = Trait::name;
+        static constexpr auto fn_name = Trait::fn_name;
+        using consume_t = input_frame::changes<input_frame::button_change>;
+
+        claim_state cur{};
+        press_watch<policy> watch{};
+        slot<Trait> in{};
+
+        template <class Self>
+        constexpr claim_state feed(
+            Self &self, const input_frame::frame<input_frame::button_change> &f,
+            time_point now) noexcept
+        {
+            switch (watch(f, now))
+            {
+            case 1:
+                return state::hold(cur);
+            case 2:
+                in.collect(now,
+                           click_event{f.context.pointer_x, f.context.pointer_y, now});
+                return state::ready(cur);
+            case -1:
+                return state::idle(cur);
+            default:
+                return watch.down ? state::hold(cur) : state::keep(cur);
+            }
+        }
+
+        template <class Self>
+        constexpr claim_state tick(Self &, time_point) noexcept
+        {
+            return state::keep(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state win(Self &self) noexcept
+        {
+            self.template invoke<fn_name>(in.data);
+            cur = claim_state::idle;
+            return cur;
+        }
+
+        template <class Self>
+        constexpr claim_state lose(Self &) noexcept
+        {
+            watch.clear();
+            cur = claim_state::idle;
+            return cur;
+        }
+    };
+
+    // ── multi_click_template ────────────────────────────────────────
+    template <class Trait>
+    struct multi_click_template
+    {
+        using policy = typename Trait::policy;
+        static constexpr auto name = Trait::name;
+        static constexpr auto fn_name = Trait::fn_name;
+        using consume_t = input_frame::changes<input_frame::button_change>;
+
+        claim_state cur{};
+        press_watch<policy> watch{};
+        slot<Trait> in{};
+        int clicks{};
+        time_point last{};
+        bool armed{};
+
+        template <class Self>
+        constexpr claim_state feed(
+            Self &self, const input_frame::frame<input_frame::button_change> &f,
+            time_point now) noexcept
+        {
+            if (armed && now - last > time_point{policy::gap_ms})
+            {
+                reset_chain();
+                (void)state::idle(cur);
+            }
+            switch (watch(f, now))
+            {
+            case 1:
+                return state::hold(cur);
+            case 2: {
+                ++clicks;
+                armed = true;
+                last = now;
+                if (clicks >= policy::count)
+                {
+                    const int count = clicks;
+                    reset_chain();
+                    in.collect(now, multi_click_event{f.context.pointer_x,
+                                                      f.context.pointer_y, count, now});
+                    return state::ready(cur);
+                }
+                return state::hold(cur);
+            }
+            case -1:
+                reset_chain();
+                return state::idle(cur);
+            default:
+                return (armed || clicks > 0 || watch.down) ? state::hold(cur)
+                                                           : state::keep(cur);
+            }
+        }
+
+        template <class Self>
+        constexpr claim_state tick(Self &, time_point now) noexcept
+        {
+            if (armed && now - last > time_point{policy::gap_ms})
+            {
+                reset_chain();
+                return state::idle(cur);
+            }
+            return state::keep(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state win(Self &self) noexcept
+        {
+            self.template invoke<fn_name>(in.data);
+            reset_chain();
+            cur = claim_state::idle;
+            return cur;
+        }
+
+        template <class Self>
+        constexpr claim_state lose(Self &) noexcept
+        {
+            reset_chain();
+            cur = claim_state::idle;
+            return cur;
+        }
+
+        constexpr void reset_chain() noexcept
+        {
+            clicks = 0;
+            armed = false;
+            watch.clear();
+        }
+    };
+
+    // ── drag_template ───────────────────────────────────────────────
+    template <class Trait>
+    struct drag_template
+    {
+        using policy = typename Trait::policy;
+        static constexpr auto name = Trait::name;
+        static constexpr auto fn_name = Trait::fn_name;
         using consume_t =
             input_frame::changes<input_frame::button_change, input_frame::move_change>;
-        using payload_t = detail::drag_payload;
-        using track_t = detail::drag_track;
-        using phase_t = payload_t::phase_t;
 
-        payload_t payload{};
-        track_t t{};
-        bool dragging = false;
-        bool ending = false;
+        claim_state cur{};
+        slot<Trait> in{};
+        double down_x{}, down_y{}, last_x{}, last_y{};
+        bool down{}, dragging{}, finished_{};
 
-        intent::claim_state feed(const input_frame::frame<input_frame::button_change> &f,
-                                 intent::time_point now) noexcept
+        template <class Self>
+        constexpr claim_state feed(
+            Self &self, const input_frame::frame<input_frame::button_change> &f,
+            time_point now) noexcept
         {
-            if (f.change.button != input_frame::MouseButton::eMOUSE_BUTTON_LEFT)
-                return claim(cur);
+            if (f.change.button != policy::button)
+                return state::keep(cur);
             if (f.change.transition == input_frame::Transition::Press)
             {
                 if (f.change.repeat)
-                    return claim(cur);
-                return drag_start(f, now);
+                    return state::keep(cur);
+                if (cur != claim_state::idle)
+                    (void)state::idle(cur);
+                down = true;
+                dragging = false;
+                down_x = last_x = f.context.pointer_x;
+                down_y = last_y = f.context.pointer_y;
+                return state::hold(cur);
             }
-            return drag_end(f, now);
-        }
-
-        intent::claim_state feed(const input_frame::frame<input_frame::move_change> &f,
-                                 intent::time_point now) noexcept
-        {
-            return drag_move(f, now);
-        }
-
-        intent::claim_state drag_start(
-            const input_frame::frame<input_frame::button_change> &f,
-            intent::time_point now) noexcept
-        {
-            if (cur != intent::claim_state::idle) // 上一条 claim 还没结束：先收掉
-                settle_claim();
-            t.press(f.context.pointer_x, f.context.pointer_y);
+            down = false;
+            if (!dragging)
+                return state::idle(cur);
             dragging = false;
-            ending = false;
-            return claim(intent::claim_state::hold);
+            finished_ = true;
+            in.collect(
+                now, drag_event{drag_phase::end, f.context.pointer_x, f.context.pointer_y,
+                                0.0, 0.0, f.context.pointer_x - down_x,
+                                f.context.pointer_y - down_y, now, f.context.modifier});
+            return state::ready(cur);
         }
 
-        intent::claim_state drag_move(
-            const input_frame::frame<input_frame::move_change> &f,
-            intent::time_point now) noexcept
+        template <class Self>
+        constexpr claim_state feed(Self &self,
+                                   const input_frame::frame<input_frame::move_change> &f,
+                                   time_point now) noexcept
         {
+            if (!down)
+                return state::keep(cur);
             const auto &m = f.change;
-            if (!t.down)
-                return claim(intent::claim_state::idle);
             if (!dragging)
             {
-                if (!t.past_slop(m.x, m.y))
+                if (std::hypot(m.x - down_x, m.y - down_y) <= policy::slop_px)
                 {
-                    t.last(m.x, m.y);
-                    return claim(intent::claim_state::hold);
+                    last_x = m.x;
+                    last_y = m.y;
+                    return state::hold(cur);
                 }
                 dragging = true;
-                // 这一帧的坐标就是这一帧的事件。
-                payload = t.make(phase_t::begin, m.x, m.y, 0, 0);
-                t.last(m.x, m.y);
-                return claim(intent::claim_state::ready);
+                last_x = m.x;
+                last_y = m.y;
+                in.collect(now,
+                           drag_event{drag_phase::begin, m.x, m.y, 0.0, 0.0, m.x - down_x,
+                                      m.y - down_y, now, f.context.modifier});
+                return state::ready(cur);
             }
-            payload = t.make(phase_t::move, m.x, m.y, m.dx, m.dy);
-            t.last(m.x, m.y);
-            return claim(intent::claim_state::ready);
+            const double dx = m.x - last_x;
+            const double dy = m.y - last_y;
+            last_x = m.x;
+            last_y = m.y;
+            in.collect(now, drag_event{drag_phase::move, m.x, m.y, dx, dy, m.x - down_x,
+                                       m.y - down_y, now, f.context.modifier});
+            return state::ready(cur);
         }
 
-        intent::claim_state drag_end(
-            const input_frame::frame<input_frame::button_change> &f,
-            intent::time_point now) noexcept
+        template <class Self>
+        constexpr claim_state tick(Self &, time_point) noexcept
         {
-            t.release();
-            if (!dragging)
-                return claim(intent::claim_state::idle); // 没拖过：claim 结束
-            dragging = false;
-            ending = true;
-            payload =
-                t.make(phase_t::end, f.context.pointer_x, f.context.pointer_y, 0, 0);
-            return claim(intent::claim_state::ready);
+            return state::keep(cur);
         }
 
-        void *receiver_{};
-        using invoke_type = void (*)(void *self) noexcept;
-        invoke_type invoke_{};
-        template <class Receiver>
-        constexpr void bind(Receiver &ptr) noexcept
+        template <class Self>
+        constexpr claim_state win(Self &self) noexcept
         {
-            receiver_ = &ptr;
-            invoke_ = invoke_type{[](void *ptr) noexcept {
-                auto *self = static_cast<drag *>(ptr);
-                static_cast<Receiver *>(self->receiver_)
-                    ->template invoke<fn_name>(self->payload);
-            }};
-        }
-        constexpr intent::claim_state win() noexcept
-        {
-            assert(invoke_ != nullptr);
-            invoke_(this);
-            if (ending)
-            {
-                ending = false;
-                settle_claim(); // end 是最后一个事件
-            }
-            else
-                consume_event(); // claim 继续，等下一个事件
+            self.template invoke<fn_name>(in.data);
+            cur = finished_ ? claim_state::idle : claim_state::hold;
+            finished_ = false;
             return cur;
         }
-        intent::claim_state lose() noexcept
+
+        template <class Self>
+        constexpr claim_state lose(Self &) noexcept
         {
-            t = {};
+            down = false;
             dragging = false;
-            ending = false;
-            settle_claim();
+            finished_ = false;
+            cur = claim_state::idle;
             return cur;
         }
     };
 
-    // ── 悬停：指针进入窗口时报一次（离开不算事件）──────────────────
-    struct hover : detail::fsm_state
+    // ── hover_template（none） ─────────────────────────────────────
+    template <class Trait>
+    struct hover_template
     {
-        static constexpr auto name = static_string{"on_hover"};
-        static constexpr auto fn_name = name;
+        static constexpr auto name = Trait::name;
+        static constexpr auto fn_name = Trait::fn_name;
         using consume_t = input_frame::changes<input_frame::cursor_enter_event>;
 
-        intent::claim_state feed(
-            const input_frame::frame<input_frame::cursor_enter_event> &f,
-            intent::time_point now) noexcept
+        claim_state cur{};
+        slot<Trait> in{};
+
+        template <class Self>
+        constexpr claim_state feed(
+            Self &self, const input_frame::frame<input_frame::cursor_enter_event> &f,
+            time_point) noexcept
         {
             if (f.change.value)
-                return claim(intent::claim_state::ready);
-            return claim(cur); // 离开不产生事件
+                return state::ready(cur);
+            return state::keep(cur);
         }
-        void *receiver_{};
-        using invoke_type = void (*)(void *self) noexcept;
-        invoke_type invoke_{};
-        template <class Receiver>
-        constexpr void bind(Receiver &ptr) noexcept
+
+        template <class Self>
+        constexpr claim_state tick(Self &, time_point) noexcept
         {
-            receiver_ = &ptr;
-            invoke_ = invoke_type{[](void *ptr) noexcept {
-                auto *self = static_cast<hover *>(ptr);
-                static_cast<Receiver *>(self->receiver_)->template invoke<fn_name>();
-            }};
+            return state::keep(cur);
         }
-        constexpr intent::claim_state win() noexcept
+
+        template <class Self>
+        constexpr claim_state win(Self &self) noexcept
         {
-            assert(invoke_ != nullptr);
-            invoke_(this);
-            settle_claim();
+            self.template invoke<fn_name>();
+            cur = claim_state::idle;
             return cur;
         }
-        intent::claim_state lose() noexcept
+
+        template <class Self>
+        constexpr claim_state lose(Self &) noexcept
         {
-            settle_claim();
+            cur = claim_state::idle;
             return cur;
         }
     };
 
-    // ── 滚轮：一格一次（delta 交给载荷）────────────────────────────
-    struct wheel : detail::fsm_state
+    // ── wheel_template ─────────────────────────────────────────────
+    template <class Trait>
+    struct wheel_template
     {
-        static constexpr auto name = static_string{"on_wheel"};
-        static constexpr auto fn_name = name;
-        using consume_t = input_frame::changes<input_frame::scroll_event>;
+        static constexpr auto name = Trait::name;
+        static constexpr auto fn_name = Trait::fn_name;
+        using consume_t = input_frame::changes<scroll_event>;
 
-        struct payload_t
-        {
-            int delta = 0;
-        } payload{};
+        claim_state cur{};
+        slot<Trait> in{};
 
-        intent::claim_state feed(const input_frame::frame<input_frame::scroll_event> &f,
-                                 intent::time_point now) noexcept
+        template <class Self>
+        constexpr claim_state feed(Self &self, const input_frame::frame<scroll_event> &f,
+                                   time_point now) noexcept
         {
-            payload.delta = static_cast<int>(f.change.yoffset);
-            return claim(intent::claim_state::ready);
+            in.collect(now, wheel_event{static_cast<int>(f.change.yoffset), now});
+            return state::ready(cur);
         }
-        void *receiver_{};
-        using invoke_type = void (*)(void *self) noexcept;
-        invoke_type invoke_{};
-        template <class Receiver>
-        constexpr void bind(Receiver &ptr) noexcept
+
+        template <class Self>
+        constexpr claim_state tick(Self &, time_point) noexcept
         {
-            receiver_ = &ptr;
-            invoke_ = invoke_type{[](void *ptr) noexcept {
-                auto *self = static_cast<wheel *>(ptr);
-                static_cast<Receiver *>(self->receiver_)
-                    ->template invoke<fn_name>(self->payload);
-            }};
+            return state::keep(cur);
         }
-        constexpr intent::claim_state win() noexcept
+
+        template <class Self>
+        constexpr claim_state win(Self &self) noexcept
         {
-            assert(invoke_ != nullptr);
-            invoke_(this);
-            settle_claim();
+            self.template invoke<fn_name>(in.data);
+            cur = claim_state::idle;
             return cur;
         }
-        intent::claim_state lose() noexcept
+
+        template <class Self>
+        constexprs claim_state lose(Self &) noexcept
         {
-            settle_claim();
+            cur = claim_state::idle;
             return cur;
         }
     };
 
-    // ── 键盘 A ─────────────────────────────────────────────────────
-    struct key_a : detail::fsm_state
+    // ── key_template（none） ───────────────────────────────────────
+    template <class Trait>
+    struct key_template
     {
-        static constexpr auto name = static_string{"on_key_A"};
-        static constexpr auto fn_name = name;
+        using policy = typename Trait::policy;
+        static constexpr auto name = Trait::name;
+        static constexpr auto fn_name = Trait::fn_name;
         using consume_t = input_frame::changes<input_frame::key_change>;
 
-        intent::claim_state feed(const input_frame::frame<input_frame::key_change> &f,
-                                 intent::time_point) noexcept
+        claim_state cur{};
+        slot<Trait> in{};
+
+        template <class Self>
+        constexpr claim_state feed(Self &self,
+                                   const input_frame::frame<input_frame::key_change> &f,
+                                   time_point) noexcept
         {
             if (f.change.transition == input_frame::Transition::Press &&
-                !f.change.repeat && f.change.key == Key::eA)
-                return claim(intent::claim_state::ready);
-            return claim(cur);
+                !f.change.repeat && f.change.key == policy::key)
+                return state::ready(cur);
+            return state::keep(cur);
         }
 
-        using invoke_type = void (*)(void *self) noexcept;
-        void *receiver_{};
-        invoke_type invoke_{};
-        template <class Receiver>
-        constexpr void bind(Receiver &ptr) noexcept
+        template <class Self>
+        constexpr claim_state tick(Self &, time_point) noexcept
         {
-            receiver_ = &ptr;
-            invoke_ = invoke_type{[](void *self) noexcept {
-                auto *m = static_cast<key_a *>(self);
-                static_cast<Receiver *>(m->receiver_)->template invoke<fn_name>();
-            }};
+            return state::keep(cur);
         }
-        constexpr intent::claim_state win() noexcept
+
+        template <class Self>
+        constexpr claim_state win(Self &self) noexcept
         {
-            assert(invoke_ != nullptr);
-            invoke_(this);
-            settle_claim();
+            self.template invoke<fn_name>();
+            cur = claim_state::idle;
             return cur;
         }
-        intent::claim_state lose() noexcept
+
+        template <class Self>
+        constexpr claim_state lose(Self &) noexcept
         {
-            settle_claim();
+            cur = claim_state::idle;
             return cur;
         }
     };
 
-    // ── 键盘 C：普通输入，和快捷键竞争 ───────────────────────────
-    struct key_c : detail::fsm_state
+    // ── key_observer_template ──────────────────────────────────────
+    template <class Trait>
+    struct key_observer_template
     {
-        static constexpr auto name = static_string{"on_key_C"};
-        static constexpr auto fn_name = name;
+        static constexpr auto name = Trait::name;
+        static constexpr auto fn_name = Trait::fn_name;
         using consume_t = input_frame::changes<input_frame::key_change>;
 
-        intent::claim_state feed(const input_frame::frame<input_frame::key_change> &f,
-                                 intent::time_point) noexcept
+        claim_state cur{};
+        slot<Trait> in{};
+
+        template <class Self>
+        constexpr claim_state feed(Self &self,
+                                   const input_frame::frame<input_frame::key_change> &f,
+                                   time_point now) noexcept
         {
-            if (f.change.transition == input_frame::Transition::Press &&
-                !f.change.repeat && f.change.key == Key::eC)
-                return claim(intent::claim_state::ready);
-            return claim(cur);
+            if (f.change.repeat)
+                return state::keep(cur);
+            in.collect(now, key_event{f.change.key, f.change.transition, now});
+            return state::ready(cur);
         }
 
-        using invoke_type = void (*)(void *self) noexcept;
-        void *receiver_{};
-        invoke_type invoke_{};
-        template <class Receiver>
-        constexpr void bind(Receiver &ptr) noexcept
+        template <class Self>
+        constexpr claim_state tick(Self &, time_point) noexcept
         {
-            receiver_ = &ptr;
-            invoke_ = invoke_type{[](void *self) noexcept {
-                auto *m = static_cast<key_c *>(self);
-                static_cast<Receiver *>(m->receiver_)->template invoke<fn_name>();
-            }};
+            return state::keep(cur);
         }
-        constexpr intent::claim_state win() noexcept
+
+        template <class Self>
+        constexpr claim_state win(Self &self) noexcept
         {
-            assert(invoke_ != nullptr);
-            invoke_(this);
-            settle_claim();
+            self.template invoke<fn_name>(in.data);
+            cur = claim_state::idle;
             return cur;
         }
-        intent::claim_state lose() noexcept
+
+        template <class Self>
+        constexpr claim_state lose(Self &) noexcept
         {
-            settle_claim();
+            cur = claim_state::idle;
             return cur;
         }
     };
 
-    // ── 快捷键：一个识别器 + 一张表；一次匹配可带多个 command ─────
-    enum class command : std::uint8_t
+    // ── chord_template ─────────────────────────────────────────────
+    template <class Trait>
+    struct chord_template
     {
-        copy,
-        copy_plain,
-        paste,
-        save,
-        notify
-    };
-
-    constexpr std::string_view command_name(command c) noexcept
-    {
-        switch (c)
-        {
-        case command::copy:
-            return "copy";
-        case command::copy_plain:
-            return "copy_plain";
-        case command::paste:
-            return "paste";
-        case command::save:
-            return "save";
-        case command::notify:
-            return "notify";
-        }
-        return "?";
-    }
-
-    struct shortcut : detail::fsm_state
-    {
-        static constexpr auto name = static_string{"on_shortcut"};
-        static constexpr auto fn_name = name;
+        static constexpr auto name = Trait::name;
+        static constexpr auto fn_name = Trait::fn_name;
         using consume_t = input_frame::changes<input_frame::key_change>;
 
-        struct payload_t
+        claim_state cur{};
+        slot<Trait> in{};
+
+        template <class Self>
+        constexpr claim_state feed(Self &self,
+                                   const input_frame::frame<input_frame::key_change> &f,
+                                   time_point now) noexcept
+        {
+            if (auto e = Trait::match(f.change, now))
+            {
+                in.collect(now, *e);
+                return state::ready(cur);
+            }
+            return state::keep(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state tick(Self &, time_point) noexcept
+        {
+            return state::keep(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state win(Self &self) noexcept
+        {
+            self.template invoke<fn_name>(in.data);
+            cur = claim_state::idle;
+            return cur;
+        }
+
+        template <class Self>
+        constexpr claim_state lose(Self &) noexcept
+        {
+            cur = claim_state::idle;
+            return cur;
+        }
+    };
+} // namespace gesture
+
+// ═══════════════════════════════════════════════════════════════════════
+//  mcs::app —— 数据 + Trait + tree + arena
+// ═══════════════════════════════════════════════════════════════════════
+namespace mcs::app
+{
+    using intent::time_point;
+
+    inline constexpr std::int64_t click_max_ms = 250;
+    inline constexpr std::int64_t dbl_gap_ms = 300;
+    inline constexpr std::int64_t triple_gap_ms = 250;
+    inline constexpr double drag_slop_px = 4.0;
+
+    namespace policy
+    {
+        struct click
+        {
+            static constexpr auto button = input_frame::MouseButton::eMOUSE_BUTTON_LEFT;
+            static constexpr std::int64_t tap_max_ms = mcs::app::click_max_ms;
+            static constexpr double slop_px = mcs::app::drag_slop_px;
+        };
+        struct multi
+        {
+            static constexpr auto button = input_frame::MouseButton::eMOUSE_BUTTON_LEFT;
+            static constexpr std::int64_t tap_max_ms = mcs::app::click_max_ms;
+            static constexpr double slop_px = mcs::app::drag_slop_px;
+            static constexpr int count = 2;
+            static constexpr std::int64_t gap_ms = mcs::app::dbl_gap_ms;
+        };
+        struct multi3
+        {
+            static constexpr auto button = input_frame::MouseButton::eMOUSE_BUTTON_LEFT;
+            static constexpr std::int64_t tap_max_ms = mcs::app::click_max_ms;
+            static constexpr double slop_px = mcs::app::drag_slop_px;
+            static constexpr int count = 3;
+            static constexpr std::int64_t gap_ms = mcs::app::triple_gap_ms;
+        };
+        struct drag
+        {
+            static constexpr auto button = input_frame::MouseButton::eMOUSE_BUTTON_LEFT;
+            static constexpr double slop_px = mcs::app::drag_slop_px;
+        };
+        struct hover
+        {
+        };
+        struct wheel
+        {
+        };
+        struct key_a
+        {
+            static constexpr auto key = Key::eA;
+        };
+        struct key_c
+        {
+            static constexpr auto key = Key::eC;
+        };
+        struct shortcut
+        {
+        };
+    } // namespace policy
+
+    namespace detail
+    {
+        enum class command : std::uint8_t
+        {
+            copy,
+            copy_plain,
+            paste,
+            save,
+            notify
+        };
+        constexpr std::string_view command_name(command c) noexcept
+        {
+            switch (c)
+            {
+            case command::copy:
+                return "copy";
+            case command::copy_plain:
+                return "copy_plain";
+            case command::paste:
+                return "paste";
+            case command::save:
+                return "save";
+            case command::notify:
+                return "notify";
+            }
+            return "?";
+        }
+
+        struct shortcut_event
         {
             std::array<command, 2> items{};
             int n = 0;
-        } payload{};
+        };
 
-        intent::claim_state feed(const input_frame::frame<input_frame::key_change> &f,
-                                 intent::time_point) noexcept
+        struct counters
         {
-            const auto &c = f.change;
-            if (c.transition != input_frame::Transition::Press || c.repeat)
-                return claim(cur);
+            int click{};
+            int double_click{};
+            int triple_click{};
+            int hover{};
+            int wheel{};
+            int key_a{};
+            int key_c{};
+            int shortcut{};
+            int any_key{};
+            int commands{};
+            int drag_begin{};
+            int drag_move{};
+            int drag_end{};
+            double x{}, y{};
+            double total_dx{}, total_dy{};
+            double move_x{}, move_y{}, move_dx{}, move_dy{};
+            int delta{};
+            friend constexpr bool operator==(const counters &,
+                                             const counters &) = default;
+        };
 
-            const bool ctrl = c.modifier.hasAll(ModifierKey::Control());
-            const bool shift = c.modifier.hasAll(ModifierKey::Shift());
-            const bool alt = c.modifier.hasAll(ModifierKey::Alt());
-            if (!ctrl || alt)
-                return claim(cur);
+        inline time_point now_ms() noexcept
+        {
+            static const auto t0 = std::chrono::steady_clock::now();
+            return std::chrono::duration_cast<time_point>(
+                std::chrono::steady_clock::now() - t0);
+        }
 
-            if (c.key == Key::eC)
+        template <class Self>
+        inline time_point now_of(Self &self) noexcept
+        {
+            return self.manual_clock ? self.now : now_ms();
+        }
+
+        constexpr std::string_view to_string(intent::verdict v) noexcept
+        {
+            return v == intent::verdict::accepted ? "acc" : "sup";
+        }
+
+        template <class App>
+        inline void report(const App &app) noexcept
+        {
+            for (const auto &e : app.arbiter.events())
             {
-                payload.items[0] = shift ? command::copy_plain : command::copy;
-                payload.n = 1;
-                return claim(intent::claim_state::ready);
+                if (e.name == "drag" || e.name == "hover")
+                    continue;
+                std::println("  [t={:>6}ms] {:<18} {:<3}", e.at.count(), e.name,
+                             to_string(e.v));
             }
-            if (c.key == Key::eS)
-            {
-                payload.items[0] = command::save;
-                payload.items[1] = command::notify;
-                payload.n = 2;
-                return claim(intent::claim_state::ready);
-            }
-            if (c.key == Key::eV)
-            {
-                payload.items[0] = command::paste;
-                payload.n = 1;
-                return claim(intent::claim_state::ready);
-            }
-            return claim(cur);
         }
+    } // namespace detail
 
-        using invoke_type = void (*)(void *self) noexcept;
-        void *receiver_{};
-        invoke_type invoke_{};
-        template <class Receiver>
-        constexpr void bind(Receiver &ptr) noexcept
-        {
-            receiver_ = &ptr;
-            invoke_ = invoke_type{[](void *self) noexcept {
-                auto *m = static_cast<shortcut *>(self);
-                static_cast<Receiver *>(m->receiver_)
-                    ->template invoke<fn_name>(m->payload);
-            }};
-        }
-        constexpr intent::claim_state win() noexcept
-        {
-            assert(invoke_ != nullptr);
-            invoke_(this);
-            settle_claim();
-            return cur;
-        }
-        intent::claim_state lose() noexcept
-        {
-            settle_claim();
-            return cur;
-        }
-    };
-
-    // ── 键盘 HUD：独立观察者，和动作/快捷键同帧并行 ──────────────
-    struct key_hud : detail::fsm_state
+    // ── arena（局部 Trait：只写 payload + collect）────────────────
+    inline auto make_arena()
     {
-        static constexpr auto name = static_string{"on_key_HUD"};
-        static constexpr auto fn_name = name;
-        using consume_t = input_frame::changes<input_frame::key_change>;
-
-        struct payload_t
+        struct click_payload
+        {
+            double x{}, y{};
+            time_point at{};
+        };
+        struct multi_click_payload
+        {
+            double x{}, y{};
+            int count{};
+            time_point at{};
+        };
+        struct drag_payload
+        {
+            gesture::drag_phase phase{};
+            double x{}, y{}, dx{}, dy{};
+            double total_dx{}, total_dy{};
+            ModifierKey modifier{};
+            time_point at{};
+        };
+        struct wheel_payload
+        {
+            int delta{};
+            time_point at{};
+        };
+        struct any_key_payload
         {
             Key key{};
             input_frame::Transition transition{};
-        } payload{};
-
-        intent::claim_state feed(const input_frame::frame<input_frame::key_change> &f,
-                                 intent::time_point) noexcept
-        {
-            if (f.change.repeat)
-                return claim(cur);
-            payload = {f.change.key, f.change.transition};
-            return claim(intent::claim_state::ready);
-        }
-
-        using invoke_type = void (*)(void *self) noexcept;
-        void *receiver_{};
-        invoke_type invoke_{};
-        template <class Receiver>
-        constexpr void bind(Receiver &ptr) noexcept
-        {
-            receiver_ = &ptr;
-            invoke_ = invoke_type{[](void *self) noexcept {
-                auto *m = static_cast<key_hud *>(self);
-                static_cast<Receiver *>(m->receiver_)
-                    ->template invoke<fn_name>(m->payload);
-            }};
-        }
-        constexpr intent::claim_state win() noexcept
-        {
-            assert(invoke_ != nullptr);
-            invoke_(this);
-            settle_claim();
-            return cur;
-        }
-        intent::claim_state lose() noexcept
-        {
-            settle_claim();
-            return cur;
-        }
-    };
-
-    // ── 叶子：name 是 kind 的身份（进日志）；最后一个参数是回调名 ───
-    using l_click = intent::leaf<click>;
-    using l_dbl = intent::leaf<double_click>;
-    using l_triple = intent::leaf<triple_click>;
-    using l_drag = intent::leaf<drag>;
-    using l_hover = intent::leaf<hover>;
-    using l_wheel = intent::leaf<wheel>;
-    using l_key = intent::leaf<key_a>;
-    using l_key_c = intent::leaf<key_c>;
-    using l_shortcut = intent::leaf<shortcut>;
-    using l_hud = intent::leaf<key_hud>;
-
-    // ── 树：只声明"谁比谁具体"，不写任何顺序 ───────────────────────
-    //    refines<A, B> 读作"A 等 B" ⇒ **B 更具体，B 赢**（第二个参数才是细的）。
-    //      拖拽 > 单击、双击 > 单击、三击 > 双击 > 单击
-    //    拖拽和双击/三击之间没有边 —— 免得"刚点完一下"的挂起双击把拖拽挡住。
-    //
-    //    快捷键 > 普通 C：Ctrl+C 时 shortcut 赢，key_c 让位。
-    //    HUD 和它们都没有边：一个 C 事件可以同时产生 C/快捷键 + HUD 两个 emit。
-    using Tree = intent::all_of<
-        intent::refines<l_click,
-                        intent::all_of<l_drag, intent::refines<l_dbl, l_triple>>>, //
-        l_hover,                                                                   //
-        l_wheel,                                                                   //
-        intent::refines<l_key_c, l_shortcut>,                                      //
-        l_key,                                                                     //
-        l_hud>;
-
-    // Frame 的裁剪由 FSM 的 feed(frame<T>) 重载完成；
-    // ui 不需要 FrameOf，也不需要全局 frame_types。
-    using ui_type = intent::debug_arbiter<Tree>;
-
-    // 回调打到哪儿：自检要靠它验证 sink 那一路确实通了
-    namespace detail
-    {
-        struct tally
-        {
-            int click{}, dbl{}, triple{}, hover{}, wheel{}, key_a{}, key_c{};
-            int shortcut{}, hud{}, commands{};
-            int drag_begin{}, drag_move{}, drag_end{};
-            double x{}, y{}, dx{}, dy{}, total_dx{}, total_dy{};
-            double move_x{}, move_y{}, move_dx{}, move_dy{};
-            int delta{};
-
-            friend constexpr bool operator==(const tally &, const tally &) = default;
+            time_point at{};
         };
-    } // namespace detail
 
-    // 事件时刻：正常情况取墙上时钟；自检时用 arena.now 给的逻辑时间
-    inline intent::time_point now_ms() noexcept
-    {
-        static const auto t0 = std::chrono::steady_clock::now();
-        return std::chrono::duration_cast<intent::time_point>(
-            std::chrono::steady_clock::now() - t0);
-    }
-    template <class Self>
-    inline intent::time_point now_of(Self &self) noexcept
-    {
-        return self.fake_clock ? self.now : now_ms();
-    }
-
-    // 判决的两种结果，打印用（和 event 做邻居）
-    constexpr std::string_view to_string(intent::verdict v) noexcept
-    {
-        return v == intent::verdict::accepted ? "acc" : "sup";
-    }
-
-    // 把这一帧的播报打出来（name = kind / verdict / at）
-    //   拖拽的相位由 on_drag 回调打印，trace 里不重复刷屏；悬停同理。
-    inline void report(const ui_type &u) noexcept
-    {
-        for (const auto &e : u.events())
+        // name / fn_name / policy / payload_t 都在 base；局部只写 payload + collect
+        struct Trait_click : gesture::trait_base<click_payload, static_string{"click"},
+                                                 static_string{"on_click"}, policy::click>
         {
-            if (e.name == "on_hover" || e.name == "on_drag")
-                continue;
-            std::println("  [t={:>6}ms] {:<14} {:<3}", e.at.count(), e.name,
-                         to_string(e.v));
-        }
-    }
+            static void collect(time_point, payload_t &d,
+                                const gesture::click_event &e) noexcept
+            {
+                d = {e.x, e.y, e.at};
+            }
+        };
 
-    // ── 唯一的 arena 构造：窗口模式和自检模式共用同一份 ────────────
-    inline auto make_arena()
-    {
-        return make_aggregate<"arena">(
-            field<"ui">(ui_type{}),          //
-            field<"tally">(detail::tally{}), // 回调写这里，自检读这里
-            field<"event_context">(input_frame::event_context{}), // 变化前的快照
-            field<"now">(intent::time_point{}),                   // 逻辑时间
-            field<"fake_clock">(false),                           // 自检：时间由测试喂
-            field<"keep_events">(false), // 自检：tick 后不清空播报
-            field<"frames">(0u),         //
+        struct Trait_double_click
+            : gesture::trait_base<multi_click_payload, static_string{"double_click"},
+                                  static_string{"on_double_click"}, policy::multi>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::multi_click_event &e) noexcept
+            {
+                d = {e.x, e.y, e.count, e.at};
+            }
+        };
 
-            // ── 赢家落地：参数个数要和载荷对得上 ──
-            method<"on_click">([](auto &self, auto &&p) noexcept {
-                ++self.tally.click;
-                self.tally.x = p.x;
-                self.tally.y = p.y;
-                std::println("  >>> 单击    (x={:.1f}, y={:.1f})", p.x, p.y);
-            }),
-            method<"on_dbl">([](auto &self, auto &&p) noexcept {
-                ++self.tally.dbl;
-                self.tally.x = p.x;
-                self.tally.y = p.y;
-                std::println("  >>> 双击    (x={:.1f}, y={:.1f}, 共 {} 次)", p.x, p.y,
-                             p.count);
-            }),
-            method<"on_triple">([](auto &self, auto &&p) noexcept {
-                ++self.tally.triple;
-                self.tally.x = p.x;
-                self.tally.y = p.y;
-                std::println("  >>> 三击    (x={:.1f}, y={:.1f}, 共 {} 次)", p.x, p.y,
-                             p.count);
-            }),
-            // 拖拽三段共用的回调：p 用 auto&& 接，引擎按叶子的载荷类型转发
-            method<"on_drag">([](auto &self, auto &&p) noexcept {
-                using pt = detail::drag_payload::phase_t;
-                switch (p.phase)
+        struct Trait_triple_click
+            : gesture::trait_base<multi_click_payload, static_string{"triple_click"},
+                                  static_string{"on_triple_click"}, policy::multi3>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::multi_click_event &e) noexcept
+            {
+                d = {e.x, e.y, e.count, e.at};
+            }
+        };
+
+        struct Trait_drag : gesture::trait_base<drag_payload, static_string{"drag"},
+                                                static_string{"on_drag"}, policy::drag>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::drag_event &e) noexcept
+            {
+                d = {e.phase,    e.x,        e.y,        e.dx, e.dy,
+                     e.total_dx, e.total_dy, e.modifier, e.at};
+            }
+        };
+
+        struct Trait_hover
+            : gesture::trait_base<gesture::none_payload, static_string{"hover"},
+                                  static_string{"on_hover"}, policy::hover>
+        {
+        };
+
+        struct Trait_wheel : gesture::trait_base<wheel_payload, static_string{"wheel"},
+                                                 static_string{"on_wheel"}, policy::wheel>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::wheel_event &e) noexcept
+            {
+                d = {e.delta, e.at};
+            }
+        };
+
+        struct Trait_key_a
+            : gesture::trait_base<gesture::none_payload, static_string{"key_a"},
+                                  static_string{"on_key_a"}, policy::key_a>
+        {
+        };
+
+        struct Trait_key_c
+            : gesture::trait_base<gesture::none_payload, static_string{"key_c"},
+                                  static_string{"on_key_c"}, policy::key_c>
+        {
+        };
+
+        struct Trait_shortcut
+            : gesture::trait_base<detail::shortcut_event, static_string{"shortcut"},
+                                  static_string{"on_shortcut"}, policy::shortcut>
+        {
+            static std::optional<payload_t> match(const input_frame::key_change &c,
+                                                  time_point) noexcept
+            {
+                if (c.transition != input_frame::Transition::Press || c.repeat)
+                    return std::nullopt;
+                const bool ctrl = c.modifier.hasAll(ModifierKey::Control());
+                const bool shift = c.modifier.hasAll(ModifierKey::Shift());
+                const bool alt = c.modifier.hasAll(ModifierKey::Alt());
+                if (!ctrl || alt)
+                    return std::nullopt;
+                payload_t r{};
+                if (c.key == Key::eC)
                 {
-                case pt::begin:
-                    ++self.tally.drag_begin;
-                    std::println("  >>> 拖拽·开始 (起点 {:.1f},{:.1f})", p.x, p.y);
+                    r.items[0] =
+                        shift ? detail::command::copy_plain : detail::command::copy;
+                    r.n = 1;
+                    return r;
+                }
+                if (c.key == Key::eS)
+                {
+                    r.items[0] = detail::command::save;
+                    r.items[1] = detail::command::notify;
+                    r.n = 2;
+                    return r;
+                }
+                if (c.key == Key::eV)
+                {
+                    r.items[0] = detail::command::paste;
+                    r.n = 1;
+                    return r;
+                }
+                return std::nullopt;
+            }
+            static void collect(time_point, payload_t &d, const payload_t &e) noexcept
+            {
+                d = e;
+            }
+        };
+
+        struct Trait_any_key
+            : gesture::trait_base<any_key_payload, static_string{"any_key"},
+                                  static_string{"on_any_key"}, policy::hover>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::key_event &e) noexcept
+            {
+                d = {e.key, e.transition, e.at};
+            }
+        };
+
+        using tree = intent::all_of<
+            intent::refines<
+                intent::leaf<gesture::click_template<Trait_click>>,
+                intent::all_of<intent::leaf<gesture::drag_template<Trait_drag>>,
+                               intent::refines<intent::leaf<gesture::multi_click_template<
+                                                   Trait_double_click>>,
+                                               intent::leaf<gesture::multi_click_template<
+                                                   Trait_triple_click>>>>>,
+            intent::leaf<gesture::hover_template<Trait_hover>>,
+            intent::leaf<gesture::wheel_template<Trait_wheel>>,
+            intent::refines<intent::leaf<gesture::key_template<Trait_key_c>>,
+                            intent::leaf<gesture::chord_template<Trait_shortcut>>>,
+            intent::leaf<gesture::key_template<Trait_key_a>>,
+            intent::leaf<gesture::key_observer_template<Trait_any_key>>>;
+
+        return make_aggregate<"arena">(
+            field<"click">(Trait_click::payload_t{}),
+            field<"double_click">(Trait_double_click::payload_t{}),
+            field<"triple_click">(Trait_triple_click::payload_t{}),
+            field<"drag">(Trait_drag::payload_t{}),
+            field<"wheel">(Trait_wheel::payload_t{}),
+            field<"shortcut">(Trait_shortcut::payload_t{}),
+            field<"key_event">(Trait_any_key::payload_t{}),
+            field<"arbiter">(intent::debug_arbiter<tree>{}),
+            field<"counters">(detail::counters{}),
+            field<"input_state">(input_frame::event_context{}),
+            field<"now">(time_point{}), field<"manual_clock">(false),
+            field<"keep_trace">(false), field<"verbose">(true), field<"frames">(0u),
+
+            method<"on_click">([](auto &self, const Trait_click::payload_t &e) noexcept {
+                ++self.counters.click;
+                self.click = e;
+                self.counters.x = e.x;
+                self.counters.y = e.y;
+                if (self.verbose)
+                    std::println("  >>> 单击    (x={:.1f}, y={:.1f})", e.x, e.y);
+            }),
+            method<"on_double_click">(
+                [](auto &self, const Trait_double_click::payload_t &e) noexcept {
+                    ++self.counters.double_click;
+                    self.double_click = e;
+                    self.counters.x = e.x;
+                    self.counters.y = e.y;
+                    if (self.verbose)
+                        std::println("  >>> 双击    (x={:.1f}, y={:.1f}, count={})", e.x,
+                                     e.y, e.count);
+                }),
+            method<"on_triple_click">(
+                [](auto &self, const Trait_triple_click::payload_t &e) noexcept {
+                    ++self.counters.triple_click;
+                    self.triple_click = e;
+                    self.counters.x = e.x;
+                    self.counters.y = e.y;
+                    if (self.verbose)
+                        std::println("  >>> 三击    (x={:.1f}, y={:.1f}, count={})", e.x,
+                                     e.y, e.count);
+                }),
+            method<"on_drag">([](auto &self, const Trait_drag::payload_t &e) noexcept {
+                self.drag = e;
+                switch (e.phase)
+                {
+                case gesture::drag_phase::begin:
+                    ++self.counters.drag_begin;
+                    if (self.verbose)
+                        std::println("  >>> 拖拽·开始 (起点 {:.1f},{:.1f})", e.x, e.y);
                     break;
-                case pt::move:
-                    // 每一次 move 帧都是一条独立事件；坐标就是这一帧的坐标。
-                    ++self.tally.drag_move;
-                    self.tally.move_x = p.x;
-                    self.tally.move_y = p.y;
-                    self.tally.move_dx = p.dx;
-                    self.tally.move_dy = p.dy;
-                    std::println("  >>> 拖拽·移动 (到 {:.1f},{:.1f}; d={:.1f},{:.1f})",
-                                 p.x, p.y, p.dx, p.dy);
+                case gesture::drag_phase::move:
+                    ++self.counters.drag_move;
+                    self.counters.move_x = e.x;
+                    self.counters.move_y = e.y;
+                    self.counters.move_dx = e.dx;
+                    self.counters.move_dy = e.dy;
+                    if (self.verbose)
+                        std::println(
+                            "  >>> 拖拽·移动 (到 {:.1f},{:.1f}; d={:.1f},{:.1f})", e.x,
+                            e.y, e.dx, e.dy);
                     break;
-                case pt::end:
-                    ++self.tally.drag_end;
-                    self.tally.x = p.x;
-                    self.tally.y = p.y;
-                    self.tally.total_dx = p.total_dx;
-                    self.tally.total_dy = p.total_dy;
-                    std::println("  >>> 拖拽·释放 (到 {:.1f},{:.1f}；总位移 "
-                                 "{:.1f},{:.1f}；期间移动 "
-                                 "{} 次)",
-                                 p.x, p.y, p.total_dx, p.total_dy, self.tally.drag_move);
+                case gesture::drag_phase::end:
+                    ++self.counters.drag_end;
+                    self.counters.x = e.x;
+                    self.counters.y = e.y;
+                    self.counters.total_dx = e.total_dx;
+                    self.counters.total_dy = e.total_dy;
+                    if (self.verbose)
+                        std::println(
+                            "  >>> 拖拽·释放 (到 {:.1f},{:.1f}; 总位移 {:.1f},{:.1f})",
+                            e.x, e.y, e.total_dx, e.total_dy);
                     break;
                 }
             }),
             method<"on_hover">([](auto &self) noexcept {
-                ++self.tally.hover;
-                std::println("  >>> 悬停    进入窗口");
+                ++self.counters.hover;
+                if (self.verbose)
+                    std::println("  >>> 悬停    进入窗口");
             }),
-            method<"on_wheel">([](auto &self, auto &&p) noexcept {
-                ++self.tally.wheel;
-                self.tally.delta = p.delta;
-                std::println("  >>> 滚轮    (delta={})", p.delta);
+            method<"on_wheel">([](auto &self, const Trait_wheel::payload_t &e) noexcept {
+                ++self.counters.wheel;
+                self.wheel = e;
+                self.counters.delta = e.delta;
+                if (self.verbose)
+                    std::println("  >>> 滚轮    (delta={})", e.delta);
             }),
-            method<"on_key_A">([](auto &self) noexcept {
-                ++self.tally.key_a;
-                std::println("  >>> 键盘 A");
+            method<"on_key_a">([](auto &self) noexcept {
+                ++self.counters.key_a;
+                if (self.verbose)
+                    std::println("  >>> 键盘 A");
             }),
-            method<"on_key_C">([](auto &self) noexcept {
-                ++self.tally.key_c;
-                std::println("  >>> 键盘 C");
+            method<"on_key_c">([](auto &self) noexcept {
+                ++self.counters.key_c;
+                if (self.verbose)
+                    std::println("  >>> 键盘 C");
             }),
-            method<"on_shortcut">([](auto &self, auto &&p) noexcept {
-                ++self.tally.shortcut;
-                self.tally.commands += p.n;
-                std::print("  >>> 快捷键");
-                for (int i = 0; i < p.n; ++i)
-                    std::print(" {}", command_name(p.items[i]));
-                std::println("");
-            }),
-            method<"on_key_HUD">([](auto &self, auto &&p) noexcept {
-                ++self.tally.hud;
-                std::println("  >>> HUD key={} {}", static_cast<int>(p.key),
-                             p.transition == input_frame::Transition::Press ? "down"
-                                                                            : "up");
+            method<"on_shortcut">(
+                [](auto &self, const Trait_shortcut::payload_t &e) noexcept {
+                    ++self.counters.shortcut;
+                    self.shortcut = e;
+                    self.counters.commands += e.n;
+                    if (self.verbose)
+                    {
+                        std::print("  >>> 快捷键");
+                        for (int i = 0; i < e.n; ++i)
+                            std::print(" {}", detail::command_name(e.items[i]));
+                        std::println("");
+                    }
+                }),
+            method<"on_any_key">([](auto &self,
+                                    const Trait_any_key::payload_t &e) noexcept {
+                ++self.counters.any_key;
+                self.key_event = e;
+                if (self.verbose)
+                    std::println("  >>> HUD key={} {}", static_cast<int>(e.key),
+                                 e.transition == input_frame::Transition::Press ? "down"
+                                                                                : "up");
             }),
 
-            // 绑定：把 sinks 接到上面那些回调上（只需要一次）
-            method<"bind">([](auto &self) noexcept { self.ui.bind(self); }),
-
-            // 时间推进 + 把这一帧的播报打出来
             method<"tick">([](auto &self) noexcept {
-                const auto now = now_of(self);
+                const auto now = detail::now_of(self);
                 self.now = now;
-                self.ui.tick(now);
-                report(self.ui);
-                if (!self.keep_events)
-                    self.ui.clear_events();
+                self.arbiter.tick(self, now);
+                if (self.verbose)
+                    detail::report(self);
+                if (!self.keep_trace)
+                    self.arbiter.clear_events();
                 ++self.frames;
             }),
 
-            // 平台事件 → input_frame::frame<T>：唯一的适配层。
-            // 过滤（左键/按键 A）和事件分派都在 FSM 内部。
-            method<"input_event">([]<class Self, class E>(Self &self, E e) noexcept {
-                const auto now = now_of(self);
+            method<"input_event">([](auto &self, auto e) noexcept {
+                const auto now = detail::now_of(self);
                 self.now = now;
-
-                using frame_t =
-                    decltype(input_frame::build_change(self.event_context, e));
+                using frame_t = decltype(input_frame::build_change(self.input_state, e));
                 if constexpr (!std::is_void_v<frame_t>)
                 {
-                    auto f = input_frame::build_change(self.event_context, e);
-                    self.ui.feed(f, now);
-                    input_frame::apply_change(self.event_context, f);
+                    auto f = input_frame::build_change(self.input_state, e);
+                    self.arbiter.feed(self, f, now);
+                    input_frame::apply_change(self.input_state, f);
                 }
             }));
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    //  自检：不建窗口，但**走和窗口模式同一个 arena**
-    //    伪造平台事件 → arena.input_event → 翻译 → 矩阵 → sink → 回调
-    //    所以它同时测到：make_aggregate 那层、bind、input_event、tick、载荷。
-    // ═══════════════════════════════════════════════════════════════════
     inline int selftest()
     {
         auto arena = make_arena();
-        arena.fake_clock = true;
-        arena.keep_events = true;
-        arena.invoke<"bind">();
+        arena.manual_clock = true;
+        arena.keep_trace = true;
+        arena.verbose = false;
 
         int fails = 0;
         auto check = [&](std::string_view what, bool ok) {
@@ -2607,65 +2682,135 @@ namespace app
             if (!ok)
                 ++fails;
         };
+
         auto key = [&](Key k, Action a, ModifierKey mods, std::int64_t ms) {
-            arena.now = intent::time_point{ms};
+            arena.now = time_point{ms};
             arena.invoke<"input_event">(keyboard_event{k, a, mods});
+        };
+        auto move_to = [&](double x, double y, std::int64_t ms) {
+            arena.now = time_point{ms};
+            arena.invoke<"input_event">(position2d_event{x, y});
+        };
+        auto press = [&](std::int64_t ms) {
+            arena.now = time_point{ms};
+            arena.invoke<"input_event">(mousebutton_event{
+                MouseButtons::eMOUSE_BUTTON_LEFT, Action::ePRESS, ModifierKey::None()});
+        };
+        auto release = [&](std::int64_t ms) {
+            arena.now = time_point{ms};
+            arena.invoke<"input_event">(mousebutton_event{
+                MouseButtons::eMOUSE_BUTTON_LEFT, Action::eRELEASE, ModifierKey::None()});
+        };
+        auto tick = [&](std::int64_t ms) {
+            arena.now = time_point{ms};
+            arena.invoke<"tick">();
         };
         auto count = [&](std::string_view name, std::int64_t at) {
             int n = 0;
-            for (const auto &e : arena.ui.events())
+            for (const auto &e : arena.arbiter.events())
                 if (e.name == name && e.v == intent::verdict::accepted &&
                     e.at.count() == at)
                     ++n;
             return n;
         };
 
-        // 1) 普通 C：key_c + HUD 并行，两个 emit
-        key(Key::eC, Action::ePRESS, ModifierKey::None(), 0);
-        check("plain C -> on_key_C", arena.tally.key_c == 1);
+        move_to(100, 100, 900);
+        press(1000);
+        release(1050);
+        tick(1400);
+        check("单击 -> on_click", arena.counters.click == 1);
+        check("单击的数据在 arena.click", arena.click.x == 100 && arena.click.y == 100);
+
+        move_to(200, 200, 1900);
+        press(2000);
+        release(2020);
+        press(2100);
+        release(2120);
+        tick(2400);
+        check("双击 -> on_double_click", arena.counters.double_click == 1);
+        check("双击的数据在 arena.double_click", arena.double_click.count == 2);
+        check("双击时单击不重复", arena.counters.click == 1);
+
+        move_to(300, 300, 2900);
+        press(3000);
+        release(3020);
+        press(3100);
+        release(3120);
+        press(3200);
+        release(3220);
+        tick(3220);
+        check("三击 -> on_triple_click", arena.counters.triple_click == 1);
+        check("三击的数据在 arena.triple_click", arena.triple_click.count == 3);
+
+        move_to(10, 10, 3900);
+        press(4000);
+        move_to(20, 20, 4010);
+        move_to(30, 30, 4020);
+        release(4030);
+        check("拖拽 begin/move/end", arena.counters.drag_begin == 1 &&
+                                         arena.counters.drag_move == 1 &&
+                                         arena.counters.drag_end == 1);
+        check("拖拽的数据在 arena.drag",
+              arena.drag.total_dx == 20.0 && arena.drag.total_dy == 20.0);
+
+        arena.now = time_point{5000};
+        arena.invoke<"input_event">(scroll_event{0.0, 1.0});
+        check("滚轮 -> on_wheel", arena.counters.wheel == 1);
+        check("滚轮的数据在 arena.wheel", arena.wheel.delta == 1);
+
+        arena.now = time_point{6000};
+        arena.invoke<"input_event">(cursor_enter_event{true});
+        check("进入窗口 -> on_hover", arena.counters.hover == 1);
+
+        key(Key::eC, Action::ePRESS, ModifierKey::None(), 7000);
+        check("plain C -> on_key_c", arena.counters.key_c == 1);
         check("plain C -> HUD 同时 emit",
-              count("on_key_C", 0) == 1 && count("on_key_HUD", 0) == 1);
+              count("key_c", 7000) == 1 && count("any_key", 7000) == 1);
+        check("HUD 的数据在 arena.key_event", arena.key_event.key == Key::eC);
 
-        // 2) Ctrl+C：shortcut > key_c；HUD 仍然并行
-        key(Key::eLEFT_CONTROL, Action::ePRESS, ModifierKey::Control(), 10);
-        key(Key::eC, Action::ePRESS, ModifierKey::Control(), 20);
-        check("Ctrl+C -> shortcut", arena.tally.shortcut == 1);
-        check("Ctrl+C -> key_c 被压掉", count("on_key_C", 20) == 0);
-        check("Ctrl+C -> shortcut + HUD 两个 emit",
-              count("on_shortcut", 20) == 1 && count("on_key_HUD", 20) == 1);
-        check("Ctrl+C 只带一个 command", arena.tally.commands == 1);
-        key(Key::eC, Action::eRELEASE, ModifierKey::Control(), 30);
-        key(Key::eLEFT_CONTROL, Action::eRELEASE, ModifierKey::None(), 40);
+        key(Key::eLEFT_CONTROL, Action::ePRESS, ModifierKey::Control(), 7100);
+        key(Key::eC, Action::ePRESS, ModifierKey::Control(), 7120);
+        check("Ctrl+C -> on_shortcut", arena.counters.shortcut == 1);
+        check("Ctrl+C -> key_c 被压掉", count("key_c", 7120) == 0);
+        check("Ctrl+C -> shortcut + HUD",
+              count("shortcut", 7120) == 1 && count("any_key", 7120) == 1);
+        check("Ctrl+C 只带一个 command", arena.counters.commands == 1);
+        check("快捷键的数据在 arena.shortcut", arena.shortcut.n == 1);
+        key(Key::eC, Action::eRELEASE, ModifierKey::Control(), 7130);
+        key(Key::eLEFT_CONTROL, Action::eRELEASE, ModifierKey::None(), 7140);
 
-        // 3) Ctrl+Shift+C：更具体的快捷键
-        key(Key::eLEFT_CONTROL, Action::ePRESS, ModifierKey::Control(), 45);
-        key(Key::eLEFT_SHIFT, Action::ePRESS, ModifierKey::CtrlShift(), 46);
-        key(Key::eC, Action::ePRESS, ModifierKey::CtrlShift(), 50);
+        key(Key::eLEFT_CONTROL, Action::ePRESS, ModifierKey::Control(), 7150);
+        key(Key::eLEFT_SHIFT, Action::ePRESS, ModifierKey::CtrlShift(), 7160);
+        key(Key::eC, Action::ePRESS, ModifierKey::CtrlShift(), 7170);
         check("Ctrl+Shift+C -> copy_plain",
-              count("on_shortcut", 50) == 1 && arena.tally.shortcut == 2);
-        check("Ctrl+Shift+C -> key_c 被压掉", count("on_key_C", 50) == 0);
-        key(Key::eC, Action::eRELEASE, ModifierKey::CtrlShift(), 55);
-        key(Key::eLEFT_SHIFT, Action::eRELEASE, ModifierKey::Control(), 56);
-        key(Key::eLEFT_CONTROL, Action::eRELEASE, ModifierKey::None(), 57);
+              count("shortcut", 7170) == 1 && arena.counters.shortcut == 2);
+        check("Ctrl+Shift+C -> key_c 被压掉", count("key_c", 7170) == 0);
+        key(Key::eC, Action::eRELEASE, ModifierKey::CtrlShift(), 7180);
+        key(Key::eLEFT_SHIFT, Action::eRELEASE, ModifierKey::Control(), 7190);
+        key(Key::eLEFT_CONTROL, Action::eRELEASE, ModifierKey::None(), 7200);
 
-        // 4) Ctrl+S：一次快捷键带两个 command（save + notify）
-        key(Key::eLEFT_CONTROL, Action::ePRESS, ModifierKey::Control(), 60);
-        key(Key::eS, Action::ePRESS, ModifierKey::Control(), 70);
+        key(Key::eLEFT_CONTROL, Action::ePRESS, ModifierKey::Control(), 7210);
+        key(Key::eS, Action::ePRESS, ModifierKey::Control(), 7220);
         check("Ctrl+S -> 一个 shortcut，两个 command",
-              count("on_shortcut", 70) == 1 && arena.tally.commands == 4);
-        key(Key::eS, Action::eRELEASE, ModifierKey::Control(), 75);
-        key(Key::eLEFT_CONTROL, Action::eRELEASE, ModifierKey::None(), 76);
+              count("shortcut", 7220) == 1 && arena.counters.commands == 4);
+        key(Key::eS, Action::eRELEASE, ModifierKey::Control(), 7230);
+        key(Key::eLEFT_CONTROL, Action::eRELEASE, ModifierKey::None(), 7240);
 
-        // 5) 普通 S：没有 key_s，也没有 shortcut；只有 HUD
-        const int before = arena.tally.shortcut;
-        key(Key::eS, Action::ePRESS, ModifierKey::None(), 90);
+        const int before = arena.counters.shortcut;
+        key(Key::eS, Action::ePRESS, ModifierKey::None(), 7250);
         check("plain S -> 没有快捷键，只有 HUD",
-              arena.tally.shortcut == before && count("on_shortcut", 90) == 0);
+              arena.counters.shortcut == before && count("shortcut", 7250) == 0);
+
+        key(Key::eA, Action::ePRESS, ModifierKey::None(), 7300);
+        check("plain A -> on_key_a + HUD",
+              arena.counters.key_a == 1 && count("any_key", 7300) == 1);
 
         std::println("自检：{} 条失败", fails);
         return fails == 0 ? 0 : 1;
     }
-} // namespace app
+} // namespace mcs::app
+
+namespace app = mcs::app;
 
 int main(int argc, char **argv)
 try
@@ -2679,7 +2824,6 @@ try
     window.setup({.width = WIDTH, .height = HEIGHT}, TITLE);
 
     auto arena = app::make_arena();
-    arena.invoke<"bind">();
 
     glfw_input_translation input;
     input.setReceiver(arena); // glfw 事件 → arena.input_event
