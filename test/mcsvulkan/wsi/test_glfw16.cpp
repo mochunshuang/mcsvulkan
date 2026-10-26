@@ -1,4 +1,5 @@
 #include <array>
+#include <bit>
 #include <cassert>
 #include <concepts>
 #include <cstddef>
@@ -737,6 +738,23 @@ namespace intent
         {
             return (w[i / 64] >> (i % 64)) & 1;
         }
+        // 只遍历置位：O(popcount)，不是 O(S)
+        template <class Fn>
+        constexpr void for_each(Fn &&f) const noexcept
+        {
+            for (std::size_t k = 0; k < W; ++k)
+            {
+                auto x = w[k];
+                while (x)
+                {
+                    const auto b = std::countr_zero(x);
+                    const auto i = static_cast<index_t>(k * 64 + b);
+                    if (i < static_cast<index_t>(S))
+                        f(i);
+                    x &= x - 1;
+                }
+            }
+        }
         // 空吗？"没人能赢"、"没有结论"、"表清空" 都用它
         constexpr bool none() const noexcept
         {
@@ -1082,7 +1100,7 @@ namespace intent
     constexpr decision<S> arbitrate(const std::array<claim_state, S> &report,
                                     const std::array<bset<S>, S> &beats) noexcept
     {
-        // ① 谁还活着 / 谁这一拍想说话
+        // ① 一次扫，建 live / ready；这是局部量，不保存为成员
         bset<S> live{}, ready{};
         for (index_t i = 0; i < S; ++i)
         {
@@ -1091,21 +1109,19 @@ namespace intent
             if (report[i] == claim_state::ready)
                 ready.set(i);
         }
+        if (ready.none())
+            return {}; // 没 ready 就没 win，没 win 就没 lose
 
-        // ② 活着的 claim 能压住谁
+        // ② 只遍历 live 的置位
         bset<S> blocked{};
-        for (index_t j = 0; j < S; ++j)
-            if (live.has(j))
-                blocked |= beats[j];
+        live.for_each([&](index_t j) noexcept { blocked |= beats[j]; });
 
         // ③ ready 里的极大元
         const bset<S> win = ready & ~blocked;
 
-        // ④ 赢家的猎物：仍然活着、但被赢家压掉的 claim
+        // ④ 只遍历 win 的置位
         bset<S> lose{};
-        for (index_t i = 0; i < S; ++i)
-            if (win.has(i))
-                lose |= beats[i];
+        win.for_each([&](index_t i) noexcept { lose |= beats[i]; });
         lose &= live & ~win;
 
         return {win, lose};
@@ -1133,7 +1149,7 @@ namespace intent
         using Recognizers = typename shape::recognizers;
 
         Recognizers recognizers{};
-        std::array<claim_state, S> reports{}; // 最近一次上报；裁决器唯一输入
+        std::array<claim_state, S> reports{}; // 最近一次上报；唯一状态源
 
         // 无观测版本
         template <class Self, class Frame>
@@ -2059,7 +2075,7 @@ namespace gesture
         }
 
         template <class Self>
-        constexprs claim_state lose(Self &) noexcept
+        constexpr claim_state lose(Self &) noexcept
         {
             cur = claim_state::idle;
             return cur;
