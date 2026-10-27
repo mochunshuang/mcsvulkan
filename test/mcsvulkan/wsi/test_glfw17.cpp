@@ -177,6 +177,318 @@ struct type_erased_invoker
     invoke_type invoke_{};
 };
 
+template <class Handler>
+class multicast_sink
+{
+  public:
+    using index_t = std::uint32_t;
+    static constexpr index_t npos = ~index_t{0};
+
+    struct handle
+    {
+        index_t slot = npos;
+        std::uint64_t gen = 0;
+        [[nodiscard]] constexpr bool valid() const noexcept
+        {
+            return slot != npos;
+        }
+        [[nodiscard]] constexpr explicit operator bool() const noexcept
+        {
+            return valid();
+        }
+    };
+
+    class scoped_binding
+    {
+        multicast_sink *owner_ = nullptr;
+        handle h_{};
+
+      public:
+        scoped_binding() noexcept = default;
+
+        scoped_binding(multicast_sink &o, handle hh) noexcept : owner_(&o), h_(hh) {}
+
+        constexpr scoped_binding(scoped_binding &&other) noexcept
+            : owner_(std::exchange(other.owner_, nullptr)),
+              h_(std::exchange(other.h_, {}))
+        {
+        }
+        constexpr scoped_binding &operator=(scoped_binding &&other) noexcept
+        {
+            if (this != &other)
+            {
+                release();
+                owner_ = std::exchange(other.owner_, nullptr);
+                h_ = std::exchange(other.h_, {});
+            }
+            return *this;
+        }
+        scoped_binding(const scoped_binding &) = delete;
+        scoped_binding &operator=(const scoped_binding &) = delete;
+
+        constexpr ~scoped_binding() noexcept
+        {
+            release();
+        }
+
+        constexpr void release() noexcept
+        {
+            if (owner_ && h_.valid())
+                owner_->unbind(h_);
+            owner_ = nullptr;
+            h_ = {};
+        }
+        constexpr void activate() noexcept
+        {
+            if (owner_ && h_.valid())
+                owner_->activate(h_);
+        }
+        constexpr void deactivate() noexcept
+        {
+            if (owner_ && h_.valid())
+                owner_->deactivate(h_);
+        }
+        constexpr bool valid() const noexcept
+        {
+            return owner_ && h_.valid();
+        }
+        constexpr handle get_handle() const noexcept
+        {
+            return h_;
+        }
+    };
+
+    constexpr multicast_sink() = default;
+    multicast_sink(const multicast_sink &) = delete;
+    multicast_sink &operator=(const multicast_sink &) = delete;
+
+    // 可能抛 bad_alloc（slots_ realloc）
+    constexpr handle bind(void *obj, Handler handler)
+    {
+        index_t idx;
+        if (distributing_ || free_head_ == npos)
+        {
+            idx = static_cast<index_t>(slots_.size());
+            slot s;
+            s.obj = obj;
+            s.handler = handler;
+            s.gen = 1;
+            s.occupied = true;
+            s.active = true;
+            slots_.push_back(s);
+        }
+        else
+        {
+            idx = free_head_;
+            auto &s = slots_[idx];
+            free_head_ = s.free_next;
+            s.free_next = npos;
+            s.obj = obj;
+            s.handler = handler;
+            s.gen += 1;
+            s.occupied = true;
+            s.active = true;
+        }
+        slots_[idx].active_pos = static_cast<index_t>(active_list_.size());
+        active_list_.push_back(idx);
+        return {idx, slots_[idx].gen};
+    }
+
+    // 分发外：swap-remove active_list_ + 进 free_head_。分发中：只标 occupied。
+    constexpr void unbind(handle h) noexcept
+    {
+        if (h.slot >= slots_.size())
+            return;
+        auto &s = slots_[h.slot];
+        if (!s.occupied || s.gen != h.gen)
+            return;
+        s.occupied = false;
+        s.obj = nullptr;
+        s.handler = {};
+        s.free_next = free_head_;
+        free_head_ = h.slot;
+        if (!distributing_)
+            swap_remove_active_(h.slot);
+        else
+            dirty_ = true;
+    }
+
+    // ★ attach 只做 sink 层封装：obj + handler，无类型擦除
+    scoped_binding attach(void *obj, Handler handler)
+    {
+        return scoped_binding{*this, bind(obj, std::move(handler))};
+    }
+    void attach(scoped_binding &out, void *obj, Handler handler)
+    {
+        out = attach(obj, std::move(handler));
+    }
+
+    constexpr void activate(handle h) noexcept
+    {
+        if (h.slot >= slots_.size())
+            return;
+        auto &s = slots_[h.slot];
+        if (!s.occupied || s.gen != h.gen)
+            return;
+        if (s.active)
+            return;
+        s.active = true;
+        if (s.active_pos == npos)
+        {
+            s.active_pos = static_cast<index_t>(active_list_.size());
+            active_list_.push_back(h.slot);
+        }
+    }
+
+    constexpr void deactivate(handle h) noexcept
+    {
+        if (h.slot >= slots_.size())
+            return;
+        auto &s = slots_[h.slot];
+        if (!s.occupied || s.gen != h.gen)
+            return;
+        if (!s.active)
+            return;
+        s.active = false;
+        if (!distributing_)
+            swap_remove_active_(h.slot);
+        else
+            dirty_ = true;
+    }
+
+    template <class... Args>
+    constexpr void dispatch(Args &&...args) noexcept
+    {
+        const bool outer = !distributing_;
+        if (outer)
+        {
+            distributing_ = true;
+            n_snapshot_ = static_cast<index_t>(active_list_.size());
+        }
+        for (index_t i = 0; i < n_snapshot_; ++i)
+        {
+            index_t idx = active_list_[i];
+            auto &s = slots_[idx];
+            if (!s.occupied || !s.active)
+                continue;
+            s.handler.invoke(s.obj, std::forward<Args>(args)...);
+        }
+        if (outer)
+        {
+            distributing_ = false;
+            if (dirty_)
+            {
+                compact_active_();
+                dirty_ = false;
+            }
+        }
+    }
+
+    [[nodiscard]] constexpr const Handler *handler_of(handle h) const noexcept
+    {
+        if (h.slot >= slots_.size())
+            return nullptr;
+        const auto &s = slots_[h.slot];
+        if (!s.occupied || s.gen != h.gen)
+            return nullptr;
+        return &s.handler;
+    }
+    [[nodiscard]] constexpr void *context_of(handle h) const noexcept
+    {
+        if (h.slot >= slots_.size())
+            return nullptr;
+        const auto &s = slots_[h.slot];
+        if (!s.occupied || s.gen != h.gen)
+            return nullptr;
+        return s.obj;
+    }
+
+    template <class... Args>
+    constexpr void invoke(handle h, Args &&...args) const noexcept
+    {
+        if (h.slot >= slots_.size())
+            return;
+        const auto &s = slots_[h.slot];
+        if (!s.occupied || s.gen != h.gen)
+            return;
+        s.handler.invoke(s.obj, std::forward<Args>(args)...);
+    }
+
+    [[nodiscard]] constexpr std::size_t slot_count() const noexcept
+    {
+        return slots_.size();
+    }
+    [[nodiscard]] constexpr std::size_t live_count() const noexcept
+    {
+        return active_list_.size();
+    }
+    [[nodiscard]] constexpr std::size_t active_list_size() const noexcept
+    {
+        return active_list_.size();
+    }
+
+    constexpr void reserve(std::size_t n)
+    {
+        slots_.reserve(n);
+    }
+
+  private:
+    struct slot
+    {
+        void *obj = nullptr;
+        Handler handler{};
+        index_t free_next = npos;
+        index_t active_pos = npos;
+        std::uint64_t gen = 0;
+        bool occupied = false;
+        bool active = true;
+    };
+
+    std::vector<slot> slots_;
+    index_t free_head_ = npos;
+    std::vector<index_t> active_list_;
+    index_t n_snapshot_ = 0;
+    bool distributing_ = false;
+    bool dirty_ = false;
+
+    constexpr void swap_remove_active_(index_t idx) noexcept
+    {
+        auto &s = slots_[idx];
+        index_t p = s.active_pos;
+        if (p == npos)
+            return;
+        index_t last = static_cast<index_t>(active_list_.size() - 1);
+        if (p != last)
+        {
+            index_t moved = active_list_[last];
+            active_list_[p] = moved;
+            slots_[moved].active_pos = p;
+        }
+        active_list_.pop_back();
+        s.active_pos = npos;
+    }
+
+    constexpr void compact_active_() noexcept
+    {
+        index_t write = 0;
+        for (index_t read = 0; read < active_list_.size(); ++read)
+        {
+            index_t idx = active_list_[read];
+            auto &s = slots_[idx];
+            if (s.occupied && s.active)
+            {
+                active_list_[write] = idx;
+                s.active_pos = write;
+                ++write;
+            }
+            else
+            {
+                s.active_pos = npos;
+            }
+        }
+        active_list_.resize(write);
+    }
+};
 struct glfw_input_translation
 {
     using time_point_type = std::chrono::steady_clock::time_point;
@@ -203,34 +515,6 @@ struct glfw_input_translation
                    window_pos_event, window_size_event, window_iconify_event,
                    window_maximize_event, framebuffer_size_event>;
     using proxy_class_type = type_erased_invoker<>;
-
-    struct receiver
-    {
-        constexpr receiver() noexcept = default;
-        receiver(void *receiver, proxy_class_type fn) noexcept
-            : receiver_{receiver}, fn_{fn}
-        {
-        }
-        template <typename T>
-        constexpr void invoke(T data) noexcept
-        {
-            if (receiver_ == nullptr)
-                return;
-            using mcs::vulkan::runtime_type_v;
-            fn_.invoke(receiver_, runtime_type_v<T>, &data);
-        }
-
-      private:
-        void *receiver_{};
-        proxy_class_type fn_;
-    };
-
-    template <typename event_type>
-    constexpr static void forwarding(void *self, event_type e) noexcept
-    {
-        auto *impl = static_cast<glfw_input_translation *>(self);
-        impl->receiver_.invoke(e);
-    }
 
     template <typename event_type>
     struct event_dispatcher
@@ -270,12 +554,12 @@ struct glfw_input_translation
     };
 
     template <typename... Events>
-    static constexpr void subscribe_all(void *ptr)
+    static constexpr void subscribe_all(void *ptr, std::tuple<Events...> *)
     {
         (event_dispatcher<Events>::instance().subscribe(ptr, &forwarding<Events>), ...);
     }
     template <typename... Events>
-    static constexpr void unsubscribe_all(void *ptr) noexcept
+    static constexpr void unsubscribe_all(void *ptr, std::tuple<Events...> *) noexcept
     {
         static_assert((noexcept(event_dispatcher<Events>::instance().unsubscribe(
                            ptr, &forwarding<Events>)) &&
@@ -283,37 +567,57 @@ struct glfw_input_translation
                       "~class() need noexcept is true");
         (event_dispatcher<Events>::instance().unsubscribe(ptr, &forwarding<Events>), ...);
     }
-
     constexpr explicit glfw_input_translation()
     {
-        subscribe_all<keyboard_event, mousebutton_event, scroll_event, position2d_event,
-                      cursor_enter_event, char_event, drop_event, window_focus_event,
-                      window_pos_event, window_size_event, window_iconify_event,
-                      window_maximize_event, framebuffer_size_event>(this);
+        subscribe_all(this, static_cast<data_tuple *>(nullptr));
     }
     constexpr ~glfw_input_translation() noexcept
     {
-        unsubscribe_all<keyboard_event, mousebutton_event, scroll_event, position2d_event,
-                        cursor_enter_event, char_event, drop_event, window_focus_event,
-                        window_pos_event, window_size_event, window_iconify_event,
-                        window_maximize_event, framebuffer_size_event>(this);
+        unsubscribe_all(this, static_cast<data_tuple *>(nullptr));
     }
     glfw_input_translation(const glfw_input_translation &) = delete;
     glfw_input_translation(glfw_input_translation &&) = delete;
     glfw_input_translation &operator=(const glfw_input_translation &) = delete;
     glfw_input_translation &operator=(glfw_input_translation &&) = delete;
 
+    using multicast_t = multicast_sink<proxy_class_type>;
+    using handle = multicast_t::handle;
+    using scoped_binding = multicast_t::scoped_binding;
+
+    template <typename event_type>
+    constexpr static void forwarding(void *self, event_type e) noexcept
+    {
+        auto *impl = static_cast<glfw_input_translation *>(self);
+        using mcs::vulkan::runtime_type_v;
+        impl->sinks_.dispatch(runtime_type_v<event_type>, &e);
+    }
+
+    // ★ 类型擦除在这里发生：Obj → (void*, proxy_class_type)
     template <typename Obj>
         requires(requires() {
             proxy_class_type::build<"input_event", data_tuple, Obj>();
         })
-    constexpr void setReceiver(Obj &obj) noexcept
+    constexpr scoped_binding attach(Obj &obj)
     {
-        receiver_ = {&obj, proxy_class_type::build<"input_event", data_tuple, Obj>()};
+        return sinks_.attach(&obj,
+                             proxy_class_type::build<"input_event", data_tuple, Obj>());
+    }
+
+    template <typename Obj>
+        requires(requires() {
+            proxy_class_type::build<"input_event", data_tuple, Obj>();
+        })
+    constexpr void attach(scoped_binding &out, Obj &obj)
+    {
+        out = attach(obj);
+    }
+    constexpr void reserve(std::size_t n)
+    {
+        sinks_.reserve(n);
     }
 
   private:
-    receiver receiver_;
+    multicast_t sinks_;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1291,12 +1595,6 @@ struct input_frame
         Stylus,
         InvertedStylus,
         Trackpad
-    };
-
-    struct PointerId
-    {
-        constexpr static std::uint32_t Invalid = static_cast<std::uint32_t>(~0);
-        std::uint32_t value{Invalid};
     };
 
     using Key = mcs::vulkan::event::Key;
@@ -2554,6 +2852,7 @@ namespace mcs::app
             field<"input_state">(input_frame::event_context{}),
             field<"now">(time_point{}), field<"manual_clock">(false),
             field<"keep_trace">(false), field<"verbose">(true), field<"frames">(0u),
+            field<"input_binding">(glfw_input_translation::scoped_binding{}),
 
             method<"on_click">([](auto &self, const Trait_click::payload_t &e) noexcept {
                 ++self.counters.click;
@@ -2828,10 +3127,490 @@ namespace mcs::app
 
 namespace app = mcs::app;
 
+// ====================================== 测试用例 =======================================
+#include <cstdio>
+#include <cstdlib>
+
+#define CHECK(c)                                                 \
+    do                                                           \
+    {                                                            \
+        if (!(c))                                                \
+        {                                                        \
+            std::fprintf(stderr, "FAIL %d: %s\n", __LINE__, #c); \
+            std::exit(1);                                        \
+        }                                                        \
+    } while (0)
+
+struct mock_handler
+{
+    using fn_t = void (*)(void *, int);
+    fn_t fn = nullptr;
+    constexpr void invoke(void *obj, const void *, void *data) const noexcept
+    {
+        if (fn)
+            fn(obj, *static_cast<const int *>(data));
+    }
+    template <class Obj>
+    static constexpr mock_handler build() noexcept
+    {
+        return {[](void *p, int v) noexcept { static_cast<Obj *>(p)->on_event(v); }};
+    }
+};
+
+struct Counter
+{
+    int calls = 0;
+    int last = -1;
+    void on_event(int v) noexcept
+    {
+        ++calls;
+        last = v;
+    }
+};
+
+struct Probe
+{
+    int calls = 0;
+    void (*hook)(Probe *, int) = nullptr;
+    void on_event(int v) noexcept
+    {
+        ++calls;
+        if (hook)
+            hook(this, v);
+    }
+};
+
+using sink_t = multicast_sink<mock_handler>;
+
+static void dispatch_int(sink_t &s, int v)
+{
+    s.dispatch(static_cast<const void *>(nullptr), static_cast<void *>(&v));
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 第一组：sink 原语层（bind / unbind / activate / deactivate / dispatch / handle）
+// ════════════════════════════════════════════════════════════════════
+
+// ---- 1) 1000 slot 里只有 10 live：dispatch 只遍历 live ----
+void test_dispatch_complexity()
+{
+    sink_t s;
+    s.reserve(2048);
+    std::vector<Counter> cs(1000);
+    std::vector<sink_t::handle> hs;
+    hs.reserve(1000);
+    for (int i = 0; i < 1000; ++i)
+        hs.push_back(s.bind(&cs[i], mock_handler::build<Counter>()));
+
+    // 只留前 10 个
+    for (int i = 10; i < 1000; ++i)
+        s.unbind(hs[i]);
+
+    CHECK(s.slot_count() == 1000);
+    CHECK(s.live_count() == 10);
+    CHECK(s.active_list_size() == 10);
+
+    dispatch_int(s, 5);
+    for (int i = 0; i < 10; ++i)
+        CHECK(cs[i].calls == 1);
+    for (int i = 10; i < 1000; ++i)
+        CHECK(cs[i].calls == 0);
+}
+
+// ---- 2) 反复 bind/unbind：active_list 恒等于 N_live ----
+void test_active_list_stays_compact()
+{
+    sink_t s;
+    std::vector<Counter> pool(100);
+    sink_t::handle prev{};
+    for (int round = 0; round < 100; ++round)
+    {
+        if (prev.valid())
+            s.unbind(prev);
+        prev = s.bind(&pool[round], mock_handler::build<Counter>());
+        CHECK(s.active_list_size() == 1);
+    }
+    s.unbind(prev);
+    CHECK(s.active_list_size() == 0);
+    CHECK(s.slot_count() <= 100);
+}
+
+// ---- 3) UI 模式：打开 5 个窗口，关掉，循环 ----
+void test_ui_pattern()
+{
+    sink_t s;
+    s.reserve(32);
+    std::vector<Counter> windows(50);
+
+    for (int cycle = 0; cycle < 20; ++cycle)
+    {
+        std::vector<sink_t::handle> hs;
+        for (int i = 0; i < 5; ++i)
+            hs.push_back(
+                s.bind(&windows[cycle * 5 % 50 + i], mock_handler::build<Counter>()));
+        CHECK(s.active_list_size() == 5);
+        dispatch_int(s, cycle);
+        for (auto h : hs)
+            s.unbind(h);
+        CHECK(s.active_list_size() == 0);
+    }
+    CHECK(s.slot_count() <= 32);
+}
+
+// ---- 4) 分发中 deactivate / unbind：本轮跳过 ----
+void test_mutate_in_dispatch()
+{
+    sink_t s;
+    Probe a, b, c;
+    (void)s.bind(&a, mock_handler::build<Probe>());
+    auto hb = s.bind(&b, mock_handler::build<Probe>());
+    auto hc = s.bind(&c, mock_handler::build<Probe>());
+
+    static sink_t *gs = nullptr;
+    static sink_t::handle g_hb{}, g_hc{};
+    static bool fired = false;
+    gs = &s;
+    g_hb = hb;
+    g_hc = hc;
+    fired = false;
+    a.hook = [](Probe *, int) {
+        if (!fired)
+        {
+            gs->unbind(g_hc);
+            gs->deactivate(g_hb);
+            fired = true;
+        }
+    };
+
+    dispatch_int(s, 0);
+    CHECK(a.calls == 1 && b.calls == 0 && c.calls == 0);
+    CHECK(s.active_list_size() == 1); // 分发结束 compact 后只剩 a
+
+    a.hook = nullptr;
+    dispatch_int(s, 0);
+    CHECK(b.calls == 0 && c.calls == 0);
+}
+
+// ---- 5) 分发中 activate：下轮生效 ----
+void test_activate_in_dispatch()
+{
+    sink_t s;
+    Probe a, c;
+    (void)s.bind(&a, mock_handler::build<Probe>());
+    auto hc = s.bind(&c, mock_handler::build<Probe>());
+    s.deactivate(hc);
+    CHECK(s.active_list_size() == 1);
+
+    static sink_t *gs = nullptr;
+    static sink_t::handle g_hc{};
+    static bool fired = false;
+    gs = &s;
+    g_hc = hc;
+    fired = false;
+    a.hook = [](Probe *, int) {
+        if (!fired)
+        {
+            gs->activate(g_hc);
+            fired = true;
+        }
+    };
+
+    dispatch_int(s, 0);
+    CHECK(a.calls == 1);
+    CHECK(c.calls == 0); // 本轮快照外
+
+    a.hook = nullptr;
+    dispatch_int(s, 0);
+    CHECK(c.calls == 1); // 下轮生效
+}
+
+// ---- 6) 分发外 activate：O(1) 立即生效 ----
+void test_activate_outside_dispatch()
+{
+    sink_t s;
+    Counter a;
+    auto ha = s.bind(&a, mock_handler::build<Counter>());
+    s.deactivate(ha);
+    CHECK(s.active_list_size() == 0);
+    s.activate(ha);
+    CHECK(s.active_list_size() == 1);
+    dispatch_int(s, 42);
+    CHECK(a.calls == 1 && a.last == 42);
+}
+
+// ---- 7) 空 handle：全 no-op ----
+void test_invalid_handles()
+{
+    sink_t s;
+    Counter a;
+    (void)s.bind(&a, mock_handler::build<Counter>());
+
+    sink_t::handle empty{};
+    s.activate(empty);
+    s.deactivate(empty);
+    s.unbind(empty);
+    CHECK(s.active_list_size() == 1);
+
+    dispatch_int(s, 0);
+    CHECK(a.calls == 1);
+}
+
+// ---- 8) 槽位复用：旧 handle 永久 no-op ----
+void test_slot_recycle()
+{
+    sink_t s;
+    Counter a, b;
+    auto ha = s.bind(&a, mock_handler::build<Counter>());
+    s.unbind(ha);
+    auto hb = s.bind(&b, mock_handler::build<Counter>());
+    CHECK(hb.slot == ha.slot);
+    CHECK(hb.gen > ha.gen);
+
+    s.unbind(ha);
+    s.activate(ha);
+    dispatch_int(s, 0);
+    CHECK(a.calls == 0 && b.calls == 1);
+}
+
+// ---- 9) 分发中 bind：本轮快照外 ----
+void test_bind_in_dispatch()
+{
+    sink_t s;
+    s.reserve(8);
+    Probe a, late;
+    (void)s.bind(&a, mock_handler::build<Probe>());
+
+    static sink_t *gs = nullptr;
+    static Probe *gl = nullptr;
+    static bool fired = false;
+    gs = &s;
+    gl = &late;
+    fired = false;
+    a.hook = [](Probe *, int) {
+        if (!fired)
+        {
+            (void)gs->bind(gl, mock_handler::build<Probe>());
+            fired = true;
+        }
+    };
+
+    dispatch_int(s, 0);
+    CHECK(a.calls == 1 && late.calls == 0);
+
+    a.hook = nullptr;
+    dispatch_int(s, 0);
+    CHECK(late.calls == 1);
+}
+
+// ---- 10) 混合模式压力 ----
+void test_stress()
+{
+    sink_t s;
+    s.reserve(64);
+    std::vector<Counter> pool(64);
+    std::vector<sink_t::handle> live;
+    int dispatched = 0;
+
+    for (int round = 0; round < 1000; ++round)
+    {
+        auto h = s.bind(&pool[round % 64], mock_handler::build<Counter>());
+        live.push_back(h);
+        if (live.size() > 8)
+        {
+            s.unbind(live.front());
+            live.erase(live.begin());
+        }
+        if (!live.empty() && (round & 1))
+            s.deactivate(live.back());
+        else if (!live.empty())
+            s.activate(live.back());
+
+        dispatch_int(s, round);
+        ++dispatched;
+        CHECK(s.active_list_size() <= live.size());
+    }
+    CHECK(dispatched == 1000);
+    CHECK(s.slot_count() <= 64);
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 第二组：scoped_binding 层（RAII）
+// ════════════════════════════════════════════════════════════════════
+
+// ---- 11) 基础：析构自动 unbind ----
+void test_scoped_binding_basic()
+{
+    sink_t s;
+    Counter a;
+    {
+        auto b = s.attach(&a, mock_handler::build<Counter>());
+        CHECK(b.valid());
+        CHECK(s.active_list_size() == 1);
+        dispatch_int(s, 1);
+        CHECK(a.calls == 1);
+    } // b 析构 → unbind
+    CHECK(s.active_list_size() == 0);
+    dispatch_int(s, 1);
+    CHECK(a.calls == 1); // 不再被调用
+}
+
+// ---- 12) 空语义：所有操作 no-op ----
+void test_scoped_binding_empty()
+{
+    sink_t s;
+    sink_t::scoped_binding empty;
+    CHECK(!empty.valid());
+    empty.activate();   // no-op
+    empty.deactivate(); // no-op
+    empty.release();    // no-op
+    CHECK(empty.get_handle().slot == sink_t::npos);
+    CHECK(s.active_list_size() == 0);
+}
+
+// ---- 13) 移动构造：接管所有权，源变空 ----
+void test_scoped_binding_move_construct()
+{
+    sink_t s;
+    Counter a;
+    {
+        sink_t::scoped_binding b1 = s.attach(&a, mock_handler::build<Counter>());
+        CHECK(b1.valid());
+        sink_t::scoped_binding b2 = std::move(b1);
+        CHECK(!b1.valid()); // 源变空
+        CHECK(b2.valid());
+        CHECK(s.active_list_size() == 1);
+    } // b2 析构 → unbind；b1 析构 no-op
+    CHECK(s.active_list_size() == 0);
+}
+
+// ---- 14) activate/deactivate 与 RAII 正交 ----
+void test_scoped_binding_toggle_then_release()
+{
+    sink_t s;
+    Counter a;
+    {
+        auto b = s.attach(&a, mock_handler::build<Counter>());
+        b.deactivate();
+        CHECK(s.active_list_size() == 0);
+        dispatch_int(s, 1);
+        CHECK(a.calls == 0);
+
+        b.activate();
+        dispatch_int(s, 1);
+        CHECK(a.calls == 1);
+
+        b.deactivate(); // 再休止
+        // 作用域结束：析构 → unbind 不看 active
+    }
+    CHECK(s.active_list_size() == 0);
+    dispatch_int(s, 1);
+    CHECK(a.calls == 1); // 之后不再被调用
+}
+
+// ---- 15) release 提前释放；析构 no-op ----
+void test_scoped_binding_release_early()
+{
+    sink_t s;
+    Counter a;
+    auto b = s.attach(&a, mock_handler::build<Counter>());
+    CHECK(b.valid());
+    b.release();
+    CHECK(!b.valid());
+    CHECK(s.active_list_size() == 0);
+    dispatch_int(s, 1);
+    CHECK(a.calls == 0);
+    b.release(); // 重复 release：no-op
+    // b 析构 no-op
+}
+
+// ---- 16) 多个 scoped_binding 并存，独立控制 ----
+void test_scoped_binding_multiple()
+{
+    sink_t s;
+    Counter a, b, c;
+    auto ba = s.attach(&a, mock_handler::build<Counter>());
+    auto bb = s.attach(&b, mock_handler::build<Counter>());
+    auto bc = s.attach(&c, mock_handler::build<Counter>());
+    CHECK(s.active_list_size() == 3);
+    dispatch_int(s, 1);
+    CHECK(a.calls == 1 && b.calls == 1 && c.calls == 1);
+
+    bb.release(); // 只释放 b
+    CHECK(s.active_list_size() == 2);
+    dispatch_int(s, 2);
+    CHECK(a.calls == 2 && b.calls == 1 && c.calls == 2);
+}
+
+// ---- 17) 移动赋值：先释放旧绑定再接管 ----
+void test_scoped_binding_move_assign()
+{
+    sink_t s;
+    Counter a, b;
+    auto ba = s.attach(&a, mock_handler::build<Counter>());
+    auto bb = s.attach(&b, mock_handler::build<Counter>());
+    CHECK(s.active_list_size() == 2);
+
+    ba = std::move(bb); // ba 先 release(a)，再接管 b
+    CHECK(!bb.valid());
+    CHECK(ba.valid());
+    CHECK(s.active_list_size() == 1);
+
+    dispatch_int(s, 1);
+    CHECK(a.calls == 0); // a 已解绑
+    CHECK(b.calls == 1);
+}
+
+// ---- 18) out 参数版 attach ----
+void test_scoped_binding_attach_out()
+{
+    sink_t s;
+    Counter a;
+    sink_t::scoped_binding b;
+    s.attach(b, &a, mock_handler::build<Counter>());
+    CHECK(b.valid());
+    CHECK(s.active_list_size() == 1);
+    dispatch_int(s, 1);
+    CHECK(a.calls == 1);
+    // b 析构时自动 unbind
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 汇总入口
+// ════════════════════════════════════════════════════════════════════
+int multicast_sink_test()
+{
+    // sink 原语层
+    test_dispatch_complexity();
+    test_active_list_stays_compact();
+    test_ui_pattern();
+    test_mutate_in_dispatch();
+    test_activate_in_dispatch();
+    test_activate_outside_dispatch();
+    test_invalid_handles();
+    test_slot_recycle();
+    test_bind_in_dispatch();
+    test_stress();
+
+    // scoped_binding 层
+    test_scoped_binding_basic();
+    test_scoped_binding_empty();
+    test_scoped_binding_move_construct();
+    test_scoped_binding_toggle_then_release();
+    test_scoped_binding_release_early();
+    test_scoped_binding_multiple();
+    test_scoped_binding_move_assign();
+    test_scoped_binding_attach_out();
+
+    std::printf("All multicast_sink + scoped_binding tests passed.\n");
+    return 0;
+}
+
 int main(int argc, char **argv)
 try
 {
-    std::setvbuf(stdout, nullptr, _IONBF, 0); // 重定向时也立刻看得到输出
+    multicast_sink_test();
+    std::setvbuf(stdout, nullptr, _IONBF,
+                 0); // 重定向时也立刻看得到输出
 
     if (argc > 1 && std::string_view{argv[1]} == "--selftest")
         return app::selftest();
@@ -2839,10 +3618,9 @@ try
     surface window{};
     window.setup({.width = WIDTH, .height = HEIGHT}, TITLE);
 
-    auto arena = app::make_arena();
-
-    glfw_input_translation input;
-    input.setReceiver(arena); // glfw 事件 → arena.input_event
+    glfw_input_translation input;   // 先声明（后析构）
+    auto arena = app::make_arena(); // 后声明（先析构）
+    input.attach(arena.input_binding, arena);
 
     std::println("就绪：单击 / 双击 / 三击 / 拖拽 / 滚轮 / A / C / Ctrl+C / Ctrl+Shift+C "
                  "/ Ctrl+S / HUD；关窗口退出。");
