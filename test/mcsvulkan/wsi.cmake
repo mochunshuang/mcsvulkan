@@ -30,6 +30,7 @@ add_vulkan_wsi_test(test_glfw13)
 add_vulkan_wsi_test(test_glfw14)
 add_vulkan_wsi_test(test_glfw15)
 add_vulkan_wsi_test(test_glfw16)
+add_vulkan_wsi_test(test_glfw17)
 
 
 # end
