@@ -9159,13 +9159,25 @@ namespace mcs::app
     } // namespace detail
 
     // ── arena（局部 Trait：只写 payload + collect）────────────────
+    struct click_payload
+    {
+        double x{}, y{};
+        time_point at{};
+    };
+    struct Trait_click : gesture::trait_base<click_payload, static_string{"click"},
+                                             static_string{"on_click"}, policy::click>
+    {
+        static void collect(time_point, payload_t &d,
+                            const gesture::click_event &e) noexcept
+        {
+            d = {e.x, e.y, e.at};
+        }
+    };
+    using click_template_recognizer = gesture::click_template<Trait_click>;
+
     inline auto make_arena()
     {
-        struct click_payload
-        {
-            double x{}, y{};
-            time_point at{};
-        };
+
         struct multi_click_payload
         {
             double x{}, y{};
@@ -9193,15 +9205,6 @@ namespace mcs::app
         };
 
         // name / fn_name / policy / payload_t 都在 base；局部只写 payload + collect
-        struct Trait_click : gesture::trait_base<click_payload, static_string{"click"},
-                                                 static_string{"on_click"}, policy::click>
-        {
-            static void collect(time_point, payload_t &d,
-                                const gesture::click_event &e) noexcept
-            {
-                d = {e.x, e.y, e.at};
-            }
-        };
 
         struct Trait_double_click
             : gesture::trait_base<multi_click_payload, static_string{"double_click"},
@@ -9320,7 +9323,7 @@ namespace mcs::app
 
         using tree = intent::all_of<
             intent::refines<
-                intent::leaf<gesture::click_template<Trait_click>>,
+                intent::leaf<click_template_recognizer>,
                 intent::all_of<intent::leaf<gesture::drag_template<Trait_drag>>,
                                intent::refines<intent::leaf<gesture::multi_click_template<
                                                    Trait_double_click>>,
@@ -9481,6 +9484,11 @@ namespace mcs::app
 } // namespace mcs::app
 
 namespace app = mcs::app;
+auto &inputTranslation()
+{
+    static auto input = glfw_input_translation{};
+    return input;
+}
 //diff: [test_intent] end
 
 int main()
@@ -9595,6 +9603,32 @@ try
         drawRecorder, uniformBuffers, descriptorSets);
 
     // ===== hover：全局唯一一份 实体→函数 关联（外键 = 池实体下标）=====
+    using recognizer_tree = intent::leaf<app::click_template_recognizer>;
+    auto &input_trans = inputTranslation();
+    auto arena = make_aggregate<"arena">(
+        field<"click">(app::Trait_click::payload_t{}),
+        field<"arbiter">(intent::debug_arbiter<recognizer_tree>{}),
+        field<"input_state">(input_frame::event_context{}),
+        field<"input_binding">(glfw_input_translation::scoped_binding{}),
+        method<"on_click">([](auto &self, const app::Trait_click::payload_t &e) noexcept {
+            self.click = e;
+            std::println("arena: on_click");
+        }),
+        method<"tick">([](auto &self) noexcept {
+            const auto now = app::detail::now_ms();
+            self.arbiter.tick(self, now);
+        }),
+        method<"input_event">([](auto &self, auto e) noexcept {
+            const auto now = app::detail::now_ms();
+            using frame_t = decltype(input_frame::build_change(self.input_state, e));
+            if constexpr (!std::is_void_v<frame_t>)
+            {
+                auto f = input_frame::build_change(self.input_state, e);
+                self.arbiter.feed(self, f, now);
+                input_frame::apply_change(self.input_state, f);
+            }
+        }));
+    input_trans.attach(arena.input_binding, arena);
 
     ui_new::ScreenWidget screen{
         ui_new::Size{WIDTH, HEIGHT},
