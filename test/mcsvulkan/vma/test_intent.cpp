@@ -6609,47 +6609,6 @@ static constexpr uint64_t getShaderData(object_key key) noexcept
     fatal_error(std::format("no handle for entity_index: {}", entity_index));
 }
 
-namespace render
-{
-    // NOTE: 实现 RenderObject 的匿名实现类的效果
-    template <class Agg>
-    struct AggRenderObject final : ui_new::RenderObject
-    {
-        Agg agg;
-
-        constexpr explicit AggRenderObject(Agg a) noexcept : agg(std::move(a)) {}
-
-        constexpr void render(ui_new::ScreenWidget *s, ui_new::Widget *owner,
-                              render_context &ctx) override
-        {
-            agg.template invoke<"render">(s, owner, ctx);
-        }
-    };
-    template <typename Agg, static_string hover_fn_name>
-    struct HoverFn
-    {
-        static constexpr auto handler(picking_result r, bool enter, InputCtx &inputCtx,
-                                      ui_new::ScreenWidget *screen) noexcept
-        {
-            uint64_t ptr = getShaderData(r.key);
-            auto *agg = reinterpret_cast<Agg *>(ptr);
-            agg->template invoke<hover_fn_name>(r, enter, inputCtx, screen);
-        };
-        static constexpr auto index()
-        {
-            static const uint32_t fn = hoverPool().bind(&handler);
-            return fn;
-        }
-    };
-
-    template <class Agg>
-    [[nodiscard]] inline auto asRenderObject(Agg &&a)
-    {
-        using D = std::decay_t<Agg>;
-        return std::make_unique<AggRenderObject<D>>(std::forward<Agg>(a));
-    }
-} // namespace render
-
 //diff: [test_dod24.cpp] end [替换旧的布局，并更新录制的算法]
 
 //diff: [test_dod22] end
@@ -9022,6 +8981,13 @@ namespace mcs::app
     inline constexpr std::int64_t triple_gap_ms = 250;
     inline constexpr double drag_slop_px = 4.0;
 
+    inline time_point now_ms() noexcept
+    {
+        static const auto t0 = std::chrono::steady_clock::now();
+        return std::chrono::duration_cast<time_point>(std::chrono::steady_clock::now() -
+                                                      t0);
+    }
+
     namespace policy
     {
         struct click
@@ -9126,13 +9092,6 @@ namespace mcs::app
             friend constexpr bool operator==(const counters &,
                                              const counters &) = default;
         };
-
-        inline time_point now_ms() noexcept
-        {
-            static const auto t0 = std::chrono::steady_clock::now();
-            return std::chrono::duration_cast<time_point>(
-                std::chrono::steady_clock::now() - t0);
-        }
 
         template <class Self>
         inline time_point now_of(Self &self) noexcept
@@ -9489,6 +9448,55 @@ auto &inputTranslation()
     static auto input = glfw_input_translation{};
     return input;
 }
+
+namespace render
+{
+    // NOTE: 实现 RenderObject 的匿名实现类的效果
+    template <class Agg>
+    struct AggRenderObject final : ui_new::RenderObject
+    {
+        Agg agg;
+
+        constexpr explicit AggRenderObject(Agg a) noexcept : agg(std::move(a)) {}
+
+        constexpr void render(ui_new::ScreenWidget *s, ui_new::Widget *owner,
+                              render_context &ctx) override
+        {
+            agg.template invoke<"render">(s, owner, ctx);
+        }
+    };
+    template <typename Agg, static_string hover_fn_name>
+    struct HoverFn
+    {
+        static constexpr auto handler(picking_result r, bool enter, InputCtx &inputCtx,
+                                      ui_new::ScreenWidget *screen) noexcept
+        {
+            uint64_t ptr = getShaderData(r.key);
+            auto *agg = reinterpret_cast<Agg *>(ptr);
+            agg->template invoke<hover_fn_name>(r, enter, inputCtx, screen);
+        };
+        static constexpr auto index()
+        {
+            static const uint32_t fn = hoverPool().bind(&handler);
+            return fn;
+        }
+    };
+
+    static constexpr auto postBindInputTranslation = [](auto &agg) {
+        inputTranslation().attach(agg.input_binding, agg);
+    };
+
+    template <class Agg, class Handler = decltype(postBindInputTranslation)>
+    [[nodiscard]] constexpr auto asRenderObject(
+        Agg &&a, Handler postHandler = postBindInputTranslation)
+    {
+        using D = std::decay_t<Agg>;
+        auto renderObject = std::make_unique<AggRenderObject<D>>(std::forward<Agg>(a));
+        if constexpr (requires() { postHandler(renderObject->agg); })
+            postHandler(renderObject->agg);
+        return renderObject;
+    }
+}; // namespace render
 //diff: [test_intent] end
 
 int main()
@@ -9604,205 +9612,198 @@ try
 
     // ===== hover：全局唯一一份 实体→函数 关联（外键 = 池实体下标）=====
     using recognizer_tree = intent::leaf<app::click_template_recognizer>;
-    auto &input_trans = inputTranslation();
-    auto arena = make_aggregate<"arena">(
-        field<"click">(app::Trait_click::payload_t{}),
+    auto textBox = make_aggregate<"TextBox">(
+        // ── 数据字段 ─────────────────────────────────────────
+        field<"text">(std::string("CD")),
+        field<"textGlyphProxies">(std::vector<proxy_value<GlyphPool>>{}),
+        field<"cachedGlyphs">(std::vector<shader_data::Glyph>{}),
+        field<"cachedOwnerOffset">(ui_new::Offset{-1e30, -1e30}),
+        field<"cachedViewport">(glm::vec2{-1.0f, -1.0f}),
+        field<"owner">(static_cast<ui_new::Widget *>(nullptr)),
+
+        // ════════════════════════════════════════════════════════
+        // hover —— 用户逻辑，就地写
+        // ════════════════════════════════════════════════════════
+        method<"hover_0">([](auto &&self, picking_result r, bool enter,
+                             InputCtx &inputCtx, ui_new::ScreenWidget *screen) noexcept {
+            std::println("[hover_0] type={} entity={} primitive={} "
+                         "ver={} {} (hover_fn={}) text={}",
+                         r.key.object_type, r.key.entity_index, r.primitive_id(),
+                         r.render_version(), enter ? "ENTER" : "LEAVE", r.hover_fn,
+                         self.text);
+            //NOTE: 是有Self的类型信息的。enter 决定加载和卸载，以及当前的处理函数
+        }),
+        method<"hover_1">([](auto &&self, picking_result r, bool enter,
+                             InputCtx &inputCtx, ui_new::ScreenWidget *screen) noexcept {
+            std::println("[hover_1] type={} entity={} primitive={} "
+                         "ver={} {} (hover_fn={}) text={}",
+                         r.key.object_type, r.key.entity_index, r.primitive_id(),
+                         r.render_version(), enter ? "ENTER" : "LEAVE", r.hover_fn,
+                         self.text);
+        }),
+
+        // ════════════════════════════════════════════════════════
+        // render —— 只负责「缓存校验 + 提交」
+        // ════════════════════════════════════════════════════════
+        method<"render">([](auto &&self, ui_new::ScreenWidget *screen,
+                            ui_new::Widget *owner, render_context &ctx) {
+            (void)screen;
+
+            const auto &viewports = ctx.drawRecorder.currentDynamic.viewports;
+            if (viewports.empty())
+                return;
+
+            const float windowWidth = viewports[0].width;
+            const float windowHeight = viewports[0].height;
+            const ui_new::Offset off = owner->offset;
+
+            const bool cacheValid = !self.cachedGlyphs.empty() &&
+                                    self.cachedOwnerOffset.x == off.x &&
+                                    self.cachedOwnerOffset.y == off.y &&
+                                    self.cachedViewport.x == windowWidth &&
+                                    self.cachedViewport.y == windowHeight;
+
+            if (!cacheValid)
+                self.template invoke<"rebuildCache">(owner, windowWidth, windowHeight,
+                                                     ctx);
+
+            if (!self.cachedGlyphs.empty())
+                ctx.drawRecorder.addInstances(
+                    std::span<const shader_data::Glyph>(self.cachedGlyphs));
+        }),
+
+        // ════════════════════════════════════════════════════════
+        // rebuildCache —— 原 TextRenderObject::rebuildCache 整体
+        // ════════════════════════════════════════════════════════
+        method<"rebuildCache">([](auto &&self, ui_new::Widget *owner, float windowWidth,
+                                  float windowHeight, render_context &ctx) {
+            self.textGlyphProxies.clear();
+            self.cachedGlyphs.clear();
+
+            self.owner = owner;
+
+            const float fontSizePx = 24.0f; // 两块原本就是同一个值，提到最外层
+
+            // ★ 反查钥匙 owner
+            const uint64_t data_ptr = reinterpret_cast<uint64_t>(&self);
+            using Self = std::remove_reference_t<decltype(self)>;
+
+            auto emit_one = [&](const auto &g, float cursorX, float baselineY,
+                                uint32_t hover_fn_id) -> bool {
+                if (g.plane_bounds == decltype(g.plane_bounds){})
+                    return false;
+                auto [glyph, proxy] =
+                    gen_glyph(g, windowWidth, windowHeight, fontSizePx, cursorX,
+                              baselineY, data_ptr, hover_fn_id, glm::vec4(1.0f), 1);
+                self.textGlyphProxies.push_back(std::move(proxy));
+                self.cachedGlyphs.push_back(std::move(glyph));
+                return true;
+            };
+
+            // ────────────────────────────────────────────────────────────
+            // 上层：一整段 shape result → 流式 emit
+            //   · 空字形也推进 cursor（advance 已含空格宽度）
+            //   · baseline 固定，cursorX 从 startX 起累加
+            // ────────────────────────────────────────────────────────────
+            auto emit_shape_stream = [&](const auto &shapeResult, float startX,
+                                         float baselineY, uint32_t hover_fn_id) {
+                float cursorX = startX;
+                for (const auto &run : shapeResult)
+                    for (const auto &g : run)
+                    {
+                        emit_one(g, cursorX, baselineY, hover_fn_id);
+                        cursorX += g.advance_x * fontSizePx;
+                    }
+            };
+
+            // ============ 第一块：五位置单字符 ============
+            //   布局策略与第二块不同：不是流式，而是"每个字符独立对齐到固定锚点"
+            //   所以这里不走 emit_shape_stream，只复用 emit_one。
+            {
+                auto textResult = run_text_pipeline(ctx.fontSelect, "ABCDE", "zh-CN");
+                const auto &shapeResult = textResult.shape_result;
+
+                std::vector<const std::remove_cvref_t<decltype(shapeResult[0][0])> *>
+                    glyphPtrs;
+                for (const auto &run : shapeResult)
+                    for (const auto &g : run)
+                        glyphPtrs.push_back(&g);
+
+                if (glyphPtrs.size() >= 5)
+                {
+                    const float margin = 20.0f;
+                    std::array<glm::vec2, 5> positions = {
+                        glm::vec2(margin, margin),
+                        glm::vec2(windowWidth - margin - fontSizePx, margin),
+                        glm::vec2(windowWidth - margin - fontSizePx,
+                                  windowHeight - margin - fontSizePx),
+                        glm::vec2(margin, windowHeight - margin - fontSizePx),
+                        glm::vec2(windowWidth * 0.5f, windowHeight * 0.5f)};
+                    const uint32_t hfn = render::HoverFn<Self, "hover_0">::index();
+                    for (int i = 0; i < 5; ++i)
+                    {
+                        const auto &g = *glyphPtrs[i];
+                        // 把字形的 plane_bounds 对齐到 positions[i]
+                        float cursorX = positions[i].x - g.plane_bounds.left * fontSizePx;
+                        float baselineY =
+                            positions[i].y + g.plane_bounds.top * fontSizePx;
+                        emit_one(g, cursorX, baselineY, hfn);
+                    }
+                }
+            }
+
+            // ============ 第二块：正式文本（顶部居中）============
+            if (!self.text.empty())
+            {
+                auto textResult =
+                    run_text_pipeline(ctx.fontSelect, self.text.data(), "zh-CN");
+                const auto &shapeResult = textResult.shape_result;
+
+                // 总宽 → 居中起点
+                float totalWidth = 0.0f;
+                for (const auto &run : shapeResult)
+                    for (const auto &g : run)
+                        totalWidth += g.advance_x * fontSizePx;
+
+                const float topMargin = 20.0f;
+                const float baselineY = topMargin + fontSizePx;
+                const float startX = (windowWidth - totalWidth) * 0.5f;
+                const uint32_t hfn = render::HoverFn<Self, "hover_1">::index();
+                emit_shape_stream(shapeResult, startX, baselineY, hfn);
+            }
+
+            self.cachedOwnerOffset = owner->offset;
+            self.cachedViewport = {windowWidth, windowHeight};
+        }),
+        // input 相关定义的数据段
         field<"arbiter">(intent::debug_arbiter<recognizer_tree>{}),
         field<"input_state">(input_frame::event_context{}),
         field<"input_binding">(glfw_input_translation::scoped_binding{}),
+        field<"click">(app::Trait_click::payload_t{}),
         method<"on_click">([](auto &self, const app::Trait_click::payload_t &e) noexcept {
             self.click = e;
             std::println("arena: on_click");
         }),
         method<"tick">([](auto &self) noexcept {
-            const auto now = app::detail::now_ms();
+            const auto now = app::now_ms();
             self.arbiter.tick(self, now);
         }),
         method<"input_event">([](auto &self, auto e) noexcept {
-            const auto now = app::detail::now_ms();
             using frame_t = decltype(input_frame::build_change(self.input_state, e));
             if constexpr (!std::is_void_v<frame_t>)
             {
                 auto f = input_frame::build_change(self.input_state, e);
+                const auto now = app::now_ms();
                 self.arbiter.feed(self, f, now);
                 input_frame::apply_change(self.input_state, f);
             }
-        }));
-    input_trans.attach(arena.input_binding, arena);
-
+        })
+        //
+    );
     ui_new::ScreenWidget screen{
         ui_new::Size{WIDTH, HEIGHT},
         ui_new::Container("panel").child(ui_new::Container("rectBox").renderObject(
-            render::asRenderObject(make_aggregate<"TextBox">(
-                // ── 数据字段 ─────────────────────────────────────────
-                field<"text">(std::string("CD")),
-                field<"textGlyphProxies">(std::vector<proxy_value<GlyphPool>>{}),
-                field<"cachedGlyphs">(std::vector<shader_data::Glyph>{}),
-                field<"cachedOwnerOffset">(ui_new::Offset{-1e30, -1e30}),
-                field<"cachedViewport">(glm::vec2{-1.0f, -1.0f}),
-                field<"owner">(static_cast<ui_new::Widget *>(nullptr)),
-
-                // ════════════════════════════════════════════════════════
-                // hover —— 用户逻辑，就地写
-                // ════════════════════════════════════════════════════════
-                method<"hover_0">([](auto &&self, picking_result r, bool enter,
-                                     InputCtx &inputCtx,
-                                     ui_new::ScreenWidget *screen) noexcept {
-                    std::println("[hover_0] type={} entity={} primitive={} "
-                                 "ver={} {} (hover_fn={}) text={}",
-                                 r.key.object_type, r.key.entity_index, r.primitive_id(),
-                                 r.render_version(), enter ? "ENTER" : "LEAVE",
-                                 r.hover_fn, self.text);
-                    //NOTE: 是有Self的类型信息的。enter 决定加载和卸载，以及当前的处理函数
-                }),
-                method<"hover_1">([](auto &&self, picking_result r, bool enter,
-                                     InputCtx &inputCtx,
-                                     ui_new::ScreenWidget *screen) noexcept {
-                    std::println("[hover_1] type={} entity={} primitive={} "
-                                 "ver={} {} (hover_fn={}) text={}",
-                                 r.key.object_type, r.key.entity_index, r.primitive_id(),
-                                 r.render_version(), enter ? "ENTER" : "LEAVE",
-                                 r.hover_fn, self.text);
-                }),
-
-                // ════════════════════════════════════════════════════════
-                // render —— 只负责「缓存校验 + 提交」
-                // ════════════════════════════════════════════════════════
-                method<"render">([](auto &&self, ui_new::ScreenWidget *screen,
-                                    ui_new::Widget *owner, render_context &ctx) {
-                    (void)screen;
-
-                    const auto &viewports = ctx.drawRecorder.currentDynamic.viewports;
-                    if (viewports.empty())
-                        return;
-
-                    const float windowWidth = viewports[0].width;
-                    const float windowHeight = viewports[0].height;
-                    const ui_new::Offset off = owner->offset;
-
-                    const bool cacheValid = !self.cachedGlyphs.empty() &&
-                                            self.cachedOwnerOffset.x == off.x &&
-                                            self.cachedOwnerOffset.y == off.y &&
-                                            self.cachedViewport.x == windowWidth &&
-                                            self.cachedViewport.y == windowHeight;
-
-                    if (!cacheValid)
-                        self.template invoke<"rebuildCache">(owner, windowWidth,
-                                                             windowHeight, ctx);
-
-                    if (!self.cachedGlyphs.empty())
-                        ctx.drawRecorder.addInstances(
-                            std::span<const shader_data::Glyph>(self.cachedGlyphs));
-                }),
-
-                // ════════════════════════════════════════════════════════
-                // rebuildCache —— 原 TextRenderObject::rebuildCache 整体
-                // ════════════════════════════════════════════════════════
-                method<"rebuildCache">([](auto &&self, ui_new::Widget *owner,
-                                          float windowWidth, float windowHeight,
-                                          render_context &ctx) {
-                    self.textGlyphProxies.clear();
-                    self.cachedGlyphs.clear();
-
-                    self.owner = owner;
-
-                    const float fontSizePx = 24.0f; // 两块原本就是同一个值，提到最外层
-
-                    // ★ 反查钥匙 owner
-                    const uint64_t data_ptr = reinterpret_cast<uint64_t>(&self);
-                    using Self = std::remove_reference_t<decltype(self)>;
-
-                    auto emit_one = [&](const auto &g, float cursorX, float baselineY,
-                                        uint32_t hover_fn_id) -> bool {
-                        if (g.plane_bounds == decltype(g.plane_bounds){})
-                            return false;
-                        auto [glyph, proxy] = gen_glyph(
-                            g, windowWidth, windowHeight, fontSizePx, cursorX, baselineY,
-                            data_ptr, hover_fn_id, glm::vec4(1.0f), 1);
-                        self.textGlyphProxies.push_back(std::move(proxy));
-                        self.cachedGlyphs.push_back(std::move(glyph));
-                        return true;
-                    };
-
-                    // ────────────────────────────────────────────────────────────
-                    // 上层：一整段 shape result → 流式 emit
-                    //   · 空字形也推进 cursor（advance 已含空格宽度）
-                    //   · baseline 固定，cursorX 从 startX 起累加
-                    // ────────────────────────────────────────────────────────────
-                    auto emit_shape_stream = [&](const auto &shapeResult, float startX,
-                                                 float baselineY, uint32_t hover_fn_id) {
-                        float cursorX = startX;
-                        for (const auto &run : shapeResult)
-                            for (const auto &g : run)
-                            {
-                                emit_one(g, cursorX, baselineY, hover_fn_id);
-                                cursorX += g.advance_x * fontSizePx;
-                            }
-                    };
-
-                    // ============ 第一块：五位置单字符 ============
-                    //   布局策略与第二块不同：不是流式，而是"每个字符独立对齐到固定锚点"
-                    //   所以这里不走 emit_shape_stream，只复用 emit_one。
-                    {
-                        auto textResult =
-                            run_text_pipeline(ctx.fontSelect, "ABCDE", "zh-CN");
-                        const auto &shapeResult = textResult.shape_result;
-
-                        std::vector<
-                            const std::remove_cvref_t<decltype(shapeResult[0][0])> *>
-                            glyphPtrs;
-                        for (const auto &run : shapeResult)
-                            for (const auto &g : run)
-                                glyphPtrs.push_back(&g);
-
-                        if (glyphPtrs.size() >= 5)
-                        {
-                            const float margin = 20.0f;
-                            std::array<glm::vec2, 5> positions = {
-                                glm::vec2(margin, margin),
-                                glm::vec2(windowWidth - margin - fontSizePx, margin),
-                                glm::vec2(windowWidth - margin - fontSizePx,
-                                          windowHeight - margin - fontSizePx),
-                                glm::vec2(margin, windowHeight - margin - fontSizePx),
-                                glm::vec2(windowWidth * 0.5f, windowHeight * 0.5f)};
-                            const uint32_t hfn =
-                                render::HoverFn<Self, "hover_0">::index();
-                            for (int i = 0; i < 5; ++i)
-                            {
-                                const auto &g = *glyphPtrs[i];
-                                // 把字形的 plane_bounds 对齐到 positions[i]
-                                float cursorX =
-                                    positions[i].x - g.plane_bounds.left * fontSizePx;
-                                float baselineY =
-                                    positions[i].y + g.plane_bounds.top * fontSizePx;
-                                emit_one(g, cursorX, baselineY, hfn);
-                            }
-                        }
-                    }
-
-                    // ============ 第二块：正式文本（顶部居中）============
-                    if (!self.text.empty())
-                    {
-                        auto textResult =
-                            run_text_pipeline(ctx.fontSelect, self.text.data(), "zh-CN");
-                        const auto &shapeResult = textResult.shape_result;
-
-                        // 总宽 → 居中起点
-                        float totalWidth = 0.0f;
-                        for (const auto &run : shapeResult)
-                            for (const auto &g : run)
-                                totalWidth += g.advance_x * fontSizePx;
-
-                        const float topMargin = 20.0f;
-                        const float baselineY = topMargin + fontSizePx;
-                        const float startX = (windowWidth - totalWidth) * 0.5f;
-                        const uint32_t hfn = render::HoverFn<Self, "hover_1">::index();
-                        emit_shape_stream(shapeResult, startX, baselineY, hfn);
-                    }
-
-                    self.cachedOwnerOffset = owner->offset;
-                    self.cachedViewport = {windowWidth, windowHeight};
-                })))))};
+            render::asRenderObject(std::move(textBox))))};
 
     shader_data::hover_manager hoverManager{.screen = &screen};
     // 新的 soaCtx 仅包含 uiRects 和 uiWireRects
