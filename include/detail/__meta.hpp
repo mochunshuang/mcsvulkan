@@ -11,3 +11,4 @@
 #include "./meta/name_spec.hpp"
 #include "./meta/class_utils.hpp"
 #include "./meta/template_args.hpp"
+#include "./meta/composed_type.hpp"
