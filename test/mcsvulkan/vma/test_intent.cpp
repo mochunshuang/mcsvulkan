@@ -1357,7 +1357,9 @@ namespace shader_data
                     pc.commandConstantsAddress =
                         commandConstantsBuffer.address + seg.constantByteOffset;
 
-                    cmd.pushConstants(unit.staticKey.layout, VK_SHADER_STAGE_VERTEX_BIT,
+                    cmd.pushConstants(unit.staticKey.layout,
+                                      VK_SHADER_STAGE_VERTEX_BIT |
+                                          VK_SHADER_STAGE_FRAGMENT_BIT,
                                       0, sizeof(PushData), &pc);
 
                     cmd.drawIndexedIndirect(indirectDrawBuffer.buffer.buffer(),
@@ -6531,10 +6533,20 @@ static constexpr auto make_glyph =
     [](const auto &g, float W, float H, float fontSizePx, float cursorX, float baselineY,
        uint64_t data, uint32_t entity_index, uint32_t hover_fn_id, glm::vec4 color,
        uint32_t modulateFlag) -> shader_data::Glyph {
-    float leftPx = cursorX + g.plane_bounds.left * fontSizePx;
-    float rightPx = cursorX + g.plane_bounds.right * fontSizePx;
-    float topPx = baselineY - g.plane_bounds.top * fontSizePx;
-    float bottomPx = baselineY - g.plane_bounds.bottom * fontSizePx;
+    // JSON 的 plane_bounds 跟随 atlas.yOrigin：
+    //   "top"    -> y 向下（top 为负、bottom 为正）
+    //   "bottom" -> y 向上（top 为正、bottom 为负）
+    // HarfBuzz 的 offset 是 y 向上；屏幕 y 向下，所以 offset_y 用减。
+    const bool y_down = (g.font_ctx->font.atlas.yOrigin == "top");
+    const float ydir = y_down ? 1.0f : -1.0f;
+    const float ox = static_cast<float>(g.offset_x) * fontSizePx;
+    const float oy = static_cast<float>(g.offset_y) * fontSizePx;
+    float leftPx = cursorX + ox + static_cast<float>(g.plane_bounds.left) * fontSizePx;
+    float rightPx = cursorX + ox + static_cast<float>(g.plane_bounds.right) * fontSizePx;
+    float topPx =
+        baselineY - oy + ydir * static_cast<float>(g.plane_bounds.top) * fontSizePx;
+    float bottomPx =
+        baselineY - oy + ydir * static_cast<float>(g.plane_bounds.bottom) * fontSizePx;
     float w = rightPx - leftPx;
     float h = bottomPx - topPx;
 
@@ -6542,10 +6554,13 @@ static constexpr auto make_glyph =
     float cy = ((topPx + h * 0.5f) / H) * 2.0f - 1.0f;
 
     UvTransform uv;
+    // V 轴向下增长；quad 的 v=0 在顶部，所以 scale.y = bottom - top（正），
+    // offset.y = top。原来用 (top-bottom, bottom) 是配合负高度的几何翻转，
+    // 现在几何 h 已为正，UV 必须同步正过来，否则字是倒的。
     uv.scale = glm::vec2(static_cast<float>(g.uv_bounds.right - g.uv_bounds.left),
-                         static_cast<float>(g.uv_bounds.top - g.uv_bounds.bottom));
+                         static_cast<float>(g.uv_bounds.bottom - g.uv_bounds.top));
     uv.offset = glm::vec2(static_cast<float>(g.uv_bounds.left),
-                          static_cast<float>(g.uv_bounds.bottom));
+                          static_cast<float>(g.uv_bounds.top));
 
     shader_data::Glyph glyph{};
     glyph.data = data;
@@ -9499,6 +9514,356 @@ namespace render
 }; // namespace render
 //diff: [test_intent] end
 
+// ═══════════════════════════════════════════════════════════════════════
+// table_demo：一张“数据 + 算法”的表
+//
+//   类型层：column<...> 是 part，table_schema<...> 是 composed type
+//   对象层：make_table<Schema>(rows, font) 造出“数据 + 端口”的聚合
+//   算法层：solve_columns / window_for / shape_cell / push_rect / push_text
+//
+//   没有为表新增任何基类；它和 TextBox 一样，只是一个带
+//   field<> + method<"render"> 的聚合，靠 asRenderObject 上桌。
+// ═══════════════════════════════════════════════════════════════════════
+namespace table_demo
+{
+    using namespace ui_new;
+
+    // ── 1. 类型层：列 = part ────────────────────────────────────────
+    template <static_string Name, int Width, int Weight = 0>
+    struct column
+    {
+        static constexpr auto name = Name;
+        static constexpr float width = static_cast<float>(Width);
+        static constexpr float weight = static_cast<float>(Weight);
+    };
+
+    // ── 2. 类型层：表 = 列的 composed_type ──────────────────────────
+    template <class... Cols>
+    struct table_schema
+    {
+        static constexpr std::size_t count = sizeof...(Cols);
+        static constexpr std::array<static_string, count> names{Cols::name...};
+        static constexpr std::array<float, count> widths{Cols::width...};
+        static constexpr std::array<float, count> weights{Cols::weight...};
+    };
+
+    // ── 3. 运行期数据 ──────────────────────────────────────────────
+    template <std::size_t N>
+    struct table_metrics
+    {
+        std::array<float, N> x{};
+        std::array<float, N> w{};
+    };
+
+    struct table_prefs
+    {
+        float pad = 12.0f;      // 列间距（px）
+        float row_h = 30.0f;    // 行高（px）
+        float row_gap = 2.0f;   // 行间距（px）
+        float header_h = 40.0f; // 表头高（px）
+        int selected = 3;       // 选中行（演示状态）
+    };
+
+    struct row_window
+    {
+        std::size_t first = 0;
+        std::size_t last = 0;
+    };
+
+    // ── 4. 算法层：列宽求解（fixed + flex，余数给最后一列）──────────
+    template <class Schema>
+    table_metrics<Schema::count> solve_columns(float avail, const table_prefs &prefs,
+                                               float scale = 1.0f)
+    {
+        constexpr std::size_t N = Schema::count;
+        table_metrics<N> m{};
+        float fixed = 0.0f, weight = 0.0f;
+        for (std::size_t i = 0; i < N; ++i)
+        {
+            if (Schema::weights[i] > 0.0f)
+                weight += Schema::weights[i];
+            else
+                fixed += Schema::widths[i] * scale;
+        }
+        const float inner = std::max(0.0f, avail - prefs.pad * static_cast<float>(N + 1));
+        const float flex = std::max(0.0f, inner - fixed);
+        float x = prefs.pad;
+        for (std::size_t i = 0; i < N; ++i)
+        {
+            const float w = Schema::weights[i] > 0.0f
+                                ? flex * Schema::weights[i] / weight
+                                : Schema::widths[i] * scale;
+            m.x[i] = x;
+            m.w[i] = static_cast<float>(static_cast<int>(w));
+            x += m.w[i] + prefs.pad;
+        }
+        m.w[N - 1] += std::max(0.0f, avail - x);
+        return m;
+    }
+
+    // ── 5. 算法层：可见行窗口（定高，O(1)）─────────────────────────
+    inline row_window window_for(float scroll, float body_h, std::size_t n, float step)
+    {
+        if (n == 0 || step <= 0.0f)
+            return {};
+        const std::size_t first = static_cast<std::size_t>(scroll / step);
+        const std::size_t span = static_cast<std::size_t>(body_h / step) + 2;
+        return {std::min(first, n), std::min(n, first + span)};
+    }
+
+    // ── 6. 算法层：一个单元格 → glyph 模板（相对 cell 原点）──────────
+    struct cell_glyphs
+    {
+        std::vector<shader_data::Glyph> glyphs;
+        float advance = 0.0f;
+    };
+
+    template <class Font>
+    cell_glyphs shape_cell(Font &font, std::string_view text, float font_px, float vw, float vh)
+    {
+        namespace font_ns = mcs::vulkan::font;
+        cell_glyphs out;
+        if (text.empty())
+            return out;
+
+        std::string owned{text};
+        auto norm = font_ns::utf8proc::normalize(owned.c_str());
+        auto analyze = font_ns::bidi::analyze(norm.codepoints, 0);
+        auto runs = font_ns::assign_fonts(analyze, font);
+        auto shaped =
+            font_ns::harfbuzz::shape(analyze.mirrored_codepoints, runs, font.notdefFont());
+
+        float cursor = 0.0f;
+        for (const auto &run : shaped)
+            for (const auto &g : run)
+            {
+                if (!(g.plane_bounds == decltype(g.plane_bounds){}))
+                    out.glyphs.push_back(make_glyph(g, vw, vh, font_px, cursor, 0.0f, 0, 0,
+                                                     ~0u, glm::vec4(1.0f), 1));
+                cursor += g.advance_x * font_px;
+            }
+        out.advance = cursor;
+        return out;
+    }
+
+    // ── 7. 发射器：像素矩形 → Rectangle 实例 ───────────────────────
+    inline void push_rect(std::vector<shader_data::Rectangle> &out, float x, float y, float w,
+                          float h, glm::vec4 color, float vw, float vh, float radius = 0.0f)
+    {
+        shader_data::Rectangle r{};
+        r.effects = shader_data::FX_ROUNDED | shader_data::FX_FILL;
+        for (auto &c : r.colors)
+            c = color;
+        const float cx = (x + w * 0.5f) / vw * 2.0f - 1.0f;
+        const float cy = (y + h * 0.5f) / vh * 2.0f - 1.0f;
+        const float sx = w / vw * 2.0f;
+        const float sy = h / vh * 2.0f;
+        r.model = glm::translate(glm::mat4(1.0f), glm::vec3(cx, cy, 0.0f));
+        r.vertexTransform.matrix = glm::scale(glm::mat4(1.0f), glm::vec3(sx, sy, 1.0f));
+        r.uvTransform = UvTransform::identity();
+        r.size = glm::vec2(sx, sy);
+        r.radiusSoftness = glm::vec4(radius, 0.0015f, 0.0f, 0.0f);
+        out.push_back(r);
+    }
+
+    // ── 8. 发射器：glyph 模板 + 像素平移 → Glyph 实例 ───────────────
+    inline void push_text(std::vector<shader_data::Glyph> &out, const cell_glyphs &cg, float x,
+                          float baseline, float vw, float vh, glm::vec4 color)
+    {
+        const float dx = x / vw * 2.0f;
+        const float dy = baseline / vh * 2.0f;
+        for (auto g : cg.glyphs)
+        {
+            g.model[3][0] += dx;
+            g.model[3][1] += dy;
+            g.color = color;
+            g.modulateFlag = 1;
+            g.hover_fn = ~0u;
+            out.push_back(g);
+        }
+    }
+
+    // ── 9. 具体表：列 schema + 行数据 ──────────────────────────────
+    using demo_schema = table_schema<column<"Name", 220>, column<"Status", 0, 1>,
+                                     column<"Size", 80>, column<"Modified", 130>,
+                                     column<"Action", 70>>;
+
+    using demo_row = std::array<std::string, demo_schema::count>;
+
+    inline std::vector<demo_row> demo_rows()
+    {
+        std::vector<demo_row> rows;
+        const char *names[] = {"atlas.msdf", "ui.frag", "table.vert", "scene.gltf",
+                               "font.json"};
+        const char *status[] = {"ready", "busy", "ready", "error", "ready"};
+        for (int i = 0; i < 18; ++i)
+        {
+            rows.push_back(demo_row{
+                std::string(names[i % 5]) + "#" + std::to_string(i),
+                status[i % 5],
+                std::to_string(12 + i * 7) + ".5 KB",
+                "2026-10-" + std::to_string(10 + i % 20),
+                (i % 3) ? "open" : "edit",
+            });
+        }
+        return rows;
+    }
+
+    // ── 10. 对象层：表 = 数据 + 端口 ───────────────────────────────
+    template <class Schema>
+    auto make_table(std::vector<std::array<std::string, Schema::count>> rows, FontSelect *font)
+    {
+        using metrics_t = table_metrics<Schema::count>;
+        return make_aggregate<"Table">(
+            field<"rows">(std::move(rows)),
+            field<"font">(font),
+            field<"prefs">(table_prefs{}),
+            field<"metrics">(metrics_t{}),
+            field<"headers">(std::vector<cell_glyphs>{}),
+            field<"cells">(std::vector<cell_glyphs>{}),
+            field<"viewport">(glm::vec2{0.0f, 0.0f}),
+            field<"built">(false),
+
+            // 缓存：viewport 变了才重新整形
+            method<"rebuild">([](auto &self, float vw, float vh) {
+                self.viewport = glm::vec2{vw, vh};
+                self.headers.clear();
+                self.cells.clear();
+                self.headers.reserve(Schema::count);
+                self.cells.reserve(self.rows.size() * Schema::count);
+                for (std::size_t c = 0; c < Schema::count; ++c)
+                    self.headers.push_back(
+                        shape_cell(*self.font, Schema::names[c].view(), 15.0f, vw, vh));
+                for (const auto &row : self.rows)
+                    for (std::size_t c = 0; c < Schema::count; ++c)
+                        self.cells.push_back(shape_cell(*self.font, row[c], 15.0f, vw, vh));
+                self.built = true;
+            }),
+
+            method<"render">([](auto &self, ui_new::ScreenWidget *, ui_new::Widget *owner,
+                                render_context &ctx) {
+                const auto &viewports = ctx.drawRecorder.currentDynamic.viewports;
+                if (viewports.empty())
+                    return;
+                // 用真实 framebuffer 尺寸，不用 ScreenWidget 的逻辑尺寸
+                const float vw = viewports[0].width;
+                const float vh = viewports[0].height;
+                if (!self.built || self.viewport.x != vw || self.viewport.y != vh)
+                    self.template invoke<"rebuild">(vw, vh);
+                if (self.rows.empty())
+                    return;
+
+                constexpr std::size_t N = Schema::count;
+                const auto &prefs = self.prefs;
+                const float margin = 40.0f;
+                const float top = 100.0f;
+                const float x0 = static_cast<float>(owner->offset.x) + margin;
+                const float y0 = static_cast<float>(owner->offset.y) + top;
+                const float w = vw - margin * 2.0f;
+                const float h = vh - top - margin;
+                if (w < 260.0f || h < 160.0f)
+                    return;
+
+                const float scale = vw / 800.0f;
+                self.metrics = solve_columns<Schema>(w, prefs, scale);
+                const auto &m = self.metrics;
+                const float step = prefs.row_h + prefs.row_gap;
+                const float body_h = h - prefs.header_h;
+                // 不要在 render 里读 clock：两个 frame-in-flight 的 recorder
+                // 是在不同时刻录的，会各自存下不同的 scroll；交替呈现时
+                // 整张表就在两个位置之间抖。ABCDE 是静态的，所以没事。
+                // 要做动画，应由每帧唯一的 tick 更新 scroll，并每帧重录。
+                const float scroll = 0.0f;
+                const auto win = window_for(scroll, body_h, self.rows.size(), step);
+
+                // ── 阶段 1：外框 + 表头（全屏裁剪）─────────────────
+                std::vector<shader_data::Rectangle> rects;
+                std::vector<shader_data::Glyph> glyphs;
+                rects.reserve(32);
+                glyphs.reserve(N * 8);
+
+                push_rect(rects, x0, y0, w, h, {0.10f, 0.11f, 0.14f, 0.97f}, vw, vh, 0.018f);
+                push_rect(rects, x0, y0, w, prefs.header_h, {0.17f, 0.19f, 0.25f, 1.0f}, vw,
+                          vh, 0.01f);
+                for (std::size_t c = 0; c < N; ++c)
+                    push_text(glyphs, self.headers[c], x0 + m.x[c], y0 + 26.0f, vw, vh,
+                              {0.85f, 0.87f, 0.92f, 1.0f});
+                for (std::size_t c = 1; c < N; ++c)
+                    push_rect(rects, x0 + m.x[c] - prefs.pad * 0.5f, y0 + 6.0f, 1.0f,
+                              prefs.header_h - 12.0f, {1, 1, 1, 0.08f}, vw, vh);
+                if (!rects.empty())
+                    ctx.drawRecorder.addInstances(
+                        std::span<const shader_data::Rectangle>{rects});
+                if (!glyphs.empty())
+                    ctx.drawRecorder.addInstances(std::span<const shader_data::Glyph>{glyphs});
+
+                // ── 阶段 2：行内容（裁剪到 body）───────────────────
+                rects.clear();
+                glyphs.clear();
+                const VkRect2D body_sc{
+                    .offset = {static_cast<int32_t>(x0),
+                               static_cast<int32_t>(y0 + prefs.header_h)},
+                    .extent = {static_cast<uint32_t>(w), static_cast<uint32_t>(body_h)}};
+                const auto saved = ctx.drawRecorder.currentDynamic.scissors;
+                ctx.drawRecorder.setScissors(std::span<const VkRect2D>{&body_sc, 1});
+
+                const int hot_row = -1;
+                for (std::size_t i = win.first; i < win.last; ++i)
+                {
+                    const float ry =
+                        y0 + prefs.header_h + static_cast<float>(i) * step - scroll;
+                    glm::vec4 bg = (i % 2) ? glm::vec4{0.13f, 0.14f, 0.18f, 0.95f}
+                                           : glm::vec4{0.15f, 0.16f, 0.21f, 0.95f};
+                    if (static_cast<int>(i) == hot_row)
+                        bg = {0.19f, 0.22f, 0.30f, 0.98f};
+                    if (static_cast<int>(i) == prefs.selected)
+                        bg = {0.19f, 0.31f, 0.44f, 0.98f};
+                    push_rect(rects, x0, ry, w, prefs.row_h, bg, vw, vh, 0.004f);
+
+                    for (std::size_t c = 0; c < N; ++c)
+                    {
+                        glm::vec4 fg{0.84f, 0.86f, 0.91f, 1.0f};
+                        if (c == 1)
+                        {
+                            if (self.rows[i][c] == "ready")
+                                fg = {0.45f, 0.85f, 0.55f, 1.0f};
+                            else if (self.rows[i][c] == "busy")
+                                fg = {0.95f, 0.75f, 0.35f, 1.0f};
+                            else
+                                fg = {0.95f, 0.45f, 0.45f, 1.0f};
+                        }
+                        if (c == 4)
+                            fg = {0.55f, 0.72f, 0.95f, 1.0f};
+                        push_text(glyphs, self.cells[i * N + c], x0 + m.x[c], ry + 21.0f,
+                                  vw, vh, fg);
+                    }
+                }
+                if (!rects.empty())
+                    ctx.drawRecorder.addInstances(
+                        std::span<const shader_data::Rectangle>{rects});
+                if (!glyphs.empty())
+                    ctx.drawRecorder.addInstances(std::span<const shader_data::Glyph>{glyphs});
+                ctx.drawRecorder.setScissors(std::span<const VkRect2D>{saved});
+
+                // ── 阶段 3：外框线 + 列线 + 滚动条（全屏裁剪）───────
+                rects.clear();
+                const glm::vec4 line{1, 1, 1, 0.16f};
+                push_rect(rects, x0, y0, w, 1.0f, line, vw, vh);
+                push_rect(rects, x0, y0 + h - 1.0f, w, 1.0f, line, vw, vh);
+                push_rect(rects, x0, y0, 1.0f, h, line, vw, vh);
+                push_rect(rects, x0 + w - 1.0f, y0, 1.0f, h, line, vw, vh);
+                for (std::size_t c = 1; c < N; ++c)
+                    push_rect(rects, x0 + m.x[c] - prefs.pad * 0.5f, y0 + prefs.header_h,
+                              1.0f, h - prefs.header_h, {1, 1, 1, 0.07f}, vw, vh);
+
+                // 静态表：先不画滚动条（没有滚动状态时画了反而误导）
+                if (!rects.empty())
+                    ctx.drawRecorder.addInstances(
+                        std::span<const shader_data::Rectangle>{rects});
+            }));
+    }
+} // namespace table_demo
+
 int main()
 try
 {
@@ -9745,8 +10110,10 @@ try
                         const auto &g = *glyphPtrs[i];
                         // 把字形的 plane_bounds 对齐到 positions[i]
                         float cursorX = positions[i].x - g.plane_bounds.left * fontSizePx;
+                        // plane_bounds.top 在 y-down 里是负数；baseline 要减去它
+                        // 才能让字形的视觉顶部落在 positions[i].y。
                         float baselineY =
-                            positions[i].y + g.plane_bounds.top * fontSizePx;
+                            positions[i].y - g.plane_bounds.top * fontSizePx;
                         emit_one(g, cursorX, baselineY, hfn);
                     }
                 }
@@ -9800,10 +10167,16 @@ try
         })
         //
     );
+    // 表：schema 在类型层，rows/prefs 在对象层，render 里只调算法
+    auto tableBox = table_demo::make_table<table_demo::demo_schema>(
+        table_demo::demo_rows(), &fontSelect);
+
     ui_new::ScreenWidget screen{
         ui_new::Size{WIDTH, HEIGHT},
-        ui_new::Container("panel").child(ui_new::Container("rectBox").renderObject(
-            render::asRenderObject(std::move(textBox))))};
+        ui_new::Container("panel")
+            .renderObject(render::asRenderObject(std::move(tableBox), [](auto &) noexcept {}))
+            .child(ui_new::Container("rectBox").renderObject(
+                render::asRenderObject(std::move(textBox))))};
 
     shader_data::hover_manager hoverManager{.screen = &screen};
     // 新的 soaCtx 仅包含 uiRects 和 uiWireRects
@@ -10431,13 +10804,23 @@ try
                                 VK_ACCESS_2_TRANSFER_READ_BIT,
                                 VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
                 //NOTE: 复制到 pickingFrames，就可以读取了，拿到着色器的输出
+                // 鼠标坐标可能是上一次窗口尺寸留下的；窗口缩小后 y 会超过
+                // picking image 的高度。这里无条件拷贝（保证回读缓冲有内容），
+                // 所以必须把坐标 clamp 到当前 extent 内。
+                const auto pickExtent = globalCtx.swapchain.refImageExtent();
+                const int32_t pickX =
+                    std::clamp(static_cast<int32_t>(mousePos.x), 0,
+                               std::max(0, static_cast<int32_t>(pickExtent.width) - 1));
+                const int32_t pickY =
+                    std::clamp(static_cast<int32_t>(mousePos.y), 0,
+                               std::max(0, static_cast<int32_t>(pickExtent.height) - 1));
                 commandBuffer.copyImageToBuffer(
                     resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     pickingFrames[currentFrame].buffer(),
                     std::array<VkBufferImageCopy, 1>{VkBufferImageCopy{
                         .bufferOffset = 0,
                         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                        .imageOffset = {mousePos.x, mousePos.y, 0},
+                        .imageOffset = {pickX, pickY, 0},
                         .imageExtent = {1, 1, 1}}});
 
                 //diff: [test_indirectdraw_no_pick] end
