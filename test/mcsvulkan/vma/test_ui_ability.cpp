@@ -96,8 +96,8 @@ using mcs::vulkan::match;
 
 using mcs::vulkan::fatal_error;
 
-constexpr uint32_t WIDTH = 800;
-constexpr uint32_t HEIGHT = 600;
+constexpr uint32_t WIDTH = 1280;
+constexpr uint32_t HEIGHT = 800;
 constexpr auto TITLE = "test_my_triangle";
 
 static constexpr auto MAX_FRAMES_IN_FLIGHT = 2;
@@ -514,18 +514,131 @@ struct mesh_data
 struct PushData
 {
     // 字段顺序必须与 test_dod19.vert 的 PushConsts 完全一致
-    // （GLSL: vertex/data/commandConstants/cameraIndex，Glyph 不需要 attributeAddress）
+    // （GLSL: vertex/data/commandConstants/geomEntry，Glyph 不需要 attributeAddress）
     uint64_t vertexAddress;           // 全局顶点缓冲区地址
     uint64_t instanceAddress;         // 全局实例堆地址（shader: dataAddress）
     uint64_t commandConstantsAddress; // 命令常量缓冲区地址
-    uint32_t cameraIndex;             // 0: 3D, 1: UI
-    uint32_t renderVersion = 0;       // 渲染的版本。picking跨帧需要版本来过滤就版本
+    uint32_t
+        geomEntry; // 几何入口 id（专用字段，不再借用相机索引）：0=普通 1=描边批处理 2=填充扇形批处理
+    uint32_t renderVersion = 0; // 渲染的版本。picking跨帧需要版本来过滤就版本
+    // 一条 UI 命令的全部参数（与 test_ui_ability.frag 的 push_constant 严格一致）
+    glm::vec4 uiRect{};   // xy = 命令矩形左上角（像素），zw = 宽高（像素）
+    glm::vec4 uiColor{};  // 主色
+    glm::vec4 uiColor2{}; // 次色（渐变终点 / 阴影色 / 底色）
+    glm::vec4 uiParams{}; // x = mode，yzw = 模式参数
+    glm::vec4 uiAux{};    // 追加参数（线端点 / 偏移 / 角度 / 图集 UV）
+    // 拾取：x=object_type(命令 id) y=entity_index z=(version<<16)|primitive w=hover_fn
+    // NOTE: 加上这一组正好 128 字节 = VkPhysicalDeviceLimits::maxPushConstantsSize 的保证下限
+    glm::uvec4 uiPick{};
+
     bool operator==(const PushData &o) const noexcept = default;
     constexpr bool valid() const noexcept
     {
         return vertexAddress != 0 && instanceAddress != 0 && commandConstantsAddress != 0;
     }
 };
+
+// ═══════════════════════════════════════════════════════════════════════
+// 离屏层（offscreen render target）
+//
+//   blur / backdrop blur / group opacity 的真实做法：先把内容画到离屏图像上，
+//   再模糊 / 按组不透明度合成回主通道。这里的离屏图像同时具备两种身份：
+//     · 渲染目标（COLOR_ATTACHMENT）
+//     · 可被 bindless 数组采样的纹理（SAMPLED）
+//   每 frame-in-flight 一套，尺寸固定成图块大小（比全屏省得多）。
+// ═══════════════════════════════════════════════════════════════════════
+struct ui_layer_ctx
+{
+    static constexpr uint32_t kPerFrame = 4; // A=模糊结果 B=糊的临时 C=组 D=背景
+    static constexpr VkExtent2D kExtent{320, 192};
+    struct layer
+    {
+        VkImage image{};
+        VkImageView view{};
+        uint32_t texture{};
+        uint32_t sampler{};
+    };
+    std::array<std::array<layer, kPerFrame>, MAX_FRAMES_IN_FLIGHT> layers{};
+};
+ui_layer_ctx &uiLayers()
+{
+    static ui_layer_ctx ctx;
+    return ctx;
+}
+
+// 建离屏层：用 create_texture 建（能生成视图、能进 bindless 数组），
+// 初始内容是一张全透明图，之后每帧都会被 clear，所以内容无所谓。
+constexpr auto initUiLayers(const LogicalDevice &device, const CommandPool &pool,
+                            const Queue &queue, VkFormat format, uint32_t sampler_index,
+                            auto &textureManager, auto &descriptorSetManager)
+{
+    auto &ctx = uiLayers();
+
+    std::vector<uint8_t> zeros(static_cast<std::size_t>(ui_layer_ctx::kExtent.width) *
+                                   ui_layer_ctx::kExtent.height * 4u,
+                               0u);
+
+    for (uint32_t frame = 0; frame < MAX_FRAMES_IN_FLIGHT; ++frame)
+        for (uint32_t slot = 0; slot < ui_layer_ctx::kPerFrame; ++slot)
+        {
+            uint32_t texture_index = 0;
+            for (auto i : textureManager.view_free_indexes())
+            {
+                texture_index = static_cast<uint32_t>(i);
+                break;
+            }
+
+            mcs::vulkan::memory::create_texture builder{
+                [format](mcs::vulkan::memory::create_texture::image_info imageInfo)
+                    -> mcs::vulkan::memory::create_texture::create_info {
+                    return {.imageType = VK_IMAGE_TYPE_2D,
+                            .format = format,
+                            .extent = {.width = imageInfo.extent.width,
+                                       .height = imageInfo.extent.height,
+                                       .depth = 1},
+                            .mipLevels = 1,
+                            .arrayLayers = 1,
+                            .samples = VK_SAMPLE_COUNT_1_BIT,
+                            .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                     VK_IMAGE_USAGE_SAMPLED_BIT |
+                                     VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+                },
+                mcs::vulkan::memory::gen_memory_allocate_info(
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+                [](VkImageCreateInfo imageCreateInfo, VkImage image)
+                    -> mcs::vulkan::memory::create_texture::view_create_info {
+                    return {.image = image,
+                            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                            .format = imageCreateInfo.format,
+                            .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                                 .baseMipLevel = 0,
+                                                 .levelCount = 1,
+                                                 .baseArrayLayer = 0,
+                                                 .layerCount = 1}};
+                }};
+
+            auto resource = builder.build(
+                device, pool, queue,
+                mcs::vulkan::memory::create_texture::image_info{
+                    .extent = ui_layer_ctx::kExtent,
+                    .pixels = std::span<const uint8_t>{zeros.data(), zeros.size()},
+                    .mipLevels = 1});
+
+            ctx.layers[frame][slot] = ui_layer_ctx::layer{.image = resource.image(),
+                                                          .view = resource.imageView(),
+                                                          .texture = texture_index,
+                                                          .sampler = sampler_index};
+
+            textureManager.use_slot(texture_index, std::move(resource), "ui.layer");
+        }
+
+    descriptorSetManager.update_texture(textureManager.view_used_indexes());
+}
+
 constexpr auto inputInit(float aspect)
 {
     auto camera = [&]() {
@@ -690,13 +803,13 @@ namespace shader_data
             hover_fns.push_back(std::move(fn));
             return hover_fns.size() - 1;
         }
-        // 按实体下标调用（0xFFFFFFFF = 未绑定；已释放 = 不调用）
+        // 按实体下标调用（0xFFFFFFFF = 未绑定；越界/已释放 = 不调用）
         void call(uint32_t entity, const picking_result &r, bool enter,
                   InputCtx &inputCtx, ui_new::ScreenWidget *screen) noexcept
         {
-            if (entity == ~0U)
+            // 拾取未命中时会返回 type=0/entity=0 的结果，这里必须是保护而不是断言
+            if (entity == ~0U || entity >= hover_fns.size())
                 return;
-            assert(entity < hover_fns.size());
             hover_fns[entity](r, enter, inputCtx, screen);
         }
     };
@@ -721,10 +834,14 @@ namespace shader_data
             static_assert(0xFFFFFFFF == uint32_t{~0U});
             if (cur.key == r.key)
                 return; // 同一外键：无动作
-            if (cur.key.object_type != 0xFFFFFFFF && cur.hover_fn != ~0U)
+            // 0 和 0xFFFFFFFF 都表示"没命中"（拾取 miss 时 object_type = 0）
+            const auto hasObject = [](uint32_t t) noexcept {
+                return t != 0U && t != ~0U;
+            };
+            if (hasObject(cur.key.object_type) && cur.hover_fn != ~0U)
                 pool.call(cur.hover_fn, cur, hover_leave, inputCtx, screen);
             cur = r;
-            if (r.key.object_type != 0xFFFFFFFF && r.hover_fn != ~0U)
+            if (hasObject(r.key.object_type) && r.hover_fn != ~0U)
                 pool.call(r.hover_fn, r, hover_enter, inputCtx, screen);
         }
     };
@@ -1527,7 +1644,9 @@ constexpr auto init()
                      .shaderInt64 = VK_TRUE,
 
                  }},
-            {.synchronization2 = VK_TRUE, .dynamicRendering = VK_TRUE},
+            {.shaderDemoteToHelperInvocation = VK_TRUE,
+             .synchronization2 = VK_TRUE,
+             .dynamicRendering = VK_TRUE},
             {
                 .descriptorIndexing = VK_TRUE,
                 .shaderSampledImageArrayNonUniformIndexing = VK_TRUE,
@@ -1638,7 +1757,8 @@ constexpr auto init()
                                               .colorSpace =
                                                   VK_COLOR_SPACE_SRGB_NONLINEAR_KHR}},
                  .imageArrayLayers = 1,
-                 .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                 .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                  .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
                  .queueFamilyIndices = {},
                  .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
@@ -1658,6 +1778,7 @@ constexpr auto init()
                                       .baseArrayLayer = 0,
                                       .layerCount = 1}});
     auto swapchain = swapchainBuild.build(*device.get(), *surface.get());
+
     frame_context<MAX_FRAMES_IN_FLIGHT> frameContext{*device.get(),
                                                      swapchain.imagesSize()};
     // hardware
@@ -1675,6 +1796,8 @@ constexpr auto init()
 using mcs::vulkan::tool::resource_manager;
 
 constexpr static auto font_linear_sampler_key = "font_linear_sampler";
+// UI 纹理用：线性过滤 + clamp + 完整 mip 链（九宫格不能 repeat，否则边缘会串色）
+constexpr static auto ui_clamp_sampler_key = "ui_clamp_linear_sampler";
 constexpr static auto font_nearest_neighbor_sampler_key = "font_nearest_neighbor_sampler";
 constexpr static auto texture_ui_key = "white";
 constexpr auto descriptorInit(auto &hardwareCtx)
@@ -1686,7 +1809,7 @@ constexpr auto descriptorInit(auto &hardwareCtx)
     auto &commandPool = *hardwareCtx.commandPool.get();
 
     constexpr int MAX_TEXTURES = 64; // 预分配最大纹理槽位数（足够大）
-    constexpr int SAMPLER_COUNT = 4; // 创建2个不同的采样器
+    constexpr int SAMPLER_COUNT = 5; // 4 个原有 + 1 个 UI 用的 clamp 线性采样器
 
     std::array<VkDescriptorBindingFlags, 4> bindingFlags = {
         // 绑定0：Uniform Buffer - 通常不需要绑定后更新
@@ -1730,7 +1853,9 @@ constexpr auto descriptorInit(auto &hardwareCtx)
                              .binding = 3,
                              .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                              .descriptorCount = 1,
-                             .stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+                             // 顶点阶段读段数据、片元阶段读端点
+                             .stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
+                                           VK_SHADER_STAGE_FRAGMENT_BIT,
                          }, //diff: [test_indirectdraw] end
                      }})
             .build(device));
@@ -1927,6 +2052,29 @@ constexpr auto descriptorInit(auto &hardwareCtx)
                                 .unnormalizedCoordinates = VK_FALSE})
                 .build(device));
         upload_keys.emplace_back(font_nearest_neighbor_sampler_key);
+
+        // UI 专用：线性 + CLAMP_TO_EDGE + mipmap 线性（九宫格 / alpha mask / mipmap）
+        samplers.emplace_back(
+            create_sampler{}
+                .setCreateInfo({.pNext = {},
+                                .flags = {},
+                                .magFilter = VK_FILTER_LINEAR,
+                                .minFilter = VK_FILTER_LINEAR,
+                                .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+                                .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                .mipLodBias = 0,
+                                .anisotropyEnable = VK_FALSE,
+                                .maxAnisotropy = 1.0F,
+                                .compareEnable = VK_FALSE,
+                                .compareOp = VK_COMPARE_OP_ALWAYS,
+                                .minLod = 0,
+                                .maxLod = VK_LOD_CLAMP_NONE,
+                                .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+                                .unnormalizedCoordinates = VK_FALSE})
+                .build(device));
+        upload_keys.emplace_back(ui_clamp_sampler_key);
 
         for (auto [resource, index, key] :
              std::views::zip(samplers, samplerManager.view_free_indexes(), upload_keys))
@@ -2216,6 +2364,279 @@ using FontCtx =
     decltype(initFont(std::declval<HardwareCtx &>(), std::declval<DescriptorCtx &>()));
 using FontSelect = std::remove_cvref_t<decltype(std::declval<FontCtx>().fontSelect)>;
 
+// ═══════════════════════════════════════════════════════════════════════
+// 真实纹理：九宫格 / alpha mask / mipmap
+//
+//   和前两轮的“程序化近似”不同，这里真的建了纹理：
+//     · 真的像素数据（3x3 九宫格图、径向 alpha 遮罩、高频棋盘）
+//     · 真的 mip 链（create_texture 会用 vkCmdBlitImage 逐级生成）
+//     · 真的注册进 bindless 数组 + 更新描述符
+//   着色器只负责 UV 分区 / 采样 / textureLod。
+// ═══════════════════════════════════════════════════════════════════════
+// 特殊管线池：混合模式与模板裁剪都要真的换 VkPipeline
+//   0=UI(over) 1=add 2=multiply 3=erase 4=maskA 5=maskB 6=clipped
+struct ui_pipeline_ctx
+{
+    // 存 Pipeline（RAII 对象）而不是裸 VkPipeline：临时对象析构会销毁管线
+    std::array<std::optional<mcs::vulkan::Pipeline>, 9> pipes{};
+    // 必须在 device 销毁前显式清理：函数内 static 的析构晚于 device，
+    // 否则退出时会报 N 条 "VkPipeline ... has not been destroyed"
+    void reset() noexcept
+    {
+        for (auto &p : pipes)
+            p.reset();
+    }
+};
+// ═══════════════════════════════════════════════════════════════════════
+// 文本 Unicode：一行 = HarfBuzz shape 出来的字形序列（视觉顺序）
+//   drawFrame 是无捕获 lambda，数据只能走文件作用域静态
+// ═══════════════════════════════════════════════════════════════════════
+struct text_glyph
+{
+    glm::vec4 uv;    // uv_bounds
+    glm::vec4 plane; // plane_bounds（1em 归一化）
+    float advance{0.0F};
+    uint32_t tex{0};
+    uint32_t samp{0};
+    uint32_t fontType{0}; // 0=MSDF/SDF（median3），1=bitmap（直接采 RGBA）
+};
+struct text_line
+{
+    std::vector<text_glyph> glyphs;
+    float width{0.0F}; // 1em 单位
+};
+inline std::unordered_map<char32_t, text_glyph> &uiAsciiGlyphs() noexcept
+{
+    static std::unordered_map<char32_t, text_glyph> glyphs;
+    return glyphs;
+}
+
+inline std::array<text_line, 4> &uiUnicodeLines() noexcept
+{
+    static std::array<text_line, 4> lines;
+    return lines;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// path 输入接口：PathId + 注册表
+//   消费者（even-odd 填充 / path 描边）只拿 PathId，不再内联构造轮廓；
+//   注册表每帧 reset()，PathId 在同一帧内稳定。
+// ═══════════════════════════════════════════════════════════════════════
+namespace ui_path
+{
+    struct contour
+    {
+        std::vector<glm::vec2> pts; // 已展平（像素坐标）
+        bool closed{true};
+    };
+    using path = std::vector<contour>;
+
+    struct registry
+    {
+        std::vector<path> paths;
+        uint32_t generation{0}; // 每次 reset 自增：PathId 只在同一代内有效
+        void reset() noexcept
+        {
+            paths.clear();
+            ++generation;
+        }
+        uint32_t add(path p)
+        {
+            paths.push_back(std::move(p));
+            return static_cast<uint32_t>(paths.size() - 1);
+        }
+        [[nodiscard]] bool valid(uint32_t id) const noexcept
+        {
+            return id < paths.size(); // bounds check：坏命令不能越界
+        }
+        [[nodiscard]] const path &get(uint32_t id) const
+        {
+            static const path empty; // 越界兜底，返回空 path 而不是 UB
+            return valid(id) ? paths[id] : empty;
+        }
+        [[nodiscard]] static constexpr uint32_t invalid() noexcept
+        {
+            return 0xFFFFFFFFu;
+        }
+    };
+    inline registry &get() noexcept
+    {
+        static registry r;
+        return r;
+    }
+} // namespace ui_path
+
+// 几何路径用的顶点缓冲（CPU 侧 tessellation 结果）
+ui_pipeline_ctx &uiPipelines()
+{
+    static ui_pipeline_ctx ctx;
+    return ctx;
+}
+
+struct ui_texture_ctx
+{
+    uint32_t nineSlice{};
+    uint32_t alphaMask{};
+    uint32_t checker{};
+    uint32_t sampler{};
+    VkExtent2D nineSliceExtent{};
+    VkExtent2D alphaMaskExtent{};
+};
+ui_texture_ctx &uiTextures()
+{
+    static ui_texture_ctx ctx;
+    return ctx;
+}
+
+constexpr auto initUiTextures(const LogicalDevice &device, const CommandPool &pool,
+                              const Queue &queue, uint32_t sampler_index,
+                              auto &textureManager, auto &descriptorSetManager)
+{
+    auto &ctx = uiTextures();
+    ctx.sampler = sampler_index;
+
+    // 通用的“像素 → 纹理”构造：RGBA8、可采样、可生成 mip
+    auto create_ui_texture = [&](VkExtent2D extent, uint32_t mipLevels,
+                                 const std::vector<uint8_t> &pixels) -> uint32_t {
+        mcs::vulkan::memory::create_texture builder{
+            [](mcs::vulkan::memory::create_texture::image_info imageInfo)
+                -> mcs::vulkan::memory::create_texture::create_info {
+                return {.imageType = VK_IMAGE_TYPE_2D,
+                        .format = VK_FORMAT_R8G8B8A8_UNORM,
+                        .extent = {.width = imageInfo.extent.width,
+                                   .height = imageInfo.extent.height,
+                                   .depth = 1},
+                        .mipLevels = imageInfo.mipLevels,
+                        .arrayLayers = 1,
+                        .samples = VK_SAMPLE_COUNT_1_BIT,
+                        .tiling = VK_IMAGE_TILING_OPTIMAL,
+                        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                 VK_IMAGE_USAGE_SAMPLED_BIT,
+                        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+            },
+            mcs::vulkan::memory::gen_memory_allocate_info(
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+            [](VkImageCreateInfo imageCreateInfo,
+               VkImage image) -> mcs::vulkan::memory::create_texture::view_create_info {
+                return {.image = image,
+                        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                        .format = imageCreateInfo.format,
+                        .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                             .baseMipLevel = 0,
+                                             .levelCount = imageCreateInfo.mipLevels,
+                                             .baseArrayLayer = 0,
+                                             .layerCount = 1}};
+            }};
+
+        auto resource = builder.build(
+            device, pool, queue,
+            mcs::vulkan::memory::create_texture::image_info{
+                .extent = extent,
+                .pixels = std::span<const uint8_t>{pixels.data(), pixels.size()},
+                .mipLevels = mipLevels});
+
+        uint32_t texture_index = 0;
+        for (auto i : textureManager.view_free_indexes())
+        {
+            texture_index = static_cast<uint32_t>(i);
+            break;
+        }
+        textureManager.use_slot(texture_index, std::move(resource), "ui.texture");
+        return texture_index;
+    };
+
+    // ── 1. 九宫格源图：96x96，3x3 分区 + 6px 边框 + 1px 分区线 ──────────
+    {
+        constexpr uint32_t S = 96;
+        constexpr uint32_t CELL = S / 3;
+        constexpr uint32_t BORDER = 6;
+        static const uint8_t palette[9][3] = {
+            {230, 60, 60},  {60, 200, 80},   {60, 110, 230},
+            {230, 200, 60}, {240, 240, 240}, {60, 210, 210},
+            {200, 80, 210}, {240, 140, 60},  {140, 140, 140}};
+        std::vector<uint8_t> px(static_cast<std::size_t>(S) * S * 4u);
+        for (uint32_t y = 0; y < S; ++y)
+            for (uint32_t x = 0; x < S; ++x)
+            {
+                const uint32_t cell = (y / CELL) * 3u + (x / CELL);
+                uint8_t r = palette[cell][0];
+                uint8_t g = palette[cell][1];
+                uint8_t b = palette[cell][2];
+                // 外框 + 分区线：这两类像素在拉伸时必须保持原宽度
+                const bool frame =
+                    x < BORDER || y < BORDER || x + BORDER >= S || y + BORDER >= S;
+                const bool line = (x % CELL) < 1u || (y % CELL) < 1u;
+                if (frame)
+                {
+                    r = static_cast<uint8_t>(r / 3);
+                    g = static_cast<uint8_t>(g / 3);
+                    b = static_cast<uint8_t>(b / 3);
+                }
+                else if (line)
+                {
+                    r = static_cast<uint8_t>(r / 2 + 60);
+                    g = static_cast<uint8_t>(g / 2 + 60);
+                    b = static_cast<uint8_t>(b / 2 + 60);
+                }
+                const std::size_t o = (static_cast<std::size_t>(y) * S + x) * 4u;
+                px[o + 0] = r;
+                px[o + 1] = g;
+                px[o + 2] = b;
+                px[o + 3] = 255;
+            }
+        ctx.nineSliceExtent = {S, S};
+        ctx.nineSlice = create_ui_texture({S, S}, 1, px);
+    }
+
+    // ── 2. alpha 遮罩：128x128，径向渐变 + 一圈环 ──────────────────────
+    {
+        constexpr uint32_t S = 128;
+        std::vector<uint8_t> px(static_cast<std::size_t>(S) * S * 4u);
+        for (uint32_t y = 0; y < S; ++y)
+            for (uint32_t x = 0; x < S; ++x)
+            {
+                const float fx = (static_cast<float>(x) + 0.5F) / S * 2.0F - 1.0F;
+                const float fy = (static_cast<float>(y) + 0.5F) / S * 2.0F - 1.0F;
+                const float r = std::sqrt(fx * fx + fy * fy);
+                const float disc = glm::clamp((0.85F - r) / 0.12F, 0.0F, 1.0F);
+                const float ring =
+                    glm::clamp(1.0F - std::abs(r - 0.62F) / 0.05F, 0.0F, 1.0F);
+                const float a = std::max(disc, ring * 0.9F);
+                const std::size_t o = (static_cast<std::size_t>(y) * S + x) * 4u;
+                px[o + 0] = 255;
+                px[o + 1] = 255;
+                px[o + 2] = 255;
+                px[o + 3] = static_cast<uint8_t>(a * 255.0F);
+            }
+        ctx.alphaMaskExtent = {S, S};
+        ctx.alphaMask = create_ui_texture({S, S}, 1, px);
+    }
+
+    // ── 3. 棋盘：256x256、8px 格，带完整 mip 链（8 级）─────────────────
+    {
+        constexpr uint32_t S = 256;
+        constexpr uint32_t CELL = 8;
+        constexpr uint32_t MIPS = 8; // 256 -> 1
+        std::vector<uint8_t> px(static_cast<std::size_t>(S) * S * 4u);
+        for (uint32_t y = 0; y < S; ++y)
+            for (uint32_t x = 0; x < S; ++x)
+            {
+                const bool on = ((x / CELL) + (y / CELL)) % 2u == 0u;
+                const uint8_t v = on ? 235 : 40;
+                const std::size_t o = (static_cast<std::size_t>(y) * S + x) * 4u;
+                px[o + 0] = v;
+                px[o + 1] = v;
+                px[o + 2] = v;
+                px[o + 3] = 255;
+            }
+        ctx.checker = create_ui_texture({S, S}, MIPS, px);
+    }
+
+    descriptorSetManager.update_texture(textureManager.view_used_indexes());
+}
+
 struct mesh_manager
 {
     std::vector<Vertex> allVertices;
@@ -2298,9 +2719,9 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
         {.imageType = VK_IMAGE_TYPE_2D,
          .format = mcs::vulkan::memory::create_resources::findSupportedFormat(
              physical_device,
-             std::array<VkFormat, 3>{VkFormat::VK_FORMAT_D32_SFLOAT,
-                                     VkFormat::VK_FORMAT_D32_SFLOAT_S8_UINT,
-                                     VkFormat::VK_FORMAT_D24_UNORM_S8_UINT},
+             std::array<VkFormat, 3>{VkFormat::VK_FORMAT_D32_SFLOAT_S8_UINT,
+                                     VkFormat::VK_FORMAT_D24_UNORM_S8_UINT,
+                                     VkFormat::VK_FORMAT_D32_SFLOAT},
              VkImageTiling::VK_IMAGE_TILING_OPTIMAL,
              VkFormatFeatureFlagBits::VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT),
          .extent = {.width = swapchain.refImageExtent().width,
@@ -2316,10 +2737,18 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
         [](VkImageCreateInfo imageCreateInfo, VkImage image) noexcept
             -> mcs::vulkan::memory::create_image::view_create_info {
+            // 纯深度格式没有模板分量，aspectMask 只能是 DEPTH
+            const bool stencil = imageCreateInfo.format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+                                 imageCreateInfo.format == VK_FORMAT_D24_UNORM_S8_UINT ||
+                                 imageCreateInfo.format == VK_FORMAT_D16_UNORM_S8_UINT ||
+                                 imageCreateInfo.format == VK_FORMAT_S8_UINT;
             return {.image = image,
                     .viewType = VK_IMAGE_VIEW_TYPE_2D,
                     .format = imageCreateInfo.format,
-                    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+                    .subresourceRange = {.aspectMask = static_cast<VkImageAspectFlags>(
+                                             stencil ? (VK_IMAGE_ASPECT_DEPTH_BIT |
+                                                        VK_IMAGE_ASPECT_STENCIL_BIT)
+                                                     : VK_IMAGE_ASPECT_DEPTH_BIT),
                                          .baseMipLevel = 0,
                                          .levelCount = 1,
                                          .baseArrayLayer = 0,
@@ -2482,7 +2911,12 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
                           static_cast<uint32_t>(mainColorFormats.size()),
                       .pColorAttachmentFormats = mainColorFormats.data(),
                       //diff: [test_indirectdraw_no_pick] end
-                      .depthAttachmentFormat = depthFormat_ref}}),
+                      .depthAttachmentFormat = depthFormat_ref,
+                      // 深度格式带模板分量时，管线必须同时声明 stencil 格式，
+                      // 否则 VkRenderingInfo::pStencilAttachment 会触发 VUID-08917
+                      .stencilAttachmentFormat = depthResourcesBuild.hasStencilComponent()
+                                                     ? depthFormat_ref
+                                                     : VK_FORMAT_UNDEFINED}}),
                  .stages = create_graphics_pipeline::makeStages(
                      stage_info{.stage = VK_SHADER_STAGE_VERTEX_BIT,
                                 .filePath = VERT_SHADER_PATH,
@@ -2568,6 +3002,195 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
                  .layout = *pipelineLayout})
             .build(device);
     };
+    // 离屏层管线：只有一张颜色附件（离屏图像），无深度/无拾取
+    auto makeLayerPipeline = [&]() {
+        std::array<VkFormat, 1> layerColorFormats = {swapchainBuild.refImageFormat()};
+        return create_graphics_pipeline{}
+            .setCreateInfo(
+                {.pNext = make_pNext(structure_chain<VkPipelineRenderingCreateInfo>{
+                     {.colorAttachmentCount = 1,
+                      .pColorAttachmentFormats = layerColorFormats.data(),
+                      .depthAttachmentFormat = VK_FORMAT_UNDEFINED,
+                      .stencilAttachmentFormat = VK_FORMAT_UNDEFINED}}),
+                 .stages = create_graphics_pipeline::makeStages(
+                     stage_info{.stage = VK_SHADER_STAGE_VERTEX_BIT,
+                                .filePath = VERT_SHADER_PATH,
+                                .pName = "main"},
+                     stage_info{.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                                .filePath = FRAG_SHADER_PATH,
+                                .pName = "main"}),
+                 .vertexInputState = {},
+                 .inputAssemblyState = {.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                                        .primitiveRestartEnable = VK_FALSE},
+                 .tessellationState = {},
+                 .viewportState = {.viewports = {VkViewport{}}, .scissors = {VkRect2D{}}},
+                 .rasterizationState = {.depthClampEnable = VK_FALSE,
+                                        .rasterizerDiscardEnable = VK_FALSE,
+                                        .polygonMode = VK_POLYGON_MODE_FILL,
+                                        .cullMode = VK_CULL_MODE_NONE,
+                                        .frontFace = VK_FRONT_FACE_CLOCKWISE,
+                                        .depthBiasEnable = VK_FALSE,
+                                        .lineWidth = 1.0F},
+                 .multisampleState = {.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+                                      .sampleShadingEnable = VK_FALSE,
+                                      .minSampleShading = 1.0F,
+                                      .sampleMask = {},
+                                      .alphaToCoverageEnable = VK_FALSE,
+                                      .alphaToOneEnable = VK_FALSE},
+                 .depthStencilState = {.depthTestEnable = VK_FALSE,
+                                       .depthWriteEnable = VK_FALSE,
+                                       .depthCompareOp = VK_COMPARE_OP_ALWAYS,
+                                       .depthBoundsTestEnable = VK_FALSE,
+                                       .stencilTestEnable = VK_FALSE,
+                                       .front = {},
+                                       .back = {},
+                                       .minDepthBounds = 0.0F,
+                                       .maxDepthBounds = 1.0F},
+                 .colorBlendState =
+                     {.logicOpEnable = VK_FALSE,
+                      .logicOp = VkLogicOp::VK_LOGIC_OP_COPY,
+                      .attachments =
+                          {{.blendEnable = VK_TRUE,
+                            .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+                            .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                            .colorBlendOp = VK_BLEND_OP_ADD,
+                            .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+                            .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                            .alphaBlendOp = VK_BLEND_OP_ADD,
+                            .colorWriteMask =
+                                VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT}}},
+                 .dynamicState = {.dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT,
+                                                    VK_DYNAMIC_STATE_SCISSOR}},
+                 .layout = *pipelineLayout})
+            .build(device);
+    };
+    auto pipelineUILayer = makeLayerPipeline();
+
+    // 通用管线工厂：混合 / 模板 / 颜色写掩码 都可配
+    auto makePipelineEx = [&](VkPipelineColorBlendAttachmentState blendAttachment,
+                              VkBool32 stencilEnable, VkStencilOpState stencilOp,
+                              VkColorComponentFlags colorWrite,
+                              const char *vsEntry = "main") {
+        const VkPipelineColorBlendAttachmentState pickAttachmentState{
+            .blendEnable = VK_FALSE,
+            .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT};
+        return create_graphics_pipeline{}
+            .setCreateInfo(
+                {.pNext = make_pNext(structure_chain<VkPipelineRenderingCreateInfo>{
+                     {.colorAttachmentCount =
+                          static_cast<uint32_t>(mainColorFormats.size()),
+                      .pColorAttachmentFormats = mainColorFormats.data(),
+                      .depthAttachmentFormat = depthFormat_ref,
+                      .stencilAttachmentFormat = depthResourcesBuild.hasStencilComponent()
+                                                     ? depthFormat_ref
+                                                     : VK_FORMAT_UNDEFINED}}),
+                 .stages = create_graphics_pipeline::makeStages(
+                     stage_info{.stage = VK_SHADER_STAGE_VERTEX_BIT,
+                                .filePath = VERT_SHADER_PATH,
+                                .pName = vsEntry},
+                     stage_info{.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                                .filePath = FRAG_SHADER_PATH,
+                                .pName = "main"}),
+                 .vertexInputState = {},
+                 .inputAssemblyState = {.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                                        .primitiveRestartEnable = VK_FALSE},
+                 .tessellationState = {},
+                 .viewportState = {.viewports = {VkViewport{}}, .scissors = {VkRect2D{}}},
+                 .rasterizationState = {.depthClampEnable = VK_FALSE,
+                                        .rasterizerDiscardEnable = VK_FALSE,
+                                        .polygonMode = VK_POLYGON_MODE_FILL,
+                                        .cullMode = VK_CULL_MODE_NONE,
+                                        .frontFace = VK_FRONT_FACE_CLOCKWISE,
+                                        .depthBiasEnable = VK_FALSE,
+                                        .lineWidth = 1.0F},
+                 .multisampleState = {.rasterizationSamples =
+                                          physical_device.getMaxUsableSampleCount(),
+                                      .sampleShadingEnable = VK_FALSE,
+                                      .minSampleShading = 1.0F,
+                                      .sampleMask = {},
+                                      .alphaToCoverageEnable = VK_FALSE,
+                                      .alphaToOneEnable = VK_FALSE},
+                 .depthStencilState = {.depthTestEnable = VK_FALSE,
+                                       .depthWriteEnable = VK_FALSE,
+                                       .depthCompareOp = VK_COMPARE_OP_ALWAYS,
+                                       .depthBoundsTestEnable = VK_FALSE,
+                                       .stencilTestEnable = stencilEnable,
+                                       .front = stencilOp,
+                                       .back = stencilOp,
+                                       .minDepthBounds = 0.0F,
+                                       .maxDepthBounds = 1.0F},
+                 .colorBlendState = {.logicOpEnable = VK_FALSE,
+                                     .logicOp = VkLogicOp::VK_LOGIC_OP_COPY,
+                                     .attachments = {blendAttachment,
+                                                     pickAttachmentState}},
+                 .dynamicState = {.dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT,
+                                                    VK_DYNAMIC_STATE_SCISSOR,
+                                                    VK_DYNAMIC_STATE_STENCIL_REFERENCE}},
+                 .layout = *pipelineLayout})
+            .build(device);
+    };
+
+    const auto blendOver = VkPipelineColorBlendAttachmentState{
+        .blendEnable = VK_TRUE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .alphaBlendOp = VK_BLEND_OP_ADD,
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT};
+    auto blendWith = [&](VkBlendFactor src, VkBlendFactor dst) {
+        auto a = blendOver;
+        a.srcColorBlendFactor = src;
+        a.dstColorBlendFactor = dst;
+        return a;
+    };
+    const auto noColorWrite =
+        VkPipelineColorBlendAttachmentState{.blendEnable = VK_FALSE, .colorWriteMask = 0};
+    const auto stencilAlwaysIncr =
+        VkStencilOpState{.failOp = VK_STENCIL_OP_KEEP,
+                         .passOp = VK_STENCIL_OP_INCREMENT_AND_CLAMP,
+                         .depthFailOp = VK_STENCIL_OP_KEEP,
+                         .compareOp = VK_COMPARE_OP_ALWAYS,
+                         .compareMask = 0xFF,
+                         .writeMask = 0xFF,
+                         .reference = 0};
+    auto stencilEqualIncr = stencilAlwaysIncr;
+    stencilEqualIncr.compareOp = VK_COMPARE_OP_EQUAL;
+    auto stencilEqualKeep = stencilAlwaysIncr;
+    stencilEqualKeep.compareOp = VK_COMPARE_OP_EQUAL;
+    stencilEqualKeep.passOp = VK_STENCIL_OP_KEEP;
+    stencilEqualKeep.writeMask = 0x00;
+
+    uiPipelines().pipes[1] =
+        makePipelineEx(blendWith(VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE), VK_FALSE,
+                       stencilAlwaysIncr, 0);
+    uiPipelines().pipes[2] =
+        makePipelineEx(blendWith(VK_BLEND_FACTOR_DST_COLOR, VK_BLEND_FACTOR_ZERO),
+                       VK_FALSE, stencilAlwaysIncr, 0);
+    uiPipelines().pipes[3] = makePipelineEx(
+        blendWith(VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA), VK_FALSE,
+        stencilAlwaysIncr, 0);
+    uiPipelines().pipes[4] = makePipelineEx(noColorWrite, VK_TRUE, stencilAlwaysIncr, 0);
+    uiPipelines().pipes[5] = makePipelineEx(noColorWrite, VK_TRUE, stencilEqualIncr, 0);
+    // 几何管线：模板 INVERT（even-odd 奇偶计数）；多边形顶点由推送常量传入
+    {
+        auto stencilInvert = stencilAlwaysIncr;
+        stencilInvert.passOp = VK_STENCIL_OP_INVERT;
+        uiPipelines().pipes[7] = makePipelineEx(noColorWrite, VK_TRUE, stencilInvert, 0);
+        // 8 = 路径描边：写颜色、不测模板（覆盖率由片元解析算）
+        uiPipelines().pipes[8] =
+            makePipelineEx(blendOver, VK_FALSE, stencilAlwaysIncr, 0);
+    }
+
+    uiPipelines().pipes[6] =
+        makePipelineEx(blendOver, VK_TRUE, stencilEqualKeep,
+                       VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
+
     // 创建4个管线
     auto pipelineOpaque3D = makePipeline(VK_TRUE, VK_TRUE, VK_FALSE);
     auto pipelineTransparent3D = makePipeline(VK_TRUE, VK_FALSE, VK_TRUE);
@@ -2575,12 +3198,12 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
     auto pipelineTransparentUI = makePipeline(VK_FALSE, VK_FALSE, VK_TRUE);
     return make_aggregate<"mainPipelineCtx", "pipelineLayout", "pipelineOpaque3D",
                           "pipelineTransparent3D", "pipelineOpaqueUI",
-                          "pipelineTransparentUI", "swapchainAttachments",
-                          "pickingAttachments">(
+                          "pipelineTransparentUI", "pipelineUILayer",
+                          "swapchainAttachments", "pickingAttachments">(
         std::move(pipelineLayout), std::move(pipelineOpaque3D),
         std::move(pipelineTransparent3D), std::move(pipelineOpaqueUI),
-        std::move(pipelineTransparentUI), std::move(swapchainAttachments),
-        std::move(pickingAttachments));
+        std::move(pipelineTransparentUI), std::move(pipelineUILayer),
+        std::move(swapchainAttachments), std::move(pickingAttachments));
 }
 
 //diff: [test_dod22] start
@@ -9937,11 +10560,115 @@ try
     auto textResult = run_text_pipeline(fontSelect, u8"A", "zh-CN");
     const auto &shapeResult = textResult.shape_result;
     using ShapeResult = std::remove_cvref_t<decltype(shapeResult)>;
+    // ── 文本 Unicode：真实 shape 结果驱动的多语言行 ──────────────────────
+    auto shapeLine = [&](const char *utf8) {
+        text_line line;
+        auto res = run_text_pipeline(fontSelect, utf8, "zh-CN");
+        for (const auto &run : res.shape_result)
+        {
+            for (const auto &g : run)
+            {
+                text_glyph tg{};
+                tg.uv = {static_cast<float>(g.uv_bounds.left),
+                         static_cast<float>(g.uv_bounds.top),
+                         static_cast<float>(g.uv_bounds.right),
+                         static_cast<float>(g.uv_bounds.bottom)};
+                tg.plane = {static_cast<float>(g.plane_bounds.left),
+                            static_cast<float>(g.plane_bounds.top),
+                            static_cast<float>(g.plane_bounds.right),
+                            static_cast<float>(g.plane_bounds.bottom)};
+                tg.advance = static_cast<float>(g.advance_x);
+                tg.tex = g.font_ctx->bind.texture_index;
+                tg.samp = g.font_ctx->bind.sampler_index;
+                // FontType 决定着色器走距离场还是位图采样
+                using FT = mcs::vulkan::font::FontType;
+                const FT ftype = g.font_ctx->type;
+                const bool isDistance =
+                    (ftype == FT::eSDF || ftype == FT::ePSDF ||
+                     ftype == FT::eMSDF || ftype == FT::eMTSDF);
+                tg.fontType = isDistance ? 0u : 1u;
+                line.glyphs.push_back(tg);
+                line.width += tg.advance + static_cast<float>(g.offset_x);
+            }
+        }
+        return line;
+    };
+    // ASCII 字形表：一次 shape 全部可打印字符，之后所有标签都走这张表
+    //   配对用 HarfBuzz 的 logical_idx（连字也不会错位）
+    {
+        auto &glyphs = uiAsciiGlyphs();
+        const char *corpus = " !\"#$%&'()*+,-./"
+                             "0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`"
+                             "abcdefghijklmnopqrstuvwxyz{|}~";
+        auto ascii = shapeLine(corpus);
+        for (const auto &g : ascii.glyphs)
+        {
+            (void)g;
+        }
+        std::size_t idx = 0;
+        for (const auto &run :
+             run_text_pipeline(fontSelect, corpus, "zh-CN").shape_result)
+        {
+            for (const auto &g : run)
+            {
+                const std::size_t ci = g.logical_idx;
+                if (ci >= std::strlen(corpus))
+                    continue;
+                text_glyph tg{};
+                tg.uv = {static_cast<float>(g.uv_bounds.left),
+                         static_cast<float>(g.uv_bounds.top),
+                         static_cast<float>(g.uv_bounds.right),
+                         static_cast<float>(g.uv_bounds.bottom)};
+                tg.plane = {static_cast<float>(g.plane_bounds.left),
+                            static_cast<float>(g.plane_bounds.top),
+                            static_cast<float>(g.plane_bounds.right),
+                            static_cast<float>(g.plane_bounds.bottom)};
+                tg.advance = static_cast<float>(g.advance_x);
+                tg.tex = g.font_ctx->bind.texture_index;
+                tg.samp = g.font_ctx->bind.sampler_index;
+                glyphs[static_cast<char32_t>(static_cast<unsigned char>(corpus[ci]))] =
+                    tg;
+                ++idx;
+            }
+        }
+        std::println("[TEXT] ascii glyph table: {} codepoints", glyphs.size());
+    }
+    {
+        auto &lines = uiUnicodeLines();
+        lines[0] = shapeLine("UI ABILITY");
+        lines[1] = shapeLine("你好，世界");
+        lines[2] = shapeLine("مرحبا");
+        lines[3] = shapeLine("😀 OK"); // 😀 在 atlas 里（🙂 不在）
+        for (int i = 0; i < 4; ++i)
+        {
+            const auto &ln = lines[static_cast<std::size_t>(i)];
+            std::println("[TEXT] line {}: {} glyphs tex={}", i, ln.glyphs.size(),
+                         ln.glyphs.empty() ? 0u : ln.glyphs[0].tex);
+        }
+    }
+
+    // 离屏层：blur / backdrop / group 的真实渲染目标（每帧 4 张）
+    initUiLayers(device, commandPool, GRAPHICS_AND_PRESENT,
+                 swapchainBuild.refImageFormat(),
+                 static_cast<uint32_t>(
+                     samplerManager.find_slot_by_name(font_linear_sampler_key).value()),
+                 textureManager, descriptorSetManager);
+
+    // 真实 UI 纹理：九宫格源图 / alpha 遮罩 / 带 mip 链的棋盘
+    initUiTextures(device, commandPool, GRAPHICS_AND_PRESENT,
+                   static_cast<uint32_t>(
+                       samplerManager.find_slot_by_name(ui_clamp_sampler_key).value()),
+                   textureManager, descriptorSetManager);
+
+    // 字体图集是在 run_text_pipeline 里懒加载的（槽位 4 起），
+    // 必须在这之后再把新槽位写进描述符数组，否则着色器采样到的是未绑定的槽位。
+    descriptorSetManager.update_texture(textureManager.view_used_indexes());
+    descriptorSetManager.update_sampler(samplerManager.view_used_indexes());
 
     auto mainPipelineCtx = initPipeline(hardwareCtx, descriptorCtx);
     auto &[pipelineLayout, pipelineOpaque3D, pipelineTransparent3D, pipelineOpaqueUI,
-           pipelineTransparentUI, swapchainAttachments, pickingAttachments] =
-        mainPipelineCtx;
+           pipelineTransparentUI, pipelineUILayer, swapchainAttachments,
+           pickingAttachments] = mainPipelineCtx;
     auto &[depthResourcesBuild, depthResource, msaaResourcesBuild, msaaResource] =
         swapchainAttachments;
     auto &[pickResourcesBuild, pickResource, resolveResourcesBuild, resolveResource,
@@ -9958,21 +10685,50 @@ try
                            "resolveResourcesBuild", "resolveResource", "frames", "mouse">(
             pickResourcesBuild, pickResource, resolveResourcesBuild, resolveResource,
             pickingFrames, pickMouse);
+    // 路径描边段缓冲（批处理）：每段 3 个 vec4（4 角 + 2 端点），走 binding 3
+    shader_data::BufferResource pathSegments{
+        device, 64u * 1024u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VK_SHARING_MODE_EXCLUSIVE,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+    {
+        VkDescriptorBufferInfo bufferInfo{
+            .buffer = pathSegments.buffer.buffer(), .offset = 0, .range = VK_WHOLE_SIZE};
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i)
+        {
+            VkWriteDescriptorSet write{.sType = sType<VkWriteDescriptorSet>(),
+                                       .dstSet = descriptorSets[i],
+                                       .dstBinding = 3,
+                                       .descriptorCount = 1,
+                                       .descriptorType =
+                                           VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                       .pBufferInfo = &bufferInfo};
+            device.updateDescriptorSets(1, &write, 0, nullptr);
+        }
+    }
+
+    // 调试用：把 swapchain 图像整帧拷回 CPU，写成 PPM（验证靠像素，不靠屏幕截图）
+    shader_data::BufferResource frameDump{
+        device,
+        static_cast<VkDeviceSize>(swapchain.refImageExtent().width) *
+            swapchain.refImageExtent().height * 4u,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+
     auto globalCtx =
         make_aggregate_ref<"globalCtx", "device", "window", "surface", "swapchainBuild",
                            "swapchain", "frameContext", "commandPool", "commandBuffers",
-                           "queue", "meshMap">(
+                           "queue", "meshMap", "frameDump", "pathSegments">(
             device, window, surface, swapchainBuild, swapchain, frameContext, commandPool,
-            commandBuffers, GRAPHICS_AND_PRESENT, meshMap);
+            commandBuffers, GRAPHICS_AND_PRESENT, meshMap, frameDump, pathSegments);
 
     auto mainCtx =
         make_aggregate_ref<"mainCtx", "pipelineOpaque3D", "pipelineTransparent3D",
-                           "pipelineOpaqueUI", "pipelineTransparentUI", "pipelineLayout",
-                           "depthResourcesBuild", "depthResource", "msaaResourcesBuild",
-                           "msaaResource">(
+                           "pipelineOpaqueUI", "pipelineTransparentUI", "pipelineUILayer",
+                           "pipelineLayout", "depthResourcesBuild", "depthResource",
+                           "msaaResourcesBuild", "msaaResource">(
             pipelineOpaque3D, pipelineTransparent3D, pipelineOpaqueUI,
-            pipelineTransparentUI, pipelineLayout, depthResourcesBuild, depthResource,
-            msaaResourcesBuild, msaaResource);
+            pipelineTransparentUI, pipelineUILayer, pipelineLayout, depthResourcesBuild,
+            depthResource, msaaResourcesBuild, msaaResource);
 
     auto mainShaderCtx = make_aggregate_ref<"mainShaderCtx", "drawRecorder",
                                             "uniformBuffers", "descriptorSets">(
@@ -10514,33 +11270,103 @@ try
 
     // diff: [test_indirectdraw] end
     // diff: [test_dod5] start
+    // ═══════════════════════════════════════════════════════════════════════
+    // UI 命令层（C 风格）
+    //
+    //   一条 UI 命令 = 一个全屏三角形 + 一组推送常量：
+    //       setScissor    → 这条命令的裁剪
+    //       pushConstants → 这条命令的全部参数（mode/rect/颜色/几何）
+    //       draw(3)       → 全屏三角形，形状由片元着色器按 mode 求 SDF
+    //
+    //   能力全部在 test_ui_ability.frag 的 mode 表里（与下面的枚举一一对应），
+    //   这里只按顺序记录命令，不做批处理、不做间接绘制、没有后端对象。
+    //
+    //   按约定：除 draw 之外，mainPipeline.xxx 全部留空。
+    // ═══════════════════════════════════════════════════════════════════════
+    enum ui_mode : int
+    {
+        MODE_FILL = 0,        // 圆角矩形填充
+        MODE_LINEAR,          // 线性渐变
+        MODE_RADIAL,          // 径向渐变
+        MODE_CONIC,           // 圆锥渐变
+        MODE_ARC,             // 圆弧/环
+        MODE_OUTER_SHADOW,    // 外阴影
+        MODE_INNER_SHADOW,    // 内阴影
+        MODE_PERCORNER,       // 每角半径
+        MODE_ALPHA_MASK,      // alpha 遮罩
+        MODE_PATH_AA,         // 路径解析抗锯齿
+        MODE_DASH,            // 虚线描边
+        MODE_ROTATE,          // 旋转
+        MODE_SKEW,            // 斜切
+        MODE_NINE_SLICE,      // 九宫格
+        MODE_EVENODD,         // 奇偶填充
+        MODE_GLYPH,           // MSDF 字形
+        MODE_SRGB,            // sRGB / 线性渐变
+        MODE_BLUR,            // 模糊
+        MODE_BACKDROP,        // 背景模糊
+        MODE_GROUP,           // 组不透明度
+        MODE_MIPMAP,          // mipmap
+        MODE_PICKING,         // 拾取
+        MODE_BLEND,           // 混合模式
+        MODE_LAYER_BLUR,      // 离屏可分离模糊（y=方向 z=半径 w=源纹理 aux.x=源采样器）
+        MODE_LAYER_COMPOSITE, // 离屏合成（y=不透明度 z=源纹理 w=源采样器 aux.x=圆角）
+        MODE_CHECKER,         // 棋盘背景内容（背景模糊的来源）
+        MODE_NINE_SLICE_TEX,  // 纹理九宫格（y=源边框 z=源纹理 w=源采样器 aux.xy=源尺寸）
+        MODE_ALPHA_MASK_TEX,  // 纹理 alpha 遮罩（z=纹理 w=源采样器）
+        MODE_MIPMAP_TEX,      // 真 mip 采样（y=最大 lod z=纹理 w=源采样器）
+        MODE_CLIP_MASK,       // 模板裁剪遮罩（形状外 discard）
+        MODE_SOLID,           // 纯色覆盖（几何 / 模板覆盖 pass 用）
+        MODE_SOLID_GEOM,      // 几何覆盖（颜色写死）
+        MODE_PATH_STROKE,     // 路径描边：解析覆盖率 AA（y=半宽 z=1 开 AA）
+        MODE_GLYPH_BITMAP,    // 位图字形（emoji）：图集 RGBA，不走距离场
+    };
+
+    // 几何入口标记（PushData.geomEntry 是专用字段）：0 = 普通全屏三角形
+    constexpr uint32_t kGeomStroke = 1u;       // 描边批处理（段数据在 storage buffer）
+    constexpr uint32_t kGeomFan = 2u;          // 填充扇形批处理（顶点在 buffer 高位区）
+    constexpr uint32_t kFanVertexBase = 2048u; // 与 VS 里 kFanBase 一致
+
     static constexpr auto mainPipeline = make_aggregate<"mainPipeline">(
-        method<"transitionImageLayout">([](world_type &world, input_type &inputCtx,
-                                           data_type &soaCtx) {
+        // NOTE: 布局转换 / 开始渲染 / 管线状态 / 结束渲染 都并进 draw 了
+        method<"transitionImageLayout">([](world_type &, input_type &, data_type &) {}),
+        method<"beginRendering">([](world_type &, input_type &, data_type &) {}),
+        method<"setPipelineState">([](world_type &, input_type &, data_type &) {}),
+        method<"draw">([](world_type &world, input_type &inputCtx, data_type &soaCtx) {
             auto &globalCtx = world.globalCtx;
             auto &mainCtx = world.mainCtx;
+            auto &mainShaderCtx = world.mainShaderCtx;
             auto &recordCtx = world.recordCtx;
             auto &pickCtx = world.pickCtx;
 
             auto &swapchain = globalCtx.swapchain;
             auto &commandBuffers = globalCtx.commandBuffers;
 
+            // ↓↓↓ 就是它：一个 VkCommandBuffer，后面全是 vkCmd* 级别的调用 ↓↓↓
             const auto &[currentFrame, imageIndex] = recordCtx.info;
             const auto &commandBuffer = commandBuffers[currentFrame];
 
-            // images
-            auto pickingImage = pickCtx.pickResource.image();
-            auto resolveImage = pickCtx.resolveResource.image();
-            auto &depthResource = mainCtx.depthResource;
-            auto &msaaResource = mainCtx.msaaResource;
+            auto &pipelineLayout = mainCtx.pipelineLayout;
+            auto &descriptorSets = mainShaderCtx.descriptorSets;
+            auto descriptorSet = descriptorSets[currentFrame];
+
+            const VkExtent2D extent = swapchain.refImageExtent();
+            const float W = static_cast<float>(extent.width);
+            const float H = static_cast<float>(extent.height);
 
             VkImage image = swapchain.image(imageIndex);
-            VkImage depthImage = depthResource.image();
+            const VkImage depthImage = mainCtx.depthResource.image();
+            const VkImage msaaImage = mainCtx.msaaResource.image();
+            const VkImage pickingImage = pickCtx.pickResource.image();
+            const VkImage resolveImage = pickCtx.resolveResource.image();
 
-            VkImage msaaImage = msaaResource.image();
+            // 深度附件：只有带模板分量的格式才能声明 STENCIL aspect，
+            // 否则 D32_SFLOAT 这类纯深度格式会触发 VUID-09594 / 09601。
+            const bool hasStencil = mainCtx.depthResourcesBuild.hasStencilComponent();
+            const VkImageAspectFlags depthAspect =
+                hasStencil ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                           : VK_IMAGE_ASPECT_DEPTH_BIT;
 
-            // Before starting rendering,
-            // transition the swapchain image to COLOR_ATTACHMENT_OPTIMAL
+            // ── 1. 布局转换 ─────────────────────────────────────────────
             my_render::transition_image_layout(
                 commandBuffer,
                 my_render::image_info{
@@ -10565,15 +11391,14 @@ try
                                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}},
                 my_render::image_info{
                     .image = depthImage,
-                    .aspect_mask = VK_IMAGE_ASPECT_DEPTH_BIT,
+                    .aspect_mask = depthAspect,
                     .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
                             .access_mask = VK_ACCESS_2_NONE,
                             .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
-                    .dst = {.layout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                    .dst = {.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                             .access_mask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                             .stage_mask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                                           VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT}},
-                //diff: [test_indirectdraw_no_pick] start  转换拾取 MSAA 图像布局
                 my_render::image_info{
                     .image = pickingImage,
                     .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -10589,209 +11414,1476 @@ try
                             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
                     .dst = {VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}}
-                //diff: [test_indirectdraw_no_pick] end
-            );
-        }),
-        method<"beginRendering">([](world_type &world, input_type &inputCtx,
-                                    data_type &soaCtx) {
-            auto &globalCtx = world.globalCtx;
-            auto &mainCtx = world.mainCtx;
-            auto &recordCtx = world.recordCtx;
-            auto &pickCtx = world.pickCtx;
+                            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
 
-            auto &swapchain = globalCtx.swapchain;
-            auto &commandBuffers = globalCtx.commandBuffers;
+            // ── 2. 离屏 pass：blur / group opacity / backdrop blur ────────
+            //   先把内容画到离屏层（320x192），再模糊 / 按组 alpha 合成回主通道。
+            //   层 A=模糊结果 B=模糊临时 C=组 D=背景
+            auto &frameLayers = uiLayers().layers[currentFrame];
+            constexpr VkExtent2D LEXT = ui_layer_ctx::kExtent;
+            const VkViewport layerViewport{.x = 0.0F,
+                                           .y = 0.0F,
+                                           .width = static_cast<float>(LEXT.width),
+                                           .height = static_cast<float>(LEXT.height),
+                                           .minDepth = 0.0F,
+                                           .maxDepth = 1.0F};
+            const VkRect2D layerScissor{{0, 0}, LEXT};
 
-            const auto &[currentFrame, imageIndex] = recordCtx.info;
-            const auto &commandBuffer = commandBuffers[currentFrame];
+            auto layerToColor = [&](VkImage layerImage) {
+                my_render::transition_image_layout(
+                    commandBuffer,
+                    my_render::image_info{
+                        .image = layerImage,
+                        .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                                .access_mask = VK_ACCESS_2_NONE,
+                                .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                        .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                .stage_mask =
+                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
+            };
+            auto layerToSampled = [&](VkImage layerImage) {
+                my_render::transition_image_layout(
+                    commandBuffer,
+                    my_render::image_info{
+                        .image = layerImage,
+                        .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                .stage_mask =
+                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                        .dst = {.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                .access_mask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                                .stage_mask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT}});
+            };
+            auto layerBegin = [&](VkImageView layerView) {
+                VkRenderingAttachmentInfo attachment{
+                    .sType = sType<VkRenderingAttachmentInfo>(),
+                    .imageView = layerView,
+                    .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                    .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                    .clearValue = {.color = {.float32 = {0.0F, 0.0F, 0.0F, 0.0F}}}};
+                commandBuffer.beginRendering(
+                    {.sType = sType<VkRenderingInfo>(),
+                     .renderArea = {.offset = {.x = 0, .y = 0}, .extent = LEXT},
+                     .layerCount = 1,
+                     .colorAttachmentCount = 1,
+                     .pColorAttachments = &attachment,
+                     .pDepthAttachment = nullptr,
+                     .pStencilAttachment = nullptr});
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineUILayer);
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                                 nullptr);
+                commandBuffer.setViewport(0, std::span{&layerViewport, 1});
+            };
+            // 层内一条命令：裁剪固定为整层
+            auto layerCmd = [&](int mode, VkRect2D box, glm::vec4 color, glm::vec4 color2,
+                                glm::vec3 params, glm::vec4 aux) {
+                PushData pc{};
+                pc.geomEntry = 0; // 普通全屏三角形（1/2 是几何入口，不能再用）
+                pc.uiRect = {static_cast<float>(box.offset.x),
+                             static_cast<float>(box.offset.y),
+                             static_cast<float>(box.extent.width),
+                             static_cast<float>(box.extent.height)};
+                pc.uiColor = color;
+                pc.uiColor2 = color2;
+                pc.uiParams = {static_cast<float>(mode), params.x, params.y, params.z};
+                pc.uiAux = aux;
+                pc.uiPick = {0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 0xFFFFFFFFu};
+                commandBuffer.setScissor(0, std::span{&layerScissor, 1});
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(PushData), &pc);
+                commandBuffer.draw(3, 1, 0, 0);
+            };
+            const VkRect2D fullLayer{{0, 0}, LEXT};
 
-            // imageViews
-            auto &depthResource = mainCtx.depthResource;
-            auto &msaaResource = mainCtx.msaaResource;
+            // A：模糊演示的内容（两个圆角块 + 一个圆环）
+            layerToColor(frameLayers[0].image);
+            layerBegin(frameLayers[0].view);
+            layerCmd(MODE_FILL, {{20, 30}, {150, 120}}, {0.95F, 0.55F, 0.25F, 1.0F}, {},
+                     {18.0F, 0.0F, 0.0F}, {});
+            layerCmd(MODE_FILL, {{130, 60}, {150, 110}}, {0.30F, 0.65F, 0.95F, 0.9F}, {},
+                     {24.0F, 0.0F, 0.0F}, {});
+            layerCmd(MODE_ARC, fullLayer, {1.0F, 1.0F, 1.0F, 0.9F}, {},
+                     {70.0F, 14.0F, 0.0F}, {-2.2F, 1.9F, 0.0F, 0.0F});
+            commandBuffer.endRendering();
+            layerToSampled(frameLayers[0].image);
 
-            VkImageView msaaImageView = msaaResource.imageView();
-            VkImageView imageView = swapchain.imageView(imageIndex);
-            auto pickingImageView = pickCtx.pickResource.imageView();
-            auto pickingResolveImageView = pickCtx.resolveResource.imageView();
-            VkImageView depthImageView = depthResource.imageView();
-            auto imageExtent = swapchain.imageExtent();
+            // A →(横) B →(纵) A：可分离高斯模糊
+            layerToColor(frameLayers[1].image);
+            layerBegin(frameLayers[1].view);
+            layerCmd(MODE_LAYER_BLUR, fullLayer, {}, {},
+                     {0.0F, 3.0F, static_cast<float>(frameLayers[0].texture)},
+                     {static_cast<float>(frameLayers[0].sampler), 0.0F, 0.0F, 0.0F});
+            commandBuffer.endRendering();
+            layerToSampled(frameLayers[1].image);
 
+            layerToColor(frameLayers[0].image);
+            layerBegin(frameLayers[0].view);
+            layerCmd(MODE_LAYER_BLUR, fullLayer, {}, {},
+                     {1.0F, 3.0F, static_cast<float>(frameLayers[1].texture)},
+                     {static_cast<float>(frameLayers[1].sampler), 0.0F, 0.0F, 0.0F});
+            commandBuffer.endRendering();
+            layerToSampled(frameLayers[0].image);
+
+            // C：组内容（两个重叠的圆），整组最后按同一 alpha 合成
+            layerToColor(frameLayers[2].image);
+            layerBegin(frameLayers[2].view);
+            layerCmd(MODE_FILL, {{26, 36}, {160, 120}}, {0.30F, 0.65F, 0.95F, 1.0F}, {},
+                     {60.0F, 0.0F, 0.0F}, {});
+            layerCmd(MODE_FILL, {{120, 36}, {160, 120}}, {0.95F, 0.45F, 0.30F, 0.6F}, {},
+                     {60.0F, 0.0F, 0.0F}, {});
+            commandBuffer.endRendering();
+            layerToSampled(frameLayers[2].image);
+
+            // D：背景内容（棋盘）→ 模糊 → 作为毛玻璃后面的“真实背景”
+            layerToColor(frameLayers[3].image);
+            layerBegin(frameLayers[3].view);
+            layerCmd(MODE_CHECKER, fullLayer, {0.08F, 0.10F, 0.16F, 1.0F},
+                     {0.55F, 0.70F, 0.95F, 1.0F}, {26.0F, 0.0F, 0.0F}, {});
+            commandBuffer.endRendering();
+            layerToSampled(frameLayers[3].image);
+
+            layerToColor(frameLayers[1].image);
+            layerBegin(frameLayers[1].view);
+            layerCmd(MODE_LAYER_BLUR, fullLayer, {}, {},
+                     {0.0F, 2.0F, static_cast<float>(frameLayers[3].texture)},
+                     {static_cast<float>(frameLayers[3].sampler), 0.0F, 0.0F, 0.0F});
+            commandBuffer.endRendering();
+            layerToSampled(frameLayers[1].image);
+
+            layerToColor(frameLayers[3].image);
+            layerBegin(frameLayers[3].view);
+            layerCmd(MODE_LAYER_BLUR, fullLayer, {}, {},
+                     {1.0F, 2.0F, static_cast<float>(frameLayers[1].texture)},
+                     {static_cast<float>(frameLayers[1].sampler), 0.0F, 0.0F, 0.0F});
+            commandBuffer.endRendering();
+            layerToSampled(frameLayers[3].image);
+
+            // ── 2. beginRendering：MSAA 颜色 + 拾取 + 深度/模板 ─────────
             VkRenderingAttachmentInfo colorAttachment = {
                 .sType = sType<VkRenderingAttachmentInfo>(),
-                .imageView = msaaImageView,
-                .imageLayout = VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT,
-                .resolveImageView =
-                    imageView, //NOTE: 将msaaImageView的输出替换到imageView，这就是关键
-                .resolveImageLayout =
-                    VkImageLayout::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-                .clearValue = {.color = {.float32 = {0.0F, 0.0F, 0.0F, 1.0F}}}};
-            //diff: [test_indirectdraw_no_pick] start
-            // 拾取附件（location=1）
-            VkRenderingAttachmentInfo pickAttachment{
-                .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                .imageView = pickingImageView,
+                .imageView = mainCtx.msaaResource.imageView(),
                 .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .resolveMode =
-                    VK_RESOLVE_MODE_SAMPLE_ZERO_BIT, // 整数格式必须用 SAMPLE_ZERO
-                .resolveImageView = pickingResolveImageView,
+                .resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT,
+                .resolveImageView = swapchain.imageView(imageIndex),
                 .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
                 .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-                .clearValue = {
-                    .color = {.uint32 = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0}}}}; // NOLINT
+                .clearValue = {.color = {.float32 = {0.05F, 0.055F, 0.07F, 1.0F}}}};
+            VkRenderingAttachmentInfo pickAttachment = {
+                .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+                .imageView = pickCtx.pickResource.imageView(),
+                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+                .resolveImageView = pickCtx.resolveResource.imageView(),
+                .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = {.color = {.uint32 = {0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 0u}}}};
             std::array attachments = {colorAttachment, pickAttachment};
-            //                        ^ 索引 0          ^ 索引 1
-            //diff: [test_indirectdraw_no_pick] end
-
             VkRenderingAttachmentInfo depthAttachment = {
                 .sType = sType<VkRenderingAttachmentInfo>(),
-                .imageView = depthImageView,
-                .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                .imageView = mainCtx.depthResource.imageView(),
+                .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                 .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
                 .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
                 .clearValue = {.depthStencil = {.depth = 1.0F}}};
 
             commandBuffer.beginRendering(
                 {.sType = sType<VkRenderingInfo>(),
-                 .renderArea = {.offset = {.x = 0, .y = 0}, .extent = imageExtent},
+                 .renderArea = {.offset = {.x = 0, .y = 0}, .extent = extent},
                  .layerCount = 1,
-                 //diff: [test_indirectdraw_no_pick] start
                  .colorAttachmentCount = static_cast<uint32_t>(attachments.size()),
                  .pColorAttachments = attachments.data(),
-                 //diff: [test_indirectdraw_no_pick] end
-                 .pDepthAttachment = &depthAttachment});
-        }),
-        method<"setPipelineState">(
-            [](world_type &world, input_type &inputCtx, data_type &soaCtx) {
-                auto &globalCtx = world.globalCtx;
-                auto &mainCtx = world.mainCtx;
-                auto &recordCtx = world.recordCtx;
-                auto &mainShaderCtx = world.mainShaderCtx;
+                 .pDepthAttachment = &depthAttachment,
+                 .pStencilAttachment = hasStencil ? &depthAttachment : nullptr});
 
-                auto &swapchain = globalCtx.swapchain;
-                auto &commandBuffers = globalCtx.commandBuffers;
+            // ── 3. 管线 / 描述符 / 视口 ─────────────────────────────────
+            commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                       *mainCtx.pipelineTransparentUI);
+            commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                             *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                             nullptr);
+            const VkViewport viewport{.x = 0.0F,
+                                      .y = 0.0F,
+                                      .width = W,
+                                      .height = H,
+                                      .minDepth = 0.0F,
+                                      .maxDepth = 1.0F};
+            commandBuffer.setViewport(0, std::span{&viewport, 1});
 
-                const auto &[currentFrame, imageIndex] = recordCtx.info;
-                const auto &commandBuffer = commandBuffers[currentFrame];
-
-                auto imageExtent = swapchain.imageExtent();
-                auto &pipelineLayout = mainCtx.pipelineLayout;
-
-                auto &descriptorSets = mainShaderCtx.descriptorSets;
-                auto descriptorSet = descriptorSets[currentFrame];
-
-                auto &uniformBuffers = mainShaderCtx.uniformBuffers;
-
-                // 绑定公共资源：索引缓冲、描述符集、推送常量公共部分（如缓冲地址）
-                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                                 *pipelineLayout, 0, 1, &(descriptorSet),
-                                                 0, nullptr);
-
-                auto uploadUniformBuffers = [&]() {
-                    UniformBufferObject ubo;
-                    // 3D 矩阵从 camera 获取
-                    ubo.cameraInfo[0].view = inputCtx.camera.getViewMatrix();
-                    ubo.cameraInfo[0].proj = inputCtx.camera.getProjMatrix();
-                    // UI 矩阵从 uiCamera 获取
-                    ubo.cameraInfo[1].view = inputCtx.uiCamera.getViewMatrix();
-                    ubo.cameraInfo[1].proj = inputCtx.uiCamera.getProjMatrix();
-
-                    memcpy(uniformBuffers[currentFrame].mapPtr(), &ubo, sizeof(ubo));
-                };
-                uploadUniformBuffers();
-            }),
-        method<"draw">([](world_type &world, input_type &inputCtx, data_type &soaCtx) {
-            auto &mainShaderCtx = world.mainShaderCtx;
-            auto &recordCtx = world.recordCtx;
-            auto &globalCtx = world.globalCtx;
-            auto &mainCtx = world.mainCtx;
-            auto &fontCtx = world.fontCtx;
-
-            auto &commandBuffers = globalCtx.commandBuffers;
-            auto &pipelineLayout = mainCtx.pipelineLayout;
-
-            const auto &[currentFrame, imageIndex] = recordCtx.info;
-            const auto &commandBuffer = commandBuffers[currentFrame];
-
-            // diff: [test_dod21] start: 区别在 直接往 GPU 写入数据.是 shaderDataRecorder 的增强版本
-            // ============================================================
-            // 使用 DrawRecorder 构建真实 UI 场景（含文字）
-            // ============================================================
-            auto &recorder = mainShaderCtx.drawRecorder[currentFrame];
-            auto &screen = soaCtx.screen;
-
-            if (screen.hasDirty(currentFrame))
+            // ── 4. 命令表 ───────────────────────────────────────────────
+            // 一条命令 = 矩形 + 两个颜色 + 参数 + 裁剪；params.x 由 mode 填
+            struct ui_cmd
             {
-                recorder.reset();
+                glm::vec4 rect; // xy=左上(px) zw=尺寸(px)
+                glm::vec4 color;
+                glm::vec4 color2;
+                glm::vec4 params; // x=mode, y/z/w=模式参数
+                glm::vec4 aux;
+                glm::uvec4 pick; // x=命令 id y=实体 z=(version<<16)|primitive w=hover_fn
+                VkRect2D scissor;
+                int pipe{
+                    0}; // 0=UI(over) 1=add 2=multiply 3=erase 4=maskA 5=maskB 6=clipped
+                uint32_t ref{0};              // 模板参考值
+                int pathKind{0};              // 0=无 1=even-odd 填充 2=描边
+                uint32_t pathId{0xFFFFFFFFu}; // ui_path 注册表里的 PathId
+                uint32_t pathGen{0};          // PathId 所属的 generation
+            };
+            std::array<ui_cmd, 1024> cmds{};
+            uint32_t cmdCount = 0;
 
-                auto &meshMap = globalCtx.meshMap;
-                auto &quad_meta = meshMap["quad"];
-                auto &swapchain = globalCtx.swapchain;
-                auto extent = swapchain.refImageExtent();
+            // 每个命令都可以带自己的拾取 id：id=0xFFFFFFFF 表示不参与拾取
+            const uint32_t pickVersion = soaCtx.screen.renderVersion();
+            auto add = [&](int mode, VkRect2D box, glm::vec4 color, glm::vec4 color2 = {},
+                           glm::vec3 params = {}, glm::vec4 aux = {},
+                           VkRect2D scissor = {}, uint32_t id = 0xFFFFFFFFu,
+                           uint32_t entity = 0u, uint32_t primitive = 0u, int pipe = 0,
+                           uint32_t stencilRef = 0u, int pathKind = 0,
+                           uint32_t pathId = 0xFFFFFFFFu, uint32_t pathGen = 0u) {
+                const uint32_t packedPick =
+                    ((pickVersion & 0xFFFFu) << 16) | (primitive & 0xFFFFu);
+                if (cmdCount >= cmds.size())
+                    return;
+                VkRect2D sc = (scissor.extent.width == 0u || scissor.extent.height == 0u)
+                                  ? box
+                                  : scissor;
+                const int32_t x0 = std::max<int32_t>(sc.offset.x, 0);
+                const int32_t y0 = std::max<int32_t>(sc.offset.y, 0);
+                const int32_t x1 =
+                    std::min<int32_t>(sc.offset.x + static_cast<int32_t>(sc.extent.width),
+                                      static_cast<int32_t>(extent.width));
+                const int32_t y1 = std::min<int32_t>(
+                    sc.offset.y + static_cast<int32_t>(sc.extent.height),
+                    static_cast<int32_t>(extent.height));
+                if (x1 <= x0 || y1 <= y0)
+                    return;
+                cmds[cmdCount++] = ui_cmd{
+                    {static_cast<float>(box.offset.x), static_cast<float>(box.offset.y),
+                     static_cast<float>(box.extent.width),
+                     static_cast<float>(box.extent.height)},
+                    color,
+                    color2,
+                    {static_cast<float>(mode), params.x, params.y, params.z},
+                    aux,
+                    {id, entity, packedPick, 0xFFFFFFFFu},
+                    {{x0, y0},
+                     {static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0)}},
+                    pipe,
+                    stencilRef,
+                    pathKind,
+                    pathId,
+                    pathGen};
+            };
+            // 便捷入口：要换管线/设模板参考时用它，避免手写 id/entity/primitive 位置参数
+            auto addPipe = [&](int mode, VkRect2D box, glm::vec4 color, glm::vec4 color2,
+                               glm::vec3 params, glm::vec4 aux, VkRect2D scissor,
+                               int pipe, uint32_t ref) {
+                add(mode, box, color, color2, params, aux, scissor, 0xFFFFFFFFu, 0u, 0u,
+                    pipe, ref);
+            };
 
-                // ---------- 视口 / 裁剪 ----------
-                VkViewport fullVP{.x = 0.0F,
-                                  .y = 0.0F,
-                                  .width = static_cast<float>(extent.width),
-                                  .height = static_cast<float>(extent.height),
-                                  .minDepth = 0.0F,
-                                  .maxDepth = 1.0F};
-                VkRect2D fullSC{.offset = {.x = 0, .y = 0}, .extent = extent};
+            // 字形表：由 shape 结果构建（ASCII 全集），不再硬编码 A–Z，
+            // 每个字形带自己的 font atlas（fallback 后可能来自不同字体）
+            const auto &asciiGlyphs = uiAsciiGlyphs();
 
-                PushData pcBase{.vertexAddress = recorder.globalVertexBuffer.address,
-                                .instanceAddress = recorder.globalHeapBuffer.address,
-                                .commandConstantsAddress =
-                                    recorder.commandConstantsBuffer.address,
-                                .cameraIndex = 1,
-                                .renderVersion = screen.renderVersion()};
-                // ---------- 设置初始化状态 ----------
-                recorder.setPipeline(*mainCtx.pipelineTransparentUI);
-                recorder.setLayout(*mainCtx.pipelineLayout);
-                recorder.setPushData(pcBase);
-                recorder.setMesh(quad_meta);
-                recorder.setViewports(std::span{&fullVP, 1});
-                recorder.setScissors(std::span{&fullSC, 1});
-                //-------------------------------------
+            // 唯一的"发一个字形命令"的地方：text() 与 textRich() 都走它
+            auto emitGlyph = [&](float pen, float y, float px, glm::vec4 color,
+                                 const text_glyph &g, VkRect2D clip) -> float {
+                const float gw = (g.plane.z - g.plane.x) * px;
+                const float gh = (g.plane.w - g.plane.y) * px;
+                if (gw > 0.5F && gh > 0.5F)
+                    add((g.fontType == 1u) ? MODE_GLYPH_BITMAP : MODE_GLYPH,
+                        {{static_cast<int32_t>(pen + g.plane.x * px),
+                          static_cast<int32_t>(y + g.plane.y * px)},
+                         {static_cast<uint32_t>(std::ceil(gw)),
+                          static_cast<uint32_t>(std::ceil(gh))}},
+                        color, {},
+                        {2.0F, static_cast<float>(g.tex), static_cast<float>(g.samp)},
+                        {g.uv.x, g.uv.y, g.uv.z, g.uv.w}, clip);
+                return pen + px * g.advance;
+            };
+
+            // 一行 MSDF 文字 = 一串 GLYPH 命令（文字也是命令）
+            //   字形数据全部来自 shape 结果（uiAsciiGlyphs），每个字形自带 atlas
+            auto text = [&](float x, float y, float px, glm::vec4 color,
+                            std::string_view str, VkRect2D clip = {}) -> float {
+                float pen = x;
+                // UTF-8 解码 → 码点 → 字形
+                std::size_t i = 0;
+                while (i < str.size())
+                {
+                    const auto b0 = static_cast<unsigned char>(str[i]);
+                    char32_t cp = b0;
+                    std::size_t len = 1;
+                    if ((b0 & 0x80U) == 0U)
+                    {
+                        cp = b0;
+                    }
+                    else if ((b0 & 0xE0U) == 0xC0U && i + 1 < str.size())
+                    {
+                        cp = ((b0 & 0x1FU) << 6) |
+                             (static_cast<unsigned char>(str[i + 1]) & 0x3FU);
+                        len = 2;
+                    }
+                    else if ((b0 & 0xF0U) == 0xE0U && i + 2 < str.size())
+                    {
+                        cp = ((b0 & 0x0FU) << 12) |
+                             ((static_cast<unsigned char>(str[i + 1]) & 0x3FU) << 6) |
+                             (static_cast<unsigned char>(str[i + 2]) & 0x3FU);
+                        len = 3;
+                    }
+                    else if ((b0 & 0xF8U) == 0xF0U && i + 3 < str.size())
+                    {
+                        cp = ((b0 & 0x07U) << 18) |
+                             ((static_cast<unsigned char>(str[i + 1]) & 0x3FU) << 12) |
+                             ((static_cast<unsigned char>(str[i + 2]) & 0x3FU) << 6) |
+                             (static_cast<unsigned char>(str[i + 3]) & 0x3FU);
+                        len = 4;
+                    }
+                    i += len;
+
+                    if (cp == U' ')
+                    {
+                        pen += px * 0.34F;
+                        continue;
+                    }
+                    const auto it = asciiGlyphs.find(cp);
+                    if (it == asciiGlyphs.end())
+                    {
+                        pen += px * 0.5F;
+                        continue;
+                    }
+                    const text_glyph &g = it->second;
+                    pen = emitGlyph(pen, y, px, color, g, clip);
+                }
+                return pen;
+            };
+
+            // 多语言一行：按 shape 结果的视觉顺序逐字形发命令（每字形自己的 atlas）
+            auto textRich = [&](float x, float y, float px, glm::vec4 color,
+                                const text_line &line) {
+                float pen = x;
+                for (const auto &g : line.glyphs)
+                    pen = emitGlyph(pen, y, px, color, g, {});
+                return pen;
+            };
+
+            // ── 4.1 页面 + 顶栏 ─────────────────────────────────────────
+            add(MODE_FILL, {{0, 0}, extent}, {0.055F, 0.06F, 0.075F, 1.0F});
+            add(MODE_LINEAR, {{0, 0}, {extent.width, 56u}}, {0.10F, 0.45F, 0.85F, 1.0F},
+                {0.55F, 0.22F, 0.80F, 1.0F}, {14.0F, 0.0F, 0.0F},
+                {1.0F, 0.25F, 0.0F, 0.0F});
+            text(20.0F, 42.0F, 30.0F, {1.0F, 1.0F, 1.0F, 1.0F}, "UI ABILITY");
+
+            // ── 文本 Unicode 验收区（页面下方空白处）────────────────────
+            {
+                const float y0 = static_cast<float>(H) - 96.0F;
+                for (int i = 0; i < 4; ++i)
+                {
+                    const glm::vec4 c = (i == 2) ? glm::vec4{0.55F, 0.85F, 1.0F, 1.0F}
+                                                 : glm::vec4{0.95F, 0.95F, 0.95F, 1.0F};
+                    textRich(20.0F + static_cast<float>(i) * 300.0F, y0, 42.0F, c,
+                             uiUnicodeLines()[static_cast<std::size_t>(i)]);
+                }
             }
 
-            render_context context{.drawRecorder = recorder,
-                                   .input = inputCtx.input,
-                                   .clock = inputCtx.clock,
-                                   .fontSelect = fontCtx.fontSelect};
-            screen.recorderCmd(currentFrame, context);
+            // ── 4.2 图块布局：固定像素尺寸 + 流式排布 ───────────────────
+            //   图块尺寸是像素常量（不随窗口缩放），列/行数由窗口大小算出来：
+            //   窗口变大 → 能摆下更多案例；窗口变小 → 自动减少，图块本身不变形。
+            constexpr float kTileW = 132.0F;
+            constexpr float kTileH = 106.0F;
+            constexpr float kGap = 6.0F;
+            const float gridTop = 64.0F;
+            const int kCols = std::max(1, static_cast<int>((W - kGap) / (kTileW + kGap)));
+            const int kRows =
+                std::max(1, static_cast<int>((H - gridTop - kGap) / (kTileH + kGap)));
+            const int kCapacity = kCols * kRows;
+            auto cell = [&](int index) {
+                const int cx = index % kCols;
+                const int cy = index / kCols;
+                return VkRect2D{
+                    {static_cast<int32_t>(kGap +
+                                          static_cast<float>(cx) * (kTileW + kGap)),
+                     static_cast<int32_t>(gridTop +
+                                          static_cast<float>(cy) * (kTileH + kGap))},
+                    {static_cast<uint32_t>(kTileW), static_cast<uint32_t>(kTileH)}};
+            };
+            // 是否落在可见范围内（越界的图块整格不画）
+            auto inView = [&](int index) {
+                return index / kCols < kRows;
+            };
 
-            recorder.end();
-            recorder.doDraw(commandBuffer);
-            // diff: [test_dod21] end
-        }),
-        method<"endRendering">([](world_type &world, input_type &inputCtx,
-                                  data_type &soaCtx) {
-            auto &mainShaderCtx = world.mainShaderCtx;
-            auto &recordCtx = world.recordCtx;
-            auto &globalCtx = world.globalCtx;
-            auto &pickCtx = world.pickCtx;
+            // ═══════════════════════════════════════════════════════
+            // 几何前端：展平 / 三角化 / 描边（纯函数，shared）
+            // ═══════════════════════════════════════════════════════
+            auto flatten_cubic = [](glm::vec2 p0, glm::vec2 p1, glm::vec2 p2,
+                                    glm::vec2 p3, int steps) {
+                std::vector<glm::vec2> out;
+                out.reserve(static_cast<std::size_t>(steps));
+                for (int i = 0; i < steps; ++i)
+                {
+                    const float t = static_cast<float>(i) / static_cast<float>(steps);
+                    const float u = 1.0F - t;
+                    out.push_back(u * u * u * p0 + 3.0F * u * u * t * p1 +
+                                  3.0F * u * t * t * p2 + t * t * t * p3);
+                }
+                return out;
+            };
+            auto fanTriangles = [](const ui_path::contour &c) {
+                std::vector<glm::vec2> tris;
+                const auto &p = c.pts;
+                if (p.size() < 3)
+                    return tris;
+                for (std::size_t i = 1; i + 1 < p.size(); ++i)
+                {
+                    tris.push_back(p[0]);
+                    tris.push_back(p[i]);
+                    tris.push_back(p[i + 1]);
+                }
+                return tris;
+            };
+            // 描边段（miter 接头）：每段 20 float = 5 个 vec4
+            //   角点 = 顶点处的斜接点（相邻两段偏移线的交点），不是 p ± d*half
+            //   每个顶点算一次左右斜接点，相邻段共用 → 接头天然闭合、不出刺
+            auto strokeSegments = [&](const ui_path::contour &c, float half,
+                                      glm::vec2 shift, std::vector<float> &out) {
+                const auto &p = c.pts;
+                const std::size_t n = p.size();
+                if (n < 2)
+                    return;
+                const std::size_t segCount = c.closed ? n : (n - 1);
+                constexpr float kMiterLimit = 4.0F; // 斜接长度上限（× 半宽）
 
-            auto &commandBuffers = globalCtx.commandBuffers;
+                auto pos = [&](std::size_t i) {
+                    return p[i] + shift;
+                };
+                auto dirOf = [&](std::size_t i, std::size_t j) { // i -> j 的单位方向
+                    const glm::vec2 d = pos(j) - pos(i);
+                    const float l = std::sqrt(d.x * d.x + d.y * d.y);
+                    return l > 1e-5F ? d / l : glm::vec2{1.0F, 0.0F};
+                };
 
-            const auto &[currentFrame, imageIndex] = recordCtx.info;
-            const auto &commandBuffer = commandBuffers[currentFrame];
+                // 逐顶点预计算：左右斜接点 + 角平分平面法线（朝前）
+                std::vector<glm::vec2> leftPt(n), rightPt(n), planeN(n);
+                for (std::size_t i = 0; i < n; ++i)
+                {
+                    const std::size_t prev = (i + n - 1) % n;
+                    const std::size_t next = (i + 1) % n;
+                    const glm::vec2 d0 = dirOf(prev, i); // 入边方向
+                    const glm::vec2 d1 = dirOf(i, next); // 出边方向
+                    const glm::vec2 n0{-d0.y, d0.x};
+                    const glm::vec2 n1{-d1.y, d1.x};
+                    glm::vec2 m = n0 + n1;
+                    const float ml = std::sqrt(m.x * m.x + m.y * m.y);
+                    if (ml < 1e-4F)
+                        m = n0;
+                    else
+                        m /= ml;
+                    float denom = glm::dot(m, n0);
+                    if (denom < 1e-3F)
+                        denom = 1e-3F;
+                    // 斜接长度 = half / cos(半角)，超 limit 就夹住（miter-clip，
+                    // 视觉上等同 bevel，但不需要额外三角形，也不会拉出长刺）
+                    const float scale = std::min(half / denom, half * kMiterLimit);
+                    leftPt[i] = pos(i) + m * scale;
+                    rightPt[i] = pos(i) - m * scale;
+                    glm::vec2 bis = d0 + d1; // 角平分平面法线（朝前）
+                    const float bl = std::sqrt(bis.x * bis.x + bis.y * bis.y);
+                    planeN[i] = bl > 1e-4F ? bis / bl : d1;
+                }
 
-            auto resolveImage = pickCtx.resolveResource.image();
+                for (std::size_t i = 0; i < segCount; ++i)
+                {
+                    const std::size_t j = (i + 1) % n;
+                    const glm::vec2 a = pos(i);
+                    const glm::vec2 b = pos(j);
+                    glm::vec2 d = b - a;
+                    const float len = std::sqrt(d.x * d.x + d.y * d.y);
+                    if (len < 1e-3F)
+                        continue;
+                    d /= len;
+                    const glm::vec2 nn{-d.y, d.x};
 
-            auto &pickingFrames = pickCtx.frames;
-            auto &pickMouse = pickCtx.mouse;
+                    // 胶囊角点：沿段两端各外推 half，保证圆头不被 quad 切掉
+                    const glm::vec2 ea = a - d * half;
+                    const glm::vec2 eb = b + d * half;
+                    const glm::vec2 q0 = ea + nn * half;
+                    const glm::vec2 q1 = eb + nn * half;
+                    const glm::vec2 q2 = ea - nn * half;
+                    const glm::vec2 q3 = eb - nn * half;
+                    const glm::vec2 planeA = planeN[i];
+                    const glm::vec2 planeB = -planeN[j];
+                    out.push_back(q0.x / W * 2.0F - 1.0F);
+                    out.push_back(q0.y / H * 2.0F - 1.0F);
+                    out.push_back(q1.x / W * 2.0F - 1.0F);
+                    out.push_back(q1.y / H * 2.0F - 1.0F);
+                    out.push_back(q2.x / W * 2.0F - 1.0F);
+                    out.push_back(q2.y / H * 2.0F - 1.0F);
+                    out.push_back(q3.x / W * 2.0F - 1.0F);
+                    out.push_back(q3.y / H * 2.0F - 1.0F);
+                    out.push_back(a.x);
+                    out.push_back(a.y);
+                    out.push_back(b.x);
+                    out.push_back(b.y);
+                    out.push_back(nn.x);
+                    out.push_back(nn.y);
+                    out.push_back(planeA.x);
+                    out.push_back(planeA.y);
+                    out.push_back(planeB.x);
+                    out.push_back(planeB.y);
+                    out.push_back(0.0F);
+                    out.push_back(0.0F);
+                }
+            };
 
-            auto &mousePos = pickMouse.pos;
+            // 注册本帧的 path（PathId 只在同一 generation 内有效）
+            auto &pathRegistry = ui_path::get();
+            pathRegistry.reset();
+            const uint32_t idFill = [&]() {
+                const VkRect2D box = cell(14);
+                const float cx = static_cast<float>(box.offset.x) +
+                                 static_cast<float>(box.extent.width) * 0.5F;
+                const float cy = static_cast<float>(box.offset.y) +
+                                 static_cast<float>(box.extent.height) * 0.5F;
+                const float rad = std::min(static_cast<float>(box.extent.width),
+                                           static_cast<float>(box.extent.height)) *
+                                  0.44F;
+                ui_path::path p;
+                ui_path::contour star;
+                const int order[5] = {0, 2, 4, 1, 3};
+                for (int i = 0; i < 5; ++i)
+                {
+                    const float ang =
+                        -1.5707963F + static_cast<float>(order[i]) * 1.2566371F;
+                    star.pts.emplace_back(cx + std::cos(ang) * rad,
+                                          cy + std::sin(ang) * rad);
+                }
+                p.push_back(std::move(star));
+                const float r2 = rad * 0.22F;
+                const float k = 0.5523F;
+                const glm::vec2 c{cx, cy};
+                const glm::vec2 dirs[4] = {
+                    {r2, 0.0F}, {0.0F, r2}, {-r2, 0.0F}, {0.0F, -r2}};
+                ui_path::contour ring;
+                for (int q = 0; q < 4; ++q)
+                {
+                    const glm::vec2 p0 = c + dirs[q];
+                    const glm::vec2 p3 = c + dirs[(q + 1) % 4];
+                    const glm::vec2 p1 = p0 + glm::vec2{-dirs[q].y, dirs[q].x} * k;
+                    const glm::vec2 p2 =
+                        p3 - glm::vec2{-dirs[(q + 1) % 4].y, dirs[(q + 1) % 4].x} * k;
+                    const auto seg = flatten_cubic(p0, p1, p2, p3, 12);
+                    ring.pts.insert(ring.pts.end(), seg.begin(), seg.end());
+                }
+                p.push_back(std::move(ring));
+                return pathRegistry.add(std::move(p));
+            }();
+            // path_aa 图块分左右两半，对齐 test_ui_path_aa 的两种语义：
+            //   左：填充三角形，边缘靠 MSAA（就是 test_ui_path_aa 的做法）
+            //   右：闭合贝塞尔描边，边缘靠片元解析覆盖率
+            const VkRect2D pathTile = cell(9);
+            const VkRect2D msaaBox{
+                {pathTile.offset.x, pathTile.offset.y},
+                {pathTile.extent.width / 2u - 2u, pathTile.extent.height}};
+            const VkRect2D strokeBox{
+                {pathTile.offset.x + static_cast<int32_t>(pathTile.extent.width / 2u) + 2,
+                 pathTile.offset.y},
+                {pathTile.extent.width / 2u - 2u, pathTile.extent.height}};
 
-            commandBuffer.endRendering();
-            // 无条件录制拷贝：鼠标无效时用最后位置，保证回读缓冲总是被写入（避免读到全零初值）
+            // 左半：一个三角形（填充，不用解析 AA）
+            const uint32_t idTri = [&]() {
+                ui_path::contour tri;
+                const float x0 = static_cast<float>(msaaBox.offset.x) + 10.0F;
+                const float y0 = static_cast<float>(msaaBox.offset.y) + 10.0F;
+                const float w = static_cast<float>(msaaBox.extent.width) - 20.0F;
+                const float h = static_cast<float>(msaaBox.extent.height) - 20.0F;
+                tri.pts.emplace_back(x0 + w * 0.5F, y0);           // 顶点
+                tri.pts.emplace_back(x0, y0 + h);                  // 左下
+                tri.pts.emplace_back(x0 + w, y0 + h);              // 右下
+                ui_path::path p;
+                p.push_back(std::move(tri));
+                return pathRegistry.add(std::move(p));
+            }();
+
+            const uint32_t idStroke = [&]() {
+                const VkRect2D box = strokeBox;
+                const glm::vec2 c{static_cast<float>(box.offset.x) +
+                                      static_cast<float>(box.extent.width) * 0.5F,
+                                  static_cast<float>(box.offset.y) +
+                                      static_cast<float>(box.extent.height) * 0.5F};
+                const float rx = static_cast<float>(box.extent.width) * 0.30F;
+                const float ry = static_cast<float>(box.extent.height) * 0.26F;
+                const float k = 0.5523F;
+                const glm::vec2 dirs[4] = {
+                    {rx, 0.0F}, {0.0F, ry}, {-rx, 0.0F}, {0.0F, -ry}};
+                ui_path::contour blob;
+                for (int q = 0; q < 4; ++q)
+                {
+                    const glm::vec2 p0 = c + dirs[q];
+                    const glm::vec2 p3 = c + dirs[(q + 1) % 4];
+                    const glm::vec2 p1 = p0 + glm::vec2{-dirs[q].y, dirs[q].x} * k;
+                    const glm::vec2 p2 =
+                        p3 - glm::vec2{-dirs[(q + 1) % 4].y, dirs[(q + 1) % 4].x} * k;
+                    const auto seg = flatten_cubic(p0, p1, p2, p3, 24);
+                    blob.pts.insert(blob.pts.end(), seg.begin(), seg.end());
+                }
+                ui_path::path p;
+                p.push_back(std::move(blob));
+                return pathRegistry.add(std::move(p));
+            }();
+
+            // 一条 path 命令对应的子 pass：由 emit 循环按 pathKind 分发
+            auto drawPathCommand = [&](const ui_cmd &c) {
+                if (c.pathGen != pathRegistry.generation || !pathRegistry.valid(c.pathId))
+                {
+                    std::println("[path] stale PathId {} (gen {} != {})", c.pathId,
+                                 c.pathGen, pathRegistry.generation);
+                    return;
+                }
+                const auto &path = pathRegistry.get(c.pathId);
+                if (c.pathKind == 1)
+                {
+                    // even-odd 填充：每条轮廓一次 INVERT draw + EQUAL 0xFF 覆盖
+                    std::vector<float> packed;
+                    std::vector<uint32_t> triCounts;
+                    for (const auto &contour : path)
+                    {
+                        const auto tris = fanTriangles(contour);
+                        triCounts.push_back(static_cast<uint32_t>(tris.size()));
+                        for (const auto &pt : tris)
+                        {
+                            packed.push_back(pt.x / W * 2.0F - 1.0F);
+                            packed.push_back(pt.y / H * 2.0F - 1.0F);
+                        }
+                    }
+                    const std::size_t byteOffset =
+                        static_cast<std::size_t>(kFanVertexBase) * 2u * sizeof(float);
+                    globalCtx.pathSegments.write(byteOffset, packed.data(),
+                                                 sizeof(float) * packed.size());
+                    commandBuffer.setScissor(0, std::span{&c.scissor, 1});
+                    commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                               *(*uiPipelines().pipes[7]));
+                    commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK, 0u);
+                    PushData fan{};
+                    fan.geomEntry = kGeomFan;
+                    fan.uiParams =
+                        glm::vec4{static_cast<float>(MODE_SOLID), 0.0F, 0.0F, 0.0F};
+                    fan.uiColor = c.color;
+                    commandBuffer.pushConstants(*pipelineLayout,
+                                                VK_SHADER_STAGE_VERTEX_BIT |
+                                                    VK_SHADER_STAGE_FRAGMENT_BIT,
+                                                0, sizeof(PushData), &fan);
+                    uint32_t base = 0;
+                    for (const uint32_t count : triCounts)
+                    {
+                        commandBuffer.draw(count, 1, kFanVertexBase + base, 0);
+                        base += count;
+                    }
+                    commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                               *(*uiPipelines().pipes[6]));
+                    commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK,
+                                                      0xFFu);
+                    PushData cover{};
+                    cover.uiRect = {static_cast<float>(c.scissor.offset.x),
+                                    static_cast<float>(c.scissor.offset.y),
+                                    static_cast<float>(c.scissor.extent.width),
+                                    static_cast<float>(c.scissor.extent.height)};
+                    cover.uiParams =
+                        glm::vec4{static_cast<float>(MODE_SOLID), 0.0F, 0.0F, 0.0F};
+                    cover.uiColor = c.color;
+                    commandBuffer.pushConstants(*pipelineLayout,
+                                                VK_SHADER_STAGE_VERTEX_BIT |
+                                                    VK_SHADER_STAGE_FRAGMENT_BIT,
+                                                0, sizeof(PushData), &cover);
+                    commandBuffer.draw(3, 1, 0, 0);
+                }
+                else if (c.pathKind == 2)
+                {
+                    // 描边：同一份 path → 两份数据（开/关 AA）→ 2 次 draw
+                    const float half = c.params.y;
+                    const float bh = static_cast<float>(c.scissor.extent.height);
+                    std::vector<float> segs;
+                    for (const auto &contour : path)
+                        strokeSegments(contour, half, glm::vec2{0.0F, -bh * 0.18F}, segs);
+                    const std::size_t floatsA = segs.size();
+                    for (const auto &contour : path)
+                        strokeSegments(contour, half, glm::vec2{0.0F, bh * 0.18F}, segs);
+                    globalCtx.pathSegments.write(0, segs.data(),
+                                                 sizeof(float) * segs.size());
+                    const uint32_t segsA = static_cast<uint32_t>(floatsA / 20u);
+                    const uint32_t segsB =
+                        static_cast<uint32_t>((segs.size() - floatsA) / 20u);
+                    commandBuffer.setScissor(0, std::span{&c.scissor, 1});
+                    commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                               *(*uiPipelines().pipes[8]));
+                    commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK, 0u);
+                    PushData stroke{};
+                    stroke.geomEntry = kGeomStroke;
+                    stroke.uiAux = c.color;
+                    stroke.uiParams =
+                        glm::vec4{static_cast<float>(MODE_PATH_STROKE), half, 1.0F, 1.0F};
+                    commandBuffer.pushConstants(*pipelineLayout,
+                                                VK_SHADER_STAGE_VERTEX_BIT |
+                                                    VK_SHADER_STAGE_FRAGMENT_BIT,
+                                                0, sizeof(PushData), &stroke);
+                    commandBuffer.draw(6u * segsA, 1, 0, 0);
+                    stroke.uiParams.z = 0.0F;
+                    commandBuffer.pushConstants(*pipelineLayout,
+                                                VK_SHADER_STAGE_VERTEX_BIT |
+                                                    VK_SHADER_STAGE_FRAGMENT_BIT,
+                                                0, sizeof(PushData), &stroke);
+                    commandBuffer.draw(6u * segsB, 1, 6u * segsA, 0);
+                }
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineTransparentUI);
+            };
+
+            // 一条 path 命令：路径内容在注册表里，命令表只带 PathId
+            auto addPath = [&](int kind, uint32_t id, VkRect2D box, glm::vec4 color,
+                               glm::vec3 params = {}) {
+                add(MODE_SOLID, box, color, {}, params, {}, box, 0xFFFFFFFFu, 0u, 0u, 0,
+                    0u, kind, id, pathRegistry.generation);
+            };
+
+            // ── 4.3 能力表：一个 mode 一条命令 ──────────────────────────
+            struct ability
             {
-                //diff: [test_indirectdraw_no_pick] start
-                // 转换 resolve 目标到 TRANSFER_SRC
+                int mode;
+                glm::vec4 color;
+                glm::vec4 color2;
+                glm::vec3 params; // y/z/w（x 由 mode 填）
+                glm::vec4 aux;
+            };
+            static const ability kAbilities[] = {
+                {MODE_FILL, {0.28F, 0.56F, 0.95F, 1.0F}, {}, {18.0F, 0.0F, 0.0F}, {}},
+                {MODE_LINEAR,
+                 {0.95F, 0.35F, 0.35F, 1.0F},
+                 {0.20F, 0.45F, 0.95F, 1.0F},
+                 {12.0F, 0.0F, 0.0F},
+                 {1.0F, 0.35F, 0.0F, 0.0F}},
+                {MODE_RADIAL,
+                 {0.98F, 0.82F, 0.30F, 1.0F},
+                 {0.20F, 0.10F, 0.05F, 1.0F},
+                 {90.0F, 12.0F, 0.0F},
+                 {}},
+                {MODE_CONIC,
+                 {0.20F, 0.85F, 0.85F, 1.0F},
+                 {0.85F, 0.25F, 0.70F, 1.0F},
+                 {0.0F, 12.0F, 0.0F},
+                 {}},
+                {MODE_ARC,
+                 {1.0F, 1.0F, 1.0F, 1.0F},
+                 {},
+                 {62.0F, 14.0F, 0.0F},
+                 {-2.6F, 2.2F, 0.0F, 0.0F}},
+                {MODE_OUTER_SHADOW,
+                 {0.30F, 0.62F, 0.40F, 1.0F},
+                 {0.0F, 0.0F, 0.0F, 0.75F},
+                 {16.0F, 34.0F, 0.0F},
+                 {6.0F, 10.0F, 0.0F, 0.0F}},
+                {MODE_INNER_SHADOW,
+                 {0.35F, 0.40F, 0.55F, 1.0F},
+                 {0.0F, 0.0F, 0.0F, 0.85F},
+                 {16.0F, 26.0F, 0.0F},
+                 {}},
+                {MODE_PERCORNER,
+                 {0.92F, 0.55F, 0.20F, 1.0F},
+                 {},
+                 {28.0F, 4.0F, 28.0F},
+                 {4.0F, 0.0F, 0.0F, 0.0F}},
+                {MODE_ALPHA_MASK,
+                 {0.85F, 0.30F, 0.35F, 1.0F},
+                 {},
+                 {10.0F, 14.0F, 0.0F},
+                 {}},
+                {MODE_PATH_AA, {0.40F, 0.80F, 0.45F, 1.0F}, {}, {0.0F, 0.0F, 0.0F}, {}},
+                {MODE_DASH, {0.95F, 0.90F, 0.35F, 1.0F}, {}, {8.0F, 18.0F, 12.0F}, {}},
+                {MODE_ROTATE, {0.85F, 0.40F, 0.75F, 1.0F}, {}, {0.55F, 10.0F, 0.0F}, {}},
+                {MODE_SKEW,
+                 {0.35F, 0.75F, 0.85F, 1.0F},
+                 {},
+                 {10.0F, 0.0F, 0.0F},
+                 {0.35F, 0.0F, 0.0F, 0.0F}},
+                {MODE_NINE_SLICE,
+                 {},
+                 {0.05F, 0.05F, 0.05F, 1.0F},
+                 {12.0F, 14.0F, 0.0F},
+                 {}},
+                {MODE_EVENODD, {0.95F, 0.75F, 0.20F, 1.0F}, {}, {0.45F, 0.0F, 0.0F}, {}},
+                {MODE_GLYPH, {}, {}, {}, {}}, // 占位：图块里单独画字
+                {MODE_SRGB,
+                 {0.10F, 0.10F, 0.10F, 1.0F},
+                 {0.90F, 0.90F, 0.90F, 1.0F},
+                 {12.0F, 0.0F, 0.0F},
+                 {}},
+                {MODE_BLUR,
+                 {0.85F, 0.85F, 0.90F, 1.0F},
+                 {0.10F, 0.11F, 0.14F, 1.0F},
+                 {4.0F, 0.0F, 0.0F},
+                 {}},
+                {MODE_BACKDROP, {0.85F, 0.90F, 1.0F, 0.45F}, {}, {3.0F, 14.0F, 0.0F}, {}},
+                {MODE_GROUP,
+                 {0.30F, 0.65F, 0.95F, 1.0F},
+                 {0.95F, 0.45F, 0.30F, 1.0F},
+                 {0.0F, 0.45F, 0.0F},
+                 {}},
+                {MODE_MIPMAP,
+                 {0.85F, 0.65F, 0.25F, 1.0F},
+                 {0.15F, 0.12F, 0.08F, 1.0F},
+                 {8.0F, 0.0F, 0.0F},
+                 {}},
+                {MODE_PICKING,
+                 {0.55F, 0.85F, 0.95F, 1.0F},
+                 {},
+                 {20.0F, 7.0F, 0.0F},
+                 {42.0F, 3.0F, 0.0F, 0.0F}},
+                {MODE_BLEND,
+                 {0.95F, 0.35F, 0.35F, 1.0F},
+                 {0.12F, 0.14F, 0.20F, 1.0F},
+                 {0.0F, 0.0F, 0.0F},
+                 {}},
+            };
+            constexpr int kAbilityCount =
+                static_cast<int>(sizeof(kAbilities) / sizeof(kAbilities[0]));
+
+            // 每个图块一个稳定 id：整格都能被拾取命中（底板和能力命令共用同一个 id）
+            constexpr uint32_t kTileIdBase = 200;
+            const auto hoveredKey = world.hoverManager.cur.key; // 上一帧的拾取结果
+            const int hoveredTile =
+                (hoveredKey.object_type >= kTileIdBase &&
+                 hoveredKey.object_type < kTileIdBase + 64)
+                    ? static_cast<int>(hoveredKey.object_type - kTileIdBase)
+                    : -1;
+
+            for (int i = 0; i < kAbilityCount; ++i)
+            {
+                if (!inView(i))
+                    continue;
+                const VkRect2D box = cell(i);
+                const uint32_t id = kTileIdBase + static_cast<uint32_t>(i);
+                const uint32_t entity = static_cast<uint32_t>(i);
+                const bool hot = (hoveredTile == i);
+                // 底板（悬停时提亮，这是真的 hover 状态）
+                add(MODE_FILL, box,
+                    hot ? glm::vec4{0.17F, 0.19F, 0.24F, 1.0F}
+                        : glm::vec4{0.11F, 0.12F, 0.15F, 1.0F},
+                    {}, {10.0F, 0.0F, 0.0F}, {}, {}, id, entity);
+                // 能力本体（内缩 8px）
+                VkRect2D inner{{box.offset.x + 8, box.offset.y + 8},
+                               {box.extent.width - 16u, box.extent.height - 16u}};
+                const auto &ab = kAbilities[i];
+                if (ab.mode == MODE_GLYPH)
+                {
+                    text(static_cast<float>(inner.offset.x) + 8.0F,
+                         static_cast<float>(inner.offset.y) + 10.0F, 44.0F,
+                         {1.0F, 1.0F, 1.0F, 1.0F}, "UI", box);
+                    text(static_cast<float>(inner.offset.x) + 8.0F,
+                         static_cast<float>(inner.offset.y) + 56.0F, 22.0F,
+                         {0.75F, 0.80F, 0.90F, 1.0F}, "ATLAS", box);
+                    continue;
+                }
+                if (ab.mode == MODE_DASH)
+                {
+                    // 虚线端点用图块局部坐标（着色器里的 p 就是图块局部像素）
+                    const float lw = static_cast<float>(inner.extent.width);
+                    const float lh = static_cast<float>(inner.extent.height);
+                    add(MODE_DASH, inner, ab.color, ab.color2, ab.params,
+                        {6.0F, lh * 0.5F, lw - 6.0F, lh * 0.5F}, {}, id, entity);
+                    continue;
+                }
+                if (ab.mode == MODE_BLUR || ab.mode == MODE_BACKDROP ||
+                    ab.mode == MODE_GROUP)
+                {
+                    // 真实离屏结果：blur→A(0)，group→C(2)，backdrop→D(3)
+                    const auto &layer = (ab.mode == MODE_BLUR)    ? frameLayers[0]
+                                        : (ab.mode == MODE_GROUP) ? frameLayers[2]
+                                                                  : frameLayers[3];
+                    const float opacity = (ab.mode == MODE_GROUP) ? 0.45F : 1.0F;
+                    add(MODE_LAYER_COMPOSITE, inner, {}, {},
+                        {opacity, static_cast<float>(layer.texture),
+                         static_cast<float>(layer.sampler)},
+                        {12.0F, 0.0F, 0.0F, 0.0F}, {}, id, entity);
+                    if (ab.mode == MODE_BACKDROP)
+                        add(MODE_FILL, inner, {0.86F, 0.91F, 1.0F, 0.22F}, {},
+                            {14.0F, 0.0F, 0.0F}, {}, {}, id, entity);
+                    continue;
+                }
+                if (ab.mode == MODE_EVENODD)
+                    continue; // 面板已画
+                if (ab.mode == MODE_BACKDROP)
+                    continue; // 面板已画；真·背景模糊在第二段 pass 里画
+                if (ab.mode == MODE_PATH_AA)
+                    continue; // 面板已画；真路径描边（解析 AA）在命令循环之后
+                if (ab.mode == MODE_BLEND)
+                {
+                    // 真实 Vulkan 混合：over / add / multiply 三条不同 blend state 的管线
+                    add(MODE_FILL, inner, {0.09F, 0.10F, 0.15F, 1.0F}, {},
+                        {8.0F, 0.0F, 0.0F});
+                    const int32_t cx =
+                        inner.offset.x + static_cast<int32_t>(inner.extent.width) / 2;
+                    const int32_t cy =
+                        inner.offset.y + static_cast<int32_t>(inner.extent.height) / 2;
+                    const int32_t rad = static_cast<int32_t>(
+                        std::min(inner.extent.width, inner.extent.height) / 2u);
+                    auto disc = [&](int32_t dx, glm::vec4 color, int pipe) {
+                        addPipe(MODE_FILL,
+                                {{cx + dx - rad, cy - rad},
+                                 {static_cast<uint32_t>(rad * 2),
+                                  static_cast<uint32_t>(rad * 2)}},
+                                color, {}, {static_cast<float>(rad), 0.0F, 0.0F}, {}, {},
+                                pipe, 0u);
+                    };
+                    disc(-rad / 2, {0.95F, 0.45F, 0.35F, 0.85F}, 0); // over（默认）
+                    disc(0, {0.35F, 0.85F, 0.55F, 0.85F}, 1);        // add
+                    disc(rad / 2, {0.55F, 0.55F, 0.95F, 0.85F}, 2);  // multiply
+                    // erase：blend = ZERO / ONE_MINUS_SRC_ALPHA —— 直接把已画内容"挖掉"
+                    //   （挖在 over 圆上，能看见底板透出来）
+                    addPipe(MODE_FILL,
+                            {{cx - rad / 2 - rad / 4, cy - rad / 4},
+                             {static_cast<uint32_t>(rad / 2),
+                              static_cast<uint32_t>(rad / 2)}},
+                            {1.0F, 1.0F, 1.0F, 1.0F}, {},
+                            {static_cast<float>(rad / 4), 0.0F, 0.0F}, {}, {}, 3, 0u);
+                    continue;
+                }
+                if (ab.mode == MODE_NINE_SLICE)
+                {
+                    // 真纹理九宫格：源图 96x96、边框 6px
+                    const auto &tex = uiTextures();
+                    add(MODE_NINE_SLICE_TEX, inner, {}, {},
+                        {6.0F, static_cast<float>(tex.nineSlice),
+                         static_cast<float>(tex.sampler)},
+                        {static_cast<float>(tex.nineSliceExtent.width),
+                         static_cast<float>(tex.nineSliceExtent.height), 0.0F, 0.0F},
+                        {}, id, entity);
+                    continue;
+                }
+                if (ab.mode == MODE_ALPHA_MASK)
+                {
+                    // 真纹理 alpha 遮罩
+                    const auto &tex = uiTextures();
+                    add(MODE_ALPHA_MASK_TEX, inner, ab.color, {},
+                        {0.0F, static_cast<float>(tex.alphaMask),
+                         static_cast<float>(tex.sampler)},
+                        {}, {}, id, entity);
+                    continue;
+                }
+                if (ab.mode == MODE_MIPMAP)
+                {
+                    // 真 mip 链采样：lod 0..3 四条横带
+                    const auto &tex = uiTextures();
+                    add(MODE_MIPMAP_TEX, inner, {}, {},
+                        {7.0F, static_cast<float>(tex.checker),
+                         static_cast<float>(tex.sampler)},
+                        {}, {}, id, entity);
+                    continue;
+                }
+                if (ab.mode == MODE_ARC)
+                {
+                    // 环半径按图块尺寸缩放，否则大半径会把整条环推到裁剪框外
+                    const float lw = static_cast<float>(inner.extent.width);
+                    const float lh = static_cast<float>(inner.extent.height);
+                    const float radius = (lw < lh ? lw : lh) * 0.32F;
+                    add(MODE_ARC, inner, ab.color, ab.color2,
+                        {radius, ab.params.y, ab.params.z}, ab.aux, {}, id, entity);
+                    continue;
+                }
+                add(ab.mode, inner, ab.color, ab.color2, ab.params, ab.aux, {}, id,
+                    entity);
+            }
+
+            // ── 4.4 真实布局：度量 → 换行 / 省略号 / 富文本 / 光标 / 表格 ──
+            //   度量也用 shape 结果的 advance（同一个字形表，不再有第二套数据）
+            auto glyphOf = [&](char ch) -> const text_glyph * {
+                const auto it = asciiGlyphs.find(
+                    static_cast<char32_t>(static_cast<unsigned char>(ch)));
+                return it == asciiGlyphs.end() ? nullptr : &it->second;
+            };
+            auto advanceOf = [&](char ch) -> float {
+                if (ch == ' ')
+                    return 0.34F;
+                const text_glyph *g = glyphOf(ch);
+                return g != nullptr ? g->advance : 0.5F;
+            };
+            // 文本度量：宽度完全由排版结果的 advance 累加而来
+            auto measure = [&](std::string_view s, float px) -> float {
+                float w = 0.0F;
+                for (const char ch : s)
+                    w += advanceOf(ch) * px;
+                return w;
+            };
+            // 贪心换行：先按空格断词，单词超宽就按字符硬断
+            auto wrap = [&](std::string_view s, float px, float maxW) {
+                std::vector<std::string_view> lines;
+                std::size_t i = 0;
+                while (i < s.size())
+                {
+                    std::size_t j = i;
+                    std::size_t lastSpace = std::string_view::npos;
+                    float w = 0.0F;
+                    while (j < s.size())
+                    {
+                        if (s[j] == ' ')
+                            lastSpace = j;
+                        const float adv = advanceOf(s[j]) * px;
+                        if (j > i && w + adv > maxW)
+                            break;
+                        w += adv;
+                        ++j;
+                    }
+                    std::size_t end = j;
+                    if (j < s.size() && lastSpace != std::string_view::npos &&
+                        lastSpace > i)
+                        end = lastSpace; // 在最后一个空格处断行
+                    lines.push_back(s.substr(i, end - i));
+                    i = end;
+                    while (i < s.size() && s[i] == ' ')
+                        ++i;
+                }
+                return lines;
+            };
+            // 宽度受限的省略：先尽量放字，放不下就退字，给 "..." 留出宽度
+            const float dotWidth = 0.34F + 0.18F; // 点 + 间距
+            auto fitEllipsis = [&](std::string_view s, float px, float maxW) {
+                const float dots = 3.0F * dotWidth * px;
+                if (measure(s, px) <= maxW)
+                    return std::pair<std::string_view, bool>{s, false};
+                std::size_t n = s.size();
+                while (n > 0 && measure(s.substr(0, n), px) + dots > maxW)
+                    --n;
+                return std::pair<std::string_view, bool>{s.substr(0, n), true};
+            };
+
+            // 23：状态机（hover / pressed 来自真实拾取和鼠标按键）
+            {
+                const VkRect2D box = cell(23);
+                const uint32_t id = kTileIdBase + 23u;
+                const bool hot = (hoveredTile == 23);
+                const bool pressed = hot && inputCtx.input.isMouseButtonPressed(
+                                                MouseButtons::eMOUSE_BUTTON_LEFT);
+                const glm::vec4 color = pressed ? glm::vec4{0.16F, 0.42F, 0.70F, 1.0F}
+                                        : hot   ? glm::vec4{0.34F, 0.50F, 0.72F, 1.0F}
+                                                : glm::vec4{0.22F, 0.24F, 0.30F, 1.0F};
+                add(MODE_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
+                    {}, {}, id, 23u);
+                VkRect2D btn{{box.offset.x + 10, box.offset.y + 10},
+                             {box.extent.width - 20u, box.extent.height - 20u}};
+                add(MODE_FILL, btn, color, {}, {8.0F, 0.0F, 0.0F}, {}, {}, id, 23u);
+                text(static_cast<float>(btn.offset.x) + 10.0F,
+                     static_cast<float>(btn.offset.y) +
+                         static_cast<float>(btn.extent.height) * 0.62F,
+                     15.0F, {1.0F, 1.0F, 1.0F, 0.92F},
+                     pressed ? "PRESS" : (hot ? "HOVER" : "IDLE"));
+            }
+            // 24：表格布局（权重解列宽 + 只画可见行 + 单元格省略号）
+            {
+                const VkRect2D box = cell(24);
+                const uint32_t id = kTileIdBase + 24u;
+                add(MODE_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
+                    {}, {}, id, 24u);
+                const float pad = 6.0F;
+                const float headerH = 16.0F;
+                const float rowH = 15.0F;
+                const float x0 = static_cast<float>(box.offset.x) + pad;
+                const float y0 = static_cast<float>(box.offset.y) + pad;
+                const float w = static_cast<float>(box.extent.width) - pad * 2.0F;
+                const float h = static_cast<float>(box.extent.height) - pad * 2.0F;
+                // 列宽由权重求出来，不是写死的像素
+                const float weight[3] = {1.9F, 1.55F, 1.55F};
+                const float weightSum = weight[0] + weight[1] + weight[2];
+                float colX[4]{x0, 0.0F, 0.0F, x0 + w};
+                for (int c = 1; c < 3; ++c)
+                    colX[c] = colX[c - 1] + w * weight[c - 1] / weightSum;
+                // 表头
+                add(MODE_FILL,
+                    {{static_cast<int32_t>(x0), static_cast<int32_t>(y0)},
+                     {static_cast<uint32_t>(w), static_cast<uint32_t>(headerH)}},
+                    {0.19F, 0.22F, 0.29F, 1.0F}, {}, {3.0F, 0.0F, 0.0F}, {}, {}, id, 24u);
+                text(x0 + 3.0F, y0 + 12.0F, 10.0F, {0.85F, 0.88F, 0.94F, 1.0F}, "NAME",
+                     box);
+                text(colX[1] + 3.0F, y0 + 12.0F, 10.0F, {0.85F, 0.88F, 0.94F, 1.0F},
+                     "STATE", box);
+                // 可见行数由高度算出来，只画放得下的行（真实的窗口化）
+                const int totalRows = 64;
+                const int visibleRows =
+                    static_cast<int>(std::max(0.0F, (h - headerH) / rowH));
+                for (int r = 0; r < visibleRows; ++r)
+                {
+                    const float ry = y0 + headerH + static_cast<float>(r) * rowH;
+                    add(MODE_FILL,
+                        {{static_cast<int32_t>(x0), static_cast<int32_t>(ry)},
+                         {static_cast<uint32_t>(w), static_cast<uint32_t>(rowH - 1.0F)}},
+                        (r % 2) ? glm::vec4{0.13F, 0.14F, 0.18F, 1.0F}
+                                : glm::vec4{0.15F, 0.16F, 0.21F, 1.0F},
+                        {}, {1.0F, 0.0F, 0.0F}, {}, {}, id, 24u);
+                    // 单元格：按列宽做度量 + 省略号截断
+                    const std::string name =
+                        std::string("ROW ") + static_cast<char>('A' + (r % 26));
+                    const std::string stateText =
+                        (r % 3 == 0) ? "READY" : (r % 3 == 1 ? "BUSY" : "IDLE");
+                    const auto [nameFit, nameCut] =
+                        fitEllipsis(name, 9.0F, colX[1] - colX[0] - 6.0F);
+                    const auto [stateFit, stateCut] =
+                        fitEllipsis(stateText, 9.0F, colX[2] - colX[1] - 6.0F);
+                    text(colX[0] + 3.0F, ry + rowH * 0.78F, 9.0F,
+                         {0.84F, 0.86F, 0.91F, 1.0F}, nameFit, box);
+                    if (nameCut)
+                    {
+                        const float dotX = colX[0] + 3.0F + measure(nameFit, 9.0F);
+                        for (int d = 0; d < 3; ++d)
+                            add(MODE_FILL,
+                                {{static_cast<int32_t>(dotX +
+                                                       static_cast<float>(d) * 3.0F),
+                                  static_cast<int32_t>(ry + rowH * 0.72F)},
+                                 {1u, 1u}},
+                                {0.84F, 0.86F, 0.91F, 1.0F}, {}, {0.5F, 0.0F, 0.0F}, {},
+                                {}, id, 24u);
+                    }
+                    text(colX[1] + 3.0F, ry + rowH * 0.78F, 9.0F,
+                         (r % 3 == 0)   ? glm::vec4{0.45F, 0.85F, 0.55F, 1.0F}
+                         : (r % 3 == 1) ? glm::vec4{0.95F, 0.75F, 0.35F, 1.0F}
+                                        : glm::vec4{0.95F, 0.45F, 0.45F, 1.0F},
+                         stateFit, box);
+                    if (stateCut)
+                    {
+                        const float dotX = colX[1] + 3.0F + measure(stateFit, 9.0F);
+                        for (int d = 0; d < 3; ++d)
+                            add(MODE_FILL,
+                                {{static_cast<int32_t>(dotX +
+                                                       static_cast<float>(d) * 3.0F),
+                                  static_cast<int32_t>(ry + rowH * 0.72F)},
+                                 {1u, 1u}},
+                                {0.90F, 0.92F, 0.96F, 1.0F}, {}, {0.5F, 0.0F, 0.0F}, {},
+                                {}, id, 24u);
+                    }
+                }
+                // 列分隔线
+                for (int c = 1; c < 3; ++c)
+                    add(MODE_FILL,
+                        {{static_cast<int32_t>(colX[c]), static_cast<int32_t>(y0)},
+                         {1u, static_cast<uint32_t>(h)}},
+                        {1.0F, 1.0F, 1.0F, 0.10F}, {}, {0.0F, 0.0F, 0.0F}, {}, {}, id,
+                        24u);
+                if (totalRows > visibleRows)
+                    add(MODE_FILL,
+                        {{static_cast<int32_t>(x0 + w - 3.0F), static_cast<int32_t>(y0)},
+                         {3u, static_cast<uint32_t>(h)}},
+                        {1.0F, 1.0F, 1.0F, 0.08F}, {}, {1.0F, 0.0F, 0.0F}, {}, {}, id,
+                        24u);
+            }
+            // 25：文本换行（真实宽度约束下的贪心换行）
+            {
+                const VkRect2D box = cell(25);
+                const uint32_t id = kTileIdBase + 25u;
+                add(MODE_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
+                    {}, {}, id, 25u);
+                const float x0 = static_cast<float>(box.offset.x) + 8.0F;
+                float y = static_cast<float>(box.offset.y) + 18.0F;
+                const float maxW = static_cast<float>(box.extent.width) - 16.0F;
+                for (const auto &line : wrap("WRAP TEXT BY WIDTH", 15.0F, maxW))
+                {
+                    text(x0, y, 15.0F, {0.90F, 0.92F, 0.96F, 1.0F}, line, box);
+                    y += 18.0F;
+                }
+                // 宽度示意线，说明换行是按这个宽度断的
+                add(MODE_FILL,
+                    {{static_cast<int32_t>(x0), static_cast<int32_t>(y - 4.0F)},
+                     {static_cast<uint32_t>(maxW), 1u}},
+                    {1.0F, 1.0F, 1.0F, 0.15F}, {}, {0.0F, 0.0F, 0.0F}, {}, {}, id, 25u);
+            }
+            // 26：省略号（度量 + 截断 + 三个点）
+            {
+                const VkRect2D box = cell(26);
+                const uint32_t id = kTileIdBase + 26u;
+                add(MODE_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
+                    {}, {}, id, 26u);
+                const float x0 = static_cast<float>(box.offset.x) + 8.0F;
+                const float y0 = static_cast<float>(box.offset.y) + 18.0F;
+                const float maxW = static_cast<float>(box.extent.width) - 16.0F;
+                const auto [fit, cut] = fitEllipsis("SELECT TEXT", 16.0F, maxW);
+                float pen = text(x0, y0, 16.0F, {0.92F, 0.93F, 0.97F, 1.0F}, fit, box);
+                if (cut)
+                    for (int d = 0; d < 3; ++d)
+                        add(MODE_FILL,
+                            {{static_cast<int32_t>(pen + static_cast<float>(d) * 4.0F),
+                              static_cast<int32_t>(y0 - 2.0F)},
+                             {2u, 2u}},
+                            {0.92F, 0.93F, 0.97F, 1.0F}, {}, {1.0F, 0.0F, 0.0F}, {}, {},
+                            id, 26u);
+                // 截断边界 = maxW，画一条竖线示意
+                add(MODE_FILL,
+                    {{static_cast<int32_t>(x0 + maxW), static_cast<int32_t>(y0 - 12.0F)},
+                     {1u, 18u}},
+                    {1.0F, 0.5F, 0.5F, 0.55F}, {}, {0.0F, 0.0F, 0.0F}, {}, {}, id, 26u);
+            }
+            // 27：富文本（多 run，各自字号与颜色，按 advance 串起来）
+            {
+                const VkRect2D box = cell(27);
+                const uint32_t id = kTileIdBase + 27u;
+                add(MODE_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
+                    {}, {}, id, 27u);
+                struct run
+                {
+                    std::string_view text;
+                    glm::vec4 color;
+                    float scale;
+                };
+                const run runs[] = {
+                    {"RICH ", {0.95F, 0.45F, 0.40F, 1.0F}, 1.0F},
+                    {"TEXT ", {0.45F, 0.80F, 0.95F, 1.0F}, 1.4F},
+                    {"MIX", {0.70F, 0.90F, 0.50F, 1.0F}, 0.8F},
+                };
+                float pen = static_cast<float>(box.offset.x) + 8.0F;
+                const float baseline = static_cast<float>(box.offset.y) + 34.0F;
+                for (const auto &r : runs)
+                {
+                    pen = text(pen, baseline, 15.0F * r.scale, r.color, r.text, box);
+                    pen += 3.0F;
+                }
+            }
+            // 28：光标 + 选区（按文本度量定位，不是固定矩形）
+            {
+                const VkRect2D box = cell(28);
+                const uint32_t id = kTileIdBase + 28u;
+                add(MODE_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
+                    {}, {}, id, 28u);
+                constexpr std::string_view content = "SELECT TEXT";
+                const float px = 14.0F;
+                const float x0 = static_cast<float>(box.offset.x) + 8.0F;
+                const float baseline = static_cast<float>(box.offset.y) + 30.0F;
+                const float lineH = 18.0F;
+                // 光标位置由鼠标 x 反算（真的做文本度量反查），再夹到 [0, len]
+                const float localX =
+                    static_cast<float>(inputCtx.input.cursorPos().xpos) - x0;
+                float acc = 0.0F;
+                int caret = 0;
+                while (caret < static_cast<int>(content.size()) &&
+                       acc + advanceOf(content[static_cast<std::size_t>(caret)]) * px <
+                           localX)
+                {
+                    acc += advanceOf(content[static_cast<std::size_t>(caret)]) * px;
+                    ++caret;
+                }
+                const float caretX =
+                    x0 + measure(content.substr(0, static_cast<std::size_t>(caret)), px);
+                // 选区 = [0, caret)
+                if (caret > 0)
+                    add(MODE_FILL,
+                        {{static_cast<int32_t>(x0),
+                          static_cast<int32_t>(baseline - lineH * 0.8F)},
+                         {static_cast<uint32_t>(caretX - x0),
+                          static_cast<uint32_t>(lineH)}},
+                        {0.20F, 0.35F, 0.60F, 0.85F}, {}, {2.0F, 0.0F, 0.0F}, {}, {}, id,
+                        28u);
+                text(x0, baseline, px, {0.95F, 0.95F, 1.0F, 1.0F}, content, box);
+                add(MODE_FILL,
+                    {{static_cast<int32_t>(caretX),
+                      static_cast<int32_t>(baseline - 13.0F)},
+                     {2u, 17u}},
+                    {1.0F, 1.0F, 1.0F, 0.95F}, {}, {1.0F, 0.0F, 0.0F}, {}, {}, id, 28u);
+            }
+            // 29：裁剪（滚动裁剪 / 嵌套圆角裁剪都靠 scissor 交集）
+            {
+                const VkRect2D box = cell(29);
+                const uint32_t id = kTileIdBase + 29u;
+                add(MODE_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
+                    {}, {}, id, 29u);
+                const uint32_t halfW = box.extent.width / 2u;
+                const VkRect2D left{{box.offset.x + 6, box.offset.y + 6},
+                                    {halfW - 10u, box.extent.height - 12u}};
+                const VkRect2D right{
+                    {box.offset.x + static_cast<int32_t>(halfW) + 2, box.offset.y + 6},
+                    {halfW - 10u, box.extent.height - 12u}};
+                // 左：滚动裁剪 —— 真的滚动（滚轮驱动）：
+                //   1) 偏移量累积成 scroll，行位置 = 基准 + scroll
+                //   2) 只画落在裁剪框里的行（窗口化），其余根本不发命令
+                //   3) 每帧重录命令表，所以滚起来是连续的
+                {
+                    static float scroll = 0.0F;
+                    // 滚轮值只有真实事件才有限；默认哨兵（NaN/极大值）不能参与运算
+                    const double wheel = inputCtx.input.scroll().yoffset;
+                    if (std::isfinite(wheel) && std::abs(wheel) < 100.0)
+                        scroll += static_cast<float>(wheel) * 24.0F;
+                    scroll = std::fmod(scroll, 400.0F);
+                    const float rowH = 26.0F;
+                    const int32_t first =
+                        static_cast<int32_t>(std::floor(-scroll / rowH)) - 1;
+                    const int32_t rows =
+                        static_cast<int32_t>(left.extent.height / rowH) + 3;
+                    for (int32_t r = 0; r < rows; ++r)
+                    {
+                        const int32_t rowIndex = first + r;
+                        const float ry = static_cast<float>(left.offset.y) +
+                                         static_cast<float>(rowIndex) * rowH + scroll;
+                        if (ry + rowH < static_cast<float>(left.offset.y) ||
+                            ry > static_cast<float>(left.offset.y + left.extent.height))
+                            continue; // 完全在裁剪框外：不发命令
+                        add(MODE_FILL,
+                            {{left.offset.x, static_cast<int32_t>(ry)},
+                             {left.extent.width, static_cast<uint32_t>(rowH - 2.0F)}},
+                            (rowIndex % 2) ? glm::vec4{0.22F, 0.40F, 0.62F, 1.0F}
+                                           : glm::vec4{0.30F, 0.52F, 0.78F, 1.0F},
+                            {}, {4.0F, 0.0F, 0.0F}, {}, left, id, 29u);
+                    }
+                    // 滚动条：长度按可见比例、位置按偏移
+                    const float total = 400.0F;
+                    const float ratio = static_cast<float>(left.extent.height) / total;
+                    const int32_t barH = static_cast<int32_t>(
+                        static_cast<float>(left.extent.height) * ratio);
+                    const int32_t barY =
+                        left.offset.y +
+                        static_cast<int32_t>(
+                            static_cast<float>(left.extent.height -
+                                               static_cast<uint32_t>(barH)) *
+                            (std::fmod(-scroll,
+                                       total - static_cast<float>(left.extent.height)) /
+                             std::max(1.0F,
+                                      total - static_cast<float>(left.extent.height))));
+                    add(MODE_FILL,
+                        {{left.offset.x + static_cast<int32_t>(left.extent.width) - 3,
+                          barY},
+                         {3u, static_cast<uint32_t>(barH)}},
+                        {1.0F, 1.0F, 1.0F, 0.45F}, {}, {1.0F, 0.0F, 0.0F}, {}, {}, id,
+                        29u);
+                }
+                // 右：模板(stencil) 嵌套圆角裁剪 —— 不是 scissor 求交
+                //   1) 外层圆角矩形：ALWAYS + INCR  → 区域变 1
+                //   2) 内层圆角矩形：EQUAL 1 + INCR → 交集区域变 2
+                //   3) 内容：        EQUAL 2 + KEEP → 只画交集，圆角保持
+                const int32_t discR = static_cast<int32_t>(right.extent.width / 3);
+                const VkRect2D innerShape{
+                    {right.offset.x + static_cast<int32_t>(right.extent.width) - discR,
+                     right.offset.y - discR},
+                    {static_cast<uint32_t>(discR * 2), static_cast<uint32_t>(discR * 2)}};
+                addPipe(MODE_CLIP_MASK, right, {}, {}, {20.0F, 0.0F, 0.0F}, {}, right, 4,
+                        0u); // 外层：圆角矩形 → 模板 1
+                addPipe(MODE_CLIP_MASK, innerShape, {}, {},
+                        {static_cast<float>(discR), 0.0F, 0.0F}, {}, innerShape, 5,
+                        1u); // 内层：圆 → 只在外层内再 +1，交集变 2
+                addPipe(MODE_CONIC, right, {0.98F, 0.85F, 0.30F, 1.0F},
+                        {0.25F, 0.75F, 0.60F, 1.0F}, {0.0F, 12.0F, 0.0F}, {}, right, 6,
+                        2u); // 内容：只画模板 == 2 的地方
+            }
+
+            // 页面内容：玻璃图块下面的彩色壁纸 + 高频棋盘
+            //   （玻璃本身比图块内缩一圈，四周留一圈"清晰"的壁纸作对照）
+            if (inView(18))
+            {
+                const VkRect2D wallpaper = cell(18);
+                add(MODE_RADIAL, wallpaper, {0.98F, 0.30F, 0.45F, 1.0F},
+                    {0.15F, 0.10F, 0.30F, 1.0F}, {110.0F, 16.0F, 0.0F}, {});
+                add(MODE_CONIC, wallpaper, {0.20F, 0.95F, 0.75F, 1.0F},
+                    {0.98F, 0.85F, 0.20F, 1.0F}, {0.0F, 16.0F, 0.0F}, {});
+                add(MODE_CHECKER, wallpaper, {0.98F, 0.98F, 0.98F, 0.55F},
+                    {0.15F, 0.18F, 0.30F, 0.55F}, {7.0F, 0.0F, 0.0F}, {});
+            }
+
+            // ── 4.5 悬停高亮：picking 命中的图块描边 ────────────────────
+            if (hoveredTile >= 0 && hoveredTile < kCapacity)
+            {
+                const VkRect2D box = cell(hoveredTile);
+                const glm::vec4 line{1.0F, 1.0F, 1.0F, 0.55F};
+                add(MODE_FILL, {{box.offset.x, box.offset.y}, {box.extent.width, 2u}},
+                    line, {}, {1.0F, 0.0F, 0.0F});
+                add(MODE_FILL,
+                    {{box.offset.x,
+                      box.offset.y + static_cast<int32_t>(box.extent.height) - 2},
+                     {box.extent.width, 2u}},
+                    line, {}, {1.0F, 0.0F, 0.0F});
+                add(MODE_FILL, {{box.offset.x, box.offset.y}, {2u, box.extent.height}},
+                    line, {}, {1.0F, 0.0F, 0.0F});
+                add(MODE_FILL,
+                    {{box.offset.x + static_cast<int32_t>(box.extent.width) - 2,
+                      box.offset.y},
+                     {2u, box.extent.height}},
+                    line, {}, {1.0F, 0.0F, 0.0F});
+            }
+
+            // path 命令：even-odd 填充 + 描边，都由 emit 循环按 PathId 分发
+            addPath(1, idFill, cell(14), {0.95F, 0.78F, 0.22F, 1.0F});
+            // 左：三角形填充 + MSAA 边缘（test_ui_path_aa 的语义）
+            addPath(1, idTri, msaaBox, {0.55F, 0.80F, 1.0F, 1.0F});
+            // 右：贝塞尔描边 + 片元解析覆盖率（解析 AA 的语义）
+            addPath(2, idStroke, strokeBox, {0.95F, 0.85F, 0.35F, 1.0F},
+                    {4.0F, 0.0F, 0.0F});
+
+            {
+                uint32_t nPath = 0;
+                for (uint32_t k = 0; k < cmdCount; ++k)
+                    if (cmds[k].pathKind != 0)
+                        ++nPath;
+                static bool once = false;
+                if (!once)
+                {
+                    once = true;
+                    std::println("[CMDS] total={} path={} firstMode={} firstPathKind={}",
+                                 cmdCount, nPath, (int)cmds[0].params.x,
+                                 cmds[0].pathKind);
+                }
+            }
+            // ── 5. 逐条录制：管线(按需) + 模板参考(按需) + setScissor + pushConstants + draw
+            VkPipeline boundPipe = *mainCtx.pipelineTransparentUI;
+            uint32_t boundRef = 0xFFFFFFFFu;
+            for (uint32_t i = 0; i < cmdCount; ++i)
+            {
+                const ui_cmd &c = cmds[i];
+
+                if (c.pathKind != 0)
+                {
+                    drawPathCommand(c); // 解析 PathId → 执行子 pass
+                    boundPipe = *mainCtx.pipelineTransparentUI;
+                    continue;
+                }
+
+                PushData pc{};
+                // 0 = 普通全屏三角形；1/2 已被批处理几何入口（描边/扇形）占用
+                pc.geomEntry = 0;
+                pc.uiRect = c.rect;
+                pc.uiColor = c.color;
+                pc.uiColor2 = c.color2;
+                pc.uiParams = c.params;
+                pc.uiAux = c.aux;
+                pc.uiPick = c.pick;
+
+                const VkPipeline wantPipe = (c.pipe == 0)
+                                                ? *mainCtx.pipelineTransparentUI
+                                                : *(*uiPipelines().pipes[c.pipe]);
+                if (wantPipe != boundPipe)
+                {
+                    commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, wantPipe);
+                    boundPipe = wantPipe;
+                }
+                // 模板参考值是动态状态：每次绑定带模板的管线后都要重新设置一次
+                if (c.pipe != 0)
+                {
+                    commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK,
+                                                      c.ref);
+                }
+
+                commandBuffer.setScissor(0, std::span{&c.scissor, 1});
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(PushData), &pc);
+                commandBuffer.draw(3, 1, 0, 0);
+            }
+
+            // ── 6. endRendering ─────────────────────────────────────────
+            commandBuffer.endRendering();
+
+            // ── 7. 拾取回读（鼠标位置一个像素）+ 呈现转换 ───────────────
+            {
+                auto &pickingFrames = pickCtx.frames;
+                const auto &mousePos = pickCtx.mouse.pos;
+
                 my_render::transition_image_layout(
                     commandBuffer,
                     my_render::image_info{
@@ -10803,17 +12895,13 @@ try
                         .dst = {VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                 VK_ACCESS_2_TRANSFER_READ_BIT,
                                 VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
-                //NOTE: 复制到 pickingFrames，就可以读取了，拿到着色器的输出
-                // 鼠标坐标可能是上一次窗口尺寸留下的；窗口缩小后 y 会超过
-                // picking image 的高度。这里无条件拷贝（保证回读缓冲有内容），
-                // 所以必须把坐标 clamp 到当前 extent 内。
-                const auto pickExtent = globalCtx.swapchain.refImageExtent();
+
                 const int32_t pickX =
                     std::clamp(static_cast<int32_t>(mousePos.x), 0,
-                               std::max(0, static_cast<int32_t>(pickExtent.width) - 1));
+                               std::max(0, static_cast<int32_t>(extent.width) - 1));
                 const int32_t pickY =
                     std::clamp(static_cast<int32_t>(mousePos.y), 0,
-                               std::max(0, static_cast<int32_t>(pickExtent.height) - 1));
+                               std::max(0, static_cast<int32_t>(extent.height) - 1));
                 commandBuffer.copyImageToBuffer(
                     resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     pickingFrames[currentFrame].buffer(),
@@ -10822,45 +12910,264 @@ try
                         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                         .imageOffset = {pickX, pickY, 0},
                         .imageExtent = {1, 1, 1}}});
-
-                //diff: [test_indirectdraw_no_pick] end
             }
-        }));
+
+            // ── 7.5 真·背景模糊：把"已经画好的这一帧"blit 到离屏层再模糊
+            //   1) swapchain(已 resolve) → TRANSFER_SRC，blit 到 layer D（顺便降采样）
+            //   2) D→B 横糊、B→D 纵糊
+            //   3) 第二段 rendering（LOAD，不清空）把模糊结果合成到 backdrop 图块
+            {
+                if (!inView(18))
+                    return;
+                const VkRect2D cellBox = cell(18);
+                const VkRect2D tile{
+                    {cellBox.offset.x + 12, cellBox.offset.y + 12},
+                    {cellBox.extent.width - 24u, cellBox.extent.height - 24u}};
+                auto &scratch = frameLayers[1];
+                auto &blurred = frameLayers[3];
+
+                my_render::transition_image_layout(
+                    commandBuffer,
+                    my_render::image_info{
+                        .image = image,
+                        .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                .stage_mask =
+                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                        .dst = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
+                                .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
+                layerToColor(
+                    blurred.image); // 顺手把层转到可写（TRANSFER_DST 由下一句接）
+                my_render::transition_image_layout(
+                    commandBuffer,
+                    my_render::image_info{
+                        .image = blurred.image,
+                        .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                .access_mask = VK_ACCESS_2_NONE,
+                                .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                        .dst = {.layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                .access_mask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
+                commandBuffer.blitImage(
+                    image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, blurred.image,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    std::array<VkImageBlit, 1>{VkImageBlit{
+                        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                        .srcOffsets = {{0, 0, 0},
+                                       {static_cast<int32_t>(extent.width),
+                                        static_cast<int32_t>(extent.height), 1}},
+                        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                        .dstOffsets =
+                            {{0, 0, 0},
+                             {static_cast<int32_t>(ui_layer_ctx::kExtent.width),
+                              static_cast<int32_t>(ui_layer_ctx::kExtent.height), 1}}}},
+                    VK_FILTER_LINEAR);
+
+                // 模糊：D→B（横）、B→D（纵）
+                auto blurStep = [&](const ui_layer_ctx::layer &srcLayer,
+                                    const ui_layer_ctx::layer &dstLayer, float dir,
+                                    float radius) {
+                    my_render::transition_image_layout(
+                        commandBuffer,
+                        my_render::image_info{
+                            .image = srcLayer.image,
+                            .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                            .src = {.layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    .access_mask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                    .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT},
+                            .dst = {.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                    .access_mask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                                    .stage_mask =
+                                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT}});
+                    layerToColor(dstLayer.image);
+                    layerBegin(dstLayer.view);
+                    layerCmd(MODE_LAYER_BLUR, fullLayer, {}, {},
+                             {dir, radius, static_cast<float>(srcLayer.texture)},
+                             {static_cast<float>(srcLayer.sampler), 0.0F, 0.0F, 0.0F});
+                    commandBuffer.endRendering();
+                    layerToSampled(dstLayer.image);
+                };
+                blurStep(blurred, scratch, 0.0F, 2.0F);
+                {
+                    // B 已在 SHADER_READ；把 D 重新当写目标
+                    my_render::transition_image_layout(
+                        commandBuffer,
+                        my_render::image_info{
+                            .image = blurred.image,
+                            .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                            .src = {.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                    .access_mask = VK_ACCESS_2_NONE,
+                                    .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                            .dst = {
+                                .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                .stage_mask =
+                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
+                }
+                layerBegin(blurred.view);
+                layerCmd(MODE_LAYER_BLUR, fullLayer, {}, {},
+                         {1.0F, 2.0F, static_cast<float>(scratch.texture)},
+                         {static_cast<float>(scratch.sampler), 0.0F, 0.0F, 0.0F});
+                commandBuffer.endRendering();
+                layerToSampled(blurred.image);
+
+                // swapchain 转回可写
+                my_render::transition_image_layout(
+                    commandBuffer,
+                    my_render::image_info{
+                        .image = image,
+                        .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .src = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
+                                .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT},
+                        .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                .stage_mask =
+                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
+
+                // 第二段 pass：LOAD（保留已有画面），只画这块毛玻璃
+                VkRenderingAttachmentInfo colorLoad = colorAttachment;
+                colorLoad.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                VkRenderingAttachmentInfo pickLoad = pickAttachment;
+                pickLoad.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                VkRenderingAttachmentInfo depthLoad = depthAttachment;
+                depthLoad.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                std::array loadAttachments = {colorLoad, pickLoad};
+                commandBuffer.beginRendering(
+                    {.sType = sType<VkRenderingInfo>(),
+                     .renderArea = {.offset = {.x = 0, .y = 0}, .extent = extent},
+                     .layerCount = 1,
+                     .colorAttachmentCount =
+                         static_cast<uint32_t>(loadAttachments.size()),
+                     .pColorAttachments = loadAttachments.data(),
+                     .pDepthAttachment = &depthLoad,
+                     .pStencilAttachment = hasStencil ? &depthLoad : nullptr});
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineTransparentUI);
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                                 nullptr);
+                commandBuffer.setViewport(0, std::span{&viewport, 1});
+
+                PushData glass{};
+                glass.geomEntry = 0; // 普通全屏三角形
+                glass.uiRect = {static_cast<float>(tile.offset.x),
+                                static_cast<float>(tile.offset.y),
+                                static_cast<float>(tile.extent.width),
+                                static_cast<float>(tile.extent.height)};
+                glass.uiParams = {static_cast<float>(MODE_LAYER_COMPOSITE), 1.0F,
+                                  static_cast<float>(blurred.texture),
+                                  static_cast<float>(blurred.sampler)};
+                // aux.yz = 整屏尺寸：告诉着色器“层里存的是整屏”，按屏幕位置取 uv
+                glass.uiAux = {12.0F, W, H, 0.0F};
+                commandBuffer.setScissor(0, std::span{&tile, 1});
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(PushData), &glass);
+                commandBuffer.draw(3, 1, 0, 0);
+                // 玻璃面板本身（半透明，能看见后面的模糊内容）
+                glass.uiParams = {static_cast<float>(MODE_FILL), 14.0F, 0.0F, 0.0F};
+                glass.uiColor = {0.88F, 0.92F, 1.0F, 0.18F};
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(PushData), &glass);
+                commandBuffer.draw(3, 1, 0, 0);
+                commandBuffer.endRendering();
+            }
+
+            // ── 8. 调试：第 120 帧把整帧拷回 CPU，写成 PPM（验证用像素，不靠屏幕截图）
+            static uint32_t frameCounter = 0;
+            static bool dumpPending = false;
+            const bool dumpThisFrame = (++frameCounter == 120u);
+            if (dumpPending) // 上一帧的 copy 已执行完，这时读回缓冲才有效
+            {
+                dumpPending = false;
+                globalCtx.device.waitIdle();
+                const auto *px =
+                    static_cast<const uint8_t *>(globalCtx.frameDump.buffer.mapPtr());
+                std::FILE *f = std::fopen("ui_ability_frame.ppm", "wb");
+                if (f != nullptr)
+                {
+                    std::fprintf(f, "P6\n%u %u\n255\n", extent.width, extent.height);
+                    for (uint32_t i = 0; i < extent.width * extent.height; ++i)
+                    {
+                        const uint8_t rgb[3] = {px[i * 4 + 2], px[i * 4 + 1],
+                                                px[i * 4 + 0]};
+                        std::fwrite(rgb, 1, 3, f);
+                    }
+                    std::fclose(f);
+                    std::println("[DUMP] wrote ui_ability_frame.ppm ({}x{})",
+                                 extent.width, extent.height);
+                }
+            }
+            if (dumpThisFrame)
+            {
+                my_render::transition_image_layout(
+                    commandBuffer,
+                    my_render::image_info{
+                        .image = image,
+                        .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                .stage_mask =
+                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                        .dst = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
+                                .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
+                commandBuffer.copyImageToBuffer(
+                    image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    globalCtx.frameDump.buffer.buffer(),
+                    std::array<VkBufferImageCopy, 1>{VkBufferImageCopy{
+                        .bufferOffset = 0,
+                        .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                        .imageOffset = {0, 0, 0},
+                        .imageExtent = {extent.width, extent.height, 1}}});
+            }
+
+            // 呈现前转换
+            my_render::transition_image_layout(
+                commandBuffer,
+                my_render::image_info{
+                    .image = image,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = dumpThisFrame
+                                          ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                          : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = dumpThisFrame
+                                               ? VK_ACCESS_2_TRANSFER_READ_BIT
+                                               : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                dumpThisFrame
+                                    ? VK_PIPELINE_STAGE_2_TRANSFER_BIT
+                                    : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                            .access_mask = VK_ACCESS_2_NONE,
+                            .stage_mask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT}});
+
+            if (dumpThisFrame)
+                dumpPending = true;
+        }),
+        method<"endRendering">([](world_type &, input_type &, data_type &) {}));
+
     // NOLINTNEXTLINE
-    static constexpr auto recordCommandBuffer = [](world_type &world,
-                                                   input_type &inputCtx,
-                                                   data_type &soaCtx) {
-        auto &globalCtx = world.globalCtx;
-        auto &recordCtx = world.recordCtx;
+    static constexpr auto recordCommandBuffer =
+        [](world_type &world, input_type &inputCtx, data_type &soaCtx) {
+            auto &globalCtx = world.globalCtx;
+            auto &recordCtx = world.recordCtx;
+            auto &commandBuffers = globalCtx.commandBuffers;
 
-        auto &swapchain = globalCtx.swapchain;
-        auto &commandBuffers = globalCtx.commandBuffers;
+            auto [currentFrame, imageIndex] = recordCtx.info;
+            const auto &commandBuffer = commandBuffers[currentFrame];
 
-        auto [currentFrame, imageIndex] = recordCtx.info;
-        const auto &commandBuffer = commandBuffers[currentFrame];
-        VkImage image = swapchain.image(imageIndex);
-
-        commandBuffer.begin({.sType = sType<VkCommandBufferBeginInfo>()});
-        mainPipeline.transitionImageLayout(world, inputCtx, soaCtx);
-        mainPipeline.beginRendering(world, inputCtx, soaCtx);
-        mainPipeline.setPipelineState(world, inputCtx, soaCtx);
-        mainPipeline.draw(world, inputCtx, soaCtx);
-        mainPipeline.endRendering(world, inputCtx, soaCtx);
-
-        // After rendering, transition the swapchain image to PRESENT_SRC
-        my_render::transition_image_layout(
-            commandBuffer,
-            my_render::image_info{
-                .image = image,
-                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                        .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                        .stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
-                .dst = {.layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                        .access_mask = VK_ACCESS_2_NONE,
-                        .stage_mask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT}});
-        commandBuffer.end();
-    };
+            commandBuffer.begin({.sType = sType<VkCommandBufferBeginInfo>()});
+            mainPipeline.draw(world, inputCtx, soaCtx); // 全部 vkCmd* 都在 draw 里
+            commandBuffer.end();
+        };
     // diff: [test_dod5] end
 
     // NOLINTNEXTLINE
@@ -11193,12 +13500,21 @@ try
         semaphoreIndex = (semaphoreIndex + 1) % presentCompleteSemaphore.size();
         currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     };
+    uint32_t autoExitFrames = 0;
     while (globalCtx.window.shouldClose() == 0)
     {
         task_graph.invoke_ranges<"input_start", "input_end">(world, inputCtx, soaCtx);
         drawFrame(world, inputCtx, soaCtx);
+        // 可选自动退出：只给验证用（DSH_AUTOEXIT 设了就渲染 150 帧后退出），
+        // 这样退出路径（含 device 销毁）也能被 validation 覆盖到
+        if (std::getenv("DSH_AUTOEXIT") != nullptr && ++autoExitFrames >= 150)
+            break;
     }
     device.waitIdle();
+
+    // 必须在 device 销毁前清掉静态管线：函数内 static 的析构晚于 device，
+    // 否则退出时每条管线都会报 "VkPipeline ... has not been destroyed"
+    uiPipelines().reset();
 
     std::cout << "main done\n";
     return 0;
