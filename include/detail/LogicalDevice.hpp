@@ -322,6 +322,14 @@ namespace mcs::vulkan
             table_.vkCmdSetScissor(commandBuffer, firstScissor, scissorCount, pScissors);
         }
 
+        constexpr void cmdSetStencilReference(VkCommandBuffer commandBuffer,
+                                              VkStencilFaceFlags faceMask,
+                                              uint32_t reference) const noexcept
+        {
+            MCS_ASSERT(table_.vkCmdSetStencilReference != nullptr);
+            table_.vkCmdSetStencilReference(commandBuffer, faceMask, reference);
+        }
+
         constexpr void cmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
                                uint32_t instanceCount, uint32_t firstVertex,
                                uint32_t firstInstance) const noexcept

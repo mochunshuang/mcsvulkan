@@ -245,6 +245,11 @@ namespace mcs::vulkan
             pool_->device()->cmdSetScissor(value_, firstScissor, scissors.size(),
                                            scissors.data());
         }
+        constexpr void setStencilReference(VkStencilFaceFlags faceMask,
+                                          uint32_t reference) const noexcept
+        {
+            pool_->device()->cmdSetStencilReference(value_, faceMask, reference);
+        }
         constexpr void draw(uint32_t vertexCount, uint32_t instanceCount,
                             uint32_t firstVertex, uint32_t firstInstance) const noexcept
         {
