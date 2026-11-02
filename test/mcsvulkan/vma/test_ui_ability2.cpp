@@ -29,6 +29,11 @@
 
 #include "../head.hpp"
 
+// 与 test_intent2 共用同一套协议与后端
+#include "ui_protocol.hpp"
+#include "ui_backend.hpp"
+#include "ui_shader_device.hpp"
+
 using mcs::vulkan::Instance;
 using mcs::vulkan::tool::create_instance;
 using mcs::vulkan::tool::create_debugger;
@@ -549,7 +554,8 @@ struct PushData
 // ═══════════════════════════════════════════════════════════════════════
 struct ui_layer_ctx
 {
-    static constexpr uint32_t kPerFrame = 4; // A=模糊结果 B=糊的临时 C=组 D=背景
+    static constexpr uint32_t kPerFrame =
+        8; // Compiler 按需分配（blur 会多要一张 scratch）
     static constexpr VkExtent2D kExtent{320, 192};
     struct layer
     {
@@ -967,545 +973,641 @@ namespace shader_data
         }
     };
 
-    // ═══════════════════════════════════════════════════════════════
-    // Slice<T>：一个半开区间 [start, start+count)，指向某个 Arena<T>
-    //   - 语义上等价于 std::span，但只保存 (start, count)，不持有指针；
-    //     需要读取时用 .view(pool) 把区间映射回实际的 std::span。
-    //   - 用类型参数 T 区分“这段是 VkRect2D 还是 VkViewport”，
-    //     避免把两者的 start/count 混在一起。
-    // ═══════════════════════════════════════════════════════════════
-    template <typename T>
-    struct Slice
-    {
-        uint32_t start = 0;
-        uint32_t count = 0;
-
-        [[nodiscard]] std::span<const T> view(const std::vector<T> &pool) const noexcept
-        {
-            return {pool.data() + start, count};
-        }
-
-        [[nodiscard]] bool empty() const noexcept
-        {
-            return count == 0;
-        }
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    // Arena<T>：预分配 + 线性追加的池子
-    //   - 每帧只把 count 归零，vector 的 capacity 跨帧保留；
-    //   - push_span / push_one 只会因容量不足而增长，之后不再分配；
-    //   - 追加返回 Slice<T>（或索引），外部只需保存“区间”而非“指针”。
-    //
-    //   与 GPU 侧的 BufferResource + offset 完全同构：
-    //     GPU: 一次性 buffer + indirectOffset/constantOffset
-    //     CPU: 一次性 vector + count
-    // ═══════════════════════════════════════════════════════════════
-    template <typename T>
-    struct Arena
-    {
-        std::vector<T> pool;
-        uint32_t count = 0;
-
-        void reset() noexcept
-        {
-            count = 0;
-        }
-        void reserve(size_t n)
-        {
-            pool.reserve(n);
-        }
-
-        // 追加一段连续数据，返回它在新 arena 中的位置
-        Slice<T> push_span(std::span<const T> src)
-        {
-            const uint32_t start = count;
-            if (count + src.size() > pool.size())
-                pool.resize(std::max<size_t>(pool.size() * 2, count + src.size()));
-            std::memcpy(pool.data() + start, src.data(), src.size() * sizeof(T));
-            count += static_cast<uint32_t>(src.size());
-            return {start, static_cast<uint32_t>(src.size())};
-        }
-
-        // 追加单个元素，返回它的引用（便于就地进行进一步赋值）
-        T &push_one(const T &v)
-        {
-            if (count >= pool.size())
-                pool.resize(std::max<size_t>(pool.size() * 2, 16));
-            T &slot = pool[count];
-            slot = v;
-            ++count;
-            return slot;
-        }
-
-        [[nodiscard]] std::span<const T> view(Slice<T> s) const noexcept
-        {
-            return {pool.data() + s.start, s.count};
-        }
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    // DrawSegment：一个绘制段 = 一次实际的 drawIndexedIndirect 调用
-    //
-    // 段由四个概念构成，每个概念各占一行，避免“八个 u32 平铺”：
-    //   1) 动态状态（Vulkan 每段的 scissor/viewport）→ 用 Slice<T> 引用 arena
-    //   2) 命令条数 commandCount（GPU 侧一批 command 的数量）
-    //   3) GPU 字节偏移（finishDraw 时回填，指向 indirect/const buffer）
-    //
-    // 段在 pending.cmds / consts 里严格顺序排列、无间隙、无重叠，
-    // 因此不需要 commandStart —— 遍历时按 commandCount 顺序累加即可。
-    // ═══════════════════════════════════════════════════════════════
-    struct DrawSegment
-    {
-        // ── 动态状态：本段对应的 scissor / viewport 切片 ──
-        Slice<VkRect2D> scissors;
-        Slice<VkViewport> viewports;
-
-        // ── 本段包含的 drawIndexedIndirect 命令数 ──
-        uint32_t commandCount = 0;
-
-        // ── GPU buffer 字节偏移（finishDraw 回填）──
-        uint32_t indirectByteOffset = 0;
-        uint32_t constantByteOffset = 0;
-    };
-    static_assert(std::is_trivially_copyable_v<DrawSegment>);
-
-    // ═══════════════════════════════════════════════════════════════
-    // UnitRef：一次“静态状态相同的连续绘制”的引用
-    //   - 段本身放在 segmentPool 里，UnitRef 只持有 [start, count)
-    //   - 提交时按 UnitRef.staticKey.pipeline 排序绑定，减少管线切换
-    // ═══════════════════════════════════════════════════════════════
-    struct UnitRef
-    {
-        StaticDrawKey staticKey;
-        Slice<DrawSegment> segments; // 在 segmentPool 中的切片
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    // PendingDraw：正在构建中的 DrawUnit（同一静态状态）
-    //   - 只保留命令缓冲，段一旦固定就写入 segmentPool，不再 move
-    // ═══════════════════════════════════════════════════════════════
-    struct PendingDraw
-    {
-        StaticDrawKey staticKey;
-        std::vector<VkDrawIndexedIndirectCommand> cmds; // 跨段连续存储
-        std::vector<CommandConstant> consts;            // 与 cmds 一一对应
-        size_t currentSegmentCmdStart{0};               // 当前活动段的命令起点
-    };
-
-    // ═══════════════════════════════════════════════════════════════
-    // DrawRecorder：多实例绘制的命令录制器
-    //
-    // 设计要点：
-    //   1. GPU 侧数据（顶点/实例/命令/常量）都放在固定 buffer 里，
-    //      每帧只归零 offset；动态的只是“写入量”，不是“分配”。
-    //   2. CPU 侧元数据（segment/scissor/viewport/unit）同样走 arena：
-    //      一次性预分配 + 每帧 count 归零，稳态下零分配。
-    //   3. 段与段的动态状态通过 Slice<T> 引用 arena 中的连续切片，
-    //      DrawSegment 本身保持 POD，可跨帧反复覆写。
-    // ═══════════════════════════════════════════════════════════════
-    class DrawRecorder
-    {
-      public:
-        // ── GPU 缓冲 ─────────────────────────────────
-        BufferResourceWithAddress globalVertexBuffer{};
-        BufferResource globalIndexBuffer{};
-        BufferResourceWithAddress globalHeapBuffer;
-        BufferResource indirectDrawBuffer;
-        BufferResourceWithAddress commandConstantsBuffer;
-
-        // ── GPU 端每帧线性偏移（写入量）───────────────
-        size_t heapOffset = 0;
-        size_t indirectOffset = 0;
-        size_t constantOffset = 0;
-
-        // ── CPU 端 arena（元数据）═════════════════════
-        // 所有段平铺存储；UnitRef 通过 Slice<DrawSegment> 引用其中的一段
-        Arena<DrawSegment> segments;
-        // 所有 scissor / viewport 平铺存储；DrawSegment 通过 Slice<T> 引用
-        Arena<VkRect2D> scissors;
-        Arena<VkViewport> viewports;
-        // 所有 unit 平铺存储；一次提交对应 count 个 UnitRef
-        Arena<UnitRef> units;
-
-        // ── 当前构建状态 ─────────────────────────────
-        StaticDrawKey currentStatic{};
-        DynamicDrawState currentDynamic;
-
-        // 当前 unit 在 segmentPool 中的起始下标；
-        // addInstances 懒启动时记录，finishDraw 用它确定本 unit 的段区间
-        uint32_t currentUnitSegmentStart = 0;
-
-        // ── Pending（仅暂存，不再 move 出去）────────
-        PendingDraw pending{};
-        bool pendingActive = false;
-
-        // ---------- 构造函数 ----------
-        static auto newVertexBuffer(const LogicalDevice &device, VkDeviceSize capacity)
-        {
-            return BufferResourceWithAddress{
-                device, capacity,
-                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                VK_SHARING_MODE_EXCLUSIVE,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
-        }
-
-        static auto newIndexBuffer(const LogicalDevice &device, VkDeviceSize capacity)
-        {
-            return BufferResource{device, capacity, VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                                  VK_SHARING_MODE_EXCLUSIVE,
-                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
-        }
-
-        static auto newHeapBuffer(const LogicalDevice &device, VkDeviceSize capacity)
-        {
-            return BufferResourceWithAddress{
-                device, capacity,
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                VK_SHARING_MODE_EXCLUSIVE,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
-        }
-
-        static auto newIndirectDrawBuffer(const LogicalDevice &device,
-                                          VkDeviceSize capacity)
-        {
-            return BufferResource{device, capacity, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-                                  VK_SHARING_MODE_EXCLUSIVE,
-                                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
-        }
-
-        static auto newCommandConstantsBuffer(const LogicalDevice &device,
-                                              VkDeviceSize capacity)
-        {
-            return BufferResourceWithAddress{
-                device, capacity,
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                VK_SHARING_MODE_EXCLUSIVE,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
-        }
-
-        constexpr DrawRecorder(const LogicalDevice &device, VkDeviceSize vertexCapacity,
-                               VkDeviceSize indexCapacity, VkDeviceSize heapCapacity,
-                               VkDeviceSize indirectDrawCapacity,
-                               VkDeviceSize commandConstantsCapacity)
-            : globalVertexBuffer{newVertexBuffer(device, vertexCapacity)},
-              globalIndexBuffer{newIndexBuffer(device, indexCapacity)},
-              globalHeapBuffer{newHeapBuffer(device, heapCapacity)},
-              indirectDrawBuffer{newIndirectDrawBuffer(device, indirectDrawCapacity)},
-              commandConstantsBuffer{
-                  newCommandConstantsBuffer(device, commandConstantsCapacity)}
-        {
-            // 稳态零分配的预留（数字按“不超过 100 条命令”估算，第一次运行后稳定）
-            segments.reserve(64);
-            scissors.reserve(64);
-            viewports.reserve(64);
-            units.reserve(32);
-            pending.cmds.reserve(128);
-            pending.consts.reserve(128);
-        }
-
-        // ---------- 每帧重置 ----------
-        // 只归零“写指针”，arena 的 capacity 全部保留
-        void reset() noexcept
-        {
-            heapOffset = 0;
-            indirectOffset = 0;
-            constantOffset = 0;
-
-            segments.reset();
-            scissors.reset();
-            viewports.reset();
-            units.reset();
-            currentUnitSegmentStart = 0;
-
-            currentStatic = {};
-            currentDynamic.clear();
-
-            pending.staticKey = {};
-            pending.cmds.clear();
-            pending.consts.clear();
-            pending.currentSegmentCmdStart = 0;
-
-            pendingActive = false;
-        }
-
-        // ---------- 只结束当前活动段，绝不修改已经记录的段 ----------
-        void pushCurrentSegment() noexcept
-        {
-            if (!pendingActive)
-                return;
-
-            const size_t cmdCount = pending.cmds.size() - pending.currentSegmentCmdStart;
-            if (cmdCount == 0)
-                return;
-
-            // 追加动态状态切片 + 记录本段的命令条数
-            // 注意：currentDynamic 此刻仍是“旧状态”，push 完才轮到 setter 去更新
-            segments.push_one(DrawSegment{
-                .scissors = scissors.push_span(currentDynamic.scissors),
-                .viewports = viewports.push_span(currentDynamic.viewports),
-                .commandCount = static_cast<uint32_t>(cmdCount),
-                .indirectByteOffset = 0, // finishDraw 回填
-                .constantByteOffset = 0, // finishDraw 回填
-            });
-
-            pending.currentSegmentCmdStart = pending.cmds.size();
-        }
-
-        // ---------- 结束当前 DrawUnit ----------
-        void finishDraw() noexcept
-        {
-            if (!pendingActive)
-                return;
-
-            pushCurrentSegment();
-
-            if (pending.cmds.empty())
-            {
-                pendingActive = false;
-                return;
-            }
-
-            const uint32_t segBegin = currentUnitSegmentStart;
-            const uint32_t segEnd = segments.count;
-            assert(segEnd > segBegin);
-
-            const size_t cmdBytes =
-                pending.cmds.size() * sizeof(VkDrawIndexedIndirectCommand);
-            const size_t constBytes = pending.consts.size() * sizeof(CommandConstant);
-            const size_t baseIndirect = indirectOffset;
-            const size_t baseConstant = constantOffset;
-
-            // 上传 GPU（写入量动态，分配在构造函数时已固定）
-            indirectDrawBuffer.write(baseIndirect, pending.cmds.data(), cmdBytes);
-            commandConstantsBuffer.write(baseConstant, pending.consts.data(), constBytes);
-
-            // 回填本 unit 内所有段的字节偏移。
-            // 段在 pending.cmds 里顺序排列，commandStart 可推导，无需存储。
-            uint32_t cmdCursor = 0;
-            for (uint32_t i = segBegin; i < segEnd; ++i)
-            {
-                auto &seg = segments.pool[i];
-                seg.indirectByteOffset = static_cast<uint32_t>(
-                    baseIndirect + cmdCursor * sizeof(VkDrawIndexedIndirectCommand));
-                seg.constantByteOffset = static_cast<uint32_t>(
-                    baseConstant + cmdCursor * sizeof(CommandConstant));
-                cmdCursor += seg.commandCount;
-            }
-
-            // 追加 UnitRef（只记录静态状态 + 段区间，不 move 任何 vector）
-            units.push_one(UnitRef{
-                .staticKey = pending.staticKey,
-                .segments = {segBegin, segEnd - segBegin},
-            });
-
-            indirectOffset += cmdBytes;
-            constantOffset += constBytes;
-
-            pendingActive = false;
-        }
-
-        // ---------- 静态状态设置 ----------
-        // 语义：任何一个静态状态变化都意味着“新的一次 draw call 边界”，
-        //       先把当前 pending（如果有）收尾，再切换状态。
-        void setPipeline(VkPipeline pipeline)
-        {
-            if (currentStatic.pipeline != pipeline)
-            {
-                if (currentStatic.valid())
-                    finishDraw();
-                currentStatic.pipeline = pipeline;
-            }
-        }
-
-        void setLayout(VkPipelineLayout layout)
-        {
-            if (currentStatic.layout != layout)
-            {
-                if (currentStatic.valid())
-                    finishDraw();
-                currentStatic.layout = layout;
-            }
-        }
-
-        void setPushData(const PushData &pushData)
-        {
-            if (currentStatic.pushData != pushData)
-            {
-                if (currentStatic.valid())
-                    finishDraw();
-                currentStatic.pushData = pushData;
-            }
-        }
-
-        void setMesh(const mesh_data &mesh)
-        {
-            if (currentStatic.mesh != mesh)
-            {
-                if (currentStatic.valid())
-                    finishDraw();
-                currentStatic.mesh = mesh;
-            }
-        }
-
-        // ---------- 动态状态设置 ----------
-        // 语义：动态状态只在“段边界”才能切换；切换前必须先把旧段收尾。
-        void setScissors(std::span<const VkRect2D> scissors_)
-        {
-            if (equal_scissors(currentDynamic.scissors, scissors_))
-                return;
-
-            if (pendingActive)
-                pushCurrentSegment(); // 用旧状态收段
-
-            currentDynamic.scissors.assign(scissors_.begin(), scissors_.end());
-        }
-
-        void setViewports(std::span<const VkViewport> viewports_)
-        {
-            if (equal_viewports(currentDynamic.viewports, viewports_))
-                return;
-
-            if (pendingActive)
-                pushCurrentSegment();
-
-            currentDynamic.viewports.assign(viewports_.begin(), viewports_.end());
-        }
-
-        // ---------- 添加实例数据 ----------
-        // 一次 addInstances = 一条 drawIndexedIndirect 命令
-        // 相邻且可合并的命令（同 index/vertex/type）会自动合并实例数
-        template <typename T>
-        void addInstances(std::span<const T> instances)
-        {
-            assert(currentStatic.valid());
-            const auto &mesh = currentStatic.mesh;
-
-            // 懒启动：第一次 addInstances 时记录本 unit 的段起点
-            if (!pendingActive)
-            {
-                pending.staticKey = currentStatic;
-                pending.cmds.clear();
-                pending.consts.clear();
-                pending.currentSegmentCmdStart = 0;
-                currentUnitSegmentStart = segments.count; // ★ 段区间的起点
-                pendingActive = true;
-            }
-
-            const size_t dataOffset = heapOffset;
-            globalHeapBuffer.write(heapOffset, instances.data(),
-                                   instances.size() * sizeof(T));
-            heapOffset += instances.size() * sizeof(T);
-
-            VkDrawIndexedIndirectCommand cmd =
-                mesh.getDrawCommand(static_cast<uint32_t>(instances.size()));
-            CommandConstant constant{.type_id = T::type_id,
-                                     .adddress_offset = static_cast<uint32_t>(dataOffset),
-                                     .slot_count = 0};
-
-            // 合并：只有仍在“当前活动段”内的最后一条命令才能合并
-            if (!pending.cmds.empty() &&
-                pending.currentSegmentCmdStart < pending.cmds.size())
-            {
-                auto &lastCmd = pending.cmds.back();
-                auto &lastConst = pending.consts.back();
-                const bool canMerge = lastCmd.indexCount == cmd.indexCount &&
-                                      lastCmd.firstIndex == cmd.firstIndex &&
-                                      lastCmd.vertexOffset == cmd.vertexOffset &&
-                                      lastCmd.firstInstance == cmd.firstInstance &&
-                                      lastConst.type_id == constant.type_id;
-                if (canMerge)
-                {
-                    lastCmd.instanceCount += cmd.instanceCount;
-                    return;
-                }
-            }
-
-            pending.cmds.push_back(cmd);
-            pending.consts.push_back(constant);
-        }
-
-        // ---------- 结束录制 ----------
-        void end()
-        {
-            finishDraw();
-        }
-
-        // ---------- 提交 Vulkan 命令 ----------
-        void doDraw(CommandBufferView cmd)
-        {
-            assert(!pendingActive);
-
-            // 顶点通过推送常量的设备地址传上去了
-            cmd.bindIndexBuffer(globalIndexBuffer.buffer.buffer(), 0,
-                                VK_INDEX_TYPE_UINT32);
-
-            VkPipeline lastPipeline = VK_NULL_HANDLE;
-
-            for (uint32_t u = 0; u < units.count; ++u)
-            {
-                const auto &unit = units.pool[u];
-                assert(unit.staticKey.valid());
-
-                // 只有管线真正改变时才调用绑定
-                if (unit.staticKey.pipeline != lastPipeline)
-                {
-                    cmd.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                     unit.staticKey.pipeline);
-                    lastPipeline = unit.staticKey.pipeline;
-                }
-
-                const auto segs = unit.segments.view(segments.pool);
-                for (const auto &seg : segs)
-                {
-                    // 用 Slice<T>::view 把区间映射回 std::span，语义自明
-                    cmd.setViewport(0, seg.viewports.view(viewports.pool));
-                    cmd.setScissor(0, seg.scissors.view(scissors.pool));
-
-                    PushData pc = unit.staticKey.pushData;
-                    pc.commandConstantsAddress =
-                        commandConstantsBuffer.address + seg.constantByteOffset;
-
-                    cmd.pushConstants(unit.staticKey.layout,
-                                      VK_SHADER_STAGE_VERTEX_BIT |
-                                          VK_SHADER_STAGE_FRAGMENT_BIT,
-                                      0, sizeof(PushData), &pc);
-
-                    cmd.drawIndexedIndirect(indirectDrawBuffer.buffer.buffer(),
-                                            seg.indirectByteOffset, seg.commandCount,
-                                            sizeof(VkDrawIndexedIndirectCommand));
-                }
-            }
-        }
-    };
-
 }; // namespace shader_data
 //diff: [test_dod24.cpp] end
 
-constexpr auto initDrawRecorder(const LogicalDevice &device)
+// ═══════════════════════════════════════════════════════════════════════════
+// Recorder 数据协议（GPU 侧）
+//
+// 与 test_intent 的提交协议同构，只是 payload 换成了 UI 的 DrawInstance：
+//
+//   推送常量  : { heap 地址, 本批 CommandConstant 地址, 视口尺寸 }
+//   命令常量  : { type_id, address_offset, slot_count }   ← 12 B，与 GLSL 一致
+//   heap      : [DrawInstance][payload...]，address_offset 相对 heap 基址
+//   间接命令  : VkDrawIndirectCommand，一条命令 = 一个 Batch
+//
+// 「同一条命令里放 N 个实例」就是 Batch：顶点阶段用 gl_InstanceIndex 取第 i 个
+// 实例，片元阶段拿顶点阶段传来的 payload 地址再解析一次（与 test_intent 相同）。
+// ═══════════════════════════════════════════════════════════════════════════
+namespace shader_data
 {
-    constexpr auto vertexCapacity = sizeof(Vertex) * 1000;
-    constexpr auto indexCapacity = sizeof(uint32_t) * 1000;
-    constexpr auto heapCapacity = sizeof(shader_data::Glyph) * 2000;
-    // NOTE: 目前是不超过100条命令的
-    constexpr auto indirectDrawCapacity = sizeof(VkDrawIndexedIndirectCommand) * 100;
-    constexpr auto commandConstantsCapacity = sizeof(shader_data::CommandConstant) * 100;
+    // 几何入口 = 命令常量的 type_id（shader 里同名常量必须一致）
+    inline constexpr uint32_t TYPE_INSTANCE = 1u; // 实例四边形（形状 / 字形 / 层合成）
+    inline constexpr uint32_t TYPE_STROKE = 2u;   // 路径描边批（段在 payload 里）
+    inline constexpr uint32_t TYPE_FAN = 3u;      // 路径填充扇形批（顶点在 payload 里）
 
-    std::array<shader_data::DrawRecorder, MAX_FRAMES_IN_FLIGHT> drawRecorder{
-        shader_data::DrawRecorder(device, vertexCapacity, indexCapacity, heapCapacity,
-                                  indirectDrawCapacity, commandConstantsCapacity),
-        shader_data::DrawRecorder(device, vertexCapacity, indexCapacity, heapCapacity,
-                                  indirectDrawCapacity, commandConstantsCapacity)};
-    return drawRecorder;
-}
+    // 一个 draw 的完整参数：就是旧版的 PushData 去掉地址字段
+    struct Instance
+    {
+        glm::vec4 rect{};   // xy = 左上角像素，zw = 宽高像素
+        glm::vec4 color{};  // 主色
+        glm::vec4 color2{}; // 次色
+        glm::vec4 params{}; // x = mode，y/z/w = 模式参数
+        glm::vec4 aux{};    // 追加参数
+        glm::uvec4 pick{};  // 拾取负载
+        // 作用域变换（local -> parent）：xf0 = 2x2 线性部分，xf1 = (tx,ty,i00,i01)，
+        // xf2 = (i10,i11,0,0)；单位变换时等价于没有变换。
+        glm::vec4 xf0{1.0F, 0.0F, 0.0F, 1.0F};
+        glm::vec4 xf1{0.0F, 0.0F, 1.0F, 0.0F};
+        glm::vec4 xf2{0.0F, 1.0F, 0.0F, 0.0F};
+    };
+    static_assert(sizeof(Instance) == 144, "shader: DrawInstance 必须是 144 B");
+
+    // 注意：CommandConstant 沿用上面 test_intent 协议里的那份定义（12 B），
+    // 这里不再重复声明，保证 C++ 与 GLSL 只有一处真相。
+
+    struct DrawConstants
+    {
+        uint64_t instancesAddress;        // heap 设备地址
+        uint64_t commandConstantsAddress; // 本批命令常量地址
+        glm::vec2 viewportSize;           // framebuffer 像素尺寸
+        uint32_t flags;
+        uint32_t pad;
+    };
+    static_assert(sizeof(DrawConstants) == 32, "shader: push_constant 必须是 32 B");
+
+    // 路径描边段：q0,q1 | q2,q3 | a,b(像素) | nn,planeA | planeB,0
+    struct PathSegment
+    {
+        std::array<glm::vec4, 5> v{};
+    };
+    static_assert(sizeof(PathSegment) == 80);
+
+    // host-visible + 设备地址的堆：写 = memcpy 到持久映射指针（无 staging）
+    struct DeviceHeap
+    {
+        mcs::vulkan::memory::auto_map_buffer buffer{};
+        VkDeviceSize capacity{};
+        VkDeviceAddress address{};
+
+        void write(VkDeviceSize offset, const void *src, VkDeviceSize size) noexcept
+        {
+            assert(offset + size <= capacity && "DeviceHeap 越界");
+            std::memcpy(static_cast<char *>(buffer.mapPtr()) + offset, src, size);
+        }
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return buffer.buffer() != VK_NULL_HANDLE;
+        }
+        DeviceHeap() = default;
+        DeviceHeap(const LogicalDevice &device, VkDeviceSize capacity_,
+                   VkBufferUsageFlags usage, VkMemoryPropertyFlags properties)
+            : buffer{mcs::vulkan::memory::auto_map_buffer(
+                  mcs::vulkan::memory::create_simple_buffer(
+                      device,
+                      {.size = capacity_,
+                       .usage = usage,
+                       .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
+                      properties),
+                  capacity_)},
+              capacity{capacity_}, address{device.getBufferDeviceAddress(
+                                       {.sType = sType<VkBufferDeviceAddressInfo>(),
+                                        .buffer = buffer.buffer()})}
+        {
+        }
+    };
+} // namespace shader_data
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ui：数据层（typed draw + scope），**不出现任何 Vulkan 类型**
+//
+//   · Recorder 只认识 Rect / Color / Radius / Paint / Draw / Scope
+//   · 作用域是栈：clip / blend / opacity / layer
+//   · 没有 pass、没有 target、没有 loadOp、没有 stencil —— 那些是编译产物
+// ═══════════════════════════════════════════════════════════════════════════
+namespace ui
+{
+    struct Vec2
+    {
+        float x{};
+        float y{};
+    };
+    struct Rect
+    {
+        float x{};
+        float y{};
+        float w{};
+        float h{};
+        [[nodiscard]] bool empty() const noexcept
+        {
+            return w <= 0.0F || h <= 0.0F;
+        }
+        [[nodiscard]] float right() const noexcept
+        {
+            return x + w;
+        }
+        [[nodiscard]] float bottom() const noexcept
+        {
+            return y + h;
+        }
+    };
+    struct Color
+    {
+        float r{};
+        float g{};
+        float b{};
+        float a{1.0F};
+    };
+    struct Radius
+    {
+        float tl{};
+        float tr{};
+        float br{};
+        float bl{};
+    };
+    struct Uv
+    {
+        Vec2 min{};
+        Vec2 max{1.0F, 1.0F};
+    };
+
+    // 2x3 仿射：local -> parent（变换是作用域，不是图元属性）
+    struct Transform2D
+    {
+        float m00{1.0F}, m01{0.0F};
+        float m10{0.0F}, m11{1.0F};
+        float tx{0.0F}, ty{0.0F};
+
+        [[nodiscard]] static Transform2D translate(float x, float y) noexcept
+        {
+            Transform2D t{};
+            t.tx = x;
+            t.ty = y;
+            return t;
+        }
+        [[nodiscard]] static Transform2D rotate(float radians) noexcept
+        {
+            Transform2D t{};
+            const float c = std::cos(radians);
+            const float s = std::sin(radians);
+            t.m00 = c;
+            t.m01 = -s;
+            t.m10 = s;
+            t.m11 = c;
+            return t;
+        }
+        [[nodiscard]] static Transform2D scale(float sx, float sy) noexcept
+        {
+            Transform2D t{};
+            t.m00 = sx;
+            t.m11 = sy;
+            return t;
+        }
+        [[nodiscard]] static Transform2D skew(float kx, float ky) noexcept
+        {
+            Transform2D t{};
+            t.m01 = kx;
+            t.m10 = ky;
+            return t;
+        }
+        [[nodiscard]] bool identity() const noexcept
+        {
+            return m00 == 1.0F && m01 == 0.0F && m10 == 0.0F && m11 == 1.0F &&
+                   tx == 0.0F && ty == 0.0F;
+        }
+        // this ∘ other：先 other 再 this
+        [[nodiscard]] Transform2D compose(const Transform2D &o) const noexcept
+        {
+            Transform2D r{};
+            r.m00 = m00 * o.m00 + m01 * o.m10;
+            r.m01 = m00 * o.m01 + m01 * o.m11;
+            r.m10 = m10 * o.m00 + m11 * o.m10;
+            r.m11 = m10 * o.m01 + m11 * o.m11;
+            r.tx = m00 * o.tx + m01 * o.ty + tx;
+            r.ty = m10 * o.tx + m11 * o.ty + ty;
+            return r;
+        }
+        [[nodiscard]] Vec2 apply(Vec2 p) const noexcept
+        {
+            return {m00 * p.x + m01 * p.y + tx, m10 * p.x + m11 * p.y + ty};
+        }
+        // 逆矩阵（线性部分求逆，平移随逆线性变换）
+        [[nodiscard]] Transform2D inverse() const noexcept
+        {
+            const float det = m00 * m11 - m01 * m10;
+            const float inv = std::abs(det) > 1e-8F ? 1.0F / det : 0.0F;
+            Transform2D r{};
+            r.m00 = m11 * inv;
+            r.m01 = -m01 * inv;
+            r.m10 = -m10 * inv;
+            r.m11 = m00 * inv;
+            r.tx = -(r.m00 * tx + r.m01 * ty);
+            r.ty = -(r.m10 * tx + r.m11 * ty);
+            return r;
+        }
+    };
+
+    enum class BlendMode : uint8_t
+    {
+        Over = 0,
+        Add,
+        Multiply,
+        Erase,
+    };
+
+    // 裁剪：矩形 / 圆角。圆角裁剪由 Compiler 翻译成模板掩码（Scope 里没有 stencil）
+    struct ClipSpec
+    {
+        Rect rect{};             // 局部空间的裁剪形状
+        float radius{};          // > 0 = 圆角形状
+        Transform2D transform{}; // 局部 -> 父空间（旋转/斜切裁剪就靠它）
+    };
+    using ClipId = uint32_t; // 0 = 无裁剪
+    struct ClipNode
+    {
+        ClipId parent{};
+        ClipSpec spec{};
+    };
+
+    // 图层：离屏 target 的语义描述（Compiler 据此生成 pass，而不是调用方指定 target）
+    struct LayerParams
+    {
+        Rect bounds{};           // 合成回父级的目标矩形（父级坐标）
+        uint32_t surfaceWidth{}; // 离屏分辨率；0 = 由 Compiler 取子节点并集
+        uint32_t surfaceHeight{};
+        float radius{}; // 合成时的圆角
+        float opacity{1.0F};
+        float blur{};       // >0 → Compiler 追加两趟可分离模糊
+        bool backdrop{};    // true → 先 blit 父通道内容再叠内容
+        bool screenSpace{}; // 合成时按屏幕位置取 uv（backdrop 自动 true）
+        [[nodiscard]] bool deriveBounds() const noexcept
+        {
+            return bounds.empty();
+        }
+    };
+    using LayerId = uint32_t;
+    struct LayerNode
+    {
+        LayerId parent{};
+        LayerParams params{};
+    };
+    // 层开始的位置：空层（例如没有内容的 backdrop 层）也要被 Compiler 看到
+    struct LayerMark
+    {
+        LayerId id{};
+        uint32_t drawIndex{};
+    };
+
+    // 拾取负载：每个 draw 自带（不是后端概念）
+    struct Pick
+    {
+        uint32_t objectType{0xFFFFFFFFu};
+        uint32_t entity{};
+        uint32_t primitive{};
+        uint32_t version{};
+    };
+
+    // ── Paint：矩形着色模型（typed，不是 mode 整数）──────────────────────
+    struct SolidFill
+    {
+        Color color;
+    };
+    struct LinearGradient
+    {
+        Color from{};
+        Color to{};
+        Vec2 dir{1.0F, 0.0F};
+    };
+    struct RadialGradient
+    {
+        Color inner{};
+        Color outer{};
+        float radius{};
+        float corner{};
+    };
+    struct ConicGradient
+    {
+        Color from{};
+        Color to{};
+        float phase{};
+        float corner{};
+    };
+    struct ArcRing
+    {
+        Color color{};
+        float radius{};
+        float width{};
+        float startAngle{};
+        float endAngle{};
+    };
+    struct DropShadow
+    {
+        Color color{};
+        Color shadow{};
+        float blur{};
+        Vec2 offset{};
+    };
+    struct InnerShadow
+    {
+        Color color{};
+        Color shadow{};
+        float blur{};
+    };
+    struct DotPattern
+    {
+        Color color{};
+        float cell{};
+    };
+    struct DashedLine
+    {
+        Color color{};
+        Vec2 a{};
+        Vec2 b{};
+        float width{};
+        float dash{};
+        float gap{};
+    };
+    struct NineSlicePalette
+    {
+        Color color{};
+        Color border{};
+        float borderWidth{};
+        float corner{};
+    };
+    struct StarFill
+    {
+        Color color{};
+        float innerRatio{};
+    };
+    struct CheckerFill
+    {
+        Color a{};
+        Color b{};
+        float cell{};
+    };
+    struct SrgbRamp
+    {
+        Color from{};
+        Color to{};
+    };
+    struct MipmapBands
+    {
+        Color a{};
+        Color b{};
+    };
+    struct BlendShowcase
+    {
+        Color base{};
+        Color src{};
+    };
+    struct RotatedRect
+    {
+        Color color{};
+        float angle{};
+        float corner{};
+    };
+    struct SkewedRect
+    {
+        Color color{};
+        Vec2 shear{};
+        float corner{};
+    };
+    using Paint = std::variant<SolidFill, LinearGradient, RadialGradient, ConicGradient,
+                               ArcRing, DropShadow, InnerShadow, DotPattern, DashedLine,
+                               NineSlicePalette, StarFill, CheckerFill, SrgbRamp,
+                               MipmapBands, BlendShowcase, RotatedRect, SkewedRect>;
+
+    // ── 图元：typed draw ────────────────────────────────────────────────
+    struct DrawRect
+    {
+        Rect rect{};
+        Radius radius{};
+        Paint paint{};
+    };
+    struct GlyphQuad
+    {
+        Rect rect{};
+        Uv uv{};
+        uint32_t texture{};
+        uint32_t sampler{};
+        float pxRange{};
+        Color color{1.0F, 1.0F, 1.0F, 1.0F};
+        bool bitmap{};
+    };
+    struct DrawGlyph
+    {
+        GlyphQuad quad{};
+    };
+    enum class ImageFit : uint8_t
+    {
+        Stretch = 0,
+        NineSlice,
+        MipmapLadder,
+        AlphaMask,
+    };
+    struct DrawImage
+    {
+        Rect rect{};
+        Radius radius{};
+        Uv uv{};
+        uint32_t texture{};
+        uint32_t sampler{};
+        Color tint{1.0F, 1.0F, 1.0F, 1.0F};
+        ImageFit fit{ImageFit::Stretch};
+        float border{}; // NineSlice 的源边框像素
+        float maxLod{3.0F};
+        float srcWidth{}; // NineSlice / AlphaMask 的源纹理尺寸
+        float srcHeight{};
+    };
+    struct DrawPath
+    {
+        uint32_t pathId{0xFFFFFFFFu};
+        uint32_t pathGen{};
+        Color color{};
+        float halfWidth{}; // stroke 用
+        bool stroke{};
+        bool aa{true};
+    };
+
+    using Draw = std::variant<DrawRect, DrawGlyph, DrawImage, DrawPath>;
+
+    // 作用域快照（记录时展开）：clip 是链 id，layer 是层 id
+    struct Scope
+    {
+        ClipId clip{};
+        BlendMode blend{BlendMode::Over};
+        LayerId layer{};
+        Transform2D transform{};
+    };
+    struct RecordedDraw
+    {
+        Draw draw;
+        Scope scope;
+        Pick pick;
+    };
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Recorder：只记录语义
+    //
+    //   pushClip(SolidClip) / popClip
+    //   pushBlend(Add)      / popBlend
+    //   pushOpacity(0.45)   / popOpacity     ← 组不透明度 = 隐式离屏层（Compiler 生成）
+    //   beginLayer(params)  / endLayer       ← 显式离屏层（模糊 / backdrop / 自定义分辨率）
+    //   draw(Draw, Pick)
+    // ═══════════════════════════════════════════════════════════════════════
+    class Recorder
+    {
+      public:
+        struct OpacityEntry
+        {
+            LayerId previous;
+            bool opened;
+        };
+
+        void reset() noexcept
+        {
+            draws_.clear();
+            clips_.clear();
+            layers_.clear();
+            layerMarks_.clear();
+            clipStack_.clear();
+            layerStack_.clear();
+            transformStack_.clear();
+            opacityStack_.clear();
+            blendStack_.clear();
+            clip_ = 0;
+            blend_ = BlendMode::Over;
+            layer_ = 0;
+        }
+
+        // ── clip 作用域 ────────────────────────────────────────────────
+        ClipId pushClip(const ClipSpec &spec)
+        {
+            // 裁剪形状跟随当前作用域变换（旋转/斜切之后的裁剪就在这里定下来）
+            ClipSpec local = spec;
+            local.transform = transform_.compose(spec.transform);
+            clips_.push_back(ClipNode{clip_, local});
+            clipStack_.push_back(clip_);
+            clip_ = static_cast<ClipId>(clips_.size());
+            return clip_;
+        }
+        void popClip() noexcept
+        {
+            if (clipStack_.empty())
+                return;
+            clip_ = clipStack_.back();
+            clipStack_.pop_back();
+        }
+
+        // ── transform 作用域 ───────────────────────────────────────────
+        void pushTransform(const Transform2D &t) noexcept
+        {
+            transformStack_.push_back(transform_);
+            transform_ = transform_.compose(t);
+        }
+        void popTransform() noexcept
+        {
+            if (transformStack_.empty())
+                return;
+            transform_ = transformStack_.back();
+            transformStack_.pop_back();
+        }
+
+        // ── blend 作用域 ───────────────────────────────────────────────
+        void pushBlend(BlendMode mode) noexcept
+        {
+            blendStack_.push_back(blend_);
+            blend_ = mode;
+        }
+        void popBlend() noexcept
+        {
+            if (blendStack_.empty())
+                return;
+            blend_ = blendStack_.back();
+            blendStack_.pop_back();
+        }
+
+        // ── opacity 作用域：Compiler 会为它开一个隐式离屏层再按 alpha 合成 ──
+        void pushOpacity(float alpha)
+        {
+            if (alpha >= 0.999F)
+            {
+                opacityStack_.push_back(OpacityEntry{layer_, false});
+                return;
+            }
+            opacityStack_.push_back(OpacityEntry{layer_, true});
+            LayerParams params{};
+            params.opacity = alpha; // bounds 由 Compiler 取子节点并集
+            static_cast<void>(beginLayer(params));
+        }
+        void popOpacity() noexcept
+        {
+            if (opacityStack_.empty())
+                return;
+            const OpacityEntry entry = opacityStack_.back();
+            opacityStack_.pop_back();
+            if (entry.opened)
+                endLayer();
+        }
+
+        // ── layer 作用域 ───────────────────────────────────────────────
+        LayerId beginLayer(const LayerParams &params)
+        {
+            layers_.push_back(LayerNode{layer_, params});
+            // 记录层开始的位置：没有内容的层（backdrop）也要能被 Compiler 看到
+            layerMarks_.push_back(LayerMark{static_cast<LayerId>(layers_.size()),
+                                            static_cast<uint32_t>(draws_.size())});
+            layerStack_.push_back(layer_);
+            layer_ = static_cast<LayerId>(layers_.size());
+            return layer_;
+        }
+        void endLayer() noexcept
+        {
+            if (layerStack_.empty())
+                return;
+            layer_ = layerStack_.back();
+            layerStack_.pop_back();
+        }
+
+        // ── 记录 ───────────────────────────────────────────────────────
+        void draw(const Draw &d, const Pick &pick = {})
+        {
+            draws_.push_back(
+                RecordedDraw{d, Scope{clip_, blend_, layer_, transform_}, pick});
+        }
+
+        [[nodiscard]] std::span<const RecordedDraw> draws() const noexcept
+        {
+            return draws_;
+        }
+        [[nodiscard]] std::span<const ClipNode> clips() const noexcept
+        {
+            return clips_;
+        }
+        [[nodiscard]] std::span<const LayerNode> layers() const noexcept
+        {
+            return layers_;
+        }
+        [[nodiscard]] std::span<const LayerMark> layerMarks() const noexcept
+        {
+            return layerMarks_;
+        }
+        [[nodiscard]] ClipId currentClip() const noexcept
+        {
+            return clip_;
+        }
+        [[nodiscard]] LayerId currentLayer() const noexcept
+        {
+            return layer_;
+        }
+
+      private:
+        std::vector<RecordedDraw> draws_;
+        std::vector<ClipNode> clips_;
+        std::vector<LayerNode> layers_;
+        std::vector<LayerMark> layerMarks_;
+        std::vector<ClipId> clipStack_;
+        std::vector<LayerId> layerStack_;
+        std::vector<OpacityEntry> opacityStack_;
+        std::vector<BlendMode> blendStack_;
+        std::vector<Transform2D> transformStack_;
+        ClipId clip_{};
+        BlendMode blend_{BlendMode::Over};
+        LayerId layer_{};
+        Transform2D transform_{};
+    };
+} // namespace ui
+
 //
 
 //diff: [test_dod8] end
@@ -2466,6 +2568,1963 @@ namespace ui_path
     }
 } // namespace ui_path
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Compiler：typed draw + scope → FramePlan
+//
+//   1. scope 展开：ClipId 链 → 矩形交集 + 圆角裁剪表（模板层级由这里分配）
+//   2. layer scope → 离屏 pass：内容 pass、可选模糊 pass、合成批（写回父级）
+//   3. backdrop layer → 拆父 pass + blit
+//   4. 相邻同管线 / 同裁剪的实例合并成 Batch（一条间接绘制命令）
+//   5. typed draw → GPU payload（shader_data::Instance）由这里唯一决定
+// ═══════════════════════════════════════════════════════════════════════════
+namespace ui
+{
+    // 与 shader 的 mode 常量一致（只有 Compiler 认识这些编号）
+    // shader 的 mode 编号：整个程序里唯一的着色编号表（demo 不再有自己的 mode 枚举）
+    enum Shading : uint32_t
+    {
+        M_FILL = 0,
+        M_LINEAR = 1,
+        M_RADIAL = 2,
+        M_CONIC = 3,
+        M_ARC = 4,
+        M_OUTER_SHADOW = 5,
+        M_INNER_SHADOW = 6,
+        M_PERCORNER = 7,
+        M_ALPHA_MASK = 8,
+        M_PATH_AA = 9,
+        M_DASH = 10,
+        M_ROTATE = 11,
+        M_SKEW = 12,
+        M_NINE_SLICE = 13,
+        M_EVENODD = 14,
+        M_GLYPH = 15,
+        M_SRGB = 16,
+        M_BLUR = 17,
+        M_BACKDROP = 18,
+        M_GROUP = 19,
+        M_MIPMAP = 20,
+        M_PICKING = 21,
+        M_BLEND = 22,
+        M_LAYER_BLUR = 23,
+        M_LAYER_COMPOSITE = 24,
+        M_CHECKER = 25,
+        M_NINE_SLICE_TEX = 26,
+        M_ALPHA_MASK_TEX = 27,
+        M_MIPMAP_TEX = 28,
+        M_CLIP_MASK = 29,
+        M_SOLID = 30,
+        M_SOLID_GEOM = 31,
+        M_PATH_STROKE = 32,
+        M_GLYPH_BITMAP = 33,
+    };
+
+    // 一条命令在「状态机」里的角色：决定 stencil 操作，不暴露后端管线表
+    enum class BatchRole : uint8_t
+    {
+        Color = 0,    // 写颜色（stencilRef > 0 时附带 EQUAL 测试）
+        MaskFirst,    // ALWAYS → INCR：写入第 1 级裁剪
+        MaskNext,     // EQUAL(N-1) → INCR：写入第 N 级裁剪
+        StencilClear, // ALWAYS → ZERO：清裁剪
+        PathInvert,   // ALWAYS → INVERT：even-odd 计数，不写色
+    };
+
+    struct PathBlob
+    {
+        shader_data::Instance header{};
+        std::vector<shader_data::PathSegment> segments;
+        std::vector<glm::vec2> fan;
+    };
+
+    struct Batch
+    {
+        uint32_t type{shader_data::TYPE_INSTANCE};
+        BatchRole role{BatchRole::Color};
+        BlendMode blend{BlendMode::Over};
+        uint32_t stencilRef{};
+        VkRect2D scissor{};
+        uint32_t first{};
+        uint32_t count{};
+        uint32_t blob{};
+        uint32_t firstVertex{};
+        uint32_t vertexCount{};
+    };
+
+    enum class PassKind : uint8_t
+    {
+        Draw = 0, // 画到 target（0 = 主通道，其余 = 层 slot + 1）
+        Blit,     // 主通道 / 层 → 层（backdrop 用）
+    };
+
+    struct PassPlan
+    {
+        PassKind kind{PassKind::Draw};
+        uint32_t target{}; // 0 = 主通道，其余 = layer slot + 1
+        Rect area{};
+        bool clear{true};
+        std::vector<shader_data::Instance> instances;
+        std::vector<PathBlob> paths;
+        std::vector<Batch> batches;
+        uint32_t src{}; // Blit：源（0 = 主通道，其余 = 层 slot + 1）
+    };
+
+    struct LayerPlan
+    {
+        uint32_t width{};
+        uint32_t height{};
+    };
+
+    // 层表面：由调用方（gfx::LayerPool）分配，Compiler 只拿到编号与纹理下标。
+    // 这样 Compiler 就能自己拼出 composite / blur 的 payload，Backend 不再生成数据。
+    struct SurfaceRef
+    {
+        uint32_t slot{};
+        uint32_t texture{};
+        uint32_t sampler{};
+        uint32_t width{};
+        uint32_t height{};
+    };
+    using SurfaceFn = std::function<SurfaceRef(uint32_t width, uint32_t height)>;
+
+    struct FramePlan
+    {
+        std::vector<PassPlan> passes;
+        std::vector<LayerPlan> layers; // slot 表（gfx::Backend 分配实际图像）
+        uint32_t draws{};
+        uint32_t batches{};
+        uint32_t layersUsed() const noexcept
+        {
+            return static_cast<uint32_t>(layers.size());
+        }
+    };
+
+    // ── 内部工具 ────────────────────────────────────────────────────────
+    inline Rect intersect_rect(const Rect &a, const Rect &b) noexcept
+    {
+        const float x0 = std::max(a.x, b.x);
+        const float y0 = std::max(a.y, b.y);
+        const float x1 = std::min(a.right(), b.right());
+        const float y1 = std::min(a.bottom(), b.bottom());
+        if (x1 <= x0 || y1 <= y0)
+            return Rect{};
+        return Rect{x0, y0, x1 - x0, y1 - y0};
+    }
+    inline Rect union_rect(const Rect &a, const Rect &b) noexcept
+    {
+        if (a.empty())
+            return b;
+        if (b.empty())
+            return a;
+        const float x0 = std::min(a.x, b.x);
+        const float y0 = std::min(a.y, b.y);
+        const float x1 = std::max(a.right(), b.right());
+        const float y1 = std::max(a.bottom(), b.bottom());
+        return Rect{x0, y0, x1 - x0, y1 - y0};
+    }
+
+    // 变换后的包围盒（scissor 只能是轴对齐矩形）
+    inline Rect transformed_aabb(const Rect &r, const Transform2D &t) noexcept
+    {
+        const Vec2 p0 = t.apply(Vec2{r.x, r.y});
+        const Vec2 p1 = t.apply(Vec2{r.right(), r.y});
+        const Vec2 p2 = t.apply(Vec2{r.x, r.bottom()});
+        const Vec2 p3 = t.apply(Vec2{r.right(), r.bottom()});
+        const float x0 = std::min(std::min(p0.x, p1.x), std::min(p2.x, p3.x));
+        const float y0 = std::min(std::min(p0.y, p1.y), std::min(p2.y, p3.y));
+        const float x1 = std::max(std::max(p0.x, p1.x), std::max(p2.x, p3.x));
+        const float y1 = std::max(std::max(p0.y, p1.y), std::max(p2.y, p3.y));
+        return Rect{x0, y0, x1 - x0, y1 - y0};
+    }
+    inline bool axis_aligned(const Transform2D &t) noexcept
+    {
+        return t.m01 == 0.0F && t.m10 == 0.0F;
+    }
+
+    struct ResolvedClip
+    {
+        Rect aabb{};               // 父空间交集（scissor）
+        std::vector<ClipId> masks; // 需要模板的形状裁剪（圆角 / 旋转 / 斜切）
+    };
+
+    inline ResolvedClip resolve_clip(std::span<const ClipNode> clips, ClipId id)
+    {
+        ResolvedClip out{};
+        std::vector<ClipId> chain;
+        for (ClipId c = id; c != 0 && c <= clips.size(); c = clips[c - 1].parent)
+            chain.push_back(c);
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+        {
+            const ClipNode &node = clips[*it - 1];
+            const Rect box = transformed_aabb(node.spec.rect, node.spec.transform);
+            out.aabb = out.aabb.empty() ? box : intersect_rect(out.aabb, box);
+            // 圆角或旋转/斜切：scissor 表达不了，交给模板
+            if (node.spec.radius > 0.0F || !axis_aligned(node.spec.transform))
+                out.masks.push_back(*it);
+        }
+        return out;
+    }
+
+    inline VkRect2D to_scissor(const Rect &r, const Rect &area) noexcept
+    {
+        const Rect c = r.empty() ? area : intersect_rect(r, area);
+        if (c.empty())
+            return VkRect2D{};
+        return VkRect2D{{static_cast<int32_t>(std::floor(c.x)),
+                         static_cast<int32_t>(std::floor(c.y))},
+                        {static_cast<uint32_t>(std::ceil(c.w)),
+                         static_cast<uint32_t>(std::ceil(c.h))}};
+    }
+
+    inline bool same_rect(VkRect2D a, VkRect2D b) noexcept
+    {
+        return a.offset.x == b.offset.x && a.offset.y == b.offset.y &&
+               a.extent.width == b.extent.width && a.extent.height == b.extent.height;
+    }
+
+    inline glm::vec4 to_vec4(const Color &c) noexcept
+    {
+        return {c.r, c.g, c.b, c.a};
+    }
+
+    // typed draw → GPU payload（唯一知道 shader 编码的地方）
+    inline shader_data::Instance pack_rect(const DrawRect &d)
+    {
+        shader_data::Instance inst{};
+        inst.rect = {d.rect.x, d.rect.y, d.rect.w, d.rect.h};
+        const Radius r = d.radius;
+        const bool uniform = r.tl == r.tr && r.tr == r.br && r.br == r.bl;
+        const float radius = uniform ? r.tl : 0.0F;
+        inst.params = {static_cast<float>(M_FILL), radius, 0.0F, 0.0F};
+
+        std::visit(
+            [&](const auto &p) {
+                using T = std::decay_t<decltype(p)>;
+                if constexpr (std::is_same_v<T, SolidFill>)
+                {
+                    inst.color = to_vec4(p.color);
+                }
+                else if constexpr (std::is_same_v<T, LinearGradient>)
+                {
+                    inst.params.x = static_cast<float>(M_LINEAR);
+                    inst.color = to_vec4(p.from);
+                    inst.color2 = to_vec4(p.to);
+                    inst.aux = {p.dir.x, p.dir.y, 0.0F, 0.0F};
+                }
+                else if constexpr (std::is_same_v<T, RadialGradient>)
+                {
+                    inst.params = {static_cast<float>(M_RADIAL), p.radius, p.corner,
+                                   0.0F};
+                    inst.color = to_vec4(p.inner);
+                    inst.color2 = to_vec4(p.outer);
+                }
+                else if constexpr (std::is_same_v<T, ConicGradient>)
+                {
+                    inst.params = {static_cast<float>(M_CONIC), p.phase, p.corner, 0.0F};
+                    inst.color = to_vec4(p.from);
+                    inst.color2 = to_vec4(p.to);
+                }
+                else if constexpr (std::is_same_v<T, ArcRing>)
+                {
+                    inst.params = {static_cast<float>(M_ARC), p.radius, p.width, 0.0F};
+                    inst.aux = {p.startAngle, p.endAngle, 0.0F, 0.0F};
+                    inst.color = to_vec4(p.color);
+                }
+                else if constexpr (std::is_same_v<T, DropShadow>)
+                {
+                    // 外阴影必须能溢出形状：几何扩一圈，形状盒子用 aux.z 告诉 shader
+                    const float grow = std::ceil(
+                        p.blur + std::max(std::abs(p.offset.x), std::abs(p.offset.y)));
+                    inst.rect = {d.rect.x - grow, d.rect.y - grow, d.rect.w + grow * 2.0F,
+                                 d.rect.h + grow * 2.0F};
+                    inst.params = {static_cast<float>(M_OUTER_SHADOW), radius, p.blur,
+                                   0.0F};
+                    inst.aux = {p.offset.x, p.offset.y, grow, 0.0F};
+                    inst.color = to_vec4(p.color);
+                    inst.color2 = to_vec4(p.shadow);
+                }
+                else if constexpr (std::is_same_v<T, InnerShadow>)
+                {
+                    inst.params = {static_cast<float>(M_INNER_SHADOW), radius, p.blur,
+                                   0.0F};
+                    inst.color = to_vec4(p.color);
+                    inst.color2 = to_vec4(p.shadow);
+                }
+                else if constexpr (std::is_same_v<T, DotPattern>)
+                {
+                    inst.params = {static_cast<float>(M_ALPHA_MASK), radius, p.cell,
+                                   0.0F};
+                    inst.color = to_vec4(p.color);
+                }
+                else if constexpr (std::is_same_v<T, DashedLine>)
+                {
+                    inst.params = {static_cast<float>(M_DASH), p.width, p.dash, p.gap};
+                    inst.aux = {p.a.x, p.a.y, p.b.x, p.b.y};
+                    inst.color = to_vec4(p.color);
+                }
+                else if constexpr (std::is_same_v<T, NineSlicePalette>)
+                {
+                    inst.params = {static_cast<float>(M_NINE_SLICE), p.borderWidth,
+                                   p.corner, 0.0F};
+                    inst.color = to_vec4(p.color);
+                    inst.color2 = to_vec4(p.border);
+                }
+                else if constexpr (std::is_same_v<T, StarFill>)
+                {
+                    inst.params = {static_cast<float>(M_EVENODD), p.innerRatio, 0.0F,
+                                   0.0F};
+                    inst.color = to_vec4(p.color);
+                }
+                else if constexpr (std::is_same_v<T, CheckerFill>)
+                {
+                    inst.params = {static_cast<float>(M_CHECKER), p.cell, 0.0F, 0.0F};
+                    inst.color = to_vec4(p.a);
+                    inst.color2 = to_vec4(p.b);
+                }
+                else if constexpr (std::is_same_v<T, SrgbRamp>)
+                {
+                    inst.params = {static_cast<float>(M_SRGB), radius, 0.0F, 0.0F};
+                    inst.color = to_vec4(p.from);
+                    inst.color2 = to_vec4(p.to);
+                }
+                else if constexpr (std::is_same_v<T, MipmapBands>)
+                {
+                    inst.params = {static_cast<float>(M_MIPMAP), 0.0F, 0.0F, 0.0F};
+                    inst.color = to_vec4(p.a);
+                    inst.color2 = to_vec4(p.b);
+                }
+                else if constexpr (std::is_same_v<T, BlendShowcase>)
+                {
+                    inst.params = {static_cast<float>(M_BLEND), 0.0F, 0.0F, 0.0F};
+                    inst.color = to_vec4(p.src);
+                    inst.color2 = to_vec4(p.base);
+                }
+                else if constexpr (std::is_same_v<T, RotatedRect>)
+                {
+                    inst.params = {static_cast<float>(M_ROTATE), p.angle, p.corner, 0.0F};
+                    inst.color = to_vec4(p.color);
+                }
+                else if constexpr (std::is_same_v<T, SkewedRect>)
+                {
+                    inst.params = {static_cast<float>(M_SKEW), radius, 0.0F, 0.0F};
+                    inst.aux = {p.shear.x, p.shear.y, 0.0F, 0.0F};
+                    inst.color = to_vec4(p.color);
+                }
+            },
+            d.paint);
+
+        // 四角半径不同 → 走 per-corner 着色（typed 信息直接进 payload）
+        if (!uniform && std::holds_alternative<SolidFill>(d.paint))
+        {
+            inst.params = {static_cast<float>(M_PERCORNER), r.tl, r.tr, r.br};
+            inst.aux.x = r.bl;
+        }
+        return inst;
+    }
+
+    inline shader_data::Instance pack_glyph(const DrawGlyph &d)
+    {
+        const GlyphQuad &g = d.quad;
+        shader_data::Instance inst{};
+        inst.rect = {g.rect.x, g.rect.y, g.rect.w, g.rect.h};
+        inst.color = to_vec4(g.color);
+        inst.params = {static_cast<float>(g.bitmap ? M_GLYPH_BITMAP : M_GLYPH), g.pxRange,
+                       static_cast<float>(g.texture), static_cast<float>(g.sampler)};
+        inst.aux = {g.uv.min.x, g.uv.min.y, g.uv.max.x, g.uv.max.y};
+        return inst;
+    }
+
+    inline shader_data::Instance pack_image(const DrawImage &d)
+    {
+        shader_data::Instance inst{};
+        inst.rect = {d.rect.x, d.rect.y, d.rect.w, d.rect.h};
+        inst.color = to_vec4(d.tint);
+        const float radius =
+            std::max({d.radius.tl, d.radius.tr, d.radius.br, d.radius.bl});
+        switch (d.fit)
+        {
+        case ImageFit::NineSlice:
+            inst.params = {static_cast<float>(M_NINE_SLICE_TEX), d.border,
+                           static_cast<float>(d.texture), static_cast<float>(d.sampler)};
+            inst.aux = {d.srcWidth > 0.0F ? d.srcWidth : d.rect.w,
+                        d.srcHeight > 0.0F ? d.srcHeight : d.rect.h, 0.0F, 0.0F};
+            break;
+        case ImageFit::MipmapLadder:
+            inst.params = {static_cast<float>(M_MIPMAP_TEX), d.maxLod,
+                           static_cast<float>(d.texture), static_cast<float>(d.sampler)};
+            break;
+        case ImageFit::AlphaMask:
+            inst.params = {static_cast<float>(M_ALPHA_MASK_TEX), radius,
+                           static_cast<float>(d.texture), static_cast<float>(d.sampler)};
+            break;
+        default:
+            // 普通纹理四边形：用层合成着色器（uv = p / tile）
+            inst.params = {static_cast<float>(M_LAYER_COMPOSITE), 1.0F,
+                           static_cast<float>(d.texture), static_cast<float>(d.sampler)};
+            inst.aux = {radius, 0.0F, 0.0F, 0.0F};
+            break;
+        }
+        return inst;
+    }
+
+    // ── 轮廓几何（路径填充/描边）────────────────────────────────────────
+    inline std::vector<glm::vec2> fan_triangles(const ui_path::contour &c)
+    {
+        std::vector<glm::vec2> tris;
+        const auto &p = c.pts;
+        if (p.size() < 3)
+            return tris;
+        for (std::size_t i = 1; i + 1 < p.size(); ++i)
+        {
+            tris.push_back(p[0]);
+            tris.push_back(p[i]);
+            tris.push_back(p[i + 1]);
+        }
+        return tris;
+    }
+
+    inline void stroke_segments(const ui_path::contour &c, float half, glm::vec2 shift,
+                                float W, float H,
+                                std::vector<shader_data::PathSegment> &out)
+    {
+        const auto &p = c.pts;
+        const std::size_t n = p.size();
+        if (n < 2)
+            return;
+        const std::size_t segCount = c.closed ? n : (n - 1);
+        constexpr float kMiterLimit = 4.0F;
+
+        auto pos = [&](std::size_t i) {
+            return p[i] + shift;
+        };
+        auto dirOf = [&](std::size_t i, std::size_t j) {
+            const glm::vec2 d = pos(j) - pos(i);
+            const float l = std::sqrt(d.x * d.x + d.y * d.y);
+            return l > 1e-5F ? d / l : glm::vec2{1.0F, 0.0F};
+        };
+
+        std::vector<glm::vec2> planeN(n);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const std::size_t prev = (i + n - 1) % n;
+            const std::size_t next = (i + 1) % n;
+            const glm::vec2 d0 = dirOf(prev, i);
+            const glm::vec2 d1 = dirOf(i, next);
+            const glm::vec2 n0{-d0.y, d0.x};
+            const glm::vec2 n1{-d1.y, d1.x};
+            glm::vec2 m = n0 + n1;
+            const float ml = std::sqrt(m.x * m.x + m.y * m.y);
+            if (ml < 1e-4F)
+                m = n0;
+            else
+                m /= ml;
+            float denom = glm::dot(m, n0);
+            if (denom < 1e-3F)
+                denom = 1e-3F;
+            glm::vec2 bis = d0 + d1;
+            const float bl = std::sqrt(bis.x * bis.x + bis.y * bis.y);
+            planeN[i] = bl > 1e-4F ? bis / bl : d1;
+        }
+
+        for (std::size_t i = 0; i < segCount; ++i)
+        {
+            const std::size_t j = (i + 1) % n;
+            const glm::vec2 a = pos(i);
+            const glm::vec2 b = pos(j);
+            glm::vec2 d = b - a;
+            const float len = std::sqrt(d.x * d.x + d.y * d.y);
+            if (len < 1e-3F)
+                continue;
+            d /= len;
+            const glm::vec2 nn{-d.y, d.x};
+            const glm::vec2 ea = a - d * half;
+            const glm::vec2 eb = b + d * half;
+            const glm::vec2 q0 = ea + nn * half;
+            const glm::vec2 q1 = eb + nn * half;
+            const glm::vec2 q2 = ea - nn * half;
+            const glm::vec2 q3 = eb - nn * half;
+            shader_data::PathSegment s{};
+            s.v[0] = {q0.x / W * 2.0F - 1.0F, q0.y / H * 2.0F - 1.0F,
+                      q1.x / W * 2.0F - 1.0F, q1.y / H * 2.0F - 1.0F};
+            s.v[1] = {q2.x / W * 2.0F - 1.0F, q2.y / H * 2.0F - 1.0F,
+                      q3.x / W * 2.0F - 1.0F, q3.y / H * 2.0F - 1.0F};
+            s.v[2] = {a.x, a.y, b.x, b.y};
+            s.v[3] = {nn.x, nn.y, planeN[i].x, planeN[i].y};
+            s.v[4] = {-planeN[j].x, -planeN[j].y, 0.0F, 0.0F};
+            out.push_back(s);
+        }
+    }
+} // namespace ui
+
+namespace ui
+{
+    namespace detail
+    {
+        struct PassState
+        {
+            PassPlan pass{};
+            Batch cur{};
+            bool open{false};
+            std::vector<ClipId> masked;
+            Vec2 origin{}; // 隐式层：内容用父坐标记录，编译时平移到层局部坐标
+
+            void flush()
+            {
+                if (!open)
+                    return;
+                pass.batches.push_back(cur);
+                open = false;
+            }
+            void add_instance(const shader_data::Instance &inst, BatchRole role,
+                              BlendMode blend, uint32_t ref, VkRect2D sc)
+            {
+                const bool same = open && cur.type == shader_data::TYPE_INSTANCE &&
+                                  cur.role == role && cur.blend == blend &&
+                                  cur.stencilRef == ref && same_rect(cur.scissor, sc);
+                if (!same)
+                {
+                    flush();
+                    cur = Batch{};
+                    cur.type = shader_data::TYPE_INSTANCE;
+                    cur.role = role;
+                    cur.blend = blend;
+                    cur.stencilRef = ref;
+                    cur.scissor = sc;
+                    cur.first = static_cast<uint32_t>(pass.instances.size());
+                    cur.vertexCount = 6;
+                    open = true;
+                }
+                pass.instances.push_back(inst);
+                ++cur.count;
+            }
+            void add_batch(const Batch &b)
+            {
+                flush();
+                pass.batches.push_back(b);
+            }
+        };
+    } // namespace detail
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // compile：Recorder → FramePlan
+    // ═══════════════════════════════════════════════════════════════════════
+    // 把「层内原点平移」合进图元：无变换时平移 rect，有变换时平移 xf 的 tx/ty
+    inline void place_instance(shader_data::Instance &inst, const Transform2D &tf,
+                               Vec2 origin) noexcept
+    {
+        if (tf.identity())
+        {
+            inst.rect.x -= origin.x;
+            inst.rect.y -= origin.y;
+            return;
+        }
+        const Transform2D inv = tf.inverse();
+        inst.xf0 = {tf.m00, tf.m01, tf.m10, tf.m11};
+        inst.xf1 = {tf.tx - origin.x, tf.ty - origin.y, inv.m00, inv.m01};
+        inst.xf2 = {inv.m10, inv.m11, 0.0F, 0.0F};
+    }
+
+    inline FramePlan compile(const Recorder &rec, const ui_path::registry &paths, float W,
+                             float H, const SurfaceFn &acquire)
+    {
+        using detail::PassState;
+        FramePlan plan;
+        const std::span<const RecordedDraw> draws = rec.draws();
+        const std::span<const ClipNode> clips = rec.clips();
+        const std::span<const LayerNode> layers = rec.layers();
+
+        // ── 1. 层包围盒（隐式层 = 子节点并集）────────────────────────────
+        std::vector<Rect> bounds(layers.size() + 1);
+        for (std::size_t i = 0; i < layers.size(); ++i)
+            bounds[i + 1] = layers[i].params.bounds;
+        auto draw_rect_of = [](const Draw &d) -> Rect {
+            if (const auto *r = std::get_if<DrawRect>(&d))
+                return r->rect;
+            if (const auto *g = std::get_if<DrawGlyph>(&d))
+                return g->quad.rect;
+            if (const auto *im = std::get_if<DrawImage>(&d))
+                return im->rect;
+            return Rect{};
+        };
+        for (const RecordedDraw &d : draws)
+        {
+            const Rect b = draw_rect_of(d.draw);
+            for (LayerId l = d.scope.layer; l != 0 && l <= layers.size();
+                 l = layers[l - 1].parent)
+            {
+                if (layers[l - 1].params.deriveBounds())
+                    bounds[l] = union_rect(bounds[l], b);
+            }
+        }
+
+        auto is_descendant = [&](LayerId child, LayerId ancestor) {
+            for (LayerId l = child; l != 0; l = layers[l - 1].parent)
+                if (l == ancestor)
+                    return true;
+            return false;
+        };
+
+        // ── 2. 主通道 pass（backdrop 会把它拆成两段）──────────────────────
+        PassState root;
+        root.pass.kind = PassKind::Draw;
+        root.pass.target = 0;
+        root.pass.area = Rect{0, 0, W, H};
+        root.pass.clear = true;
+
+        auto flush_state = [&](PassState &ps) {
+            const uint32_t target = ps.pass.target;
+            const Rect area = ps.pass.area;
+            ps.flush();
+            plan.passes.push_back(std::move(ps.pass));
+            ps = PassState{};
+            ps.pass.kind = PassKind::Draw;
+            ps.pass.target = target;
+            ps.pass.area = area;
+            ps.pass.clear = false; // 后半段 LOAD
+        };
+
+        // ── 3. 裁剪掩码：圆角裁剪 → 模板层级 ─────────────────────────────
+        auto emit_masks = [&](PassState &ps, const ResolvedClip &rc) {
+            const VkRect2D area = to_scissor(Rect{}, ps.pass.area);
+            if (!ps.masked.empty())
+            {
+                shader_data::Instance clear{};
+                clear.rect = {static_cast<float>(area.offset.x),
+                              static_cast<float>(area.offset.y),
+                              static_cast<float>(area.extent.width),
+                              static_cast<float>(area.extent.height)};
+                clear.params = {static_cast<float>(M_SOLID), 0.0F, 0.0F, 0.0F};
+                clear.color = {0.0F, 0.0F, 0.0F, 0.0F};
+                clear.pick = {0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 0xFFFFFFFFu};
+                ps.add_instance(clear, BatchRole::StencilClear, BlendMode::Over, 0u,
+                                area);
+            }
+            uint32_t level = 0;
+            for (const ClipId id : rc.masks)
+            {
+                const ClipNode &node = clips[id - 1];
+                shader_data::Instance mask{};
+                mask.rect = {node.spec.rect.x, node.spec.rect.y, node.spec.rect.w,
+                             node.spec.rect.h};
+                mask.params = {static_cast<float>(M_CLIP_MASK), node.spec.radius, 0.0F,
+                               0.0F};
+                mask.color = {0.0F, 0.0F, 0.0F, 0.0F};
+                mask.pick = {0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 0xFFFFFFFFu};
+                place_instance(mask, node.spec.transform, ps.origin);
+                const Rect box = transformed_aabb(node.spec.rect, node.spec.transform);
+                ps.add_instance(mask,
+                                level == 0 ? BatchRole::MaskFirst : BatchRole::MaskNext,
+                                BlendMode::Over, level,
+                                to_scissor(Rect{box.x - ps.origin.x, box.y - ps.origin.y,
+                                                box.w, box.h},
+                                           ps.pass.area));
+                ++level;
+            }
+            ps.masked = rc.masks;
+        };
+
+        auto pack_pick = [](const Pick &p) {
+            return glm::uvec4{p.objectType, p.entity,
+                              ((p.version & 0xFFFFu) << 16) | (p.primitive & 0xFFFFu),
+                              0xFFFFFFFFu};
+        };
+
+        // ── 4. 路径：PathId → 模板扇形 + 覆盖 / 描边批 ────────────────────
+        auto emit_path = [&](PassState &ps, const DrawPath &p, const Pick &pick,
+                             const Transform2D &tf, VkRect2D sc) {
+            if (p.pathGen != paths.generation || !paths.valid(p.pathId))
+                return;
+            // 路径是 CPU 端几何：作用域变换 + 层内平移都在这里落到顶点上
+            const ui_path::path &source = paths.get(p.pathId);
+            ui_path::path localPath;
+            localPath.reserve(source.size());
+            for (const auto &contourIn : source)
+            {
+                ui_path::contour contourOut;
+                contourOut.closed = contourIn.closed;
+                contourOut.pts.reserve(contourIn.pts.size());
+                for (const auto &pt : contourIn.pts)
+                {
+                    const Vec2 q = tf.apply(Vec2{pt.x, pt.y});
+                    contourOut.pts.push_back(
+                        glm::vec2{q.x - ps.origin.x, q.y - ps.origin.y});
+                }
+                localPath.push_back(std::move(contourOut));
+            }
+            const ui_path::path &path = localPath;
+            const float pathW = ps.pass.area.w;
+            const float pathH = ps.pass.area.h;
+
+            if (!p.stroke)
+            {
+                PathBlob blob;
+                blob.header.rect = {static_cast<float>(sc.offset.x),
+                                    static_cast<float>(sc.offset.y),
+                                    static_cast<float>(sc.extent.width),
+                                    static_cast<float>(sc.extent.height)};
+                blob.header.color = to_vec4(p.color);
+                blob.header.params = {static_cast<float>(M_SOLID), 0.0F, 0.0F, 0.0F};
+                blob.header.pick = pack_pick(pick);
+
+                uint32_t vertexBase = 0;
+                std::vector<std::pair<uint32_t, uint32_t>> ranges;
+                for (const auto &contour : path)
+                {
+                    const auto tris = fan_triangles(contour);
+                    if (tris.empty())
+                        continue;
+                    ranges.emplace_back(vertexBase, static_cast<uint32_t>(tris.size()));
+                    for (const auto &pt : tris)
+                        blob.fan.push_back(
+                            {pt.x / pathW * 2.0F - 1.0F, pt.y / pathH * 2.0F - 1.0F});
+                    vertexBase += static_cast<uint32_t>(tris.size());
+                }
+                if (blob.fan.empty())
+                    return;
+                const uint32_t index = static_cast<uint32_t>(ps.pass.paths.size());
+                ps.pass.paths.push_back(std::move(blob));
+
+                for (const auto &[first, count] : ranges)
+                {
+                    Batch b{};
+                    b.type = shader_data::TYPE_FAN;
+                    b.role = BatchRole::PathInvert;
+                    b.blend = BlendMode::Over;
+                    b.scissor = sc;
+                    b.blob = index;
+                    b.firstVertex = first;
+                    b.vertexCount = count;
+                    ps.add_batch(b);
+                }
+                Batch cover{};
+                cover.type = shader_data::TYPE_FAN;
+                cover.role = BatchRole::Color;
+                cover.blend = BlendMode::Over;
+                cover.stencilRef = 0xFFu;
+                cover.scissor = sc;
+                cover.blob = index;
+                cover.firstVertex = vertexBase;
+                cover.vertexCount = 3;
+                ps.add_batch(cover);
+                auto &fan = ps.pass.paths.back().fan;
+                fan.push_back({-1.0F, -1.0F});
+                fan.push_back({3.0F, -1.0F});
+                fan.push_back({-1.0F, 3.0F});
+                return;
+            }
+
+            const float bh = static_cast<float>(sc.extent.height);
+            std::vector<shader_data::PathSegment> segsA;
+            std::vector<shader_data::PathSegment> segsB;
+            for (const auto &contour : path)
+                stroke_segments(contour, p.halfWidth, glm::vec2{0.0F, -bh * 0.18F}, pathW,
+                                pathH, segsA);
+            for (const auto &contour : path)
+                stroke_segments(contour, p.halfWidth, glm::vec2{0.0F, bh * 0.18F}, pathW,
+                                pathH, segsB);
+            if (segsA.empty() || segsB.empty())
+                return;
+
+            for (uint32_t variant = 0; variant < 2; ++variant)
+            {
+                PathBlob blob;
+                blob.header.rect = {static_cast<float>(sc.offset.x),
+                                    static_cast<float>(sc.offset.y),
+                                    static_cast<float>(sc.extent.width),
+                                    static_cast<float>(sc.extent.height)};
+                blob.header.color = glm::vec4{0.0F};
+                blob.header.params = {static_cast<float>(M_PATH_STROKE), p.halfWidth,
+                                      variant == 0 ? 1.0F : 0.0F, 1.0F};
+                blob.header.aux = to_vec4(p.color);
+                blob.header.pick = pack_pick(pick);
+                blob.segments = (variant == 0) ? segsA : segsB;
+
+                Batch b{};
+                b.type = shader_data::TYPE_STROKE;
+                b.role = BatchRole::Color;
+                b.blend = BlendMode::Over;
+                b.scissor = sc;
+                b.blob = static_cast<uint32_t>(ps.pass.paths.size());
+                b.vertexCount = static_cast<uint32_t>(blob.segments.size()) * 6u;
+                ps.pass.paths.push_back(std::move(blob));
+                ps.add_batch(b);
+            }
+        };
+
+        // ══════════════════════════════════════════════════════════════════
+        // 编译规则（唯一的三步）：
+        //   投影 1  state_of(scope)  → 绘制状态（scissor / 混合 / 模板引用）
+        //                              clip 链变化时顺带把模板掩码写进同一个 pass
+        //   投影 2  geometry_of(draw)→ 几何入口 + payload（实例 / 路径 blob）
+        //   合并    相邻且状态相同的 payload → 一条间接命令（PassState::add_instance）
+        // pass 只能由两种 scope 产生：layer（离屏）和 backdrop（拆 pass + blit）。
+        // ══════════════════════════════════════════════════════════════════
+
+        // 投影 1：scope → 状态
+        struct DrawState
+        {
+            VkRect2D scissor{};
+            BlendMode blend{BlendMode::Over};
+            uint32_t stencilRef{};
+            [[nodiscard]] bool empty() const noexcept
+            {
+                return scissor.extent.width == 0u || scissor.extent.height == 0u;
+            }
+        };
+        auto state_of = [&](PassState &ps, const RecordedDraw &d) -> DrawState {
+            const ResolvedClip rc = resolve_clip(clips, d.scope.clip);
+            const Rect local = rc.aabb.empty()
+                                   ? rc.aabb
+                                   : Rect{rc.aabb.x - ps.origin.x,
+                                          rc.aabb.y - ps.origin.y, rc.aabb.w, rc.aabb.h};
+            DrawState st{};
+            st.scissor = to_scissor(local, ps.pass.area);
+            if (st.empty())
+                return st;
+            if (rc.masks != ps.masked)
+                emit_masks(ps, rc); // 状态转移：把裁剪写成模板掩码
+            st.stencilRef = static_cast<uint32_t>(rc.masks.size());
+            // 有裁剪时用 EQUAL 测试（着色仍走 over），否则用作用域里的混合模式
+            st.blend = st.stencilRef > 0 ? BlendMode::Over : d.scope.blend;
+            return st;
+        };
+
+        // 投影 2：draw → 几何 + payload
+        auto geometry_of = [&](PassState &ps, const RecordedDraw &d,
+                               const DrawState &st) {
+            if (const auto *p = std::get_if<DrawPath>(&d.draw))
+            {
+                emit_path(ps, *p, d.pick, d.scope.transform, st.scissor);
+                return;
+            }
+            shader_data::Instance inst;
+            if (const auto *r = std::get_if<DrawRect>(&d.draw))
+                inst = pack_rect(*r);
+            else if (const auto *g = std::get_if<DrawGlyph>(&d.draw))
+                inst = pack_glyph(*g);
+            else if (const auto *im = std::get_if<DrawImage>(&d.draw))
+                inst = pack_image(*im);
+            place_instance(inst, d.scope.transform, ps.origin);
+            inst.pick = pack_pick(d.pick);
+            ps.add_instance(inst, BatchRole::Color, st.blend, st.stencilRef, st.scissor);
+        };
+
+        // 一个 draw 的完整编译：一次投影 + 一次合并
+        auto fold_draw = [&](PassState &ps, const RecordedDraw &d) {
+            ++plan.draws;
+            const DrawState st = state_of(ps, d);
+            if (st.empty())
+                return;
+            geometry_of(ps, d, st);
+        };
+
+        // ── 6. 层 → 离屏 pass 序列（表面由调用方分配，payload 全部在这里生成）──
+        std::vector<bool> built(layers.size() + 1, false);
+        std::function<void(LayerId, std::size_t &, PassState &)> build_layer;
+        build_layer = [&](LayerId id, std::size_t &i, PassState &parent) {
+            if (id == 0 || id > layers.size() || built[id])
+                return;
+            built[id] = true;
+            const LayerParams lp = layers[id - 1].params;
+            Rect bnd = lp.bounds.empty() ? bounds[id] : lp.bounds;
+            if (bnd.empty())
+                bnd = Rect{0.0F, 0.0F, W, H};
+            // 表面按需分配：尺寸来自本层参数（隐式层 = 子节点并集），不再是固定池
+            const uint32_t sw =
+                lp.deriveBounds()
+                    ? static_cast<uint32_t>(std::ceil(std::max(1.0F, bnd.w)))
+                    : (lp.surfaceWidth != 0 ? lp.surfaceWidth
+                                            : static_cast<uint32_t>(std::ceil(bnd.w)));
+            const uint32_t sh =
+                lp.deriveBounds()
+                    ? static_cast<uint32_t>(std::ceil(std::max(1.0F, bnd.h)))
+                    : (lp.surfaceHeight != 0 ? lp.surfaceHeight
+                                             : static_cast<uint32_t>(std::ceil(bnd.h)));
+            const SurfaceRef surface = acquire(sw, sh);
+            const uint32_t target = surface.slot + 1;
+            plan.layers.push_back(LayerPlan{sw, sh});
+
+            if (lp.backdrop)
+            {
+                // 父 pass 必须先收尾（父内容已经画完），再 blit 到本层
+                const uint32_t parentTarget = parent.pass.target;
+                flush_state(parent);
+                PassPlan blit{};
+                blit.kind = PassKind::Blit;
+                blit.target = target;
+                blit.src = parentTarget; // 0 = 主通道
+                blit.area =
+                    Rect{0.0F, 0.0F, static_cast<float>(sw), static_cast<float>(sh)};
+                plan.passes.push_back(std::move(blit));
+            }
+
+            PassState ls;
+            ls.pass.kind = PassKind::Draw;
+            ls.pass.target = target;
+            ls.pass.area =
+                Rect{0.0F, 0.0F, static_cast<float>(sw), static_cast<float>(sh)};
+            ls.pass.clear = !lp.backdrop;
+            if (lp.deriveBounds())
+                ls.origin = Vec2{bnd.x, bnd.y}; // 隐式层：内容仍在父坐标里记录
+
+            while (i < draws.size())
+            {
+                const LayerId dl = draws[i].scope.layer;
+                if (dl == 0)
+                    break;
+                if (dl == id)
+                {
+                    fold_draw(ls, draws[i]);
+                    ++i;
+                }
+                else if (is_descendant(dl, id))
+                {
+                    build_layer(dl, i, ls);
+                }
+                else
+                {
+                    break;
+                }
+            }
+            ls.flush();
+            plan.passes.push_back(std::move(ls.pass));
+
+            // 模糊：两趟可分离；payload 也在这里生成（纹理下标来自 SurfaceRef）
+            if (lp.blur > 0.0F)
+            {
+                const SurfaceRef scratch = acquire(sw, sh);
+                uint32_t srcTexture = surface.texture;
+                uint32_t srcSampler = surface.sampler;
+                for (uint32_t dir = 0; dir < 2; ++dir)
+                {
+                    const SurfaceRef dst = (dir == 0)
+                                               ? scratch
+                                               : SurfaceRef{surface.slot, surface.texture,
+                                                            surface.sampler, sw, sh};
+                    PassPlan blur{};
+                    blur.kind = PassKind::Draw;
+                    blur.target = dst.slot + 1;
+                    blur.area = ls.pass.area;
+                    blur.clear = true;
+                    shader_data::Instance inst{};
+                    inst.rect = {0.0F, 0.0F, static_cast<float>(sw),
+                                 static_cast<float>(sh)};
+                    inst.params = {static_cast<float>(M_LAYER_BLUR),
+                                   static_cast<float>(dir), lp.blur,
+                                   static_cast<float>(srcTexture)};
+                    inst.aux = {static_cast<float>(srcSampler), 0.0F, 0.0F, 0.0F};
+                    inst.pick = {0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 0xFFFFFFFFu};
+                    blur.instances.push_back(inst);
+                    Batch b{};
+                    b.type = shader_data::TYPE_INSTANCE;
+                    b.role = BatchRole::Color;
+                    b.blend = BlendMode::Over;
+                    b.scissor = VkRect2D{{0, 0}, {sw, sh}};
+                    b.first = 0;
+                    b.count = 1;
+                    b.vertexCount = 6;
+                    blur.batches.push_back(b);
+                    plan.passes.push_back(std::move(blur));
+                    srcTexture = dst.texture;
+                    srcSampler = dst.sampler;
+                }
+            }
+
+            // 合成：普通实例批（payload 里已经有层的纹理下标）
+            const bool screen = lp.screenSpace || lp.backdrop;
+            shader_data::Instance comp{};
+            comp.rect = {bnd.x, bnd.y, bnd.w, bnd.h};
+            comp.params = {static_cast<float>(M_LAYER_COMPOSITE), lp.opacity,
+                           static_cast<float>(surface.texture),
+                           static_cast<float>(surface.sampler)};
+            comp.aux = {lp.radius, screen ? W : 0.0F, screen ? H : 0.0F, 0.0F};
+            comp.pick = {0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 0xFFFFFFFFu};
+            parent.add_instance(comp, BatchRole::Color, BlendMode::Over, 0,
+                                to_scissor(bnd, parent.pass.area));
+        };
+
+        // ── 7. 主循环：layer 标记驱动（空层也会生成 pass），其余 draw 进主通道 ──
+        const std::span<const LayerMark> marks = rec.layerMarks();
+        std::size_t i = 0;
+        std::size_t mark = 0;
+        while (i < draws.size() || mark < marks.size())
+        {
+            if (mark < marks.size() &&
+                static_cast<std::size_t>(marks[mark].drawIndex) <= i)
+            {
+                const LayerId id = marks[mark].id;
+                ++mark;
+                build_layer(id, i, root);
+                continue;
+            }
+            if (draws[i].scope.layer == 0)
+            {
+                fold_draw(root, draws[i]);
+                ++i;
+            }
+            else
+            {
+                ++i; // 层内 draw 由 build_layer 消费
+            }
+        }
+        root.flush();
+        plan.passes.push_back(std::move(root.pass));
+
+        for (const PassPlan &p : plan.passes)
+            plan.batches += static_cast<uint32_t>(p.batches.size());
+        return plan;
+    }
+} // namespace ui
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VulkanBackend：只执行 FramePlan
+//
+//   · 管线表 / 描述符 / heap / 间接命令 / 索引缓冲 / 层的图像都是它的事
+//   · 每 pass：Blit / Blur / Draw 三种；Draw 内按 batch 逐条提交
+//   · 合成批、模糊批的 payload 也由它生成（因为纹理下标只有它知道）
+// ═══════════════════════════════════════════════════════════════════════════
+// ── 本 app 的 type id / pipe id（协议不占用这两个命名空间）──────────────
+namespace proto_app
+{
+    constexpr ui_proto::TypeId tInstance = 1;
+    constexpr ui_proto::TypeId tStroke = 2;
+    constexpr ui_proto::TypeId tFan = 3;
+
+    inline const char *type_name(ui_proto::TypeId t) noexcept
+    {
+        switch (t)
+        {
+        case tInstance:
+            return "Instance";
+        case tStroke:
+            return "Stroke";
+        case tFan:
+            return "Fan";
+        default:
+            return "?";
+        }
+    }
+
+    enum : uint16_t
+    {
+        kOver = 0,
+        kAdd,
+        kMultiply,
+        kErase,
+        kClipped,
+        kMaskFirst,
+        kMaskNext,
+        kClear,
+        kPathInvert,
+        kLayer,
+        kCount
+    };
+} // namespace proto_app
+
+// ── 【ABI 层】GPU 侧协议：type id → 记录布局，push 常量槽位 ───────────────
+namespace ui_abi::ability2
+{
+    inline constexpr TypeDesc kTypes[] = {
+        {proto_app::tInstance, sizeof(shader_data::Instance), 16, "Instance"},
+        {proto_app::tStroke, 0, 1, "Stroke(blob)"},
+        {proto_app::tFan, 0, 1, "Fan(blob)"},
+    };
+    inline constexpr TypeTable kTable{kTypes};
+
+    // push 常量：3×u64 + 2×u32 = 32B，与 GLSL 的 DrawConstants 逐字段对应
+    static_assert(sizeof(shader_data::DrawConstants) == kPushSize);
+    static_assert(offsetof(shader_data::DrawConstants, instancesAddress) == 0);
+    static_assert(offsetof(shader_data::DrawConstants, commandConstantsAddress) == 8);
+    static_assert(offsetof(shader_data::DrawConstants, viewportSize) == 16);
+    static_assert(offsetof(shader_data::DrawConstants, flags) == 24);
+    static_assert(sizeof(shader_data::CommandConstant) == 12);
+} // namespace ui_abi::ability2
+
+namespace gfx
+{
+    // 设备层统一到 ui_gfx::shader_device（见 ui_shader_device.hpp）
+
+    struct PassResources
+    {
+        VkImage colorImage{};
+        VkImageView colorView{};
+        VkImage resolveImage{};
+        VkImageView resolveView{};
+        VkImage pickImage{};
+        VkImageView pickView{};
+        VkImageView pickResolveView{};
+        VkImage depthImage{};
+        VkImageView depthView{};
+        VkExtent2D extent{};
+        bool hasStencil{false};
+    };
+
+    inline std::string sibling_shader_path(const char *fileName)
+    {
+        std::string_view base{VERT_SHADER_PATH};
+        const auto pos = base.find_last_of("/\\");
+        std::string out{base.substr(0, pos == std::string_view::npos ? 0 : pos + 1)};
+        out += fileName;
+        return out;
+    }
+
+    class Backend
+    {
+      public:
+        Backend() = default;
+        ~Backend()
+        {
+            destroy();
+        }
+        Backend(const Backend &) = delete;
+        Backend &operator=(const Backend &) = delete;
+
+        void init(const LogicalDevice &device, VkDescriptorSetLayout descriptorSetLayout,
+                  VkFormat colorFormat, VkFormat depthFormat, bool hasStencil,
+                  VkSampleCountFlagBits samples)
+        {
+            device_ = &device;
+            colorFormat_ = colorFormat;
+            depthFormat_ = depthFormat;
+            hasStencil_ = hasStencil;
+            samples_ = samples;
+            vsPath_ = sibling_shader_path("test_ui_ability2.vert.spv");
+            fsPath_ = sibling_shader_path("test_ui_ability2.frag.spv");
+
+            layout_ =
+                create_pipeline_layout{}
+                    .setCreateInfo({.setLayouts = {descriptorSetLayout},
+                                    .pushConstantRanges =
+                                        {{.stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
+                                                        VK_SHADER_STAGE_FRAGMENT_BIT,
+                                          .offset = 0,
+                                          .size = sizeof(shader_data::DrawConstants)}}})
+                    .build(device);
+
+            build_pipelines();
+
+            heap_ = shader_data::DeviceHeap(device, 8u * 1024u * 1024u,
+                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            constants_ =
+                shader_data::DeviceHeap(device, 256u * 1024u,
+                                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            indirect_ =
+                shader_data::DeviceHeap(device, 256u * 1024u,
+                                        VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+            std::vector<uint32_t> indices(kMaxIndices);
+            for (uint32_t i = 0; i < kMaxIndices; ++i)
+                indices[i] = i;
+            indexBuffer_ = mcs::vulkan::memory::auto_map_buffer(
+                mcs::vulkan::memory::create_simple_buffer(
+                    device,
+                    {.size = kMaxIndices * sizeof(uint32_t),
+                     .usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+                kMaxIndices * sizeof(uint32_t));
+            std::memcpy(indexBuffer_.mapPtr(), indices.data(),
+                        indices.size() * sizeof(uint32_t));
+        }
+
+        [[nodiscard]] bool valid() const noexcept
+        {
+            return layout_.has_value();
+        }
+
+        void shutdown() noexcept
+        {
+            destroy();
+        }
+
+        void execute(const CommandBufferView &cmd, const ui::FramePlan &plan,
+                     const PassResources &res, VkDescriptorSet descriptorSet,
+                     std::span<const VkImage> layerImages,
+                     std::span<const VkImageView> layerViews)
+        {
+            submitted_ = 0;
+            heapCursor_ = 0;
+            constantCursor_ = 0;
+            indirectCursor_ = 0;
+            descriptorSet_ = descriptorSet;
+            mainImage_ = res.resolveImage;
+            mainLayout_ = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+            // 一帧一个 arena：所有 pass 顺序追加，绝不互相覆盖
+            shader_device_.begin_frame();
+            for (const ui::PassPlan &pass : plan.passes)
+            {
+                switch (pass.kind)
+                {
+                case ui::PassKind::Blit:
+                    blit_pass(cmd, pass, res, layerImages);
+                    break;
+                default:
+                    draw_pass(cmd, pass, res, descriptorSet, layerImages, layerViews);
+                    break;
+                }
+            }
+        }
+
+        [[nodiscard]] uint32_t submittedDraws() const noexcept
+        {
+            return submitted_;
+        }
+
+      private:
+        static constexpr uint32_t kMaxIndices = 65536u;
+
+        void destroy() noexcept
+        {
+            if (device_ == nullptr)
+                return;
+            pipelines_.reset();
+            layout_.reset();
+            heap_ = shader_data::DeviceHeap{};
+            constants_ = shader_data::DeviceHeap{};
+            indirect_ = shader_data::DeviceHeap{};
+            indexBuffer_ = mcs::vulkan::memory::auto_map_buffer{};
+            device_ = nullptr;
+        }
+
+        void draw_pass(const CommandBufferView &cmd, const ui::PassPlan &pass,
+                       const PassResources &res, VkDescriptorSet descriptorSet,
+                       std::span<const VkImage> layerImages,
+                       std::span<const VkImageView> layerViews)
+        {
+            const bool isLayer = pass.target != 0;
+            const VkImage layerImage = isLayer ? layerImages[pass.target - 1] : VkImage{};
+            const VkImageView layerView =
+                isLayer ? layerViews[pass.target - 1] : VkImageView{};
+
+            // ── 协议：PassPlan → List（头 + 数据），不再逐批上传 ─────────
+            ui_proto::List list;
+            ui_proto::CmdEncoder canvas(list, pass.area.w, pass.area.h, {0, 6, 0});
+            list.type_name = proto_app::type_name;
+            canvas.begin_pass(isLayer ? 1 : 0, pass.clear);
+            for (const ui::Batch &b : pass.batches)
+            {
+                const auto pid = isLayer ? uint16_t(proto_app::kLayer) : pipe_id_for(b);
+                // 管线没开 dynamic stencil 的，不能发 SetStencilReference（VUID 08608）
+                const uint16_t lanes =
+                    (b.role != ui::BatchRole::Color || b.stencilRef > 0)
+                        ? ui_proto::kLanesAll
+                        : ui_proto::kLanesBasic;
+                const auto cid = canvas.clip(static_cast<float>(b.scissor.offset.x),
+                                             static_cast<float>(b.scissor.offset.y),
+                                             static_cast<float>(b.scissor.extent.width),
+                                             static_cast<float>(b.scissor.extent.height));
+                if (b.type == shader_data::TYPE_INSTANCE)
+                {
+                    canvas.draw_raw(pid, cid, proto_app::tInstance,
+                                    pass.instances.data() + b.first, b.count,
+                                    sizeof(shader_data::Instance), canvas.default_geo(),
+                                    static_cast<uint16_t>(b.stencilRef), lanes);
+                }
+                else
+                {
+                    // 路径批：header + segments + fan 拼成一个连续 blob
+                    const ui::PathBlob &blob = pass.paths[b.blob];
+                    std::vector<std::byte> buf(sizeof(shader_data::Instance) +
+                                               blob.segments.size() *
+                                                   sizeof(shader_data::PathSegment) +
+                                               blob.fan.size() * sizeof(glm::vec2));
+                    std::size_t off = 0;
+                    auto put = [&](const void *p, std::size_t n) {
+                        if (n != 0)
+                            std::memcpy(buf.data() + off, p, n);
+                        off += n;
+                    };
+                    put(&blob.header, sizeof(blob.header));
+                    put(blob.segments.data(),
+                        blob.segments.size() * sizeof(shader_data::PathSegment));
+                    put(blob.fan.data(), blob.fan.size() * sizeof(glm::vec2));
+                    const auto geo = canvas.geom(0, b.vertexCount,
+                                                 static_cast<uint32_t>(b.firstVertex));
+                    canvas.draw_raw(pid, cid,
+                                    b.type == shader_data::TYPE_STROKE
+                                        ? proto_app::tStroke
+                                        : proto_app::tFan,
+                                    buf.data(), 1, static_cast<uint32_t>(buf.size()), geo,
+                                    static_cast<uint16_t>(b.stencilRef), lanes);
+                }
+            }
+            canvas.end_pass();
+
+            sync_registry(descriptorSet);
+            // consume/execute 由设备层完成（device_.submit）
+
+            // pass 的 begin/end 现在是记录；这里只做目标切换前的 layout 转换
+            if (isLayer)
+                transition_layer(cmd, layerImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+
+            // ── 执行：计划 → vkCmd*（设备层统一）──────────────────────────
+            const VkExtent2D vpExtent =
+                isLayer ? VkExtent2D{static_cast<uint32_t>(pass.area.w),
+                                     static_cast<uint32_t>(pass.area.h)}
+                        : res.extent;
+            // push 块：s0 = 实例堆基址（由 device 填），s1 = 常量地址（由 device 填）
+            //           s2 = viewportSize（两个 float 打进一个 u64），s3 = flags
+            const uint32_t vw =
+                std::bit_cast<uint32_t>(static_cast<float>(vpExtent.width));
+            const uint32_t vh =
+                std::bit_cast<uint32_t>(static_cast<float>(vpExtent.height));
+            shader_device_.set_push(ui_abi::PushBlock{
+                .s2 = uint64_t(vw) | (uint64_t(vh) << 32), .s3 = 0, .s4 = 0});
+            shader_device_.set_extent(vpExtent);
+
+            // 目标表：0 = 主通道，1 = 本层的离屏 target（BeginPass 记录按下标取）
+            std::array<ui_gfx::target_desc, 2> tg{};
+            tg[0] = {.color = res.colorView,
+                     .resolve = res.resolveView,
+                     .pick = res.pickView,
+                     .pick_resolve = res.pickResolveView,
+                     .depth = res.depthView,
+                     .extent = res.extent,
+                     .has_stencil = res.hasStencil,
+                     .use_pick = true,
+                     .color_clear = {.color = {.float32 = {0.05F, 0.055F, 0.07F, 1.0F}}},
+                     .pick_clear = {.color = {
+                         .uint32 = {0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 0u}}}};
+            tg[1] = {.color = layerView,
+                     .extent = {static_cast<uint32_t>(pass.area.w),
+                                static_cast<uint32_t>(pass.area.h)},
+                     .use_pick = false,
+                     .color_clear = {.color = {.float32 = {0.0F, 0.0F, 0.0F, 0.0F}}}};
+            shader_device_.set_targets(tg);
+
+            shader_device_.submit(cmd, list, 0);
+
+            if (isLayer)
+                transition_layer(cmd, layerImage,
+                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
+
+        void blit_pass(const CommandBufferView &cmd, const ui::PassPlan &pass,
+                       const PassResources &res, std::span<const VkImage> layerImages)
+        {
+            const VkImage srcImage =
+                pass.src != 0 ? layerImages[pass.src - 1] : res.resolveImage;
+            const VkImage dstImage = layerImages[pass.target - 1];
+            transition_image(cmd, srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            transition_image(cmd, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            std::array<VkImageBlit, 1> regions{
+                VkImageBlit{.srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                               .mipLevel = 0,
+                                               .baseArrayLayer = 0,
+                                               .layerCount = 1},
+                            .srcOffsets = {{0, 0, 0},
+                                           {static_cast<int32_t>(res.extent.width),
+                                            static_cast<int32_t>(res.extent.height), 1}},
+                            .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                               .mipLevel = 0,
+                                               .baseArrayLayer = 0,
+                                               .layerCount = 1},
+                            .dstOffsets = {{0, 0, 0},
+                                           {static_cast<int32_t>(pass.area.w),
+                                            static_cast<int32_t>(pass.area.h), 1}}}};
+            cmd.blitImage(srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dstImage,
+                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, regions,
+                          VK_FILTER_LINEAR);
+            // 源回到「可被采样 / 可写」的稳定状态
+            if (pass.src != 0)
+                transition_image(cmd, srcImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            else
+                transition_image(cmd, srcImage, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+            transition_image(cmd, dstImage, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
+        void transition_layer(const CommandBufferView &cmd, VkImage image,
+                              VkImageLayout dst)
+        {
+            transition_image(cmd, image, dst);
+        }
+
+        // 通用图像布局转换（主通道 / 层图像都走这里；只区分 3 种常用布局）
+        void transition_image(const CommandBufferView &cmd, VkImage image,
+                              VkImageLayout dst)
+        {
+            VkImageLayout src = VK_IMAGE_LAYOUT_UNDEFINED;
+            for (std::size_t i = 0; i < layerImages_.size(); ++i)
+                if (layerImages_[i] == image)
+                    src = layerLayouts_[i];
+            if (image == mainImage_)
+            {
+                src = mainLayout_;
+            }
+            if (src == dst)
+                return;
+            VkAccessFlags2 srcAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+            VkPipelineStageFlags2 srcStage =
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+            VkAccessFlags2 dstAccess = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+            VkPipelineStageFlags2 dstStage =
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+            if (src == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+            {
+                srcAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+                srcStage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            }
+            else if (src == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+            {
+                srcAccess = VK_ACCESS_2_TRANSFER_READ_BIT;
+                srcStage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            }
+            else if (src == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+            {
+                srcAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                srcStage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            }
+            if (dst == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+            {
+                dstAccess = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+                dstStage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+            }
+            else if (dst == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+            {
+                dstAccess = VK_ACCESS_2_TRANSFER_READ_BIT;
+                dstStage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            }
+            else if (dst == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+            {
+                dstAccess = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                dstStage = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            }
+            my_render::transition_image_layout(
+                cmd, my_render::image_info{.image = image,
+                                           .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                           .src = {.layout = src,
+                                                   .access_mask = srcAccess,
+                                                   .stage_mask = srcStage},
+                                           .dst = {.layout = dst,
+                                                   .access_mask = dstAccess,
+                                                   .stage_mask = dstStage}});
+            if (image == mainImage_)
+                mainLayout_ = dst;
+            mark_layer(image, dst);
+        }
+        void mark_layer(VkImage image, VkImageLayout layout) noexcept
+        {
+            for (std::size_t i = 0; i < layerImages_.size(); ++i)
+                if (layerImages_[i] == image || layerImages_[i] == VK_NULL_HANDLE)
+                {
+                    layerImages_[i] = image;
+                    layerLayouts_[i] = layout;
+                    return;
+                }
+        }
+
+        using stage_info = create_graphics_pipeline::stage_info;
+
+        auto make_pipeline(const std::vector<VkFormat> &colorFormats,
+                           std::vector<VkPipelineColorBlendAttachmentState> blends,
+                           bool stencilEnable, VkStencilOpState stencilOp,
+                           VkSampleCountFlagBits samples)
+        {
+            const VkPipelineRenderingCreateInfo rendering{
+                .colorAttachmentCount = static_cast<uint32_t>(colorFormats.size()),
+                .pColorAttachmentFormats = colorFormats.data(),
+                .depthAttachmentFormat =
+                    colorFormats.size() > 1 ? depthFormat_ : VK_FORMAT_UNDEFINED,
+                .stencilAttachmentFormat = (colorFormats.size() > 1 && hasStencil_)
+                                               ? depthFormat_
+                                               : VK_FORMAT_UNDEFINED};
+            return create_graphics_pipeline{}
+                .setCreateInfo(
+                    {.pNext = make_pNext(structure_chain<VkPipelineRenderingCreateInfo>{
+                         VkPipelineRenderingCreateInfo{rendering}}),
+                     .stages = create_graphics_pipeline::makeStages(
+                         stage_info{.stage = VK_SHADER_STAGE_VERTEX_BIT,
+                                    .filePath = vsPath_,
+                                    .pName = "main"},
+                         stage_info{.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                                    .filePath = fsPath_,
+                                    .pName = "main"}),
+                     .vertexInputState = {},
+                     .inputAssemblyState = {.topology =
+                                                VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                                            .primitiveRestartEnable = VK_FALSE},
+                     .tessellationState = {},
+                     .viewportState = {.viewports = {VkViewport{}},
+                                       .scissors = {VkRect2D{}}},
+                     .rasterizationState = {.depthClampEnable = VK_FALSE,
+                                            .rasterizerDiscardEnable = VK_FALSE,
+                                            .polygonMode = VK_POLYGON_MODE_FILL,
+                                            .cullMode = VK_CULL_MODE_NONE,
+                                            .frontFace = VK_FRONT_FACE_CLOCKWISE,
+                                            .depthBiasEnable = VK_FALSE,
+                                            .lineWidth = 1.0F},
+                     .multisampleState = {.rasterizationSamples = samples,
+                                          .sampleShadingEnable = VK_FALSE,
+                                          .minSampleShading = 1.0F,
+                                          .sampleMask = {},
+                                          .alphaToCoverageEnable = VK_FALSE,
+                                          .alphaToOneEnable = VK_FALSE},
+                     .depthStencilState = {.depthTestEnable = VK_FALSE,
+                                           .depthWriteEnable = VK_FALSE,
+                                           .depthCompareOp = VK_COMPARE_OP_ALWAYS,
+                                           .depthBoundsTestEnable = VK_FALSE,
+                                           .stencilTestEnable = stencilEnable,
+                                           .front = stencilOp,
+                                           .back = stencilOp,
+                                           .minDepthBounds = 0.0F,
+                                           .maxDepthBounds = 1.0F},
+                     .colorBlendState = {.logicOpEnable = VK_FALSE,
+                                         .logicOp = VkLogicOp::VK_LOGIC_OP_COPY,
+                                         .attachments = std::move(blends)},
+                     .dynamicState =
+                         {.dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT,
+                                            VK_DYNAMIC_STATE_SCISSOR,
+                                            VK_DYNAMIC_STATE_STENCIL_REFERENCE}},
+                     .layout = **layout_})
+                .build(*device_);
+        }
+
+        void build_pipelines()
+        {
+            const std::vector<VkFormat> mainFormats{colorFormat_,
+                                                    VK_FORMAT_R32G32B32A32_UINT};
+            const std::vector<VkFormat> layerFormats{colorFormat_};
+
+            const VkPipelineColorBlendAttachmentState pickState{
+                .blendEnable = VK_FALSE,
+                .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                  VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT};
+            const VkPipelineColorBlendAttachmentState over{
+                .blendEnable = VK_TRUE,
+                .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+                .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                .colorBlendOp = VK_BLEND_OP_ADD,
+                .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+                .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                .alphaBlendOp = VK_BLEND_OP_ADD,
+                .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                  VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT};
+            auto blend_with = [&](VkBlendFactor src, VkBlendFactor dst) {
+                auto a = over;
+                a.srcColorBlendFactor = src;
+                a.dstColorBlendFactor = dst;
+                return a;
+            };
+            const VkPipelineColorBlendAttachmentState noColorWrite{
+                .blendEnable = VK_FALSE, .colorWriteMask = 0};
+
+            const VkStencilOpState alwaysIncr{.failOp = VK_STENCIL_OP_KEEP,
+                                              .passOp = VK_STENCIL_OP_INCREMENT_AND_CLAMP,
+                                              .depthFailOp = VK_STENCIL_OP_KEEP,
+                                              .compareOp = VK_COMPARE_OP_ALWAYS,
+                                              .compareMask = 0xFF,
+                                              .writeMask = 0xFF,
+                                              .reference = 0};
+            VkStencilOpState equalIncr = alwaysIncr;
+            equalIncr.compareOp = VK_COMPARE_OP_EQUAL;
+            VkStencilOpState equalKeep = alwaysIncr;
+            equalKeep.compareOp = VK_COMPARE_OP_EQUAL;
+            equalKeep.passOp = VK_STENCIL_OP_KEEP;
+            equalKeep.writeMask = 0x00;
+            VkStencilOpState invert = alwaysIncr;
+            invert.passOp = VK_STENCIL_OP_INVERT;
+            VkStencilOpState zero = alwaysIncr;
+            zero.passOp = VK_STENCIL_OP_ZERO;
+
+            pipelines_.over = make_pipeline(mainFormats, {over, pickState}, false,
+                                            alwaysIncr, samples_);
+            pipelines_.add = make_pipeline(
+                mainFormats,
+                {blend_with(VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE), pickState}, false,
+                alwaysIncr, samples_);
+            pipelines_.multiply = make_pipeline(
+                mainFormats,
+                {blend_with(VK_BLEND_FACTOR_DST_COLOR, VK_BLEND_FACTOR_ZERO), pickState},
+                false, alwaysIncr, samples_);
+            pipelines_.erase = make_pipeline(
+                mainFormats,
+                {blend_with(VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA),
+                 pickState},
+                false, alwaysIncr, samples_);
+            pipelines_.maskFirst = make_pipeline(mainFormats, {noColorWrite, pickState},
+                                                 true, alwaysIncr, samples_);
+            pipelines_.maskNext = make_pipeline(mainFormats, {noColorWrite, pickState},
+                                                true, equalIncr, samples_);
+            pipelines_.clipped =
+                make_pipeline(mainFormats, {over, pickState}, true, equalKeep, samples_);
+            pipelines_.pathInvert = make_pipeline(mainFormats, {noColorWrite, pickState},
+                                                  true, invert, samples_);
+            pipelines_.stencilClear = make_pipeline(
+                mainFormats, {noColorWrite, pickState}, true, zero, samples_);
+            pipelines_.layer = make_pipeline(layerFormats, {over}, false, alwaysIncr,
+                                             VK_SAMPLE_COUNT_1_BIT);
+        }
+
+        // 管线按「角色」命名，不再用下标数组（Compiler 只给语义，映射在这里）
+        struct Pipelines
+        {
+            std::optional<mcs::vulkan::Pipeline> over;
+            std::optional<mcs::vulkan::Pipeline> add;
+            std::optional<mcs::vulkan::Pipeline> multiply;
+            std::optional<mcs::vulkan::Pipeline> erase;
+            std::optional<mcs::vulkan::Pipeline> clipped; // over + EQUAL 测试
+            std::optional<mcs::vulkan::Pipeline> maskFirst;
+            std::optional<mcs::vulkan::Pipeline> maskNext;
+            std::optional<mcs::vulkan::Pipeline> stencilClear;
+            std::optional<mcs::vulkan::Pipeline> pathInvert;
+            std::optional<mcs::vulkan::Pipeline> layer; // 单附件、单采样
+
+            void reset() noexcept
+            {
+                over.reset();
+                add.reset();
+                multiply.reset();
+                erase.reset();
+                clipped.reset();
+                maskFirst.reset();
+                maskNext.reset();
+                stencilClear.reset();
+                pathInvert.reset();
+                layer.reset();
+            }
+        };
+
+        // 语义 → 管线：这是唯一知道「角色怎么落到管线」的地方
+        [[nodiscard]] VkPipeline pipeline_for(const ui::Batch &b) const noexcept
+        {
+            switch (b.role)
+            {
+            case ui::BatchRole::MaskFirst:
+                return **pipelines_.maskFirst;
+            case ui::BatchRole::MaskNext:
+                return **pipelines_.maskNext;
+            case ui::BatchRole::StencilClear:
+                return **pipelines_.stencilClear;
+            case ui::BatchRole::PathInvert:
+                return **pipelines_.pathInvert;
+            case ui::BatchRole::Color:
+            default:
+                break;
+            }
+            if (b.stencilRef > 0)
+                return **pipelines_.clipped;
+            switch (b.blend)
+            {
+            case ui::BlendMode::Add:
+                return **pipelines_.add;
+            case ui::BlendMode::Multiply:
+                return **pipelines_.multiply;
+            case ui::BlendMode::Erase:
+                return **pipelines_.erase;
+            default:
+                return **pipelines_.over;
+            }
+        }
+
+        // ── 协议注册表：10 条管线 + 1 个 layout + 1 个 IBO ──────────────
+        uint16_t pipe_id_for(const ui::Batch &b) const noexcept
+        {
+            switch (b.role)
+            {
+            case ui::BatchRole::MaskFirst:
+                return proto_app::kMaskFirst;
+            case ui::BatchRole::MaskNext:
+                return proto_app::kMaskNext;
+            case ui::BatchRole::StencilClear:
+                return proto_app::kClear;
+            case ui::BatchRole::PathInvert:
+                return proto_app::kPathInvert;
+            case ui::BatchRole::Color:
+            default:
+                break;
+            }
+            if (b.stencilRef > 0)
+                return proto_app::kClipped;
+            switch (b.blend)
+            {
+            case ui::BlendMode::Add:
+                return proto_app::kAdd;
+            case ui::BlendMode::Multiply:
+                return proto_app::kMultiply;
+            case ui::BlendMode::Erase:
+                return proto_app::kErase;
+            default:
+                return proto_app::kOver;
+            }
+        }
+
+        void sync_registry(VkDescriptorSet ds)
+        {
+            if (pipe_desc_[0].h.v == 0)
+            {
+                const VkPipeline pipes[proto_app::kCount] = {
+                    **pipelines_.over,       **pipelines_.add,
+                    **pipelines_.multiply,   **pipelines_.erase,
+                    **pipelines_.clipped,    **pipelines_.maskFirst,
+                    **pipelines_.maskNext,   **pipelines_.stencilClear,
+                    **pipelines_.pathInvert, **pipelines_.layer};
+                static const char *names[proto_app::kCount] = {
+                    "over",      "add",      "multiply", "erase",      "clipped",
+                    "maskFirst", "maskNext", "clear",    "pathInvert", "layer"};
+                for (uint32_t i = 0; i < proto_app::kCount; ++i)
+                    pipe_desc_[i] = {
+                        ui_gfx::Handle{reinterpret_cast<uint64_t>(pipes[i]), names[i]}, 0};
+
+                layout_h_[0] =
+                    ui_gfx::Handle{reinterpret_cast<uint64_t>(**layout_), "L_ui"};
+                registry_.pipelines = pipe_desc_;
+                registry_.layouts = layout_h_;
+                registry_.descSets = desc_h_;
+                registry_.ibo = ui_gfx::Handle{
+                    reinterpret_cast<uint64_t>(indexBuffer_.buffer()), "IB"};
+
+                // 设备层：与 test_intent2 同一个结构体
+                shader_device_.init(
+                    {.registry = registry_,
+                     .abi = &ui_abi::ability2::kTable,
+                     .heap = ui_gfx::heap_ref::of_addr(heap_),
+                     .cc = ui_gfx::heap_ref::of_addr(constants_),
+                     .indirect = ui_gfx::heap_ref::of(indirect_),
+                     .heap_slot = 0, // DrawConstants.instancesAddress
+                     .cc_slot = 1}); // DrawConstants.commandConstantsAddress
+            }
+            desc_h_[0] = ui_gfx::Handle{reinterpret_cast<uint64_t>(ds), "DS"};
+        }
+
+        ui_gfx::shader_device shader_device_{};
+        ui_gfx::PipelineDesc pipe_desc_[proto_app::kCount]{};
+        ui_gfx::Handle layout_h_[1]{};
+        ui_gfx::Handle desc_h_[1]{};
+        ui_gfx::Registry registry_{};
+
+        const LogicalDevice *device_{};
+        std::optional<mcs::vulkan::PipelineLayout> layout_{};
+        Pipelines pipelines_{};
+        VkFormat colorFormat_{};
+        VkFormat depthFormat_{};
+        bool hasStencil_{false};
+        VkSampleCountFlagBits samples_{VK_SAMPLE_COUNT_1_BIT};
+        std::string vsPath_;
+        std::string fsPath_;
+        shader_data::DeviceHeap heap_{};
+        shader_data::DeviceHeap constants_{};
+        shader_data::DeviceHeap indirect_{};
+        mcs::vulkan::memory::auto_map_buffer indexBuffer_{};
+        std::array<VkImage, 8> layerImages_{};
+        std::array<VkImageLayout, 8> layerLayouts_{};
+        VkImage mainImage_{};
+        VkImageLayout mainLayout_{VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkDeviceSize heapCursor_{};
+        VkDeviceSize constantCursor_{};
+        VkDeviceSize indirectCursor_{};
+        VkDescriptorSet descriptorSet_{};
+        uint32_t submitted_{};
+    };
+} // namespace gfx
+
+// 每帧一套 Recorder / Backend（与 MAX_FRAMES_IN_FLIGHT 对齐）
+std::array<ui::Recorder, MAX_FRAMES_IN_FLIGHT> &uiRecorders()
+{
+    static std::array<ui::Recorder, MAX_FRAMES_IN_FLIGHT> recorders{};
+    return recorders;
+}
+std::array<gfx::Backend, MAX_FRAMES_IN_FLIGHT> &uiBackends()
+{
+    static std::array<gfx::Backend, MAX_FRAMES_IN_FLIGHT> backends{};
+    return backends;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UiLayerPool：按 Compiler 要的尺寸创建 / 复用离屏表面
+//   · Compiler 只拿到 SurfaceRef{slot, texture, sampler, w, h}
+//   · 图像 + bindless 注册都在这里（调用方注入 register 回调）
+//   · 每 frame-in-flight 一套，避免写到还在飞行的帧
+// ═══════════════════════════════════════════════════════════════════════════
+class UiLayerPool
+{
+  public:
+    using register_fn = std::function<uint32_t(mcs::vulkan::memory::resource &&)>;
+    using release_fn = std::function<void(uint32_t texture)>;
+
+    void init(const LogicalDevice &device, VkFormat format, uint32_t sampler,
+              register_fn registerTexture, release_fn releaseTexture)
+    {
+        device_ = &device;
+        format_ = format;
+        sampler_ = sampler;
+        register_ = std::move(registerTexture);
+        release_ = std::move(releaseTexture);
+    }
+
+    // 必须在「本 frame slot 的 fence 已等待」之后调用：
+    // 这里才真正释放上一帧淘汰掉的 bindless 槽，保证不是 use-after-free。
+    void beginFrame()
+    {
+        for (const uint32_t texture : retired_)
+            if (release_)
+                release_(texture);
+        retired_.clear();
+        ++frame_;
+    }
+
+    ui::SurfaceRef acquire(uint32_t width, uint32_t height)
+    {
+        // 1) 本帧还没用过、尺寸相同 → 直接复用
+        for (std::size_t i = 0; i < slots_.size(); ++i)
+        {
+            auto &slot = slots_[i];
+            if (slot && slot->lastUsed != frame_ && slot->width == width &&
+                slot->height == height)
+            {
+                slot->lastUsed = frame_;
+                return makeRef(i);
+            }
+        }
+
+        // 2) 找空槽；没有就按 LRU 淘汰一个（淘汰的图像延迟到下一帧释放）
+        std::size_t index = slots_.size();
+        for (std::size_t i = 0; i < slots_.size(); ++i)
+            if (!slots_[i])
+            {
+                index = i;
+                break;
+            }
+        if (index == slots_.size())
+        {
+            if (slots_.size() >= kMaxSlots)
+            {
+                std::size_t victim = 0;
+                std::uint64_t oldest = ~std::uint64_t{0};
+                for (std::size_t i = 0; i < slots_.size(); ++i)
+                    if (slots_[i] && slots_[i]->lastUsed < oldest)
+                    {
+                        oldest = slots_[i]->lastUsed;
+                        victim = i;
+                    }
+                retire(victim);
+                index = victim;
+            }
+            else
+            {
+                slots_.emplace_back();
+                images_.push_back(VK_NULL_HANDLE);
+                views_.push_back(VK_NULL_HANDLE);
+                index = slots_.size() - 1;
+            }
+        }
+
+        slots_[index] = createTarget(width, height);
+        slots_[index]->lastUsed = frame_;
+        images_[index] = slots_[index]->image;
+        views_[index] = slots_[index]->view;
+        return makeRef(index);
+    }
+
+    [[nodiscard]] std::span<const VkImage> images() const noexcept
+    {
+        return images_;
+    }
+    [[nodiscard]] std::span<const VkImageView> views() const noexcept
+    {
+        return views_;
+    }
+    [[nodiscard]] std::size_t liveTargets() const noexcept
+    {
+        std::size_t n = 0;
+        for (const auto &slot : slots_)
+            n += slot.has_value() ? 1u : 0u;
+        return n;
+    }
+    [[nodiscard]] std::size_t pendingRelease() const noexcept
+    {
+        return retired_.size();
+    }
+
+  private:
+    static constexpr std::size_t kMaxSlots = 16;
+
+    struct target
+    {
+        VkImage image{};
+        VkImageView view{};
+        uint32_t texture{};
+        uint32_t width{};
+        uint32_t height{};
+        std::uint64_t lastUsed{};
+    };
+
+    ui::SurfaceRef makeRef(std::size_t index) const noexcept
+    {
+        const target &slot = *slots_[index];
+        return ui::SurfaceRef{static_cast<uint32_t>(index), slot.texture, sampler_,
+                              slot.width, slot.height};
+    }
+
+    void retire(std::size_t index)
+    {
+        if (!slots_[index])
+            return;
+        // 只登记：真正的 free_slot 在 beginFrame()（fence 之后）
+        retired_.push_back(slots_[index]->texture);
+        slots_[index].reset();
+        images_[index] = VK_NULL_HANDLE;
+        views_[index] = VK_NULL_HANDLE;
+    }
+
+    target createTarget(uint32_t width, uint32_t height)
+    {
+        auto build = mcs::vulkan::memory::build_simple_resource(
+            {.imageType = VK_IMAGE_TYPE_2D,
+             .format = format_,
+             .extent = {.width = width, .height = height, .depth = 1},
+             .mipLevels = 1,
+             .arrayLayers = 1,
+             .samples = VK_SAMPLE_COUNT_1_BIT,
+             .tiling = VK_IMAGE_TILING_OPTIMAL,
+             .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+             .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED},
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            [](VkImageCreateInfo imageCreateInfo,
+               VkImage image) -> mcs::vulkan::memory::create_image::view_create_info {
+                return {.image = image,
+                        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                        .format = imageCreateInfo.format,
+                        .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                             .baseMipLevel = 0,
+                                             .levelCount = 1,
+                                             .baseArrayLayer = 0,
+                                             .layerCount = 1}};
+            });
+        auto resource = build.build(*device_);
+        const VkImage image = resource.image();
+        const VkImageView view = resource.imageView();
+        const uint32_t texture = register_(std::move(resource));
+        return target{image, view, texture, width, height, frame_};
+    }
+
+    const LogicalDevice *device_{};
+    VkFormat format_{};
+    uint32_t sampler_{};
+    register_fn register_;
+    release_fn release_;
+    std::vector<std::optional<target>> slots_;
+    std::vector<uint32_t> retired_;
+    std::vector<VkImage> images_;
+    std::vector<VkImageView> views_;
+    std::uint64_t frame_{};
+};
+std::array<UiLayerPool, MAX_FRAMES_IN_FLIGHT> &uiLayerPools()
+{
+    static std::array<UiLayerPool, MAX_FRAMES_IN_FLIGHT> pools{};
+    return pools;
+}
 // 几何路径用的顶点缓冲（CPU 侧 tessellation 结果）
 ui_pipeline_ctx &uiPipelines()
 {
@@ -3214,7 +5273,6 @@ constexpr auto &hoverPool() noexcept
 }
 struct render_context
 {
-    shader_data::DrawRecorder &drawRecorder;
     glfw_input &input;
     FrameClock &clock;
     FontSelect &fontSelect;
@@ -10363,136 +12421,140 @@ namespace table_demo
                 self.built = true;
             }),
 
-            method<"render">([](auto &self, ui_new::ScreenWidget *, ui_new::Widget *owner,
-                                render_context &ctx) {
-                const auto &viewports = ctx.drawRecorder.currentDynamic.viewports;
-                if (viewports.empty())
-                    return;
-                // 用真实 framebuffer 尺寸，不用 ScreenWidget 的逻辑尺寸
-                const float vw = viewports[0].width;
-                const float vh = viewports[0].height;
-                if (!self.built || self.viewport.x != vw || self.viewport.y != vh)
-                    self.template invoke<"rebuild">(vw, vh);
-                if (self.rows.empty())
-                    return;
-
-                constexpr std::size_t N = Schema::count;
-                const auto &prefs = self.prefs;
-                const float margin = 40.0f;
-                const float top = 100.0f;
-                const float x0 = static_cast<float>(owner->offset.x) + margin;
-                const float y0 = static_cast<float>(owner->offset.y) + top;
-                const float w = vw - margin * 2.0f;
-                const float h = vh - top - margin;
-                if (w < 260.0f || h < 160.0f)
-                    return;
-
-                const float scale = vw / 800.0f;
-                self.metrics = solve_columns<Schema>(w, prefs, scale);
-                const auto &m = self.metrics;
-                const float step = prefs.row_h + prefs.row_gap;
-                const float body_h = h - prefs.header_h;
-                // 不要在 render 里读 clock：两个 frame-in-flight 的 recorder
-                // 是在不同时刻录的，会各自存下不同的 scroll；交替呈现时
-                // 整张表就在两个位置之间抖。ABCDE 是静态的，所以没事。
-                // 要做动画，应由每帧唯一的 tick 更新 scroll，并每帧重录。
-                const float scroll = 0.0f;
-                const auto win = window_for(scroll, body_h, self.rows.size(), step);
-
-                // ── 阶段 1：外框 + 表头（全屏裁剪）─────────────────
-                std::vector<shader_data::Rectangle> rects;
-                std::vector<shader_data::Glyph> glyphs;
-                rects.reserve(32);
-                glyphs.reserve(N * 8);
-
-                push_rect(rects, x0, y0, w, h, {0.10f, 0.11f, 0.14f, 0.97f}, vw, vh,
-                          0.018f);
-                push_rect(rects, x0, y0, w, prefs.header_h, {0.17f, 0.19f, 0.25f, 1.0f},
-                          vw, vh, 0.01f);
-                for (std::size_t c = 0; c < N; ++c)
-                    push_text(glyphs, self.headers[c], x0 + m.x[c], y0 + 26.0f, vw, vh,
-                              {0.85f, 0.87f, 0.92f, 1.0f});
-                for (std::size_t c = 1; c < N; ++c)
-                    push_rect(rects, x0 + m.x[c] - prefs.pad * 0.5f, y0 + 6.0f, 1.0f,
-                              prefs.header_h - 12.0f, {1, 1, 1, 0.08f}, vw, vh);
-                if (!rects.empty())
-                    ctx.drawRecorder.addInstances(
-                        std::span<const shader_data::Rectangle>{rects});
-                if (!glyphs.empty())
-                    ctx.drawRecorder.addInstances(
-                        std::span<const shader_data::Glyph>{glyphs});
-
-                // ── 阶段 2：行内容（裁剪到 body）───────────────────
-                rects.clear();
-                glyphs.clear();
-                const VkRect2D body_sc{
-                    .offset = {static_cast<int32_t>(x0),
-                               static_cast<int32_t>(y0 + prefs.header_h)},
-                    .extent = {static_cast<uint32_t>(w), static_cast<uint32_t>(body_h)}};
-                const auto saved = ctx.drawRecorder.currentDynamic.scissors;
-                ctx.drawRecorder.setScissors(std::span<const VkRect2D>{&body_sc, 1});
-
-                const int hot_row = -1;
-                for (std::size_t i = win.first; i < win.last; ++i)
-                {
-                    const float ry =
-                        y0 + prefs.header_h + static_cast<float>(i) * step - scroll;
-                    glm::vec4 bg = (i % 2) ? glm::vec4{0.13f, 0.14f, 0.18f, 0.95f}
-                                           : glm::vec4{0.15f, 0.16f, 0.21f, 0.95f};
-                    if (static_cast<int>(i) == hot_row)
-                        bg = {0.19f, 0.22f, 0.30f, 0.98f};
-                    if (static_cast<int>(i) == prefs.selected)
-                        bg = {0.19f, 0.31f, 0.44f, 0.98f};
-                    push_rect(rects, x0, ry, w, prefs.row_h, bg, vw, vh, 0.004f);
-
-                    for (std::size_t c = 0; c < N; ++c)
-                    {
-                        glm::vec4 fg{0.84f, 0.86f, 0.91f, 1.0f};
-                        if (c == 1)
-                        {
-                            if (self.rows[i][c] == "ready")
-                                fg = {0.45f, 0.85f, 0.55f, 1.0f};
-                            else if (self.rows[i][c] == "busy")
-                                fg = {0.95f, 0.75f, 0.35f, 1.0f};
-                            else
-                                fg = {0.95f, 0.45f, 0.45f, 1.0f};
-                        }
-                        if (c == 4)
-                            fg = {0.55f, 0.72f, 0.95f, 1.0f};
-                        push_text(glyphs, self.cells[i * N + c], x0 + m.x[c], ry + 21.0f,
-                                  vw, vh, fg);
-                    }
-                }
-                if (!rects.empty())
-                    ctx.drawRecorder.addInstances(
-                        std::span<const shader_data::Rectangle>{rects});
-                if (!glyphs.empty())
-                    ctx.drawRecorder.addInstances(
-                        std::span<const shader_data::Glyph>{glyphs});
-                ctx.drawRecorder.setScissors(std::span<const VkRect2D>{saved});
-
-                // ── 阶段 3：外框线 + 列线 + 滚动条（全屏裁剪）───────
-                rects.clear();
-                const glm::vec4 line{1, 1, 1, 0.16f};
-                push_rect(rects, x0, y0, w, 1.0f, line, vw, vh);
-                push_rect(rects, x0, y0 + h - 1.0f, w, 1.0f, line, vw, vh);
-                push_rect(rects, x0, y0, 1.0f, h, line, vw, vh);
-                push_rect(rects, x0 + w - 1.0f, y0, 1.0f, h, line, vw, vh);
-                for (std::size_t c = 1; c < N; ++c)
-                    push_rect(rects, x0 + m.x[c] - prefs.pad * 0.5f, y0 + prefs.header_h,
-                              1.0f, h - prefs.header_h, {1, 1, 1, 0.07f}, vw, vh);
-
-                // 静态表：先不画滚动条（没有滚动状态时画了反而误导）
-                if (!rects.empty())
-                    ctx.drawRecorder.addInstances(
-                        std::span<const shader_data::Rectangle>{rects});
-            }));
+            method<"render">(
+                [](auto &, ui_new::ScreenWidget *, ui_new::Widget *, render_context &) {
+                    // 同上：遗留 UI 树的绘制路径已废弃。
+                }));
     }
 } // namespace table_demo
 
 int main()
 try
 {
+    // ═══════════════════════════════════════════════════════════════════════
+    // 设计说明（最终形态）
+    //
+    // ── 一、三条规则（全部可机械检查）────────────────────────────────────
+    //
+    //   R1 数据
+    //     一条 draw = variant<DrawRect, DrawGlyph, DrawImage, DrawPath> + Pick。
+    //     新能力 = 新的 Paint 分支（着色）或新的 Draw 类型（几何）；
+    //     不新增任何 mode 枚举 —— 全程序的着色编号只有 ui::Shading 一处
+    //     （它紧挨着 pack_*，就是 shader 的 ABI 表）。
+    //
+    //   R2 作用域
+    //     状态只有五个轴：clip / blend / opacity / transform / layer，
+    //     每轴一个栈，记录时把展开后的快照写进 RecordedDraw.scope。
+    //     没有第六个轴：Scope 里没有 stencil、没有 pipe、没有 pass、没有 target。
+    //
+    //   R3 编译
+    //     state_of(scope)  → 绘制状态（scissor / 混合 / 模板引用），
+    //                        clip 链变化时顺带把模板掩码写进同一个 pass；
+    //     geometry_of(draw)→ 几何入口 + payload（实例 / 路径 blob）；
+    //     相邻且状态相同的 payload → 一条间接命令。
+    //     pass 只能由两种 scope 产生：layer（离屏）和 backdrop（拆 pass + blit）。
+    //
+    //   违规判据（自查用）
+    //     Recorder 出现 Vk*            → 违规
+    //     Backend 生成 payload         → 违规
+    //     Compiler 出现第三种 pass 来源 → 违规
+    //     出现第二套 mode 编号          → 违规
+    //
+    // ── 二、数据流 ────────────────────────────────────────────────────────
+    //
+    //     caller
+    //       → ui::Recorder        记录 Draw + Scope 快照（无 Vk*、无 pass）
+    //       → ui::compile         state_of / geometry_of / fold_draw
+    //       → ui::FramePlan       passes[ Draw | Blit ] + batches
+    //       → gfx::Backend        pipeline_for(batch) + 上传 + 提交
+    //
+    // ── 三、代码落点 ──────────────────────────────────────────────────────
+    //
+    //     ui::Recorder   draws_ / clips_ / layers_ / layerMarks_ + 五个作用域栈
+    //     ui::compile    state_of → geometry_of → fold_draw；build_layer 递归建层
+    //     ui::Batch      { BatchRole, BlendMode, stencilRef }  ← 语义，不是后端下标
+    //     gfx::Backend   具名管线 over/add/multiply/erase/clipped/mask*/clear/invert/layer
+    //                    pipeline_for() 是唯一「语义 → VkPipeline」的地方
+    //
+    // ── 四、GPU 协议（与 test_intent 同构）───────────────────────────────
+    //
+    //     push constant 32 B : { heap 地址, 命令常量地址, 视口尺寸, flags }
+    //     CommandConstant 12 B: { type_id, address_offset, slot_count }
+    //     Instance      144 B : rect/color/color2/params/aux/pick/xf0/xf1/xf2
+    //     PathSegment    80 B : 5×vec4（胶囊角点 / 像素端点 / 平面法线）
+    //     提交：索引缓冲 0..N-1 + drawIndexedIndirect（drawCount = 1）
+    //     约束：静态断言 sizeof 对齐；写内存 = 持久映射 memcpy；
+    //           无 staging、无 buffer barrier（靠 frame slot + fence）
+    //
+    // ── 五、和 test_intent 的对比 ─────────────────────────────────────────
+    //
+    //   共同点
+    //     · push constant 里只放地址；CommandConstant 12 B 同形
+    //     · 实例在 host-visible heap 里线性追加，buffer_reference(scalar) 解引用
+    //     · 顶点阶段把 payload 地址用 flat uint64 传给片元阶段，两阶段各自解析
+    //     · 间接绘制，实例数在 GPU 侧读
+    //
+    //   差异
+    //     1. 负载：test_intent 每图元一个结构体（Glyph 136 / Rectangle 272），
+    //        type_id 决定结构体与 shader case；
+    //        ability2 只有一种 144 B 参数化负载，type_id 只决定几何入口。
+    //     2. 命令常量：test_intent 用 consts[gl_DrawIDARB]（一次多条命令）；
+    //        ability2 用 consts[0]（一条命令 = 一个 batch，不依赖 DrawID）。
+    //     3. 几何来源：test_intent 是共享顶点池 + 索引池 + mesh_data；
+    //        ability2 是实例参数现推（rect → 6 顶点；路径 → blob）。
+    //     4. 相机：test_intent 有 UBO cameraInfo[2] + cameraIndex；
+    //        ability2 没有相机，UI 就是像素空间，视口尺寸走 push constant。
+    //     5. 合批：test_intent 只合同 type_id；ability2 合同管线 + 同 scissor，
+    //        与图元种类无关（矩形和文字能进同一条命令）。
+    //     6. 重录：test_intent 有脏标记；ability2 逐帧全量重录。
+    //
+    //   多实例（两边都用了，粒度不同）
+    //     · 相同：一条命令画 N 个实例，地址 = base + gl_InstanceIndex * stride
+    //     · test_intent：stride 随 type_id 变（16/56/136/272），只能同类型合并；
+    //       另有第二维实例化 slot_count（每实例再挂顶点属性流）。
+    //     · ability2：stride 恒 144，type_id 只选几何入口；合并条件是
+    //       「同管线 + 同 scissor」，所以跨图元类型也能合（本例 326 draw → 224 命令）。
+    //     · 一句话：test_intent 是「多实例 = 同类型的 N 份」，
+    //               ability2 是「多实例 = 同状态的 N 份」。
+    //
+    //   能力
+    //     test_intent 独有：顶点/索引池、多网格、3D 相机 + UBO、脏标记、slot_count
+    //     ability2 独有：clip/transform/layer 作用域、圆角与旋转裁剪（模板形状掩码）、
+    //                    离屏层（blur / backdrop / composite）、按 scope 推导 pass、
+    //                    typed authoring API
+    //
+    //   好坏
+    //     test_intent：结构体直读、CPU 零解析、顶点池可复用；
+    //                  但每实例大、加图元要改 4 处、合批被 type_id 绑死、
+    //                  没有作用域概念（只有 scissor）。
+    //     ability2：一种负载覆盖 33 种着色 + 变换 + 拾取，合批跨类型，
+    //               scope 能推出 pass；但 shader 里有一次 mode 分派，
+    //               params 语义是 Compiler 与 shader 的隐式契约（靠 static_assert + 文档）。
+    //
+    //   一句话
+    //     test_intent 是「按类型铺数据」的通用渲染器协议；
+    //     ability2 是「按作用域铺数据」的 UI 专用协议。
+    //
+    // ── 六、为什么 3D 归 test_intent（不是能力高低，是「几何层」有没有）──
+    //
+    //   3D 一个实例 = 几百到几万个顶点，这份几何必须共享、每帧只传一次。
+    //   test_intent 的协议是两层：vertexAddress + mesh_data 是几何层，
+    //   type_id 的结构体是实例层；一次间接绘制 = 同一个 mesh 的 N 个实例。
+    //   ability2 只有实例层：几何从参数现推 —— UI 能这么干是因为形状信息在
+    //   SDF 参数里（圆角/阴影/渐变不增加顶点）；3D 不行，球的形状就是那几千个顶点。
+    //   要支持 3D，最小改动 = 加第 4 种几何入口（mesh）：实例里放 meshId + 4x4 model，
+    //   VS 从共享顶点池取顶点乘矩阵；另外还缺深度测试（现在全是 depthTestEnable=FALSE）、
+    //   视图投影（只有 viewportSize）、4x4 模型矩阵（现在是 2x3 仿射）。
+    //   → 判据不是「2D 还是 3D」，而是「几何是数据（3D）还是参数（UI）」。
+    //
+    // ── 七、已知的债（不掩饰）────────────────────────────────────────────
+    //
+    //   1. make_draw 仍是 34 分支的 ABI 适配器（demo 侧，只认 ui::Shading）
+    //   2. 逐帧全量重录，没有脏标记（大表滚动时才需要）
+    //   3. 层表面 slot 上限 16，超出走 LRU；尺寸变化会重建图像
+    //   4. barrier 按已知 pass 序列手插，没有做成 FrameGraph
+    //   5. 顶点属性流（slot_count）没有实现，留给未来的 DrawMesh
+    // ═══════════════════════════════════════════════════════════════════════
 #ifdef VERT_SHADER_PATH
     std::cout << "VERT_SHADER_PATH: " << VERT_SHADER_PATH << '\n';
 #endif
@@ -10543,14 +12605,6 @@ try
 
     auto meshManager = initMeshManager();
     auto &[allVertices, allIndices, meshMap] = meshManager;
-    auto drawRecorder = initDrawRecorder(device);
-    for (auto &recorder : drawRecorder)
-    {
-        recorder.globalVertexBuffer.write(0, allVertices.data(),
-                                          allVertices.size() * sizeof(allVertices[0]));
-        recorder.globalIndexBuffer.write(0, allIndices.data(),
-                                         allIndices.size() * sizeof(allIndices[0]));
-    }
 
     // ============================================================
     // 简单 Glyph 测试：只 shape 一个字符 "A"，生成 1 个 Glyph 实例。
@@ -10583,9 +12637,8 @@ try
                 // FontType 决定着色器走距离场还是位图采样
                 using FT = mcs::vulkan::font::FontType;
                 const FT ftype = g.font_ctx->type;
-                const bool isDistance =
-                    (ftype == FT::eSDF || ftype == FT::ePSDF ||
-                     ftype == FT::eMSDF || ftype == FT::eMTSDF);
+                const bool isDistance = (ftype == FT::eSDF || ftype == FT::ePSDF ||
+                                         ftype == FT::eMSDF || ftype == FT::eMTSDF);
                 tg.fontType = isDistance ? 0u : 1u;
                 line.glyphs.push_back(tg);
                 line.width += tg.advance + static_cast<float>(g.offset_x);
@@ -10648,11 +12701,30 @@ try
     }
 
     // 离屏层：blur / backdrop / group 的真实渲染目标（每帧 4 张）
-    initUiLayers(device, commandPool, GRAPHICS_AND_PRESENT,
-                 swapchainBuild.refImageFormat(),
-                 static_cast<uint32_t>(
-                     samplerManager.find_slot_by_name(font_linear_sampler_key).value()),
-                 textureManager, descriptorSetManager);
+    // 离屏层不再预分配：UiLayerPool 按 Compiler 要的尺寸创建/复用表面
+    {
+        const uint32_t layerSampler = static_cast<uint32_t>(
+            samplerManager.find_slot_by_name(font_linear_sampler_key).value());
+        auto registerLayerTexture =
+            [&](mcs::vulkan::memory::resource &&resource) -> uint32_t {
+            uint32_t index = 0;
+            for (auto i : textureManager.view_free_indexes())
+            {
+                index = static_cast<uint32_t>(i);
+                break;
+            }
+            textureManager.use_slot(index, std::move(resource), "ui.layer");
+            descriptorSetManager.update_texture(textureManager.view_used_indexes());
+            return index;
+        };
+        auto releaseLayerTexture = [&](uint32_t texture) {
+            textureManager.free_slot(texture);
+            descriptorSetManager.update_texture(textureManager.view_used_indexes());
+        };
+        for (auto &pool : uiLayerPools())
+            pool.init(device, swapchainBuild.refImageFormat(), layerSampler,
+                      registerLayerTexture, releaseLayerTexture);
+    }
 
     // 真实 UI 纹理：九宫格源图 / alpha 遮罩 / 带 mip 链的棋盘
     initUiTextures(device, commandPool, GRAPHICS_AND_PRESENT,
@@ -10673,6 +12745,14 @@ try
         swapchainAttachments;
     auto &[pickResourcesBuild, pickResource, resolveResourcesBuild, resolveResource,
            pickingFrames, pickMouse] = pickingAttachments;
+
+    // Recorder 后端：每 frame-in-flight 一套（管线 + heap/常量/间接命令/索引）
+    for (auto &backend : uiBackends())
+        backend.init(device, **descriptorCtx.descriptorSetLayout.get(),
+                     swapchainBuild.refImageFormat(),
+                     depthResourcesBuild.refCreateInfoFormat(),
+                     depthResourcesBuild.hasStencilComponent(),
+                     physical_device.getMaxUsableSampleCount());
 
     struct record_info
     {
@@ -10730,9 +12810,9 @@ try
             pipelineTransparentUI, pipelineUILayer, pipelineLayout, depthResourcesBuild,
             depthResource, msaaResourcesBuild, msaaResource);
 
-    auto mainShaderCtx = make_aggregate_ref<"mainShaderCtx", "drawRecorder",
-                                            "uniformBuffers", "descriptorSets">(
-        drawRecorder, uniformBuffers, descriptorSets);
+    auto mainShaderCtx =
+        make_aggregate_ref<"mainShaderCtx", "uniformBuffers", "descriptorSets">(
+            uniformBuffers, descriptorSets);
 
     // ===== hover：全局唯一一份 实体→函数 关联（外键 = 池实体下标）=====
     using recognizer_tree = intent::leaf<app::click_template_recognizer>;
@@ -10769,32 +12849,11 @@ try
         // ════════════════════════════════════════════════════════
         // render —— 只负责「缓存校验 + 提交」
         // ════════════════════════════════════════════════════════
-        method<"render">([](auto &&self, ui_new::ScreenWidget *screen,
-                            ui_new::Widget *owner, render_context &ctx) {
-            (void)screen;
-
-            const auto &viewports = ctx.drawRecorder.currentDynamic.viewports;
-            if (viewports.empty())
-                return;
-
-            const float windowWidth = viewports[0].width;
-            const float windowHeight = viewports[0].height;
-            const ui_new::Offset off = owner->offset;
-
-            const bool cacheValid = !self.cachedGlyphs.empty() &&
-                                    self.cachedOwnerOffset.x == off.x &&
-                                    self.cachedOwnerOffset.y == off.y &&
-                                    self.cachedViewport.x == windowWidth &&
-                                    self.cachedViewport.y == windowHeight;
-
-            if (!cacheValid)
-                self.template invoke<"rebuildCache">(owner, windowWidth, windowHeight,
-                                                     ctx);
-
-            if (!self.cachedGlyphs.empty())
-                ctx.drawRecorder.addInstances(
-                    std::span<const shader_data::Glyph>(self.cachedGlyphs));
-        }),
+        method<"render">(
+            [](auto &&, ui_new::ScreenWidget *, ui_new::Widget *, render_context &) {
+                // 遗留 UI 树的绘制路径：整个 scene 从未被渲染（见 main）。
+                // 真正的渲染走 ui::Recorder → ui::compile → gfx::Backend。
+            }),
 
         // ════════════════════════════════════════════════════════
         // rebuildCache —— 原 TextRenderObject::rebuildCache 整体
@@ -11283,44 +13342,6 @@ try
     //
     //   按约定：除 draw 之外，mainPipeline.xxx 全部留空。
     // ═══════════════════════════════════════════════════════════════════════
-    enum ui_mode : int
-    {
-        MODE_FILL = 0,        // 圆角矩形填充
-        MODE_LINEAR,          // 线性渐变
-        MODE_RADIAL,          // 径向渐变
-        MODE_CONIC,           // 圆锥渐变
-        MODE_ARC,             // 圆弧/环
-        MODE_OUTER_SHADOW,    // 外阴影
-        MODE_INNER_SHADOW,    // 内阴影
-        MODE_PERCORNER,       // 每角半径
-        MODE_ALPHA_MASK,      // alpha 遮罩
-        MODE_PATH_AA,         // 路径解析抗锯齿
-        MODE_DASH,            // 虚线描边
-        MODE_ROTATE,          // 旋转
-        MODE_SKEW,            // 斜切
-        MODE_NINE_SLICE,      // 九宫格
-        MODE_EVENODD,         // 奇偶填充
-        MODE_GLYPH,           // MSDF 字形
-        MODE_SRGB,            // sRGB / 线性渐变
-        MODE_BLUR,            // 模糊
-        MODE_BACKDROP,        // 背景模糊
-        MODE_GROUP,           // 组不透明度
-        MODE_MIPMAP,          // mipmap
-        MODE_PICKING,         // 拾取
-        MODE_BLEND,           // 混合模式
-        MODE_LAYER_BLUR,      // 离屏可分离模糊（y=方向 z=半径 w=源纹理 aux.x=源采样器）
-        MODE_LAYER_COMPOSITE, // 离屏合成（y=不透明度 z=源纹理 w=源采样器 aux.x=圆角）
-        MODE_CHECKER,         // 棋盘背景内容（背景模糊的来源）
-        MODE_NINE_SLICE_TEX,  // 纹理九宫格（y=源边框 z=源纹理 w=源采样器 aux.xy=源尺寸）
-        MODE_ALPHA_MASK_TEX,  // 纹理 alpha 遮罩（z=纹理 w=源采样器）
-        MODE_MIPMAP_TEX,      // 真 mip 采样（y=最大 lod z=纹理 w=源采样器）
-        MODE_CLIP_MASK,       // 模板裁剪遮罩（形状外 discard）
-        MODE_SOLID,           // 纯色覆盖（几何 / 模板覆盖 pass 用）
-        MODE_SOLID_GEOM,      // 几何覆盖（颜色写死）
-        MODE_PATH_STROKE,     // 路径描边：解析覆盖率 AA（y=半宽 z=1 开 AA）
-        MODE_GLYPH_BITMAP,    // 位图字形（emoji）：图集 RGBA，不走距离场
-    };
-
     // 几何入口标记（PushData.geomEntry 是专用字段）：0 = 普通全屏三角形
     constexpr uint32_t kGeomStroke = 1u;       // 描边批处理（段数据在 storage buffer）
     constexpr uint32_t kGeomFan = 2u;          // 填充扇形批处理（顶点在 buffer 高位区）
@@ -11416,280 +13437,174 @@ try
                             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
 
-            // ── 2. 离屏 pass：blur / group opacity / backdrop blur ────────
-            //   先把内容画到离屏层（320x192），再模糊 / 按组 alpha 合成回主通道。
-            //   层 A=模糊结果 B=模糊临时 C=组 D=背景
-            auto &frameLayers = uiLayers().layers[currentFrame];
-            constexpr VkExtent2D LEXT = ui_layer_ctx::kExtent;
-            const VkViewport layerViewport{.x = 0.0F,
-                                           .y = 0.0F,
-                                           .width = static_cast<float>(LEXT.width),
-                                           .height = static_cast<float>(LEXT.height),
-                                           .minDepth = 0.0F,
-                                           .maxDepth = 1.0F};
-            const VkRect2D layerScissor{{0, 0}, LEXT};
+            ui::Recorder &rec = uiRecorders()[currentFrame];
+            rec.reset();
+            auto &layerPool = uiLayerPools()[currentFrame];
+            layerPool.beginFrame();
 
-            auto layerToColor = [&](VkImage layerImage) {
-                my_render::transition_image_layout(
-                    commandBuffer,
-                    my_render::image_info{
-                        .image = layerImage,
-                        .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                        .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
-                                .access_mask = VK_ACCESS_2_NONE,
-                                .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
-                        .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                                .stage_mask =
-                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
+            // 本帧记录器 + 层的图像池（Recorder 只记语义；图像池归 Backend）
+            // ── 2. 场景 → Recorder：typed draw + scope 栈 ────────────────
+            //   这里没有 pass / target / loadOp / stencil：圆角裁剪、离屏层、
+            //   模糊、backdrop 全部由 Compiler 从 scope 推导。
+            auto make_draw = [](ui::Shading mode, ui::Rect r, glm::vec4 color,
+                                glm::vec4 color2, glm::vec3 params,
+                                glm::vec4 aux) -> ui::Draw {
+                const ui::Color c0{color.r, color.g, color.b, color.a};
+                const ui::Color c1{color2.r, color2.g, color2.b, color2.a};
+                const ui::Radius radius{params.x, params.x, params.x, params.x};
+                switch (mode)
+                {
+                case ui::M_FILL:
+                    return ui::DrawRect{r, radius, ui::SolidFill{c0}};
+                case ui::M_LINEAR:
+                    return ui::DrawRect{r, radius,
+                                        ui::LinearGradient{c0, c1, {aux.x, aux.y}}};
+                case ui::M_RADIAL:
+                    return ui::DrawRect{
+                        r, {}, ui::RadialGradient{c0, c1, params.x, params.y}};
+                case ui::M_CONIC:
+                    return ui::DrawRect{
+                        r, {}, ui::ConicGradient{c0, c1, params.x, params.y}};
+                case ui::M_ARC:
+                    return ui::DrawRect{
+                        r, {}, ui::ArcRing{c0, params.x, params.y, aux.x, aux.y}};
+                case ui::M_OUTER_SHADOW:
+                    return ui::DrawRect{r, radius,
+                                        ui::DropShadow{c0, c1, params.y, {aux.x, aux.y}}};
+                case ui::M_INNER_SHADOW:
+                    return ui::DrawRect{r, radius, ui::InnerShadow{c0, c1, params.y}};
+                case ui::M_PERCORNER:
+                    return ui::DrawRect{r,
+                                        ui::Radius{params.x, params.y, params.z, aux.x},
+                                        ui::SolidFill{c0}};
+                case ui::M_ALPHA_MASK:
+                    return ui::DrawRect{r, radius, ui::DotPattern{c0, params.x}};
+                case ui::M_DASH:
+                    return ui::DrawRect{r,
+                                        {},
+                                        ui::DashedLine{c0,
+                                                       {aux.x, aux.y},
+                                                       {aux.z, aux.w},
+                                                       params.x,
+                                                       params.y,
+                                                       params.z}};
+                case ui::M_NINE_SLICE:
+                    return ui::DrawRect{r, radius,
+                                        ui::NineSlicePalette{c0, c1, params.x, params.y}};
+                case ui::M_EVENODD:
+                    return ui::DrawRect{r, {}, ui::StarFill{c0, params.x}};
+                case ui::M_SRGB:
+                    return ui::DrawRect{r, radius, ui::SrgbRamp{c0, c1}};
+                case ui::M_MIPMAP:
+                    return ui::DrawRect{r, {}, ui::MipmapBands{c0, c1}};
+                case ui::M_CHECKER:
+                    return ui::DrawRect{r, {}, ui::CheckerFill{c0, c1, params.x}};
+                case ui::M_BLEND:
+                    return ui::DrawRect{r, {}, ui::BlendShowcase{c1, c0}};
+                case ui::M_ROTATE:
+                    return ui::DrawRect{r, {}, ui::RotatedRect{c0, params.x, params.y}};
+                case ui::M_SKEW:
+                    return ui::DrawRect{r, radius,
+                                        ui::SkewedRect{c0, {aux.x, aux.y}, 0.0F}};
+                case ui::M_GLYPH:
+                case ui::M_GLYPH_BITMAP: {
+                    ui::DrawGlyph glyph{};
+                    glyph.quad.rect = r;
+                    glyph.quad.uv = {{aux.x, aux.y}, {aux.z, aux.w}};
+                    glyph.quad.texture = static_cast<uint32_t>(params.y + 0.5F);
+                    glyph.quad.sampler = static_cast<uint32_t>(params.z + 0.5F);
+                    glyph.quad.pxRange = params.x;
+                    glyph.quad.color = c0;
+                    glyph.quad.bitmap = (mode == ui::M_GLYPH_BITMAP);
+                    return glyph;
+                }
+                case ui::M_NINE_SLICE_TEX:
+                case ui::M_ALPHA_MASK_TEX:
+                case ui::M_MIPMAP_TEX: {
+                    ui::DrawImage img{};
+                    img.rect = r;
+                    img.texture = static_cast<uint32_t>(params.y + 0.5F);
+                    img.sampler = static_cast<uint32_t>(params.z + 0.5F);
+                    img.tint = c0;
+                    if (mode == ui::M_NINE_SLICE_TEX)
+                    {
+                        img.fit = ui::ImageFit::NineSlice;
+                        img.border = params.x;
+                        img.srcWidth = aux.x;
+                        img.srcHeight = aux.y;
+                    }
+                    else if (mode == ui::M_MIPMAP_TEX)
+                    {
+                        img.fit = ui::ImageFit::MipmapLadder;
+                        img.maxLod = params.x;
+                    }
+                    else
+                    {
+                        img.fit = ui::ImageFit::AlphaMask;
+                    }
+                    return img;
+                }
+                default:
+                    return ui::DrawRect{r, radius, ui::SolidFill{c0}};
+                }
             };
-            auto layerToSampled = [&](VkImage layerImage) {
-                my_render::transition_image_layout(
-                    commandBuffer,
-                    my_render::image_info{
-                        .image = layerImage,
-                        .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                        .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                                .stage_mask =
-                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
-                        .dst = {.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                .access_mask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                                .stage_mask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT}});
-            };
-            auto layerBegin = [&](VkImageView layerView) {
-                VkRenderingAttachmentInfo attachment{
-                    .sType = sType<VkRenderingAttachmentInfo>(),
-                    .imageView = layerView,
-                    .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                    .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-                    .clearValue = {.color = {.float32 = {0.0F, 0.0F, 0.0F, 0.0F}}}};
-                commandBuffer.beginRendering(
-                    {.sType = sType<VkRenderingInfo>(),
-                     .renderArea = {.offset = {.x = 0, .y = 0}, .extent = LEXT},
-                     .layerCount = 1,
-                     .colorAttachmentCount = 1,
-                     .pColorAttachments = &attachment,
-                     .pDepthAttachment = nullptr,
-                     .pStencilAttachment = nullptr});
-                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineUILayer);
-                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
-                                                 nullptr);
-                commandBuffer.setViewport(0, std::span{&layerViewport, 1});
-            };
-            // 层内一条命令：裁剪固定为整层
-            auto layerCmd = [&](int mode, VkRect2D box, glm::vec4 color, glm::vec4 color2,
-                                glm::vec3 params, glm::vec4 aux) {
-                PushData pc{};
-                pc.geomEntry = 0; // 普通全屏三角形（1/2 是几何入口，不能再用）
-                pc.uiRect = {static_cast<float>(box.offset.x),
-                             static_cast<float>(box.offset.y),
-                             static_cast<float>(box.extent.width),
-                             static_cast<float>(box.extent.height)};
-                pc.uiColor = color;
-                pc.uiColor2 = color2;
-                pc.uiParams = {static_cast<float>(mode), params.x, params.y, params.z};
-                pc.uiAux = aux;
-                pc.uiPick = {0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 0xFFFFFFFFu};
-                commandBuffer.setScissor(0, std::span{&layerScissor, 1});
-                commandBuffer.pushConstants(*pipelineLayout,
-                                            VK_SHADER_STAGE_VERTEX_BIT |
-                                                VK_SHADER_STAGE_FRAGMENT_BIT,
-                                            0, sizeof(PushData), &pc);
-                commandBuffer.draw(3, 1, 0, 0);
-            };
-            const VkRect2D fullLayer{{0, 0}, LEXT};
 
-            // A：模糊演示的内容（两个圆角块 + 一个圆环）
-            layerToColor(frameLayers[0].image);
-            layerBegin(frameLayers[0].view);
-            layerCmd(MODE_FILL, {{20, 30}, {150, 120}}, {0.95F, 0.55F, 0.25F, 1.0F}, {},
-                     {18.0F, 0.0F, 0.0F}, {});
-            layerCmd(MODE_FILL, {{130, 60}, {150, 110}}, {0.30F, 0.65F, 0.95F, 0.9F}, {},
-                     {24.0F, 0.0F, 0.0F}, {});
-            layerCmd(MODE_ARC, fullLayer, {1.0F, 1.0F, 1.0F, 0.9F}, {},
-                     {70.0F, 14.0F, 0.0F}, {-2.2F, 1.9F, 0.0F, 0.0F});
-            commandBuffer.endRendering();
-            layerToSampled(frameLayers[0].image);
-
-            // A →(横) B →(纵) A：可分离高斯模糊
-            layerToColor(frameLayers[1].image);
-            layerBegin(frameLayers[1].view);
-            layerCmd(MODE_LAYER_BLUR, fullLayer, {}, {},
-                     {0.0F, 3.0F, static_cast<float>(frameLayers[0].texture)},
-                     {static_cast<float>(frameLayers[0].sampler), 0.0F, 0.0F, 0.0F});
-            commandBuffer.endRendering();
-            layerToSampled(frameLayers[1].image);
-
-            layerToColor(frameLayers[0].image);
-            layerBegin(frameLayers[0].view);
-            layerCmd(MODE_LAYER_BLUR, fullLayer, {}, {},
-                     {1.0F, 3.0F, static_cast<float>(frameLayers[1].texture)},
-                     {static_cast<float>(frameLayers[1].sampler), 0.0F, 0.0F, 0.0F});
-            commandBuffer.endRendering();
-            layerToSampled(frameLayers[0].image);
-
-            // C：组内容（两个重叠的圆），整组最后按同一 alpha 合成
-            layerToColor(frameLayers[2].image);
-            layerBegin(frameLayers[2].view);
-            layerCmd(MODE_FILL, {{26, 36}, {160, 120}}, {0.30F, 0.65F, 0.95F, 1.0F}, {},
-                     {60.0F, 0.0F, 0.0F}, {});
-            layerCmd(MODE_FILL, {{120, 36}, {160, 120}}, {0.95F, 0.45F, 0.30F, 0.6F}, {},
-                     {60.0F, 0.0F, 0.0F}, {});
-            commandBuffer.endRendering();
-            layerToSampled(frameLayers[2].image);
-
-            // D：背景内容（棋盘）→ 模糊 → 作为毛玻璃后面的“真实背景”
-            layerToColor(frameLayers[3].image);
-            layerBegin(frameLayers[3].view);
-            layerCmd(MODE_CHECKER, fullLayer, {0.08F, 0.10F, 0.16F, 1.0F},
-                     {0.55F, 0.70F, 0.95F, 1.0F}, {26.0F, 0.0F, 0.0F}, {});
-            commandBuffer.endRendering();
-            layerToSampled(frameLayers[3].image);
-
-            layerToColor(frameLayers[1].image);
-            layerBegin(frameLayers[1].view);
-            layerCmd(MODE_LAYER_BLUR, fullLayer, {}, {},
-                     {0.0F, 2.0F, static_cast<float>(frameLayers[3].texture)},
-                     {static_cast<float>(frameLayers[3].sampler), 0.0F, 0.0F, 0.0F});
-            commandBuffer.endRendering();
-            layerToSampled(frameLayers[1].image);
-
-            layerToColor(frameLayers[3].image);
-            layerBegin(frameLayers[3].view);
-            layerCmd(MODE_LAYER_BLUR, fullLayer, {}, {},
-                     {1.0F, 2.0F, static_cast<float>(frameLayers[1].texture)},
-                     {static_cast<float>(frameLayers[1].sampler), 0.0F, 0.0F, 0.0F});
-            commandBuffer.endRendering();
-            layerToSampled(frameLayers[3].image);
-
-            // ── 2. beginRendering：MSAA 颜色 + 拾取 + 深度/模板 ─────────
-            VkRenderingAttachmentInfo colorAttachment = {
-                .sType = sType<VkRenderingAttachmentInfo>(),
-                .imageView = mainCtx.msaaResource.imageView(),
-                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT,
-                .resolveImageView = swapchain.imageView(imageIndex),
-                .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-                .clearValue = {.color = {.float32 = {0.05F, 0.055F, 0.07F, 1.0F}}}};
-            VkRenderingAttachmentInfo pickAttachment = {
-                .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-                .imageView = pickCtx.pickResource.imageView(),
-                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
-                .resolveImageView = pickCtx.resolveResource.imageView(),
-                .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-                .clearValue = {.color = {.uint32 = {0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 0u}}}};
-            std::array attachments = {colorAttachment, pickAttachment};
-            VkRenderingAttachmentInfo depthAttachment = {
-                .sType = sType<VkRenderingAttachmentInfo>(),
-                .imageView = mainCtx.depthResource.imageView(),
-                .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-                .clearValue = {.depthStencil = {.depth = 1.0F}}};
-
-            commandBuffer.beginRendering(
-                {.sType = sType<VkRenderingInfo>(),
-                 .renderArea = {.offset = {.x = 0, .y = 0}, .extent = extent},
-                 .layerCount = 1,
-                 .colorAttachmentCount = static_cast<uint32_t>(attachments.size()),
-                 .pColorAttachments = attachments.data(),
-                 .pDepthAttachment = &depthAttachment,
-                 .pStencilAttachment = hasStencil ? &depthAttachment : nullptr});
-
-            // ── 3. 管线 / 描述符 / 视口 ─────────────────────────────────
-            commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                       *mainCtx.pipelineTransparentUI);
-            commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                             *pipelineLayout, 0, 1, &descriptorSet, 0,
-                                             nullptr);
-            const VkViewport viewport{.x = 0.0F,
-                                      .y = 0.0F,
-                                      .width = W,
-                                      .height = H,
-                                      .minDepth = 0.0F,
-                                      .maxDepth = 1.0F};
-            commandBuffer.setViewport(0, std::span{&viewport, 1});
-
-            // ── 4. 命令表 ───────────────────────────────────────────────
-            // 一条命令 = 矩形 + 两个颜色 + 参数 + 裁剪；params.x 由 mode 填
-            struct ui_cmd
-            {
-                glm::vec4 rect; // xy=左上(px) zw=尺寸(px)
-                glm::vec4 color;
-                glm::vec4 color2;
-                glm::vec4 params; // x=mode, y/z/w=模式参数
-                glm::vec4 aux;
-                glm::uvec4 pick; // x=命令 id y=实体 z=(version<<16)|primitive w=hover_fn
-                VkRect2D scissor;
-                int pipe{
-                    0}; // 0=UI(over) 1=add 2=multiply 3=erase 4=maskA 5=maskB 6=clipped
-                uint32_t ref{0};              // 模板参考值
-                int pathKind{0};              // 0=无 1=even-odd 填充 2=描边
-                uint32_t pathId{0xFFFFFFFFu}; // ui_path 注册表里的 PathId
-                uint32_t pathGen{0};          // PathId 所属的 generation
-            };
-            std::array<ui_cmd, 1024> cmds{};
-            uint32_t cmdCount = 0;
-
-            // 每个命令都可以带自己的拾取 id：id=0xFFFFFFFF 表示不参与拾取
             const uint32_t pickVersion = soaCtx.screen.renderVersion();
-            auto add = [&](int mode, VkRect2D box, glm::vec4 color, glm::vec4 color2 = {},
-                           glm::vec3 params = {}, glm::vec4 aux = {},
-                           VkRect2D scissor = {}, uint32_t id = 0xFFFFFFFFu,
-                           uint32_t entity = 0u, uint32_t primitive = 0u, int pipe = 0,
+            auto add = [&](ui::Shading mode, VkRect2D box, glm::vec4 color,
+                           glm::vec4 color2 = {}, glm::vec3 params = {},
+                           glm::vec4 aux = {}, VkRect2D scissor = {},
+                           uint32_t id = 0xFFFFFFFFu, uint32_t entity = 0u,
+                           uint32_t primitive = 0u, int pipe = 0,
                            uint32_t stencilRef = 0u, int pathKind = 0,
                            uint32_t pathId = 0xFFFFFFFFu, uint32_t pathGen = 0u) {
-                const uint32_t packedPick =
-                    ((pickVersion & 0xFFFFu) << 16) | (primitive & 0xFFFFu);
-                if (cmdCount >= cmds.size())
-                    return;
-                VkRect2D sc = (scissor.extent.width == 0u || scissor.extent.height == 0u)
-                                  ? box
-                                  : scissor;
-                const int32_t x0 = std::max<int32_t>(sc.offset.x, 0);
-                const int32_t y0 = std::max<int32_t>(sc.offset.y, 0);
-                const int32_t x1 =
-                    std::min<int32_t>(sc.offset.x + static_cast<int32_t>(sc.extent.width),
-                                      static_cast<int32_t>(extent.width));
-                const int32_t y1 = std::min<int32_t>(
-                    sc.offset.y + static_cast<int32_t>(sc.extent.height),
-                    static_cast<int32_t>(extent.height));
-                if (x1 <= x0 || y1 <= y0)
-                    return;
-                cmds[cmdCount++] = ui_cmd{
-                    {static_cast<float>(box.offset.x), static_cast<float>(box.offset.y),
-                     static_cast<float>(box.extent.width),
-                     static_cast<float>(box.extent.height)},
-                    color,
-                    color2,
-                    {static_cast<float>(mode), params.x, params.y, params.z},
-                    aux,
-                    {id, entity, packedPick, 0xFFFFFFFFu},
-                    {{x0, y0},
-                     {static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0)}},
-                    pipe,
-                    stencilRef,
-                    pathKind,
-                    pathId,
-                    pathGen};
+                (void)stencilRef; // 模板不再由调用方决定：圆角裁剪由 Compiler 推导
+                const ui::Pick pick{id, entity, primitive, pickVersion};
+                const ui::Rect r{static_cast<float>(box.offset.x),
+                                 static_cast<float>(box.offset.y),
+                                 static_cast<float>(box.extent.width),
+                                 static_cast<float>(box.extent.height)};
+
+                // clip 作用域：命令自带的裁剪框（或命令矩形）
+                const VkRect2D clipBox =
+                    (scissor.extent.width == 0u || scissor.extent.height == 0u) ? box
+                                                                                : scissor;
+                const ui::ClipId clip =
+                    rec.pushClip(ui::ClipSpec{{static_cast<float>(clipBox.offset.x),
+                                               static_cast<float>(clipBox.offset.y),
+                                               static_cast<float>(clipBox.extent.width),
+                                               static_cast<float>(clipBox.extent.height)},
+                                              0.0F});
+                (void)clip;
+
+                const ui::BlendMode blend = pipe == 1   ? ui::BlendMode::Add
+                                            : pipe == 2 ? ui::BlendMode::Multiply
+                                            : pipe == 3 ? ui::BlendMode::Erase
+                                                        : ui::BlendMode::Over;
+                rec.pushBlend(blend);
+                if (pathKind != 0)
+                {
+                    ui::DrawPath path{};
+                    path.pathId = pathId;
+                    path.pathGen = pathGen;
+                    path.color = {color.r, color.g, color.b, color.a};
+                    path.stroke = (pathKind == 2);
+                    path.halfWidth = params.x;
+                    rec.draw(path, pick);
+                }
+                else
+                {
+                    rec.draw(make_draw(mode, r, color, color2, params, aux), pick);
+                }
+                rec.popBlend();
+                rec.popClip();
             };
-            // 便捷入口：要换管线/设模板参考时用它，避免手写 id/entity/primitive 位置参数
-            auto addPipe = [&](int mode, VkRect2D box, glm::vec4 color, glm::vec4 color2,
-                               glm::vec3 params, glm::vec4 aux, VkRect2D scissor,
-                               int pipe, uint32_t ref) {
+            // 便捷入口：只切换混合模式（不再有 pipe/模板参数）
+            auto addPipe = [&](ui::Shading mode, VkRect2D box, glm::vec4 color,
+                               glm::vec4 color2, glm::vec3 params, glm::vec4 aux,
+                               VkRect2D scissor, int pipe, uint32_t ref) {
                 add(mode, box, color, color2, params, aux, scissor, 0xFFFFFFFFu, 0u, 0u,
                     pipe, ref);
             };
-
             // 字形表：由 shape 结果构建（ASCII 全集），不再硬编码 A–Z，
             // 每个字形带自己的 font atlas（fallback 后可能来自不同字体）
             const auto &asciiGlyphs = uiAsciiGlyphs();
@@ -11700,7 +13615,7 @@ try
                 const float gw = (g.plane.z - g.plane.x) * px;
                 const float gh = (g.plane.w - g.plane.y) * px;
                 if (gw > 0.5F && gh > 0.5F)
-                    add((g.fontType == 1u) ? MODE_GLYPH_BITMAP : MODE_GLYPH,
+                    add((g.fontType == 1u) ? ui::M_GLYPH_BITMAP : ui::M_GLYPH,
                         {{static_cast<int32_t>(pen + g.plane.x * px),
                           static_cast<int32_t>(y + g.plane.y * px)},
                          {static_cast<uint32_t>(std::ceil(gw)),
@@ -11777,8 +13692,8 @@ try
             };
 
             // ── 4.1 页面 + 顶栏 ─────────────────────────────────────────
-            add(MODE_FILL, {{0, 0}, extent}, {0.055F, 0.06F, 0.075F, 1.0F});
-            add(MODE_LINEAR, {{0, 0}, {extent.width, 56u}}, {0.10F, 0.45F, 0.85F, 1.0F},
+            add(ui::M_FILL, {{0, 0}, extent}, {0.055F, 0.06F, 0.075F, 1.0F});
+            add(ui::M_LINEAR, {{0, 0}, {extent.width, 56u}}, {0.10F, 0.45F, 0.85F, 1.0F},
                 {0.55F, 0.22F, 0.80F, 1.0F}, {14.0F, 0.0F, 0.0F},
                 {1.0F, 0.25F, 0.0F, 0.0F});
             text(20.0F, 42.0F, 30.0F, {1.0F, 1.0F, 1.0F, 1.0F}, "UI ABILITY");
@@ -11837,113 +13752,6 @@ try
                 }
                 return out;
             };
-            auto fanTriangles = [](const ui_path::contour &c) {
-                std::vector<glm::vec2> tris;
-                const auto &p = c.pts;
-                if (p.size() < 3)
-                    return tris;
-                for (std::size_t i = 1; i + 1 < p.size(); ++i)
-                {
-                    tris.push_back(p[0]);
-                    tris.push_back(p[i]);
-                    tris.push_back(p[i + 1]);
-                }
-                return tris;
-            };
-            // 描边段（miter 接头）：每段 20 float = 5 个 vec4
-            //   角点 = 顶点处的斜接点（相邻两段偏移线的交点），不是 p ± d*half
-            //   每个顶点算一次左右斜接点，相邻段共用 → 接头天然闭合、不出刺
-            auto strokeSegments = [&](const ui_path::contour &c, float half,
-                                      glm::vec2 shift, std::vector<float> &out) {
-                const auto &p = c.pts;
-                const std::size_t n = p.size();
-                if (n < 2)
-                    return;
-                const std::size_t segCount = c.closed ? n : (n - 1);
-                constexpr float kMiterLimit = 4.0F; // 斜接长度上限（× 半宽）
-
-                auto pos = [&](std::size_t i) {
-                    return p[i] + shift;
-                };
-                auto dirOf = [&](std::size_t i, std::size_t j) { // i -> j 的单位方向
-                    const glm::vec2 d = pos(j) - pos(i);
-                    const float l = std::sqrt(d.x * d.x + d.y * d.y);
-                    return l > 1e-5F ? d / l : glm::vec2{1.0F, 0.0F};
-                };
-
-                // 逐顶点预计算：左右斜接点 + 角平分平面法线（朝前）
-                std::vector<glm::vec2> leftPt(n), rightPt(n), planeN(n);
-                for (std::size_t i = 0; i < n; ++i)
-                {
-                    const std::size_t prev = (i + n - 1) % n;
-                    const std::size_t next = (i + 1) % n;
-                    const glm::vec2 d0 = dirOf(prev, i); // 入边方向
-                    const glm::vec2 d1 = dirOf(i, next); // 出边方向
-                    const glm::vec2 n0{-d0.y, d0.x};
-                    const glm::vec2 n1{-d1.y, d1.x};
-                    glm::vec2 m = n0 + n1;
-                    const float ml = std::sqrt(m.x * m.x + m.y * m.y);
-                    if (ml < 1e-4F)
-                        m = n0;
-                    else
-                        m /= ml;
-                    float denom = glm::dot(m, n0);
-                    if (denom < 1e-3F)
-                        denom = 1e-3F;
-                    // 斜接长度 = half / cos(半角)，超 limit 就夹住（miter-clip，
-                    // 视觉上等同 bevel，但不需要额外三角形，也不会拉出长刺）
-                    const float scale = std::min(half / denom, half * kMiterLimit);
-                    leftPt[i] = pos(i) + m * scale;
-                    rightPt[i] = pos(i) - m * scale;
-                    glm::vec2 bis = d0 + d1; // 角平分平面法线（朝前）
-                    const float bl = std::sqrt(bis.x * bis.x + bis.y * bis.y);
-                    planeN[i] = bl > 1e-4F ? bis / bl : d1;
-                }
-
-                for (std::size_t i = 0; i < segCount; ++i)
-                {
-                    const std::size_t j = (i + 1) % n;
-                    const glm::vec2 a = pos(i);
-                    const glm::vec2 b = pos(j);
-                    glm::vec2 d = b - a;
-                    const float len = std::sqrt(d.x * d.x + d.y * d.y);
-                    if (len < 1e-3F)
-                        continue;
-                    d /= len;
-                    const glm::vec2 nn{-d.y, d.x};
-
-                    // 胶囊角点：沿段两端各外推 half，保证圆头不被 quad 切掉
-                    const glm::vec2 ea = a - d * half;
-                    const glm::vec2 eb = b + d * half;
-                    const glm::vec2 q0 = ea + nn * half;
-                    const glm::vec2 q1 = eb + nn * half;
-                    const glm::vec2 q2 = ea - nn * half;
-                    const glm::vec2 q3 = eb - nn * half;
-                    const glm::vec2 planeA = planeN[i];
-                    const glm::vec2 planeB = -planeN[j];
-                    out.push_back(q0.x / W * 2.0F - 1.0F);
-                    out.push_back(q0.y / H * 2.0F - 1.0F);
-                    out.push_back(q1.x / W * 2.0F - 1.0F);
-                    out.push_back(q1.y / H * 2.0F - 1.0F);
-                    out.push_back(q2.x / W * 2.0F - 1.0F);
-                    out.push_back(q2.y / H * 2.0F - 1.0F);
-                    out.push_back(q3.x / W * 2.0F - 1.0F);
-                    out.push_back(q3.y / H * 2.0F - 1.0F);
-                    out.push_back(a.x);
-                    out.push_back(a.y);
-                    out.push_back(b.x);
-                    out.push_back(b.y);
-                    out.push_back(nn.x);
-                    out.push_back(nn.y);
-                    out.push_back(planeA.x);
-                    out.push_back(planeA.y);
-                    out.push_back(planeB.x);
-                    out.push_back(planeB.y);
-                    out.push_back(0.0F);
-                    out.push_back(0.0F);
-                }
-            };
-
             // 注册本帧的 path（PathId 只在同一 generation 内有效）
             auto &pathRegistry = ui_path::get();
             pathRegistry.reset();
@@ -12005,9 +13813,9 @@ try
                 const float y0 = static_cast<float>(msaaBox.offset.y) + 10.0F;
                 const float w = static_cast<float>(msaaBox.extent.width) - 20.0F;
                 const float h = static_cast<float>(msaaBox.extent.height) - 20.0F;
-                tri.pts.emplace_back(x0 + w * 0.5F, y0);           // 顶点
-                tri.pts.emplace_back(x0, y0 + h);                  // 左下
-                tri.pts.emplace_back(x0 + w, y0 + h);              // 右下
+                tri.pts.emplace_back(x0 + w * 0.5F, y0); // 顶点
+                tri.pts.emplace_back(x0, y0 + h);        // 左下
+                tri.pts.emplace_back(x0 + w, y0 + h);    // 右下
                 ui_path::path p;
                 p.push_back(std::move(tri));
                 return pathRegistry.add(std::move(p));
@@ -12041,211 +13849,110 @@ try
             }();
 
             // 一条 path 命令对应的子 pass：由 emit 循环按 pathKind 分发
-            auto drawPathCommand = [&](const ui_cmd &c) {
-                if (c.pathGen != pathRegistry.generation || !pathRegistry.valid(c.pathId))
-                {
-                    std::println("[path] stale PathId {} (gen {} != {})", c.pathId,
-                                 c.pathGen, pathRegistry.generation);
-                    return;
-                }
-                const auto &path = pathRegistry.get(c.pathId);
-                if (c.pathKind == 1)
-                {
-                    // even-odd 填充：每条轮廓一次 INVERT draw + EQUAL 0xFF 覆盖
-                    std::vector<float> packed;
-                    std::vector<uint32_t> triCounts;
-                    for (const auto &contour : path)
-                    {
-                        const auto tris = fanTriangles(contour);
-                        triCounts.push_back(static_cast<uint32_t>(tris.size()));
-                        for (const auto &pt : tris)
-                        {
-                            packed.push_back(pt.x / W * 2.0F - 1.0F);
-                            packed.push_back(pt.y / H * 2.0F - 1.0F);
-                        }
-                    }
-                    const std::size_t byteOffset =
-                        static_cast<std::size_t>(kFanVertexBase) * 2u * sizeof(float);
-                    globalCtx.pathSegments.write(byteOffset, packed.data(),
-                                                 sizeof(float) * packed.size());
-                    commandBuffer.setScissor(0, std::span{&c.scissor, 1});
-                    commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                               *(*uiPipelines().pipes[7]));
-                    commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK, 0u);
-                    PushData fan{};
-                    fan.geomEntry = kGeomFan;
-                    fan.uiParams =
-                        glm::vec4{static_cast<float>(MODE_SOLID), 0.0F, 0.0F, 0.0F};
-                    fan.uiColor = c.color;
-                    commandBuffer.pushConstants(*pipelineLayout,
-                                                VK_SHADER_STAGE_VERTEX_BIT |
-                                                    VK_SHADER_STAGE_FRAGMENT_BIT,
-                                                0, sizeof(PushData), &fan);
-                    uint32_t base = 0;
-                    for (const uint32_t count : triCounts)
-                    {
-                        commandBuffer.draw(count, 1, kFanVertexBase + base, 0);
-                        base += count;
-                    }
-                    commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                               *(*uiPipelines().pipes[6]));
-                    commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK,
-                                                      0xFFu);
-                    PushData cover{};
-                    cover.uiRect = {static_cast<float>(c.scissor.offset.x),
-                                    static_cast<float>(c.scissor.offset.y),
-                                    static_cast<float>(c.scissor.extent.width),
-                                    static_cast<float>(c.scissor.extent.height)};
-                    cover.uiParams =
-                        glm::vec4{static_cast<float>(MODE_SOLID), 0.0F, 0.0F, 0.0F};
-                    cover.uiColor = c.color;
-                    commandBuffer.pushConstants(*pipelineLayout,
-                                                VK_SHADER_STAGE_VERTEX_BIT |
-                                                    VK_SHADER_STAGE_FRAGMENT_BIT,
-                                                0, sizeof(PushData), &cover);
-                    commandBuffer.draw(3, 1, 0, 0);
-                }
-                else if (c.pathKind == 2)
-                {
-                    // 描边：同一份 path → 两份数据（开/关 AA）→ 2 次 draw
-                    const float half = c.params.y;
-                    const float bh = static_cast<float>(c.scissor.extent.height);
-                    std::vector<float> segs;
-                    for (const auto &contour : path)
-                        strokeSegments(contour, half, glm::vec2{0.0F, -bh * 0.18F}, segs);
-                    const std::size_t floatsA = segs.size();
-                    for (const auto &contour : path)
-                        strokeSegments(contour, half, glm::vec2{0.0F, bh * 0.18F}, segs);
-                    globalCtx.pathSegments.write(0, segs.data(),
-                                                 sizeof(float) * segs.size());
-                    const uint32_t segsA = static_cast<uint32_t>(floatsA / 20u);
-                    const uint32_t segsB =
-                        static_cast<uint32_t>((segs.size() - floatsA) / 20u);
-                    commandBuffer.setScissor(0, std::span{&c.scissor, 1});
-                    commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                               *(*uiPipelines().pipes[8]));
-                    commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK, 0u);
-                    PushData stroke{};
-                    stroke.geomEntry = kGeomStroke;
-                    stroke.uiAux = c.color;
-                    stroke.uiParams =
-                        glm::vec4{static_cast<float>(MODE_PATH_STROKE), half, 1.0F, 1.0F};
-                    commandBuffer.pushConstants(*pipelineLayout,
-                                                VK_SHADER_STAGE_VERTEX_BIT |
-                                                    VK_SHADER_STAGE_FRAGMENT_BIT,
-                                                0, sizeof(PushData), &stroke);
-                    commandBuffer.draw(6u * segsA, 1, 0, 0);
-                    stroke.uiParams.z = 0.0F;
-                    commandBuffer.pushConstants(*pipelineLayout,
-                                                VK_SHADER_STAGE_VERTEX_BIT |
-                                                    VK_SHADER_STAGE_FRAGMENT_BIT,
-                                                0, sizeof(PushData), &stroke);
-                    commandBuffer.draw(6u * segsB, 1, 6u * segsA, 0);
-                }
-                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineTransparentUI);
-            };
-
             // 一条 path 命令：路径内容在注册表里，命令表只带 PathId
             auto addPath = [&](int kind, uint32_t id, VkRect2D box, glm::vec4 color,
                                glm::vec3 params = {}) {
-                add(MODE_SOLID, box, color, {}, params, {}, box, 0xFFFFFFFFu, 0u, 0u, 0,
+                add(ui::M_SOLID, box, color, {}, params, {}, box, 0xFFFFFFFFu, 0u, 0u, 0,
                     0u, kind, id, pathRegistry.generation);
             };
 
             // ── 4.3 能力表：一个 mode 一条命令 ──────────────────────────
             struct ability
             {
-                int mode;
+                ui::Shading mode;
                 glm::vec4 color;
                 glm::vec4 color2;
                 glm::vec3 params; // y/z/w（x 由 mode 填）
                 glm::vec4 aux;
             };
             static const ability kAbilities[] = {
-                {MODE_FILL, {0.28F, 0.56F, 0.95F, 1.0F}, {}, {18.0F, 0.0F, 0.0F}, {}},
-                {MODE_LINEAR,
+                {ui::M_FILL, {0.28F, 0.56F, 0.95F, 1.0F}, {}, {18.0F, 0.0F, 0.0F}, {}},
+                {ui::M_LINEAR,
                  {0.95F, 0.35F, 0.35F, 1.0F},
                  {0.20F, 0.45F, 0.95F, 1.0F},
                  {12.0F, 0.0F, 0.0F},
                  {1.0F, 0.35F, 0.0F, 0.0F}},
-                {MODE_RADIAL,
+                {ui::M_RADIAL,
                  {0.98F, 0.82F, 0.30F, 1.0F},
                  {0.20F, 0.10F, 0.05F, 1.0F},
                  {90.0F, 12.0F, 0.0F},
                  {}},
-                {MODE_CONIC,
+                {ui::M_CONIC,
                  {0.20F, 0.85F, 0.85F, 1.0F},
                  {0.85F, 0.25F, 0.70F, 1.0F},
                  {0.0F, 12.0F, 0.0F},
                  {}},
-                {MODE_ARC,
+                {ui::M_ARC,
                  {1.0F, 1.0F, 1.0F, 1.0F},
                  {},
                  {62.0F, 14.0F, 0.0F},
                  {-2.6F, 2.2F, 0.0F, 0.0F}},
-                {MODE_OUTER_SHADOW,
+                {ui::M_OUTER_SHADOW,
                  {0.30F, 0.62F, 0.40F, 1.0F},
                  {0.0F, 0.0F, 0.0F, 0.75F},
                  {16.0F, 34.0F, 0.0F},
                  {6.0F, 10.0F, 0.0F, 0.0F}},
-                {MODE_INNER_SHADOW,
+                {ui::M_INNER_SHADOW,
                  {0.35F, 0.40F, 0.55F, 1.0F},
                  {0.0F, 0.0F, 0.0F, 0.85F},
                  {16.0F, 26.0F, 0.0F},
                  {}},
-                {MODE_PERCORNER,
+                {ui::M_PERCORNER,
                  {0.92F, 0.55F, 0.20F, 1.0F},
                  {},
                  {28.0F, 4.0F, 28.0F},
                  {4.0F, 0.0F, 0.0F, 0.0F}},
-                {MODE_ALPHA_MASK,
+                {ui::M_ALPHA_MASK,
                  {0.85F, 0.30F, 0.35F, 1.0F},
                  {},
                  {10.0F, 14.0F, 0.0F},
                  {}},
-                {MODE_PATH_AA, {0.40F, 0.80F, 0.45F, 1.0F}, {}, {0.0F, 0.0F, 0.0F}, {}},
-                {MODE_DASH, {0.95F, 0.90F, 0.35F, 1.0F}, {}, {8.0F, 18.0F, 12.0F}, {}},
-                {MODE_ROTATE, {0.85F, 0.40F, 0.75F, 1.0F}, {}, {0.55F, 10.0F, 0.0F}, {}},
-                {MODE_SKEW,
+                {ui::M_PATH_AA, {0.40F, 0.80F, 0.45F, 1.0F}, {}, {0.0F, 0.0F, 0.0F}, {}},
+                {ui::M_DASH, {0.95F, 0.90F, 0.35F, 1.0F}, {}, {8.0F, 18.0F, 12.0F}, {}},
+                {ui::M_ROTATE, {0.85F, 0.40F, 0.75F, 1.0F}, {}, {0.55F, 10.0F, 0.0F}, {}},
+                {ui::M_SKEW,
                  {0.35F, 0.75F, 0.85F, 1.0F},
                  {},
                  {10.0F, 0.0F, 0.0F},
                  {0.35F, 0.0F, 0.0F, 0.0F}},
-                {MODE_NINE_SLICE,
+                {ui::M_NINE_SLICE,
                  {},
                  {0.05F, 0.05F, 0.05F, 1.0F},
                  {12.0F, 14.0F, 0.0F},
                  {}},
-                {MODE_EVENODD, {0.95F, 0.75F, 0.20F, 1.0F}, {}, {0.45F, 0.0F, 0.0F}, {}},
-                {MODE_GLYPH, {}, {}, {}, {}}, // 占位：图块里单独画字
-                {MODE_SRGB,
+                {ui::M_EVENODD, {0.95F, 0.75F, 0.20F, 1.0F}, {}, {0.45F, 0.0F, 0.0F}, {}},
+                {ui::M_GLYPH, {}, {}, {}, {}}, // 占位：图块里单独画字
+                {ui::M_SRGB,
                  {0.10F, 0.10F, 0.10F, 1.0F},
                  {0.90F, 0.90F, 0.90F, 1.0F},
                  {12.0F, 0.0F, 0.0F},
                  {}},
-                {MODE_BLUR,
+                {ui::M_BLUR,
                  {0.85F, 0.85F, 0.90F, 1.0F},
                  {0.10F, 0.11F, 0.14F, 1.0F},
                  {4.0F, 0.0F, 0.0F},
                  {}},
-                {MODE_BACKDROP, {0.85F, 0.90F, 1.0F, 0.45F}, {}, {3.0F, 14.0F, 0.0F}, {}},
-                {MODE_GROUP,
+                {ui::M_BACKDROP,
+                 {0.85F, 0.90F, 1.0F, 0.45F},
+                 {},
+                 {3.0F, 14.0F, 0.0F},
+                 {}},
+                {ui::M_GROUP,
                  {0.30F, 0.65F, 0.95F, 1.0F},
                  {0.95F, 0.45F, 0.30F, 1.0F},
                  {0.0F, 0.45F, 0.0F},
                  {}},
-                {MODE_MIPMAP,
+                {ui::M_MIPMAP,
                  {0.85F, 0.65F, 0.25F, 1.0F},
                  {0.15F, 0.12F, 0.08F, 1.0F},
                  {8.0F, 0.0F, 0.0F},
                  {}},
-                {MODE_PICKING,
+                {ui::M_PICKING,
                  {0.55F, 0.85F, 0.95F, 1.0F},
                  {},
                  {20.0F, 7.0F, 0.0F},
                  {42.0F, 3.0F, 0.0F, 0.0F}},
-                {MODE_BLEND,
+                {ui::M_BLEND,
                  {0.95F, 0.35F, 0.35F, 1.0F},
                  {0.12F, 0.14F, 0.20F, 1.0F},
                  {0.0F, 0.0F, 0.0F},
@@ -12272,7 +13979,7 @@ try
                 const uint32_t entity = static_cast<uint32_t>(i);
                 const bool hot = (hoveredTile == i);
                 // 底板（悬停时提亮，这是真的 hover 状态）
-                add(MODE_FILL, box,
+                add(ui::M_FILL, box,
                     hot ? glm::vec4{0.17F, 0.19F, 0.24F, 1.0F}
                         : glm::vec4{0.11F, 0.12F, 0.15F, 1.0F},
                     {}, {10.0F, 0.0F, 0.0F}, {}, {}, id, entity);
@@ -12280,7 +13987,49 @@ try
                 VkRect2D inner{{box.offset.x + 8, box.offset.y + 8},
                                {box.extent.width - 16u, box.extent.height - 16u}};
                 const auto &ab = kAbilities[i];
-                if (ab.mode == MODE_GLYPH)
+                if (ab.mode == ui::M_ROTATE || ab.mode == ui::M_SKEW)
+                {
+                    // 旋转 / 斜切是「作用域」：图元本身仍是普通圆角矩形
+                    const float cx = static_cast<float>(inner.offset.x) +
+                                     static_cast<float>(inner.extent.width) * 0.5F;
+                    const float cy = static_cast<float>(inner.offset.y) +
+                                     static_cast<float>(inner.extent.height) * 0.5F;
+                    const float hw = static_cast<float>(inner.extent.width) * 0.30F;
+                    const float hh = static_cast<float>(inner.extent.height) * 0.30F;
+                    const float radius = ab.params.y;
+                    // 外层：图块本身的轴对齐裁剪（scissor）
+                    rec.pushClip(ui::ClipSpec{{static_cast<float>(box.offset.x),
+                                               static_cast<float>(box.offset.y),
+                                               static_cast<float>(box.extent.width),
+                                               static_cast<float>(box.extent.height)},
+                                              0.0F});
+                    ui::Transform2D xf = ui::Transform2D::translate(cx, cy);
+                    if (ab.mode == ui::M_ROTATE)
+                        xf = xf.compose(ui::Transform2D::rotate(ab.params.x));
+                    else
+                        xf = xf.compose(ui::Transform2D::skew(ab.aux.x, ab.aux.y));
+                    rec.pushTransform(xf);
+                    // 内层：旋转 / 斜切后的圆角裁剪 —— scissor 表达不了，走模板形状掩码
+                    rec.pushClip(ui::ClipSpec{{-hw, -hh, hw * 2.0F, hh * 2.0F}, radius});
+                    // 内容故意比裁剪框大：没有旋转裁剪就会溢出
+                    for (int stripe = -2; stripe <= 2; ++stripe)
+                    {
+                        const float y =
+                            static_cast<float>(stripe) * hh * 0.42F - hh * 0.16F;
+                        const float tint = (stripe % 2 == 0) ? 1.0F : 0.72F;
+                        rec.draw(ui::DrawRect{{-hw * 2.2F, y, hw * 4.4F, hh * 0.32F},
+                                              {},
+                                              ui::SolidFill{
+                                                  {ab.color.r * tint, ab.color.g * tint,
+                                                   ab.color.b * tint, ab.color.a}}},
+                                 ui::Pick{id, entity, 0u, pickVersion});
+                    }
+                    rec.popClip();
+                    rec.popTransform();
+                    rec.popClip();
+                    continue;
+                }
+                if (ab.mode == ui::M_GLYPH)
                 {
                     text(static_cast<float>(inner.offset.x) + 8.0F,
                          static_cast<float>(inner.offset.y) + 10.0F, 44.0F,
@@ -12290,42 +14039,81 @@ try
                          {0.75F, 0.80F, 0.90F, 1.0F}, "ATLAS", box);
                     continue;
                 }
-                if (ab.mode == MODE_DASH)
+                if (ab.mode == ui::M_DASH)
                 {
                     // 虚线端点用图块局部坐标（着色器里的 p 就是图块局部像素）
                     const float lw = static_cast<float>(inner.extent.width);
                     const float lh = static_cast<float>(inner.extent.height);
-                    add(MODE_DASH, inner, ab.color, ab.color2, ab.params,
+                    add(ui::M_DASH, inner, ab.color, ab.color2, ab.params,
                         {6.0F, lh * 0.5F, lw - 6.0F, lh * 0.5F}, {}, id, entity);
                     continue;
                 }
-                if (ab.mode == MODE_BLUR || ab.mode == MODE_BACKDROP ||
-                    ab.mode == MODE_GROUP)
+                if (ab.mode == ui::M_BLUR)
                 {
-                    // 真实离屏结果：blur→A(0)，group→C(2)，backdrop→D(3)
-                    const auto &layer = (ab.mode == MODE_BLUR)    ? frameLayers[0]
-                                        : (ab.mode == MODE_GROUP) ? frameLayers[2]
-                                                                  : frameLayers[3];
-                    const float opacity = (ab.mode == MODE_GROUP) ? 0.45F : 1.0F;
-                    add(MODE_LAYER_COMPOSITE, inner, {}, {},
-                        {opacity, static_cast<float>(layer.texture),
-                         static_cast<float>(layer.sampler)},
-                        {12.0F, 0.0F, 0.0F, 0.0F}, {}, id, entity);
-                    if (ab.mode == MODE_BACKDROP)
-                        add(MODE_FILL, inner, {0.86F, 0.91F, 1.0F, 0.22F}, {},
-                            {14.0F, 0.0F, 0.0F}, {}, {}, id, entity);
+                    // 显式离屏层：内容在 320x192 的层空间里画，Compiler 负责
+                    // 「内容 pass → 横向模糊 → 纵向模糊 → 合成回父级」
+                    ui::LayerParams lp{};
+                    lp.bounds = {static_cast<float>(inner.offset.x),
+                                 static_cast<float>(inner.offset.y),
+                                 static_cast<float>(inner.extent.width),
+                                 static_cast<float>(inner.extent.height)};
+                    lp.surfaceWidth = 320;
+                    lp.surfaceHeight = 192;
+                    lp.radius = 12.0F;
+                    lp.blur = 3.0F;
+                    rec.beginLayer(lp);
+                    auto layerRect = [](float x, float y, float w, float h, float radius,
+                                        ui::Color color) {
+                        return ui::DrawRect{{x, y, w, h},
+                                            {radius, radius, radius, radius},
+                                            ui::SolidFill{color}};
+                    };
+                    rec.draw(layerRect(20.0F, 30.0F, 150.0F, 120.0F, 18.0F,
+                                       {0.95F, 0.55F, 0.25F, 1.0F}));
+                    rec.draw(layerRect(130.0F, 60.0F, 150.0F, 110.0F, 24.0F,
+                                       {0.30F, 0.65F, 0.95F, 0.9F}));
+                    rec.draw(ui::DrawRect{
+                        {0.0F, 0.0F, 320.0F, 192.0F},
+                        {},
+                        ui::ArcRing{
+                            {1.0F, 1.0F, 1.0F, 0.9F}, 70.0F, 14.0F, -2.2F, 1.9F}});
+                    rec.endLayer();
                     continue;
                 }
-                if (ab.mode == MODE_EVENODD)
+                if (ab.mode == ui::M_BACKDROP)
+                    continue; // 真·背景模糊：由 §5 的 backdrop 层 scope 生成
+                if (ab.mode == ui::M_GROUP)
+                {
+                    // 组不透明度 = opacity 作用域：Compiler 会开一个隐式层再按 alpha 合成
+                    const float cx = static_cast<float>(inner.offset.x) +
+                                     static_cast<float>(inner.extent.width) * 0.5F;
+                    const float cy = static_cast<float>(inner.offset.y) +
+                                     static_cast<float>(inner.extent.height) * 0.5F;
+                    const float rad = static_cast<float>(std::min(inner.extent.width,
+                                                                  inner.extent.height)) *
+                                      0.55F;
+                    auto disc = [&](float dx, glm::vec4 c) {
+                        rec.draw(ui::DrawRect{
+                            {cx + dx - rad, cy - rad, rad * 2.0F, rad * 2.0F},
+                            {rad, rad, rad, rad},
+                            ui::SolidFill{{c.r, c.g, c.b, c.a}}});
+                    };
+                    rec.pushOpacity(0.45F);
+                    disc(-rad * 0.35F, {0.30F, 0.65F, 0.95F, 1.0F});
+                    disc(rad * 0.35F, {0.95F, 0.45F, 0.30F, 0.6F});
+                    rec.popOpacity();
+                    continue;
+                }
+                if (ab.mode == ui::M_EVENODD)
                     continue; // 面板已画
-                if (ab.mode == MODE_BACKDROP)
+                if (ab.mode == ui::M_BACKDROP)
                     continue; // 面板已画；真·背景模糊在第二段 pass 里画
-                if (ab.mode == MODE_PATH_AA)
+                if (ab.mode == ui::M_PATH_AA)
                     continue; // 面板已画；真路径描边（解析 AA）在命令循环之后
-                if (ab.mode == MODE_BLEND)
+                if (ab.mode == ui::M_BLEND)
                 {
                     // 真实 Vulkan 混合：over / add / multiply 三条不同 blend state 的管线
-                    add(MODE_FILL, inner, {0.09F, 0.10F, 0.15F, 1.0F}, {},
+                    add(ui::M_FILL, inner, {0.09F, 0.10F, 0.15F, 1.0F}, {},
                         {8.0F, 0.0F, 0.0F});
                     const int32_t cx =
                         inner.offset.x + static_cast<int32_t>(inner.extent.width) / 2;
@@ -12334,7 +14122,7 @@ try
                     const int32_t rad = static_cast<int32_t>(
                         std::min(inner.extent.width, inner.extent.height) / 2u);
                     auto disc = [&](int32_t dx, glm::vec4 color, int pipe) {
-                        addPipe(MODE_FILL,
+                        addPipe(ui::M_FILL,
                                 {{cx + dx - rad, cy - rad},
                                  {static_cast<uint32_t>(rad * 2),
                                   static_cast<uint32_t>(rad * 2)}},
@@ -12346,7 +14134,7 @@ try
                     disc(rad / 2, {0.55F, 0.55F, 0.95F, 0.85F}, 2);  // multiply
                     // erase：blend = ZERO / ONE_MINUS_SRC_ALPHA —— 直接把已画内容"挖掉"
                     //   （挖在 over 圆上，能看见底板透出来）
-                    addPipe(MODE_FILL,
+                    addPipe(ui::M_FILL,
                             {{cx - rad / 2 - rad / 4, cy - rad / 4},
                              {static_cast<uint32_t>(rad / 2),
                               static_cast<uint32_t>(rad / 2)}},
@@ -12354,11 +14142,11 @@ try
                             {static_cast<float>(rad / 4), 0.0F, 0.0F}, {}, {}, 3, 0u);
                     continue;
                 }
-                if (ab.mode == MODE_NINE_SLICE)
+                if (ab.mode == ui::M_NINE_SLICE)
                 {
                     // 真纹理九宫格：源图 96x96、边框 6px
                     const auto &tex = uiTextures();
-                    add(MODE_NINE_SLICE_TEX, inner, {}, {},
+                    add(ui::M_NINE_SLICE_TEX, inner, {}, {},
                         {6.0F, static_cast<float>(tex.nineSlice),
                          static_cast<float>(tex.sampler)},
                         {static_cast<float>(tex.nineSliceExtent.width),
@@ -12366,33 +14154,33 @@ try
                         {}, id, entity);
                     continue;
                 }
-                if (ab.mode == MODE_ALPHA_MASK)
+                if (ab.mode == ui::M_ALPHA_MASK)
                 {
                     // 真纹理 alpha 遮罩
                     const auto &tex = uiTextures();
-                    add(MODE_ALPHA_MASK_TEX, inner, ab.color, {},
+                    add(ui::M_ALPHA_MASK_TEX, inner, ab.color, {},
                         {0.0F, static_cast<float>(tex.alphaMask),
                          static_cast<float>(tex.sampler)},
                         {}, {}, id, entity);
                     continue;
                 }
-                if (ab.mode == MODE_MIPMAP)
+                if (ab.mode == ui::M_MIPMAP)
                 {
                     // 真 mip 链采样：lod 0..3 四条横带
                     const auto &tex = uiTextures();
-                    add(MODE_MIPMAP_TEX, inner, {}, {},
+                    add(ui::M_MIPMAP_TEX, inner, {}, {},
                         {7.0F, static_cast<float>(tex.checker),
                          static_cast<float>(tex.sampler)},
                         {}, {}, id, entity);
                     continue;
                 }
-                if (ab.mode == MODE_ARC)
+                if (ab.mode == ui::M_ARC)
                 {
                     // 环半径按图块尺寸缩放，否则大半径会把整条环推到裁剪框外
                     const float lw = static_cast<float>(inner.extent.width);
                     const float lh = static_cast<float>(inner.extent.height);
                     const float radius = (lw < lh ? lw : lh) * 0.32F;
-                    add(MODE_ARC, inner, ab.color, ab.color2,
+                    add(ui::M_ARC, inner, ab.color, ab.color2,
                         {radius, ab.params.y, ab.params.z}, ab.aux, {}, id, entity);
                     continue;
                 }
@@ -12472,11 +14260,11 @@ try
                 const glm::vec4 color = pressed ? glm::vec4{0.16F, 0.42F, 0.70F, 1.0F}
                                         : hot   ? glm::vec4{0.34F, 0.50F, 0.72F, 1.0F}
                                                 : glm::vec4{0.22F, 0.24F, 0.30F, 1.0F};
-                add(MODE_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
+                add(ui::M_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
                     {}, {}, id, 23u);
                 VkRect2D btn{{box.offset.x + 10, box.offset.y + 10},
                              {box.extent.width - 20u, box.extent.height - 20u}};
-                add(MODE_FILL, btn, color, {}, {8.0F, 0.0F, 0.0F}, {}, {}, id, 23u);
+                add(ui::M_FILL, btn, color, {}, {8.0F, 0.0F, 0.0F}, {}, {}, id, 23u);
                 text(static_cast<float>(btn.offset.x) + 10.0F,
                      static_cast<float>(btn.offset.y) +
                          static_cast<float>(btn.extent.height) * 0.62F,
@@ -12487,7 +14275,7 @@ try
             {
                 const VkRect2D box = cell(24);
                 const uint32_t id = kTileIdBase + 24u;
-                add(MODE_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
+                add(ui::M_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
                     {}, {}, id, 24u);
                 const float pad = 6.0F;
                 const float headerH = 16.0F;
@@ -12503,7 +14291,7 @@ try
                 for (int c = 1; c < 3; ++c)
                     colX[c] = colX[c - 1] + w * weight[c - 1] / weightSum;
                 // 表头
-                add(MODE_FILL,
+                add(ui::M_FILL,
                     {{static_cast<int32_t>(x0), static_cast<int32_t>(y0)},
                      {static_cast<uint32_t>(w), static_cast<uint32_t>(headerH)}},
                     {0.19F, 0.22F, 0.29F, 1.0F}, {}, {3.0F, 0.0F, 0.0F}, {}, {}, id, 24u);
@@ -12518,7 +14306,7 @@ try
                 for (int r = 0; r < visibleRows; ++r)
                 {
                     const float ry = y0 + headerH + static_cast<float>(r) * rowH;
-                    add(MODE_FILL,
+                    add(ui::M_FILL,
                         {{static_cast<int32_t>(x0), static_cast<int32_t>(ry)},
                          {static_cast<uint32_t>(w), static_cast<uint32_t>(rowH - 1.0F)}},
                         (r % 2) ? glm::vec4{0.13F, 0.14F, 0.18F, 1.0F}
@@ -12539,7 +14327,7 @@ try
                     {
                         const float dotX = colX[0] + 3.0F + measure(nameFit, 9.0F);
                         for (int d = 0; d < 3; ++d)
-                            add(MODE_FILL,
+                            add(ui::M_FILL,
                                 {{static_cast<int32_t>(dotX +
                                                        static_cast<float>(d) * 3.0F),
                                   static_cast<int32_t>(ry + rowH * 0.72F)},
@@ -12556,7 +14344,7 @@ try
                     {
                         const float dotX = colX[1] + 3.0F + measure(stateFit, 9.0F);
                         for (int d = 0; d < 3; ++d)
-                            add(MODE_FILL,
+                            add(ui::M_FILL,
                                 {{static_cast<int32_t>(dotX +
                                                        static_cast<float>(d) * 3.0F),
                                   static_cast<int32_t>(ry + rowH * 0.72F)},
@@ -12567,13 +14355,13 @@ try
                 }
                 // 列分隔线
                 for (int c = 1; c < 3; ++c)
-                    add(MODE_FILL,
+                    add(ui::M_FILL,
                         {{static_cast<int32_t>(colX[c]), static_cast<int32_t>(y0)},
                          {1u, static_cast<uint32_t>(h)}},
                         {1.0F, 1.0F, 1.0F, 0.10F}, {}, {0.0F, 0.0F, 0.0F}, {}, {}, id,
                         24u);
                 if (totalRows > visibleRows)
-                    add(MODE_FILL,
+                    add(ui::M_FILL,
                         {{static_cast<int32_t>(x0 + w - 3.0F), static_cast<int32_t>(y0)},
                          {3u, static_cast<uint32_t>(h)}},
                         {1.0F, 1.0F, 1.0F, 0.08F}, {}, {1.0F, 0.0F, 0.0F}, {}, {}, id,
@@ -12583,7 +14371,7 @@ try
             {
                 const VkRect2D box = cell(25);
                 const uint32_t id = kTileIdBase + 25u;
-                add(MODE_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
+                add(ui::M_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
                     {}, {}, id, 25u);
                 const float x0 = static_cast<float>(box.offset.x) + 8.0F;
                 float y = static_cast<float>(box.offset.y) + 18.0F;
@@ -12594,7 +14382,7 @@ try
                     y += 18.0F;
                 }
                 // 宽度示意线，说明换行是按这个宽度断的
-                add(MODE_FILL,
+                add(ui::M_FILL,
                     {{static_cast<int32_t>(x0), static_cast<int32_t>(y - 4.0F)},
                      {static_cast<uint32_t>(maxW), 1u}},
                     {1.0F, 1.0F, 1.0F, 0.15F}, {}, {0.0F, 0.0F, 0.0F}, {}, {}, id, 25u);
@@ -12603,7 +14391,7 @@ try
             {
                 const VkRect2D box = cell(26);
                 const uint32_t id = kTileIdBase + 26u;
-                add(MODE_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
+                add(ui::M_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
                     {}, {}, id, 26u);
                 const float x0 = static_cast<float>(box.offset.x) + 8.0F;
                 const float y0 = static_cast<float>(box.offset.y) + 18.0F;
@@ -12612,14 +14400,14 @@ try
                 float pen = text(x0, y0, 16.0F, {0.92F, 0.93F, 0.97F, 1.0F}, fit, box);
                 if (cut)
                     for (int d = 0; d < 3; ++d)
-                        add(MODE_FILL,
+                        add(ui::M_FILL,
                             {{static_cast<int32_t>(pen + static_cast<float>(d) * 4.0F),
                               static_cast<int32_t>(y0 - 2.0F)},
                              {2u, 2u}},
                             {0.92F, 0.93F, 0.97F, 1.0F}, {}, {1.0F, 0.0F, 0.0F}, {}, {},
                             id, 26u);
                 // 截断边界 = maxW，画一条竖线示意
-                add(MODE_FILL,
+                add(ui::M_FILL,
                     {{static_cast<int32_t>(x0 + maxW), static_cast<int32_t>(y0 - 12.0F)},
                      {1u, 18u}},
                     {1.0F, 0.5F, 0.5F, 0.55F}, {}, {0.0F, 0.0F, 0.0F}, {}, {}, id, 26u);
@@ -12628,7 +14416,7 @@ try
             {
                 const VkRect2D box = cell(27);
                 const uint32_t id = kTileIdBase + 27u;
-                add(MODE_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
+                add(ui::M_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
                     {}, {}, id, 27u);
                 struct run
                 {
@@ -12653,7 +14441,7 @@ try
             {
                 const VkRect2D box = cell(28);
                 const uint32_t id = kTileIdBase + 28u;
-                add(MODE_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
+                add(ui::M_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
                     {}, {}, id, 28u);
                 constexpr std::string_view content = "SELECT TEXT";
                 const float px = 14.0F;
@@ -12676,7 +14464,7 @@ try
                     x0 + measure(content.substr(0, static_cast<std::size_t>(caret)), px);
                 // 选区 = [0, caret)
                 if (caret > 0)
-                    add(MODE_FILL,
+                    add(ui::M_FILL,
                         {{static_cast<int32_t>(x0),
                           static_cast<int32_t>(baseline - lineH * 0.8F)},
                          {static_cast<uint32_t>(caretX - x0),
@@ -12684,7 +14472,7 @@ try
                         {0.20F, 0.35F, 0.60F, 0.85F}, {}, {2.0F, 0.0F, 0.0F}, {}, {}, id,
                         28u);
                 text(x0, baseline, px, {0.95F, 0.95F, 1.0F, 1.0F}, content, box);
-                add(MODE_FILL,
+                add(ui::M_FILL,
                     {{static_cast<int32_t>(caretX),
                       static_cast<int32_t>(baseline - 13.0F)},
                      {2u, 17u}},
@@ -12694,7 +14482,7 @@ try
             {
                 const VkRect2D box = cell(29);
                 const uint32_t id = kTileIdBase + 29u;
-                add(MODE_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
+                add(ui::M_FILL, box, {0.11F, 0.12F, 0.15F, 1.0F}, {}, {10.0F, 0.0F, 0.0F},
                     {}, {}, id, 29u);
                 const uint32_t halfW = box.extent.width / 2u;
                 const VkRect2D left{{box.offset.x + 6, box.offset.y + 6},
@@ -12726,7 +14514,7 @@ try
                         if (ry + rowH < static_cast<float>(left.offset.y) ||
                             ry > static_cast<float>(left.offset.y + left.extent.height))
                             continue; // 完全在裁剪框外：不发命令
-                        add(MODE_FILL,
+                        add(ui::M_FILL,
                             {{left.offset.x, static_cast<int32_t>(ry)},
                              {left.extent.width, static_cast<uint32_t>(rowH - 2.0F)}},
                             (rowIndex % 2) ? glm::vec4{0.22F, 0.40F, 0.62F, 1.0F}
@@ -12747,7 +14535,7 @@ try
                                        total - static_cast<float>(left.extent.height)) /
                              std::max(1.0F,
                                       total - static_cast<float>(left.extent.height))));
-                    add(MODE_FILL,
+                    add(ui::M_FILL,
                         {{left.offset.x + static_cast<int32_t>(left.extent.width) - 3,
                           barY},
                          {3u, static_cast<uint32_t>(barH)}},
@@ -12759,18 +14547,22 @@ try
                 //   2) 内层圆角矩形：EQUAL 1 + INCR → 交集区域变 2
                 //   3) 内容：        EQUAL 2 + KEEP → 只画交集，圆角保持
                 const int32_t discR = static_cast<int32_t>(right.extent.width / 3);
-                const VkRect2D innerShape{
-                    {right.offset.x + static_cast<int32_t>(right.extent.width) - discR,
-                     right.offset.y - discR},
-                    {static_cast<uint32_t>(discR * 2), static_cast<uint32_t>(discR * 2)}};
-                addPipe(MODE_CLIP_MASK, right, {}, {}, {20.0F, 0.0F, 0.0F}, {}, right, 4,
-                        0u); // 外层：圆角矩形 → 模板 1
-                addPipe(MODE_CLIP_MASK, innerShape, {}, {},
-                        {static_cast<float>(discR), 0.0F, 0.0F}, {}, innerShape, 5,
-                        1u); // 内层：圆 → 只在外层内再 +1，交集变 2
-                addPipe(MODE_CONIC, right, {0.98F, 0.85F, 0.30F, 1.0F},
-                        {0.25F, 0.75F, 0.60F, 1.0F}, {0.0F, 12.0F, 0.0F}, {}, right, 6,
-                        2u); // 内容：只画模板 == 2 的地方
+                const float discX = static_cast<float>(
+                    right.offset.x + static_cast<int32_t>(right.extent.width) - discR);
+                const float discY = static_cast<float>(right.offset.y - discR);
+                // 嵌套圆角裁剪：两层 clip scope，Compiler 自己生成 1/2 级模板掩码
+                rec.pushClip(ui::ClipSpec{{static_cast<float>(right.offset.x),
+                                           static_cast<float>(right.offset.y),
+                                           static_cast<float>(right.extent.width),
+                                           static_cast<float>(right.extent.height)},
+                                          20.0F});
+                rec.pushClip(ui::ClipSpec{{discX, discY, static_cast<float>(discR * 2),
+                                           static_cast<float>(discR * 2)},
+                                          static_cast<float>(discR)});
+                add(ui::M_CONIC, right, {0.98F, 0.85F, 0.30F, 1.0F},
+                    {0.25F, 0.75F, 0.60F, 1.0F}, {0.0F, 12.0F, 0.0F}, {}, right);
+                rec.popClip();
+                rec.popClip();
             }
 
             // 页面内容：玻璃图块下面的彩色壁纸 + 高频棋盘
@@ -12778,11 +14570,11 @@ try
             if (inView(18))
             {
                 const VkRect2D wallpaper = cell(18);
-                add(MODE_RADIAL, wallpaper, {0.98F, 0.30F, 0.45F, 1.0F},
+                add(ui::M_RADIAL, wallpaper, {0.98F, 0.30F, 0.45F, 1.0F},
                     {0.15F, 0.10F, 0.30F, 1.0F}, {110.0F, 16.0F, 0.0F}, {});
-                add(MODE_CONIC, wallpaper, {0.20F, 0.95F, 0.75F, 1.0F},
+                add(ui::M_CONIC, wallpaper, {0.20F, 0.95F, 0.75F, 1.0F},
                     {0.98F, 0.85F, 0.20F, 1.0F}, {0.0F, 16.0F, 0.0F}, {});
-                add(MODE_CHECKER, wallpaper, {0.98F, 0.98F, 0.98F, 0.55F},
+                add(ui::M_CHECKER, wallpaper, {0.98F, 0.98F, 0.98F, 0.55F},
                     {0.15F, 0.18F, 0.30F, 0.55F}, {7.0F, 0.0F, 0.0F}, {});
             }
 
@@ -12791,16 +14583,16 @@ try
             {
                 const VkRect2D box = cell(hoveredTile);
                 const glm::vec4 line{1.0F, 1.0F, 1.0F, 0.55F};
-                add(MODE_FILL, {{box.offset.x, box.offset.y}, {box.extent.width, 2u}},
+                add(ui::M_FILL, {{box.offset.x, box.offset.y}, {box.extent.width, 2u}},
                     line, {}, {1.0F, 0.0F, 0.0F});
-                add(MODE_FILL,
+                add(ui::M_FILL,
                     {{box.offset.x,
                       box.offset.y + static_cast<int32_t>(box.extent.height) - 2},
                      {box.extent.width, 2u}},
                     line, {}, {1.0F, 0.0F, 0.0F});
-                add(MODE_FILL, {{box.offset.x, box.offset.y}, {2u, box.extent.height}},
+                add(ui::M_FILL, {{box.offset.x, box.offset.y}, {2u, box.extent.height}},
                     line, {}, {1.0F, 0.0F, 0.0F});
-                add(MODE_FILL,
+                add(ui::M_FILL,
                     {{box.offset.x + static_cast<int32_t>(box.extent.width) - 2,
                       box.offset.y},
                      {2u, box.extent.height}},
@@ -12815,70 +14607,205 @@ try
             addPath(2, idStroke, strokeBox, {0.95F, 0.85F, 0.35F, 1.0F},
                     {4.0F, 0.0F, 0.0F});
 
+            // ── 4.6 三层嵌套层：L1(opacity) → L2(blur) → L3(opacity) → 图元 ──
+            //   验证 Compiler 的递归不只对两层成立：每个子层的 pass 都在父层
+            //   内容 pass 之前，合成批写在父 pass 里子层结束的位置。
             {
-                uint32_t nPath = 0;
-                for (uint32_t k = 0; k < cmdCount; ++k)
-                    if (cmds[k].pathKind != 0)
-                        ++nPath;
+                static constexpr float kOuterW = 320.0F;
+                static constexpr float kOuterH = 150.0F;
+                const ui::Rect outerBox{620.0F, 440.0F, kOuterW, kOuterH};
+                text(620.0F, 428.0F, 15.0F, {0.75F, 0.80F, 0.90F, 1.0F},
+                     "3-LEVEL NESTED LAYER");
+
+                // L1：外层（不透明度 + 圆角），内容用层局部坐标
+                ui::LayerParams l1{};
+                l1.bounds = outerBox;
+                l1.radius = 16.0F;
+                l1.opacity = 0.90F;
+                rec.beginLayer(l1);
+                rec.draw(ui::DrawRect{{0.0F, 0.0F, kOuterW, kOuterH},
+                                      {16.0F, 16.0F, 16.0F, 16.0F},
+                                      ui::SolidFill{{0.10F, 0.12F, 0.18F, 1.0F}}});
+
+                // L2：中层（模糊），坐标相对 L1
+                ui::LayerParams l2{};
+                l2.bounds = {30.0F, 25.0F, 260.0F, 100.0F};
+                l2.radius = 12.0F;
+                l2.blur = 3.0F;
+                rec.beginLayer(l2);
+                rec.draw(ui::DrawRect{{10.0F, 12.0F, 150.0F, 76.0F},
+                                      {12.0F, 12.0F, 12.0F, 12.0F},
+                                      ui::SolidFill{{0.95F, 0.55F, 0.25F, 1.0F}}});
+                rec.draw(ui::DrawRect{{90.0F, 22.0F, 150.0F, 70.0F},
+                                      {12.0F, 12.0F, 12.0F, 12.0F},
+                                      ui::SolidFill{{0.30F, 0.65F, 0.95F, 0.9F}}});
+
+                // L3：内层（不透明度），坐标相对 L2
+                ui::LayerParams l3{};
+                l3.bounds = {150.0F, 20.0F, 96.0F, 60.0F};
+                l3.radius = 10.0F;
+                l3.opacity = 0.55F;
+                rec.beginLayer(l3);
+                rec.draw(ui::DrawRect{{0.0F, 0.0F, 96.0F, 60.0F},
+                                      {10.0F, 10.0F, 10.0F, 10.0F},
+                                      ui::SolidFill{{0.85F, 0.35F, 0.75F, 1.0F}}});
+                rec.endLayer(); // L3 → 合成进 L2
+                rec.endLayer(); // L2（含 L3）模糊后 → 合成进 L1
+                rec.endLayer(); // L1 → 合成进主通道
+            }
+            // ── 4.7 边界用例：阴影×裁剪 / 内阴影 / 大模糊小半径 / 负偏移 / 旋转∩矩形裁剪 ──
+            //   全部是现有 typed draw + clip / transform scope，没有新机制
+            {
+                constexpr float kPanelW = 112.0F;
+                constexpr float kPanelH = 100.0F;
+                constexpr float kGapP = 8.0F;
+                constexpr float kBandY = 535.0F;
+                auto panel = [&](int index) {
+                    return ui::Rect{10.0F + static_cast<float>(index) * (kPanelW + kGapP),
+                                    kBandY, kPanelW, kPanelH};
+                };
+                text(10.0F, 520.0F, 13.0F, {0.75F, 0.80F, 0.90F, 1.0F},
+                     "EDGE CASES: shadow+clip / inner / blur40 r4 / -offset / rot+rect "
+                     "clip");
+
+                // 1) 外阴影被父 clip 裁掉（只保留中段，阴影下半被切平）
+                {
+                    const ui::Rect x = panel(0);
+                    rec.draw(ui::DrawRect{x,
+                                          {10.0F, 10.0F, 10.0F, 10.0F},
+                                          ui::SolidFill{{0.17F, 0.18F, 0.23F, 1.0F}}});
+                    // 裁剪框只到 y+56：阴影下半被切平（这就是被父 clip 裁掉的效果）
+                    rec.pushClip(ui::ClipSpec{{x.x, x.y + 16.0F, kPanelW, 40.0F}, 0.0F});
+                    rec.draw(ui::DrawRect{{x.x + 26.0F, x.y + 20.0F, 52.0F, 26.0F},
+                                          {8.0F, 8.0F, 8.0F, 8.0F},
+                                          ui::DropShadow{{0.95F, 0.55F, 0.30F, 1.0F},
+                                                         {0.0F, 0.0F, 0.0F, 0.62F},
+                                                         10.0F,
+                                                         {14.0F, 16.0F}}});
+                    rec.popClip();
+                }
+                // 2) 内阴影 + 大圆角
+                {
+                    const ui::Rect x = panel(1);
+                    rec.draw(ui::DrawRect{x,
+                                          {10.0F, 10.0F, 10.0F, 10.0F},
+                                          ui::SolidFill{{0.17F, 0.18F, 0.23F, 1.0F}}});
+                    rec.draw(ui::DrawRect{{x.x + 16.0F, x.y + 16.0F, 80.0F, 68.0F},
+                                          {20.0F, 20.0F, 20.0F, 20.0F},
+                                          ui::InnerShadow{{0.22F, 0.30F, 0.48F, 1.0F},
+                                                          {0.0F, 0.0F, 0.0F, 0.9F},
+                                                          12.0F}});
+                }
+                // 3) 大模糊 + 小圆角（半径 3）
+                {
+                    const ui::Rect x = panel(2);
+                    rec.draw(ui::DrawRect{x,
+                                          {10.0F, 10.0F, 10.0F, 10.0F},
+                                          ui::SolidFill{{0.17F, 0.18F, 0.23F, 1.0F}}});
+                    rec.draw(ui::DrawRect{{x.x + 30.0F, x.y + 22.0F, 52.0F, 32.0F},
+                                          {3.0F, 3.0F, 3.0F, 3.0F},
+                                          ui::DropShadow{{0.92F, 0.88F, 0.80F, 1.0F},
+                                                         {0.0F, 0.0F, 0.0F, 0.60F},
+                                                         34.0F,
+                                                         {0.0F, 12.0F}}});
+                }
+                // 4) 负偏移阴影
+                {
+                    const ui::Rect x = panel(3);
+                    rec.draw(ui::DrawRect{x,
+                                          {10.0F, 10.0F, 10.0F, 10.0F},
+                                          ui::SolidFill{{0.17F, 0.18F, 0.23F, 1.0F}}});
+                    rec.draw(ui::DrawRect{{x.x + 30.0F, x.y + 36.0F, 52.0F, 34.0F},
+                                          {8.0F, 8.0F, 8.0F, 8.0F},
+                                          ui::DropShadow{{0.95F, 0.45F, 0.45F, 1.0F},
+                                                         {0.0F, 0.0F, 0.0F, 0.62F},
+                                                         8.0F,
+                                                         {-26.0F, -22.0F}}});
+                }
+                // 5) 轴对齐 clip ∩ 旋转圆角 clip（内容故意溢出）
+                {
+                    const ui::Rect x = panel(4);
+                    rec.draw(ui::DrawRect{x,
+                                          {10.0F, 10.0F, 10.0F, 10.0F},
+                                          ui::SolidFill{{0.17F, 0.18F, 0.23F, 1.0F}}});
+                    const float cx = x.x + kPanelW * 0.5F;
+                    const float cy = x.y + kPanelH * 0.5F;
+                    rec.pushClip(
+                        ui::ClipSpec{{x.x + 8.0F, x.y + 8.0F, 96.0F, 84.0F}, 0.0F});
+                    rec.pushTransform(ui::Transform2D::translate(cx, cy).compose(
+                        ui::Transform2D::rotate(0.6F)));
+                    rec.pushClip(ui::ClipSpec{{-34.0F, -24.0F, 68.0F, 48.0F}, 12.0F});
+                    for (int stripe = -2; stripe <= 2; ++stripe)
+                        rec.draw(ui::DrawRect{
+                            {-90.0F, static_cast<float>(stripe) * 14.0F - 5.0F, 180.0F,
+                             10.0F},
+                            {},
+                            ui::SolidFill{{0.45F, 0.75F, 0.55F, 1.0F}}});
+                    rec.popClip();
+                    rec.popTransform();
+                    rec.popClip();
+                }
+            }
+            // ── 5. backdrop：一个 backdrop 层 scope，Compiler 负责拆 pass + blit + 模糊
+            if (inView(18))
+            {
+                const VkRect2D cellBox = cell(18);
+                const VkRect2D glassTile{
+                    {cellBox.offset.x + 12, cellBox.offset.y + 12},
+                    {cellBox.extent.width - 24u, cellBox.extent.height - 24u}};
+                ui::LayerParams lp{};
+                lp.bounds = {static_cast<float>(glassTile.offset.x),
+                             static_cast<float>(glassTile.offset.y),
+                             static_cast<float>(glassTile.extent.width),
+                             static_cast<float>(glassTile.extent.height)};
+                lp.surfaceWidth = 320;
+                lp.surfaceHeight = 192;
+                if (std::getenv("DSH_LAYER_STRESS") != nullptr)
+                {
+                    // 压测：每帧改一次层尺寸，逼出创建/复用/延迟释放三条路径
+                    static uint32_t stressFrame = 0;
+                    ++stressFrame;
+                    lp.surfaceWidth = 256u + 32u * (stressFrame % 4u);
+                }
+                lp.radius = 12.0F;
+                lp.blur = 2.0F;
+                lp.backdrop = true; // 层里先放「已经画好的这一帧」
+                rec.beginLayer(lp);
+                rec.endLayer(); // 没有内容：它只是把父通道内容模糊后合成回来
+                add(ui::M_FILL, glassTile, {0.88F, 0.92F, 1.0F, 0.18F}, {},
+                    {14.0F, 0.0F, 0.0F}, {}, {}, 0xFFFFFFFFu, 0u);
+            }
+            // ── 6. 编译 + 执行：Recorder → Compiler → Backend ────────────
+            {
+
+                auto plan =
+                    ui::compile(rec, pathRegistry, W, H, [&](uint32_t w, uint32_t h) {
+                        return layerPool.acquire(w, h);
+                    });
+
                 static bool once = false;
                 if (!once)
                 {
                     once = true;
-                    std::println("[CMDS] total={} path={} firstMode={} firstPathKind={}",
-                                 cmdCount, nPath, (int)cmds[0].params.x,
-                                 cmds[0].pathKind);
+                    std::println("[recorder] draws={} batches={} passes={}", plan.draws,
+                                 plan.batches, plan.passes.size());
                 }
+                gfx::PassResources pres{};
+                pres.colorImage = msaaImage;
+                pres.colorView = mainCtx.msaaResource.imageView();
+                pres.resolveImage = image;
+                pres.resolveView = swapchain.imageView(imageIndex);
+                pres.pickImage = pickingImage;
+                pres.pickView = pickCtx.pickResource.imageView();
+                pres.pickResolveView = pickCtx.resolveResource.imageView();
+                pres.depthImage = depthImage;
+                pres.depthView = mainCtx.depthResource.imageView();
+                pres.extent = extent;
+                pres.hasStencil = hasStencil;
+                uiBackends()[currentFrame].execute(commandBuffer, plan, pres,
+                                                   descriptorSet, layerPool.images(),
+                                                   layerPool.views());
             }
-            // ── 5. 逐条录制：管线(按需) + 模板参考(按需) + setScissor + pushConstants + draw
-            VkPipeline boundPipe = *mainCtx.pipelineTransparentUI;
-            uint32_t boundRef = 0xFFFFFFFFu;
-            for (uint32_t i = 0; i < cmdCount; ++i)
-            {
-                const ui_cmd &c = cmds[i];
-
-                if (c.pathKind != 0)
-                {
-                    drawPathCommand(c); // 解析 PathId → 执行子 pass
-                    boundPipe = *mainCtx.pipelineTransparentUI;
-                    continue;
-                }
-
-                PushData pc{};
-                // 0 = 普通全屏三角形；1/2 已被批处理几何入口（描边/扇形）占用
-                pc.geomEntry = 0;
-                pc.uiRect = c.rect;
-                pc.uiColor = c.color;
-                pc.uiColor2 = c.color2;
-                pc.uiParams = c.params;
-                pc.uiAux = c.aux;
-                pc.uiPick = c.pick;
-
-                const VkPipeline wantPipe = (c.pipe == 0)
-                                                ? *mainCtx.pipelineTransparentUI
-                                                : *(*uiPipelines().pipes[c.pipe]);
-                if (wantPipe != boundPipe)
-                {
-                    commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, wantPipe);
-                    boundPipe = wantPipe;
-                }
-                // 模板参考值是动态状态：每次绑定带模板的管线后都要重新设置一次
-                if (c.pipe != 0)
-                {
-                    commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK,
-                                                      c.ref);
-                }
-
-                commandBuffer.setScissor(0, std::span{&c.scissor, 1});
-                commandBuffer.pushConstants(*pipelineLayout,
-                                            VK_SHADER_STAGE_VERTEX_BIT |
-                                                VK_SHADER_STAGE_FRAGMENT_BIT,
-                                            0, sizeof(PushData), &pc);
-                commandBuffer.draw(3, 1, 0, 0);
-            }
-
-            // ── 6. endRendering ─────────────────────────────────────────
-            commandBuffer.endRendering();
-
             // ── 7. 拾取回读（鼠标位置一个像素）+ 呈现转换 ───────────────
             {
                 auto &pickingFrames = pickCtx.frames;
@@ -12912,174 +14839,6 @@ try
                         .imageExtent = {1, 1, 1}}});
             }
 
-            // ── 7.5 真·背景模糊：把"已经画好的这一帧"blit 到离屏层再模糊
-            //   1) swapchain(已 resolve) → TRANSFER_SRC，blit 到 layer D（顺便降采样）
-            //   2) D→B 横糊、B→D 纵糊
-            //   3) 第二段 rendering（LOAD，不清空）把模糊结果合成到 backdrop 图块
-            {
-                if (!inView(18))
-                    return;
-                const VkRect2D cellBox = cell(18);
-                const VkRect2D tile{
-                    {cellBox.offset.x + 12, cellBox.offset.y + 12},
-                    {cellBox.extent.width - 24u, cellBox.extent.height - 24u}};
-                auto &scratch = frameLayers[1];
-                auto &blurred = frameLayers[3];
-
-                my_render::transition_image_layout(
-                    commandBuffer,
-                    my_render::image_info{
-                        .image = image,
-                        .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                        .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                                .stage_mask =
-                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
-                        .dst = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
-                                .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
-                layerToColor(
-                    blurred.image); // 顺手把层转到可写（TRANSFER_DST 由下一句接）
-                my_render::transition_image_layout(
-                    commandBuffer,
-                    my_render::image_info{
-                        .image = blurred.image,
-                        .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                        .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                .access_mask = VK_ACCESS_2_NONE,
-                                .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
-                        .dst = {.layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                .access_mask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                                .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
-                commandBuffer.blitImage(
-                    image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, blurred.image,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    std::array<VkImageBlit, 1>{VkImageBlit{
-                        .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                        .srcOffsets = {{0, 0, 0},
-                                       {static_cast<int32_t>(extent.width),
-                                        static_cast<int32_t>(extent.height), 1}},
-                        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                        .dstOffsets =
-                            {{0, 0, 0},
-                             {static_cast<int32_t>(ui_layer_ctx::kExtent.width),
-                              static_cast<int32_t>(ui_layer_ctx::kExtent.height), 1}}}},
-                    VK_FILTER_LINEAR);
-
-                // 模糊：D→B（横）、B→D（纵）
-                auto blurStep = [&](const ui_layer_ctx::layer &srcLayer,
-                                    const ui_layer_ctx::layer &dstLayer, float dir,
-                                    float radius) {
-                    my_render::transition_image_layout(
-                        commandBuffer,
-                        my_render::image_info{
-                            .image = srcLayer.image,
-                            .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                            .src = {.layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                    .access_mask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                                    .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT},
-                            .dst = {.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                    .access_mask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                                    .stage_mask =
-                                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT}});
-                    layerToColor(dstLayer.image);
-                    layerBegin(dstLayer.view);
-                    layerCmd(MODE_LAYER_BLUR, fullLayer, {}, {},
-                             {dir, radius, static_cast<float>(srcLayer.texture)},
-                             {static_cast<float>(srcLayer.sampler), 0.0F, 0.0F, 0.0F});
-                    commandBuffer.endRendering();
-                    layerToSampled(dstLayer.image);
-                };
-                blurStep(blurred, scratch, 0.0F, 2.0F);
-                {
-                    // B 已在 SHADER_READ；把 D 重新当写目标
-                    my_render::transition_image_layout(
-                        commandBuffer,
-                        my_render::image_info{
-                            .image = blurred.image,
-                            .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                            .src = {.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                                    .access_mask = VK_ACCESS_2_NONE,
-                                    .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
-                            .dst = {
-                                .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                                .stage_mask =
-                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
-                }
-                layerBegin(blurred.view);
-                layerCmd(MODE_LAYER_BLUR, fullLayer, {}, {},
-                         {1.0F, 2.0F, static_cast<float>(scratch.texture)},
-                         {static_cast<float>(scratch.sampler), 0.0F, 0.0F, 0.0F});
-                commandBuffer.endRendering();
-                layerToSampled(blurred.image);
-
-                // swapchain 转回可写
-                my_render::transition_image_layout(
-                    commandBuffer,
-                    my_render::image_info{
-                        .image = image,
-                        .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                        .src = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
-                                .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT},
-                        .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                                .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                                .stage_mask =
-                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
-
-                // 第二段 pass：LOAD（保留已有画面），只画这块毛玻璃
-                VkRenderingAttachmentInfo colorLoad = colorAttachment;
-                colorLoad.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                VkRenderingAttachmentInfo pickLoad = pickAttachment;
-                pickLoad.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                VkRenderingAttachmentInfo depthLoad = depthAttachment;
-                depthLoad.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                std::array loadAttachments = {colorLoad, pickLoad};
-                commandBuffer.beginRendering(
-                    {.sType = sType<VkRenderingInfo>(),
-                     .renderArea = {.offset = {.x = 0, .y = 0}, .extent = extent},
-                     .layerCount = 1,
-                     .colorAttachmentCount =
-                         static_cast<uint32_t>(loadAttachments.size()),
-                     .pColorAttachments = loadAttachments.data(),
-                     .pDepthAttachment = &depthLoad,
-                     .pStencilAttachment = hasStencil ? &depthLoad : nullptr});
-                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineTransparentUI);
-                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
-                                                 nullptr);
-                commandBuffer.setViewport(0, std::span{&viewport, 1});
-
-                PushData glass{};
-                glass.geomEntry = 0; // 普通全屏三角形
-                glass.uiRect = {static_cast<float>(tile.offset.x),
-                                static_cast<float>(tile.offset.y),
-                                static_cast<float>(tile.extent.width),
-                                static_cast<float>(tile.extent.height)};
-                glass.uiParams = {static_cast<float>(MODE_LAYER_COMPOSITE), 1.0F,
-                                  static_cast<float>(blurred.texture),
-                                  static_cast<float>(blurred.sampler)};
-                // aux.yz = 整屏尺寸：告诉着色器“层里存的是整屏”，按屏幕位置取 uv
-                glass.uiAux = {12.0F, W, H, 0.0F};
-                commandBuffer.setScissor(0, std::span{&tile, 1});
-                commandBuffer.pushConstants(*pipelineLayout,
-                                            VK_SHADER_STAGE_VERTEX_BIT |
-                                                VK_SHADER_STAGE_FRAGMENT_BIT,
-                                            0, sizeof(PushData), &glass);
-                commandBuffer.draw(3, 1, 0, 0);
-                // 玻璃面板本身（半透明，能看见后面的模糊内容）
-                glass.uiParams = {static_cast<float>(MODE_FILL), 14.0F, 0.0F, 0.0F};
-                glass.uiColor = {0.88F, 0.92F, 1.0F, 0.18F};
-                commandBuffer.pushConstants(*pipelineLayout,
-                                            VK_SHADER_STAGE_VERTEX_BIT |
-                                                VK_SHADER_STAGE_FRAGMENT_BIT,
-                                            0, sizeof(PushData), &glass);
-                commandBuffer.draw(3, 1, 0, 0);
-                commandBuffer.endRendering();
-            }
-
             // ── 8. 调试：第 120 帧把整帧拷回 CPU，写成 PPM（验证用像素，不靠屏幕截图）
             static uint32_t frameCounter = 0;
             static bool dumpPending = false;
@@ -13101,8 +14860,10 @@ try
                         std::fwrite(rgb, 1, 3, f);
                     }
                     std::fclose(f);
-                    std::println("[DUMP] wrote ui_ability_frame.ppm ({}x{})",
-                                 extent.width, extent.height);
+                    std::println("[DUMP] wrote ui_ability_frame.ppm ({}x{}) "
+                                 "layerSlots={} pendingFree={}",
+                                 extent.width, extent.height, layerPool.liveTargets(),
+                                 layerPool.pendingRelease());
                 }
             }
             if (dumpThisFrame)
@@ -13514,6 +15275,8 @@ try
 
     // 必须在 device 销毁前清掉静态管线：函数内 static 的析构晚于 device，
     // 否则退出时每条管线都会报 "VkPipeline ... has not been destroyed"
+    for (auto &backend : uiBackends())
+        backend.shutdown();
     uiPipelines().reset();
 
     std::cout << "main done\n";

@@ -1,48 +1,50 @@
 #version 450
 // ═══════════════════════════════════════════════════════════════════════════
-// UI ability uber shader
+// UI ability uber shader（Recorder 版本）
 //
-// 一条 UI 命令 = 一个全屏三角形 + 一组推送常量（没有顶点缓冲、没有实例缓冲）。
-// 所有能力都在这里用 mode 分支实现，C++ 侧只负责按顺序 pushConstants + draw。
-//
-// 约定（C++ 侧 PushData 必须完全一致）：
-//   rect   : xy = 命令矩形左上角（framebuffer 像素，y 向下），zw = 宽高（像素）
-//   color  : 主色            color2 : 次色（渐变终点/阴影色/底色）
-//   params : x = mode，y/z/w = 模式参数
-//   aux    : 追加参数（线端点 / 偏移 / 角度 / 图集 UV / 拾取 id）
+// 与旧版的唯一区别：绘制参数不再走推送常量，而是从 heap 里取 DrawInstance。
+//   · 实例四边形（形状 / 字形 / 层合成）：一个 draw 里 N 个实例，各带自己的 rect
+//   · 路径批：payload 头部同样是一个 DrawInstance（颜色 / 参数），后面跟几何
+// mode 分支（SHADING 层）保持不变：它不认识 Recorder / Pass / Batch。
 //
 // 输出：预乘 alpha（管线混合为 ONE / ONE_MINUS_SRC_ALPHA）。
 // ═══════════════════════════════════════════════════════════════════════════
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout : require
+
+struct DrawInstance
+{
+    vec4 rect;   // xy = 命令矩形左上角（像素），zw = 宽高（像素）
+    vec4 color;  // 主色
+    vec4 color2; // 次色（渐变终点 / 阴影色 / 底色）
+    vec4 params; // x = mode，y/z/w = 模式参数
+    vec4 aux;    // 追加参数（线端点 / 偏移 / 角度 / 图集 UV）
+    uvec4 pick;  // 拾取：x=object_type y=entity z=(version<<16)|primitive w=hover_fn
+    vec4 xf0;    // 作用域变换 2x2: (m00, m01, m10, m11)
+    vec4 xf1;    // (tx, ty, i00, i01)
+    vec4 xf2;    // (i10, i11, 0, 0)
+}; // 144 B，与 C++ shader_data::Instance 逐字节一致
+
+layout(buffer_reference, scalar) readonly buffer InstanceBuffer
+{
+    DrawInstance instances[];
+};
+layout(buffer_reference, scalar) readonly buffer PathSegmentBuffer
+{
+    vec4 segs[]; // 路径描边段：每段 5 个 vec4
+};
 
 layout(location = 0) in vec2 vUV;
 layout(location = 1) flat in uint vSegIndex;
-layout(set = 0, binding = 3) readonly buffer SegmentBuffer
-{
-    vec4 segs[];
-} segBuf;
+layout(location = 2) flat in uint64_t vPayload; // 本命令 payload 的起始地址
+
 layout(location = 0) out vec4 outColor;
 layout(location = 1) out uvec4 outPicking;
 
 layout(set = 0, binding = 1) uniform texture2D uTextures[];
 layout(set = 0, binding = 2) uniform sampler uSamplers[];
-
-layout(push_constant) uniform PC
-{
-    uint64_t vertexAddress;
-    uint64_t dataAddress;
-    uint64_t commandConstantsAddress;
-    uint geomEntry;
-    uint renderVersion;
-
-    vec4 rect;
-    vec4 color;
-    vec4 color2;
-    vec4 params;
-    vec4 aux;
-    uvec4 pick; // 拾取：x=命令 id y=实体 z=(version<<16)|primitive w=hover_fn
-} pc;
 
 #define MODE_FILL 0          // 圆角矩形填充         y=圆角
 #define MODE_LINEAR 1        // 线性渐变             y=圆角 aux.xy=方向
@@ -137,78 +139,93 @@ float nine_slice_axis(float d, float t, float s, float sb, float db)
 
 void main()
 {
+    // Recorder 协议：本命令的实例（或路径批头部）就在 vPayload 指向的 heap 里
+    const DrawInstance inst = InstanceBuffer(vPayload).instances[0];
+
+    // 作用域变换：屏幕像素 → 图元 local 空间（逆变换），后面全用 local
+    const vec2 rel = gl_FragCoord.xy - inst.xf1.xy;
+    const vec2 localPos = vec2(inst.xf1.z * rel.x + inst.xf1.w * rel.y,
+                               inst.xf2.x * rel.x + inst.xf2.y * rel.y);
+
     // ── 命令矩形 → 图块局部坐标（像素，左上角原点，y 向下）────────────────
-    vec2 tile = max(pc.rect.zw, vec2(1.0));
-    vec2 p = gl_FragCoord.xy - pc.rect.xy;
+    vec2 tile = max(inst.rect.zw, vec2(1.0));
+    vec2 p = localPos - inst.rect.xy;
     vec2 uv = p / tile;
     vec2 hs = tile * 0.5;
     vec2 c = p - hs;
 
-    int mode = int(pc.params.x + 0.5);
-    float r = max(pc.params.y, 0.0);
+    int mode = int(inst.params.x + 0.5);
+    float r = max(inst.params.y, 0.0);
 
     vec4 col = vec4(0.0);
 
     if (mode == MODE_FILL)
     {
-        col = premul(pc.color, cov(sdRound(c, hs, r)));
+        col = premul(inst.color, cov(sdRound(c, hs, r)));
     }
     else if (mode == MODE_LINEAR)
     {
-        vec2 dir = pc.aux.xy;
+        vec2 dir = inst.aux.xy;
         if (dot(dir, dir) < 1e-6)
             dir = vec2(1.0, 0.0);
         dir = normalize(dir);
         float t = clamp(dot(uv - 0.5, dir) + 0.5, 0.0, 1.0);
-        col = premul(mix(pc.color, pc.color2, t), cov(sdRound(c, hs, r)));
+        col = premul(mix(inst.color, inst.color2, t), cov(sdRound(c, hs, r)));
     }
     else if (mode == MODE_RADIAL)
     {
         float t = clamp(length(c) / max(r, 1.0), 0.0, 1.0);
-        col = premul(mix(pc.color, pc.color2, t), cov(sdRound(c, hs, pc.params.z)));
+        col = premul(mix(inst.color, inst.color2, t), cov(sdRound(c, hs, inst.params.z)));
     }
     else if (mode == MODE_CONIC)
     {
         float a = fract(atan(c.y, c.x) / TAU + 0.5 + r);
-        col = premul(mix(pc.color, pc.color2, a), cov(sdRound(c, hs, pc.params.z)));
+        col = premul(mix(inst.color, inst.color2, a), cov(sdRound(c, hs, inst.params.z)));
     }
     else if (mode == MODE_ARC)
     {
-        float band = abs(length(c) - r) - max(pc.params.z, 0.5) * 0.5;
+        float band = abs(length(c) - r) - max(inst.params.z, 0.5) * 0.5;
         float ang = atan(c.y, c.x);
-        float a0 = pc.aux.x, a1 = pc.aux.y;
+        float a0 = inst.aux.x, a1 = inst.aux.y;
         float m = (a0 <= a1) ? step(a0, ang) * step(ang, a1)
                              : max(step(a0, ang), step(ang, a1));
-        col = premul(pc.color, cov(band) * m);
+        col = premul(inst.color, cov(band) * m);
     }
     else if (mode == MODE_OUTER_SHADOW)
     {
-        vec2 off = pc.aux.xy;
-        float blur = max(pc.params.z, 0.5);
-        float sh = (1.0 - smoothstep(0.0, blur, sdRound(c - off, hs, r))) * pc.color2.a;
-        float f = cov(sdRound(c, hs, r));
-        vec4 fore = premul(pc.color, f);
-        vec4 back = vec4(pc.color2.rgb * sh, sh);
+        // 几何比形状大一圈（aux.z = grow），这样阴影可以溢出形状
+        const float grow = inst.aux.z;
+        const vec2 shapeMin = inst.rect.xy + vec2(grow);
+        const vec2 hsShape = max((inst.rect.zw - vec2(2.0 * grow)) * 0.5, vec2(1.0));
+        const vec2 cShape = localPos - shapeMin - hsShape;
+        const vec2 off = inst.aux.xy;
+        const float blur = max(inst.params.z, 0.5);
+        const float sh =
+            (1.0 - smoothstep(-blur, blur, sdRound(cShape - off, hsShape, r))) *
+            inst.color2.a;
+        const float f = cov(sdRound(cShape, hsShape, r));
+        const vec4 fore = premul(inst.color, f);
+        const vec4 back = vec4(inst.color2.rgb * sh, sh);
         col = fore + back * (1.0 - fore.a);
     }
     else if (mode == MODE_INNER_SHADOW)
     {
-        float blur = max(pc.params.z, 1.0);
+        float blur = max(inst.params.z, 1.0);
         float d = sdRound(c, hs, r);
-        float f = clamp(1.0 + d / blur, 0.0, 1.0) * pc.color2.a;
-        col = premul(mix(pc.color, pc.color2, f), cov(d));
+        float f = clamp(1.0 + d / blur, 0.0, 1.0) * inst.color2.a;
+        col = premul(mix(inst.color, inst.color2, f), cov(d));
     }
     else if (mode == MODE_PERCORNER)
     {
-        col = premul(pc.color,
-                     cov(sdRound4(c, hs, vec4(pc.params.y, pc.params.z, pc.params.w,
-                                              pc.aux.x))));
+        col = premul(inst.color,
+                     cov(sdRound4(c, hs, vec4(inst.params.y, inst.params.z, inst.params.w,
+                                              inst.aux.x))));
     }
     else if (mode == MODE_ALPHA_MASK)
     {
-        vec2 g = fract(p / max(pc.params.z, 4.0)) - 0.5;
+        vec2 g = fract(p / max(inst.params.z, 4.0)) - 0.5;
         float m = 1.0 - smoothstep(0.26, 0.42, length(g));
-        col = premul(pc.color, cov(sdRound(c, hs, r)) * m);
+        col = premul(inst.color, cov(sdRound(c, hs, r)) * m);
     }
     else if (mode == MODE_PATH_AA)
     {
@@ -216,32 +233,32 @@ void main()
         vec2 p0 = vec2(hs.x, tile.y * 0.14);
         vec2 p1 = vec2(tile.x * 0.12, tile.y * 0.88);
         vec2 p2 = vec2(tile.x * 0.88, tile.y * 0.88);
-        col = premul(pc.color, cov(sdTriangle(p, p0, p1, p2)));
+        col = premul(inst.color, cov(sdTriangle(p, p0, p1, p2)));
     }
     else if (mode == MODE_DASH)
     {
-        vec2 a = pc.aux.xy;
-        vec2 b = pc.aux.zw;
+        vec2 a = inst.aux.xy;
+        vec2 b = inst.aux.zw;
         vec2 ab = b - a;
         float lab = max(length(ab), 1e-3);
         vec2 dir = ab / lab;
         vec2 pa = p - a;
         float along = dot(pa, dir);
-        float d = length(pa - dir * clamp(along, 0.0, lab)) - pc.params.y * 0.5;
-        float period = max(pc.params.z + pc.params.w, 1e-3);
-        float on = step(mod(max(along, 0.0), period), pc.params.z);
-        col = premul(pc.color, cov(d) * on);
+        float d = length(pa - dir * clamp(along, 0.0, lab)) - inst.params.y * 0.5;
+        float period = max(inst.params.z + inst.params.w, 1e-3);
+        float on = step(mod(max(along, 0.0), period), inst.params.z);
+        col = premul(inst.color, cov(d) * on);
     }
     else if (mode == MODE_ROTATE)
     {
-        float ang = pc.params.y;
+        float ang = inst.params.y;
         mat2 rot = mat2(cos(ang), -sin(ang), sin(ang), cos(ang));
-        col = premul(pc.color, cov(sdRound(rot * c, hs * 0.72, pc.params.z)));
+        col = premul(inst.color, cov(sdRound(rot * c, hs * 0.72, inst.params.z)));
     }
     else if (mode == MODE_SKEW)
     {
-        mat2 skew = mat2(1.0, pc.aux.y, pc.aux.x, 1.0);
-        col = premul(pc.color, cov(sdRound(skew * c, hs * 0.8, r)));
+        mat2 skew = mat2(1.0, inst.aux.y, inst.aux.x, 1.0);
+        col = premul(inst.color, cov(sdRound(skew * c, hs * 0.8, r)));
     }
     else if (mode == MODE_NINE_SLICE)
     {
@@ -252,9 +269,9 @@ void main()
             vec3(0.80, 0.30, 0.85), vec3(0.95, 0.55, 0.20), vec3(0.55, 0.55, 0.55));
         ivec2 cell = ivec2(clamp(uv * 3.0, vec2(0.0), vec2(2.999)));
         vec3 rgb = pal[cell.y * 3 + cell.x];
-        float outer = cov(sdRound(c, hs, pc.params.z));
-        float inner = cov(sdRound(c, hs - vec2(pc.params.y), max(pc.params.z - pc.params.y, 0.0)));
-        vec3 border = mix(rgb, pc.color2.rgb, outer * (1.0 - inner));
+        float outer = cov(sdRound(c, hs, inst.params.z));
+        float inner = cov(sdRound(c, hs - vec2(inst.params.y), max(inst.params.z - inst.params.y, 0.0)));
+        vec3 border = mix(rgb, inst.color2.rgb, outer * (1.0 - inner));
         col = premul(vec4(border, 1.0), outer);
     }
     else if (mode == MODE_EVENODD)
@@ -278,14 +295,14 @@ void main()
                 (p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x))
                 inside = !inside;
         }
-        col = premul(pc.color, inside ? 1.0 : 0.0);
+        col = premul(inst.color, inside ? 1.0 : 0.0);
     }
     else if (mode == MODE_GLYPH)
     {
         // MSDF 字形：图块内 uv 映射到图集 uv，再按屏幕导数算距离场缩放
-        uint ti = uint(pc.params.z + 0.5);
-        uint si = uint(pc.params.w + 0.5);
-        vec2 guv = mix(pc.aux.xy, pc.aux.zw, clamp(uv, vec2(0.0), vec2(1.0)));
+        uint ti = uint(inst.params.z + 0.5);
+        uint si = uint(inst.params.w + 0.5);
+        vec2 guv = mix(inst.aux.xy, inst.aux.zw, clamp(uv, vec2(0.0), vec2(1.0)));
         vec3 msd = texture(sampler2D(uTextures[nonuniformEXT(ti)],
                                      uSamplers[nonuniformEXT(si)]),
                            guv)
@@ -294,33 +311,33 @@ void main()
         ivec2 texSize = textureSize(sampler2D(uTextures[nonuniformEXT(ti)],
                                               uSamplers[nonuniformEXT(si)]),
                                     0);
-        vec2 unitRange = vec2(max(pc.params.y, 0.001)) / vec2(texSize);
+        vec2 unitRange = vec2(max(inst.params.y, 0.001)) / vec2(texSize);
         vec2 screenTexSize = vec2(1.0) / max(fwidth(guv), vec2(1e-6));
         float screenPxRange = max(0.5 * dot(unitRange, screenTexSize), 1.0);
         float a = clamp(screenPxRange * (sd - 0.5) + 0.5, 0.0, 1.0);
-        col = premul(pc.color, a * cov(sdRound(c, hs, 0.0)));
+        col = premul(inst.color, a * cov(sdRound(c, hs, 0.0)));
     }
     else if (mode == MODE_GLYPH_BITMAP)
     {
         // 位图字形（emoji 等）：图集里就是 RGBA 颜色，不是距离场
         //   不能走 median3 / distanceRange，直接采样后按 alpha 合成预乘色
-        uint ti = uint(pc.params.z + 0.5);
-        uint si = uint(pc.params.w + 0.5);
-        vec2 guv = mix(pc.aux.xy, pc.aux.zw, clamp(uv, vec2(0.0), vec2(1.0)));
+        uint ti = uint(inst.params.z + 0.5);
+        uint si = uint(inst.params.w + 0.5);
+        vec2 guv = mix(inst.aux.xy, inst.aux.zw, clamp(uv, vec2(0.0), vec2(1.0)));
         vec4 tex = texture(sampler2D(uTextures[nonuniformEXT(ti)],
                                      uSamplers[nonuniformEXT(si)]),
                            guv);
         float a = tex.a * cov(sdRound(c, hs, 0.0));
         // 图集是直通 alpha：先乘 UI 颜色再预乘
-        col = vec4(tex.rgb * pc.color.rgb * pc.color.a * a, pc.color.a * a);
+        col = vec4(tex.rgb * inst.color.rgb * inst.color.a * a, inst.color.a * a);
     }
     else if (mode == MODE_SRGB)
     {
         // 上半：gamma 空间插值；下半：线性空间插值（同一个渐变，观感不同）
         float t = uv.x;
-        vec3 lin = mix(pc.color.rgb, pc.color2.rgb, t);
-        vec3 gam = mix(pow(pc.color.rgb, vec3(1.0 / 2.2)),
-                       pow(pc.color2.rgb, vec3(1.0 / 2.2)), t);
+        vec3 lin = mix(inst.color.rgb, inst.color2.rgb, t);
+        vec3 gam = mix(pow(inst.color.rgb, vec3(1.0 / 2.2)),
+                       pow(inst.color2.rgb, vec3(1.0 / 2.2)), t);
         vec3 rgb = (uv.y < 0.5) ? gam : lin;
         col = premul(vec4(rgb, 1.0), cov(sdRound(c, hs, r)));
     }
@@ -330,18 +347,18 @@ void main()
         float band = clamp(floor(uv.y * 4.0), 0.0, 3.0);
         float cell = 4.0 * exp2(band);
         vec2 g = floor(p / cell);
-        col = premul(mix(pc.color, pc.color2, mod(g.x + g.y, 2.0)), 1.0);
+        col = premul(mix(inst.color, inst.color2, mod(g.x + g.y, 2.0)), 1.0);
     }
     else if (mode == MODE_PICKING)
     {
-        // 拾取 id 由推送常量的 pc.pick 提供，这里只负责画形状
-        col = premul(pc.color, cov(sdRound(c, hs, r)));
+        // 拾取 id 由推送常量的 inst.pick 提供，这里只负责画形状
+        col = premul(inst.color, cov(sdRound(c, hs, r)));
     }
     else if (mode == MODE_BLEND)
     {
         // 三种混合：over / add / multiply（同一张源图，三段不同合成公式）
-        vec3 base = pc.color2.rgb;
-        vec3 src = pc.color.rgb;
+        vec3 base = inst.color2.rgb;
+        vec3 src = inst.color.rgb;
         float a1 = cov(length(p - vec2(tile.x * 0.18, hs.y)) - hs.y * 0.72);
         float a2 = cov(length(p - vec2(tile.x * 0.50, hs.y)) - hs.y * 0.72);
         float a3 = cov(length(p - vec2(tile.x * 0.82, hs.y)) - hs.y * 0.72);
@@ -355,10 +372,10 @@ void main()
     {
         // 可分离高斯：一次只沿一个方向采样，横一趟、纵一趟
         vec2 uv = p / tile;
-        vec2 dir = (pc.params.y < 0.5) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
-        float radius = max(pc.params.z, 0.0);
-        uint ti = uint(pc.params.w + 0.5);
-        uint si = uint(pc.aux.x + 0.5);
+        vec2 dir = (inst.params.y < 0.5) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+        float radius = max(inst.params.z, 0.0);
+        uint ti = uint(inst.params.w + 0.5);
+        uint si = uint(inst.aux.x + 0.5);
         vec4 sum = vec4(0.0);
         float wsum = 0.0;
         for (int i = -8; i <= 8; ++i)
@@ -377,32 +394,38 @@ void main()
     else if (mode == MODE_LAYER_COMPOSITE)
     {
         // 把离屏层按 uv 铺回目标矩形，整体乘一个不透明度（组不透明度就是这么来的）
-        uint ti = uint(pc.params.z + 0.5);
-        uint si = uint(pc.params.w + 0.5);
-        // aux.yz > 0 时表示：层里存的是整屏内容，需要把图块在屏幕上的位置映射成 uv
-        vec2 uv = (pc.aux.y * pc.aux.z > 0.0)
-                      ? clamp((pc.rect.xy + p) / pc.aux.yz, vec2(0.0), vec2(1.0))
-                      : clamp(p / tile, vec2(0.0), vec2(1.0));
+        uint ti = uint(inst.params.z + 0.5);
+        uint si = uint(inst.params.w + 0.5);
+        // 两种取样方式：
+        //   aux.yz > 0  → 层里存的是「整屏」，按屏幕位置取 uv（backdrop）
+        //   否则        → 层里存的是「这个层自己的内容」，uv = p / tile 再乘
+        //                 aux.zw（= 内容在层图像里占的比例，隐式层用得到）
+        vec2 uv = (inst.aux.y * inst.aux.z > 0.0)
+                      ? clamp((inst.rect.xy + p) / inst.aux.yz, vec2(0.0), vec2(1.0))
+                      : clamp(p / tile *
+                                  vec2(inst.aux.z > 0.0 ? inst.aux.z : 1.0,
+                                       inst.aux.w > 0.0 ? inst.aux.w : 1.0),
+                              vec2(0.0), vec2(1.0));
         vec4 layerColor = texture(sampler2D(uTextures[nonuniformEXT(ti)],
                                             uSamplers[nonuniformEXT(si)]),
                                   uv);
-        float a = clamp(pc.params.y, 0.0, 1.0) * cov(sdRound(c, hs, pc.aux.x));
+        float a = clamp(inst.params.y, 0.0, 1.0) * cov(sdRound(c, hs, inst.aux.x));
         col = vec4(layerColor.rgb * a, layerColor.a * a);
     }
     else if (mode == MODE_CHECKER)
     {
         // 棋盘内容：背景模糊里的“背景”
-        float cell = max(pc.params.y, 2.0);
+        float cell = max(inst.params.y, 2.0);
         vec2 g = floor(p / cell);
-        col = premul(mix(pc.color, pc.color2, mod(g.x + g.y, 2.0)), 1.0);
+        col = premul(mix(inst.color, inst.color2, mod(g.x + g.y, 2.0)), 1.0);
     }
     else if (mode == MODE_NINE_SLICE_TEX)
     {
         // 真·九宫格：3x3 分区 UV 重映射，边角保持像素宽，中间行/列拉伸
-        uint ti = uint(pc.params.z + 0.5);
-        uint si = uint(pc.params.w + 0.5);
-        vec2 srcSize = max(pc.aux.xy, vec2(1.0));
-        float sb = max(pc.params.y, 0.0);      // 源图边框宽（像素）
+        uint ti = uint(inst.params.z + 0.5);
+        uint si = uint(inst.params.w + 0.5);
+        vec2 srcSize = max(inst.aux.xy, vec2(1.0));
+        float sb = max(inst.params.y, 0.0);      // 源图边框宽（像素）
         vec2 db = vec2(sb);                    // 目标边框宽（像素，必要时收窄）
         vec2 src;
         src.x = nine_slice_axis(p.x, tile.x, srcSize.x, sb, min(db.x, sb));
@@ -416,23 +439,23 @@ void main()
     else if (mode == MODE_ALPHA_MASK_TEX)
     {
         // 真·纹理 alpha 遮罩：alpha 来自纹理，不是程序化点阵
-        uint ti = uint(pc.params.z + 0.5);
-        uint si = uint(pc.params.w + 0.5);
+        uint ti = uint(inst.params.z + 0.5);
+        uint si = uint(inst.params.w + 0.5);
         vec2 uv = clamp(p / tile, vec2(0.0), vec2(1.0));
         float mask = texture(sampler2D(uTextures[nonuniformEXT(ti)],
                                        uSamplers[nonuniformEXT(si)]),
                              uv)
                          .a;
-        col = premul(pc.color, mask * cov(sdRound(c, hs, r)));
+        col = premul(inst.color, mask * cov(sdRound(c, hs, r)));
     }
     else if (mode == MODE_MIPMAP_TEX)
     {
         // 真·mip 采样：同一张棋盘按 lod=0..3 采样，四条横带
-        uint ti = uint(pc.params.z + 0.5);
-        uint si = uint(pc.params.w + 0.5);
+        uint ti = uint(inst.params.z + 0.5);
+        uint si = uint(inst.params.w + 0.5);
         vec2 uv = clamp(p / tile, vec2(0.0), vec2(1.0));
         float band = clamp(floor(uv.y * 4.0), 0.0, 3.0);
-        float lod = min(band, max(pc.params.y, 0.0));
+        float lod = min(band, max(inst.params.y, 0.0));
         vec4 texel = textureLod(sampler2D(uTextures[nonuniformEXT(ti)],
                                           uSamplers[nonuniformEXT(si)]),
                                 uv, lod);
@@ -441,27 +464,27 @@ void main()
     else if (mode == MODE_SOLID)
     {
         // 覆盖 pass：形状已经由几何/模板决定，这里只填色
-        col = premul(pc.color, 1.0);
+        col = premul(inst.color, 1.0);
     }
     else if (mode == MODE_SOLID_GEOM) // 兼容旧命令：等价于 MODE_SOLID
     {
-        col = premul(pc.color, 1.0);
+        col = premul(inst.color, 1.0);
     }
     else if (mode == MODE_PATH_STROKE)
     {
         // 解析覆盖率（胶囊）：片元到该段的最短距离，1px 过渡带
         //   NOTE: miter 两次尝试都出问题（外角戳刺 / 径向断条），暂回圆头，
         //         数据侧已备好斜接点与角平分平面，接回需单独一课
-        vec4 ab = segBuf.segs[vSegIndex * 5u + 2u];
+        vec4 ab = PathSegmentBuffer(vPayload + uint64_t(144u)).segs[vSegIndex * 5u + 2u];
         vec2 a = ab.xy;
         vec2 b = ab.zw;
         vec2 pa = gl_FragCoord.xy - a;
         vec2 ba = b - a;
         float t = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-4), 0.0, 1.0);
-        float d = length(pa - ba * t) - pc.params.y; // 负=在笔画内
+        float d = length(pa - ba * t) - inst.params.y; // 负=在笔画内
         float coverage =
-            (pc.params.z > 0.5) ? clamp(0.5 - d, 0.0, 1.0) : (d <= 0.0 ? 1.0 : 0.0);
-        col = premul(pc.aux, coverage);
+            (inst.params.z > 0.5) ? clamp(0.5 - d, 0.0, 1.0) : (d <= 0.0 ? 1.0 : 0.0);
+        col = premul(inst.aux, coverage);
     }
     else if (mode == MODE_CLIP_MASK)
     {
@@ -473,14 +496,14 @@ void main()
     }
     else
     {
-        col = premul(pc.color, cov(sdRound(c, hs, r)));
+        col = premul(inst.color, cov(sdRound(c, hs, r)));
     }
 
     // 完全透明的图元：颜色写 0（预乘 alpha 混合下等于不画），
     // 拾取写 0xFFFFFFFF（= 没命中）。不用 discard：SPIR-V 1.6 会把 discard
     // 降级成 DemoteToHelperInvocation，那需要额外开启设备特性。
     const bool visible = col.a > 0.0;
-    const bool has_pick = pc.pick.x != 0xFFFFFFFFu;
+    const bool has_pick = inst.pick.x != 0xFFFFFFFFu;
     outColor = visible ? col : vec4(0.0);
-    outPicking = (visible && has_pick) ? pc.pick : uvec4(0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 0u);
+    outPicking = (visible && has_pick) ? inst.pick : uvec4(0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 0u);
 }
