@@ -195,5 +195,18 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_intent test_dod24.vert test_dod24.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
+add_std_glsl_target(test_intent2 test_dod24.vert test_dod24.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
+add_std_glsl_target(test_intent3 test_dod24.vert test_dod24.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
+add_std_glsl_target(test_ui_ability test_ui_ability.vert test_ui_ability.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
+add_std_glsl_target(test_ui_ability2 test_ui_ability2.vert test_ui_ability2.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
+
 # end
 std_glsl_env_destroy()
