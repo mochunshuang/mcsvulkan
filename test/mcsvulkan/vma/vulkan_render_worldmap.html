@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Vulkan 渲染世界图 · Render World Map</title>
+<style>
+  :root{
+    --bg:#070c15;
+    --panel:rgba(10,17,30,.82);
+    --ink:#dbe7f7;
+    --dim:#7f93ae;
+    --line:rgba(148,170,200,.16);
+    --flow:#f5b942;
+    --res:#4fd1c5;
+    --sync:#ff6b81;
+    --par:#7ee787;
+    --ext:#b392f0;
+    --loop:#94a9c9;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;background:
+      radial-gradient(1200px 700px at 12% -10%, #12233f 0%, transparent 60%),
+      radial-gradient(1000px 600px at 95% 0%, #1a1630 0%, transparent 55%),
+      var(--bg);
+    color:var(--ink);
+    font-family:"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    overflow:hidden;
+  }
+  /* ---------- top bar ---------- */
+  .topbar{
+    height:68px;display:flex;align-items:center;justify-content:space-between;
+    padding:0 22px;border-bottom:1px solid var(--line);
+    background:linear-gradient(180deg,rgba(8,13,23,.95),rgba(8,13,23,.6));
+    backdrop-filter:blur(8px);position:relative;z-index:20;
+  }
+  .brand h1{
+    margin:0;font-size:15px;letter-spacing:.22em;font-weight:800;
+    background:linear-gradient(90deg,#ffd479,#f5b942 30%,#4fd1c5 70%,#b392f0);
+    -webkit-background-clip:text;background-clip:text;color:transparent;
+  }
+  .brand p{margin:4px 0 0;font-size:11px;color:var(--dim);letter-spacing:.04em}
+  .ctrls{display:flex;align-items:center;gap:14px;font-size:11.5px;color:var(--dim)}
+  .ctrls label{display:flex;align-items:center;gap:5px;cursor:pointer;user-select:none}
+  .ctrls input{accent-color:#f5b942;width:13px;height:13px;cursor:pointer}
+  .ctrls .sep{width:1px;height:18px;background:var(--line)}
+  .ctrls button{
+    width:30px;height:28px;border-radius:7px;cursor:pointer;
+    background:rgba(20,32,52,.9);border:1px solid var(--line);color:#cfe1ff;
+    font-size:13px;line-height:1;transition:.15s;
+  }
+  .ctrls button:hover{background:rgba(32,50,80,.95);border-color:rgba(245,185,66,.5);color:#ffd479}
+  .ctrls button[data-z="fit"]{width:auto;padding:0 10px;font-size:11.5px}
+
+  /* ---------- viewport ---------- */
+  #viewport{
+    position:relative;height:calc(100vh - 68px);overflow:hidden;cursor:grab;
+    background-image:
+      linear-gradient(rgba(120,160,220,.055) 1px,transparent 1px),
+      linear-gradient(90deg,rgba(120,160,220,.055) 1px,transparent 1px),
+      radial-gradient(circle at 30% 20%,rgba(40,80,140,.16),transparent 55%);
+    background-size:56px 56px,56px 56px,100% 100%;
+  }
+  #viewport.dragging{cursor:grabbing}
+  #stage{
+    position:absolute;left:0;top:0;width:2660px;height:1900px;
+    transform-origin:0 0;will-change:transform;
+  }
+  #edges{position:absolute;left:0;top:0;overflow:visible;pointer-events:none;z-index:0}
+
+  /* ---------- columns & regions ---------- */
+  .col{position:absolute;display:flex;flex-direction:column;gap:26px;z-index:2}
+  .region{
+    --tone:#6ea8fe;
+    position:relative;border-radius:18px;padding:14px 14px 16px;
+    border:1px solid color-mix(in srgb,var(--tone) 32%,transparent);
+    background:
+      radial-gradient(130% 70% at 15% 0%,color-mix(in srgb,var(--tone) 13%,transparent),transparent 62%),
+      linear-gradient(180deg,rgba(9,15,27,.72),rgba(7,11,20,.82));
+    box-shadow:0 18px 40px -28px #000, inset 0 1px 0 rgba(255,255,255,.04);
+  }
+  .region>header{display:flex;align-items:center;gap:10px;margin-bottom:13px}
+  .region .num{
+    flex:0 0 auto;width:30px;height:30px;border-radius:9px;display:grid;place-items:center;
+    font-size:14px;font-weight:800;color:var(--tone);
+    background:color-mix(in srgb,var(--tone) 16%,transparent);
+    border:1px solid color-mix(in srgb,var(--tone) 45%,transparent);
+  }
+  .region h2{margin:0;font-size:14.5px;font-weight:700;letter-spacing:.05em;color:#eaf2ff}
+  .region .rt p{
+    margin:2px 0 0;font-size:9.5px;letter-spacing:.13em;text-transform:uppercase;
+    color:color-mix(in srgb,var(--tone) 75%,#9fb0c8);
+  }
+  .nodes{display:flex;flex-direction:column;gap:9px}
+
+  /* ---------- nodes ---------- */
+  .node{
+    position:relative;border-radius:11px;padding:8px 11px;
+    background:linear-gradient(180deg,rgba(15,24,41,.94),rgba(9,15,27,.94));
+    border:1px solid rgba(148,170,200,.14);
+    border-left:3px solid var(--tone,#6ea8fe);
+    box-shadow:0 6px 16px -12px #000;
+    transition:transform .12s, box-shadow .12s, border-color .12s;
+  }
+  .node:hover{
+    transform:translateY(-1px);
+    border-color:color-mix(in srgb,var(--tone,#6ea8fe) 55%,transparent);
+    box-shadow:0 0 0 1px color-mix(in srgb,var(--tone,#6ea8fe) 35%,transparent),0 14px 26px -16px #000;
+    z-index:6;
+  }
+  .node .name{
+    font-family:"Cascadia Code","JetBrains Mono",Consolas,monospace;
+    font-size:12.4px;letter-spacing:-.01em;color:#cfe1ff;word-break:break-word;
+  }
+  .node .note{margin-top:3px;font-size:10.2px;line-height:1.35;color:var(--dim)}
+  .node.k-handle .name{color:#ffd479}
+  .node.k-handle{border-left-color:#ffd479}
+  .node.k-func .name{color:#9ece6a}
+  .node.k-func{border-left-color:#9ece6a}
+  .node.k-func .name::before{content:"▸ ";opacity:.7}
+
+  .pair{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+  .pair .from{
+    font-family:"Cascadia Code","JetBrains Mono",Consolas,monospace;
+    font-size:11.2px;color:#a8bdd8;
+  }
+  .pair .arw{color:var(--flow);font-size:11px;opacity:.9}
+  .pair .to{
+    font-family:"Cascadia Code","JetBrains Mono",Consolas,monospace;
+    font-size:11.8px;font-weight:700;color:#ffd479;
+  }
+
+  .node.k-group{
+    background:rgba(8,13,23,.55);
+    border:1px dashed rgba(148,170,200,.3);
+    border-left:3px solid var(--tone,#6ea8fe);
+    padding:9px 10px 10px;
+  }
+  .ghead{display:flex;align-items:center;gap:8px;font-size:11.3px;color:#c7d7ec;letter-spacing:.03em}
+  .gcount{
+    margin-left:auto;font-size:9.5px;color:var(--dim);
+    border:1px solid var(--line);border-radius:20px;padding:1px 7px;
+  }
+  .chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:8px}
+  .chip{
+    font-family:"Cascadia Code","JetBrains Mono",Consolas,monospace;
+    font-size:9.6px;color:#9fb3cc;padding:2.5px 6px;border-radius:5px;
+    background:rgba(120,160,220,.07);border:1px solid rgba(120,160,220,.13);
+    white-space:nowrap;
+  }
+
+  /* ---------- ribbon ---------- */
+  .ribbon{
+    position:absolute;border-radius:16px;padding:13px 18px 15px;
+    border:1px solid rgba(245,185,66,.28);
+    background:
+      linear-gradient(90deg,rgba(245,185,66,.07),rgba(245,185,66,.015) 40%,rgba(79,209,197,.05)),
+      rgba(8,13,23,.6);
+  }
+  .ribbon h3{
+    margin:0 0 10px;font-size:11.5px;letter-spacing:.16em;color:#e9c477;font-weight:700;
+  }
+  .stages{display:flex;align-items:center;flex-wrap:wrap;gap:6px}
+  .stages .st{
+    font-family:"Cascadia Code","JetBrains Mono",Consolas,monospace;font-size:10.3px;
+    padding:4px 9px;border-radius:6px;color:#d8c9a6;
+    background:rgba(245,185,66,.07);border:1px solid rgba(245,185,66,.22);
+  }
+  .stages .st.hot{color:#ffd479;background:rgba(245,185,66,.14);border-color:rgba(245,185,66,.45)}
+  .stages i{color:#5c6d85;font-style:normal;font-size:10px}
+  .lanesline{margin-top:9px;font-size:10px;color:var(--dim);display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .lanesline b{color:#9ece6a;font-weight:600;font-family:"Cascadia Code",Consolas,monospace;font-size:9.8px}
+  .ribbon .foot{margin-top:10px;font-size:10px;color:#6f819b;letter-spacing:.02em}
+
+  /* ---------- edges ---------- */
+  path.edge{fill:none;stroke-linecap:round;transition:opacity .15s,stroke-width .15s}
+  path.e-flow{stroke:var(--flow);stroke-width:1.7}
+  path.e-res{stroke:var(--res);stroke-width:1.3;opacity:.62}
+  path.e-sync{stroke:var(--sync);stroke-width:1.4;stroke-dasharray:5 4;opacity:.85}
+  path.e-par{stroke:var(--par);stroke-width:1.4;stroke-dasharray:2 5;opacity:.9}
+  path.e-ext{stroke:var(--ext);stroke-width:1.4;stroke-dasharray:1 5;opacity:.9}
+  path.e-loop{stroke:var(--loop);stroke-width:1.5;stroke-dasharray:9 7;opacity:.8}
+  #edges.dim path.edge{opacity:.07}
+  #edges.dim text.elabel{opacity:.12}
+  #edges path.edge.hl{opacity:1 !important;stroke-width:2.6}
+
+  text.elabel{
+    font-family:"Segoe UI","PingFang SC",sans-serif;font-size:9.6px;
+    fill:#93a7c2;paint-order:stroke;stroke:#070c15;stroke-width:3.4;stroke-linejoin:round;
+    letter-spacing:.02em;
+  }
+  text.elabel.l-flow{fill:#e2b45e}
+  text.elabel.l-sync{fill:#ff9aa8}
+  text.elabel.l-par{fill:#a5edaa}
+  text.elabel.l-ext{fill:#c8aef5}
+  text.elabel.l-loop{fill:#a9bcd6}
+
+  #edges.hide-res .e-res{display:none}
+  #edges.hide-sync .e-sync,#edges.hide-sync .e-par{display:none}
+  #edges.hide-ext .e-ext{display:none}
+  #edges.hide-res text.l-res{display:none}
+  #edges.hide-sync text.l-sync,#edges.hide-sync text.l-par{display:none}
+  #edges.hide-ext text.l-ext{display:none}
+
+  /* ---------- legend ---------- */
+  .legend{
+    position:absolute;left:20px;bottom:18px;z-index:10;
+    background:rgba(8,13,23,.86);border:1px solid var(--line);border-radius:12px;
+    padding:11px 14px;font-size:10.5px;color:var(--dim);backdrop-filter:blur(8px);
+    display:grid;grid-template-columns:1fr 1fr;gap:6px 18px;pointer-events:none;
+  }
+  .legend .it{display:flex;align-items:center;gap:7px;white-space:nowrap}
+  .legend .ln{width:18px;height:0;border-top:2px solid}
+  .legend .ln.dash{border-top-style:dashed}
+  .legend .ln.dot{border-top-style:dotted}
+  .legend .kb{
+    font-family:"Cascadia Code",Consolas,monospace;font-size:9px;padding:0 4px;border-radius:3px;
+    border:1px solid rgba(148,170,200,.25);color:#9fb3cc;
+  }
+  .hint{
+    position:absolute;right:20px;bottom:20px;z-index:10;font-size:10.5px;color:#5f7089;
+    background:rgba(8,13,23,.7);border:1px solid rgba(148,170,200,.1);border-radius:8px;
+    padding:5px 10px;pointer-events:none;letter-spacing:.06em;
+  }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand">
+    <h1>VULKAN · RENDER WORLD MAP</h1>
+    <p>渲染主流程 × 结构体关系 · Vulkan 1.4（cmdbuffers / renderpass / synchronization / pipelines）</p>
+  </div>
+  <div class="ctrls">
+    <label><input type="checkbox" data-t="res" checked> 资源边</label>
+    <label><input type="checkbox" data-t="sync" checked> 同步 / 并行</label>
+    <label><input type="checkbox" data-t="ext" checked> 支线</label>
+    <span class="sep"></span>
+    <button data-z="in" title="放大">＋</button>
+    <button data-z="out" title="缩小">－</button>
+    <button data-z="fit" title="适应窗口">适应</button>
+  </div>
+</div>
+
+<div id="viewport">
+  <div id="stage">
+    <svg id="edges" xmlns="http://www.w3.org/2000/svg"></svg>
+  </div>
+
+  <div class="legend">
+    <div class="it"><span class="ln" style="border-color:#f5b942"></span>主流程</div>
+    <div class="it"><span class="ln" style="border-color:#4fd1c5"></span>创建 / 资源依赖</div>
+    <div class="it"><span class="ln dash" style="border-color:#ff6b81"></span>同步 / 屏障</div>
+    <div class="it"><span class="ln dot" style="border-color:#7ee787"></span>并行</div>
+    <div class="it"><span class="ln dot" style="border-color:#b392f0"></span>扩展支线</div>
+    <div class="it"><span class="ln dash" style="border-color:#94a9c9"></span>帧循环</div>
+    <div class="it"><span class="kb">struct</span>创建信息</div>
+    <div class="it"><span class="kb" style="color:#ffd479">handle</span>设备对象</div>
+  </div>
+
+  <div class="hint">滚轮缩放 · 拖拽平移 · 双击复位</div>
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  var COL_X = [40, 650, 1340, 2060];
+  var COL_W = [560, 640, 670, 500];
+  var TOP = 150;            // 顶部留白，给帧循环弧线
+  var STAGE_W = 2660;
+
+  var TYPES = {
+    flow:{c:'#f5b942'}, res:{c:'#4fd1c5'}, sync:{c:'#ff6b81'},
+    par:{c:'#7ee787'}, ext:{c:'#b392f0'}, loop:{c:'#94a9c9'}
+  };
+
+  /* ======================= 数据：九块大陆 ======================= */
+  var REGIONS = [
+    {
+      id:'A', col:0, num:'①', tone:'#6ea8fe',
+      title:'地基', en:'Instance · Device · Queue',
+      nodes:[
+        {id:'instCI', k:'pair', from:'VkInstanceCreateInfo', to:'VkInstance',
+         note:'layers / extensions · pNext → VkApplicationInfo'},
+        {id:'phys', k:'handle', name:'VkPhysicalDevice',
+         note:'vkEnumeratePhysicalDevices → features2 / props2 / memoryProperties'},
+        {id:'qCI', k:'struct', name:'VkDeviceQueueCreateInfo',
+         note:'queueFamilyIndex · queueCount · pQueuePriorities'},
+        {id:'devCI', k:'pair', from:'VkDeviceCreateInfo', to:'VkDevice',
+         note:'pQueueCreateInfos · pNext → VkPhysicalDeviceFeatures2'},
+        {id:'dev', k:'handle', name:'VkDevice',
+         note:'所有资源的 owner · 销毁顺序与创建相反'},
+        {id:'queue', k:'handle', name:'VkQueue',
+         note:'graphics · compute · transfer · present（按 family 取）'}
+      ]
+    },
+    {
+      id:'B', col:0, num:'②', tone:'#4fd1c5',
+      title:'资源', en:'Memory · Buffer · Image · Sampler',
+      nodes:[
+        {id:'buf', k:'pair', from:'VkBufferCreateInfo', to:'VkBuffer',
+         note:'size · usage · sharingMode（顶点/索引/UBO/SSBO/间接）'},
+        {id:'img', k:'pair', from:'VkImageCreateInfo', to:'VkImage',
+         note:'format · extent · mipLevels · samples · tiling · usage · initialLayout'},
+        {id:'view', k:'pair', from:'VkImageViewCreateInfo', to:'VkImageView',
+         note:'viewType · format · components · subresourceRange'},
+        {id:'samp', k:'pair', from:'VkSamplerCreateInfo', to:'VkSampler',
+         note:'magFilter · addressMode · mipmapMode · borderColor'},
+        {id:'memReq', k:'struct', name:'VkMemoryRequirements2',
+         note:'size · alignment · memoryTypeBits'},
+        {id:'mem', k:'pair', from:'VkMemoryAllocateInfo', to:'VkDeviceMemory',
+         note:'allocationSize · memoryTypeIndex · pNext→Dedicated'},
+        {id:'bind', k:'struct', name:'VkBindBufferMemoryInfo / VkBindImageMemoryInfo',
+         note:'vkBindBufferMemory2 / vkBindImageMemory2 · memoryOffset'},
+        {id:'range', k:'struct', name:'VkImageSubresourceRange',
+         note:'aspectMask · baseMipLevel · levelCount · baseArrayLayer'}
+      ]
+    },
+    {
+      id:'C', col:0, num:'③', tone:'#f6c177',
+      title:'描述符', en:'Descriptor Set · Layout · Pool',
+      nodes:[
+        {id:'dsl', k:'pair', from:'VkDescriptorSetLayoutCreateInfo', to:'VkDescriptorSetLayout',
+         note:'VkDescriptorSetLayoutBinding[]：binding · type · stageFlags'},
+        {id:'dpool', k:'pair', from:'VkDescriptorPoolCreateInfo', to:'VkDescriptorPool',
+         note:'VkDescriptorPoolSize[] · maxSets · FREE_DESCRIPTOR_SET'},
+        {id:'dset', k:'pair', from:'VkDescriptorSetAllocateInfo', to:'VkDescriptorSet',
+         note:'descriptorPool + pSetLayouts[]'},
+        {id:'write', k:'struct', name:'VkWriteDescriptorSet',
+         note:'pBufferInfo / pImageInfo / pTexelBufferView → vkUpdateDescriptorSets'},
+        {id:'tmpl', k:'struct', name:'VkDescriptorUpdateTemplateCreateInfo',
+         note:'批量更新：entry offset / stride'},
+        {id:'push', k:'struct', name:'VkPushDescriptorSetInfo',
+         note:'1.4 · 免 descriptor set，直接推给 command buffer'}
+      ]
+    },
+    {
+      id:'D', col:1, num:'④', tone:'#f78c6c',
+      title:'管线', en:'Shader · Pipeline Layout · PSO',
+      nodes:[
+        {id:'sm', k:'pair', from:'VkShaderModuleCreateInfo', to:'VkShaderModule',
+         note:'SPIR-V：codeSize / pCode'},
+        {id:'stage', k:'struct', name:'VkPipelineShaderStageCreateInfo',
+         note:'stage · module · pName · pSpecializationInfo'},
+        {id:'states', k:'group', title:'固定功能状态 · 9 宫格',
+         chips:['VkPipelineVertexInputStateCreateInfo','VkPipelineInputAssemblyStateCreateInfo',
+                'VkPipelineTessellationStateCreateInfo','VkPipelineViewportStateCreateInfo',
+                'VkPipelineRasterizationStateCreateInfo','VkPipelineMultisampleStateCreateInfo',
+                'VkPipelineDepthStencilStateCreateInfo','VkPipelineColorBlendStateCreateInfo',
+                'VkPipelineDynamicStateCreateInfo']},
+        {id:'layout', k:'pair', from:'VkPipelineLayoutCreateInfo', to:'VkPipelineLayout',
+         note:'pSetLayouts · pPushConstantRanges（VkPushConstantRange）'},
+        {id:'gfx', k:'pair', from:'VkGraphicsPipelineCreateInfo', to:'VkPipeline',
+         note:'pStages · 9 × p*State · layout · renderPass · subpass'},
+        {id:'comp', k:'pair', from:'VkComputePipelineCreateInfo', to:'VkPipeline',
+         note:'stage · layout（compute 只有 1 个 stage）'},
+        {id:'cache', k:'pair', from:'VkPipelineCacheCreateInfo', to:'VkPipelineCache',
+         note:'initialData ← 磁盘 · 加速二次编译'}
+      ]
+    },
+    {
+      id:'E', col:1, num:'⑤', tone:'#ff8fab',
+      title:'渲染目标', en:'Render Pass · Framebuffer · Dynamic Rendering',
+      nodes:[
+        {id:'att', k:'struct', name:'VkAttachmentDescription',
+         note:'format · samples · loadOp/storeOp · initial/finalLayout'},
+        {id:'ref', k:'struct', name:'VkAttachmentReference',
+         note:'attachment 索引 + layout（color / input / resolve / depth）'},
+        {id:'sub', k:'struct', name:'VkSubpassDescription',
+         note:'pColorAttachments · pInputAttachments · pResolveAttachments · pDepthStencil'},
+        {id:'subDep', k:'struct', name:'VkSubpassDependency',
+         note:'src/dstSubpass · stageMask · accessMask · byRegion'},
+        {id:'rp', k:'pair', from:'VkRenderPassCreateInfo', to:'VkRenderPass',
+         note:'attachments[] · subpasses[] · dependencies[]'},
+        {id:'fb', k:'pair', from:'VkFramebufferCreateInfo', to:'VkFramebuffer',
+         note:'renderPass + pAttachments（VkImageView[]）· width/height/layers'},
+        {id:'rpBegin', k:'struct', name:'VkRenderPassBeginInfo',
+         note:'renderArea · clearValueCount / pClearValues → vkCmdBeginRenderPass'},
+        {id:'ratt', k:'struct', name:'VkRenderingAttachmentInfo',
+         note:'imageView · imageLayout · resolveMode · loadOp / storeOp'},
+        {id:'rinfo', k:'struct', name:'VkRenderingInfo',
+         note:'1.3 动态渲染：pColorAttachments · pDepthAttachment · renderArea'},
+        {id:'prc', k:'struct', name:'VkPipelineRenderingCreateInfo',
+         note:'pNext → 管线：colorAttachmentFormats / depth / stencil'}
+      ]
+    },
+    {
+      id:'F', col:2, num:'⑥', tone:'#9ece6a',
+      title:'命令录制', en:'Command Pool · Command Buffer · vkCmd*',
+      nodes:[
+        {id:'pool', k:'pair', from:'VkCommandPoolCreateInfo', to:'VkCommandPool',
+         note:'queueFamilyIndex · TRANSIENT / RESET_COMMAND_BUFFER'},
+        {id:'cb', k:'pair', from:'VkCommandBufferAllocateInfo', to:'VkCommandBuffer',
+         note:'LEVEL_PRIMARY（可提交）/ LEVEL_SECONDARY（被 execute）'},
+        {id:'begin', k:'struct', name:'VkCommandBufferBeginInfo',
+         note:'ONE_TIME_SUBMIT / SIMULTANEOUS_USE · pInheritanceInfo'},
+        {id:'cmds', k:'group', title:'vkCmd* 录制指令集', chips:[
+          'vkCmdBindPipeline','vkCmdBindDescriptorSets','vkCmdPushConstants',
+          'vkCmdBindVertexBuffers','vkCmdBindIndexBuffer','vkCmdDrawIndexed',
+          'vkCmdDrawIndirectCount','vkCmdDispatch','vkCmdDispatchIndirect',
+          'vkCmdCopyBufferToImage','vkCmdBlitImage','vkCmdResolveImage',
+          'vkCmdPipelineBarrier2','vkCmdBeginRendering','vkCmdEndRendering',
+          'vkCmdBeginQuery','vkCmdWriteTimestamp2','vkCmdExecuteCommands'
+        ]},
+        {id:'mt', k:'group', title:'并行录制 · 多线程', chips:[
+          '每线程独立 VkCommandPool','SECONDARY 并行录制','vkCmdExecuteCommands 合并'
+        ]},
+        {id:'life', k:'group', title:'命令缓冲状态机', chips:[
+          'Initial','Recording','Executable','Pending','Invalid'
+        ]},
+        {id:'end', k:'func', name:'vkEndCommandBuffer',
+         note:'recording → executable，之后才能提交'}
+      ]
+    },
+    {
+      id:'G', col:3, num:'⑦', tone:'#ff6b81',
+      title:'同步与提交', en:'Barrier · Semaphore · Fence · Queue Submit',
+      nodes:[
+        {id:'fence', k:'pair', from:'VkFenceCreateInfo', to:'VkFence',
+         note:'CPU 侧等待句柄 · SIGNALED · 帧节流'},
+        {id:'sem', k:'pair', from:'VkSemaphoreCreateInfo', to:'VkSemaphore',
+         note:'GPU 侧信号 · pNext→VkSemaphoreTypeCreateInfo（timeline）'},
+        {id:'depInfo', k:'struct', name:'VkDependencyInfo',
+         note:'pMemoryBarriers / pBufferMemoryBarriers / pImageMemoryBarriers'},
+        {id:'bar', k:'group', title:'屏障结构', chips:[
+          'VkMemoryBarrier2','VkBufferMemoryBarrier2',
+          'VkImageMemoryBarrier2（old/newLayout）','VkImageSubresourceRange'
+        ]},
+        {id:'lanes', k:'group', title:'并行泳道', chips:[
+          'graphics','compute（异步）','transfer / DMA','present'
+        ]},
+        {id:'sub2', k:'struct', name:'VkSubmitInfo2',
+         note:'VkSemaphoreSubmitInfo · VkCommandBufferSubmitInfo · stageMask'},
+        {id:'sub1', k:'struct', name:'VkSubmitInfo',
+         note:'旧式：pWaitSemaphores + pWaitDstStageMask'},
+        {id:'qsub', k:'func', name:'vkQueueSubmit2',
+         note:'把 command buffer 交给 queue 执行'},
+        {id:'wait', k:'func', name:'vkWaitForFences',
+         note:'CPU/GPU 同步点 · 回收帧资源'}
+      ]
+    },
+    {
+      id:'H', col:3, num:'⑧', tone:'#c099ff',
+      title:'呈现', en:'WSI · Surface · Swapchain · Present',
+      nodes:[
+        {id:'surf', k:'pair', from:'VkWin32SurfaceCreateInfoKHR', to:'VkSurfaceKHR',
+         note:'hinstance · hwnd（平台各异的 CreateInfo）'},
+        {id:'caps', k:'struct', name:'VkSurfaceCapabilitiesKHR',
+         note:'+ VkSurfaceFormatKHR · VkPresentModeKHR（选型依据）'},
+        {id:'sc', k:'pair', from:'VkSwapchainCreateInfoKHR', to:'VkSwapchainKHR',
+         note:'minImageCount · imageFormat · presentMode · compositeAlpha · oldSwapchain'},
+        {id:'gimg', k:'func', name:'vkGetSwapchainImagesKHR',
+         note:'→ VkImage[]，再建 VkImageView'},
+        {id:'acq', k:'struct', name:'VkAcquireNextImageInfoKHR',
+         note:'vkAcquireNextImageKHR：拿 index，signal 信号量'},
+        {id:'pinfo', k:'struct', name:'VkPresentInfoKHR',
+         note:'pWaitSemaphores · pSwapchains · pImageIndices'},
+        {id:'pres', k:'func', name:'vkQueuePresentKHR',
+         note:'提交给呈现引擎（presentation engine）'}
+      ]
+    },
+    {
+      id:'I', col:3, num:'⑨', tone:'#8aa0c0',
+      title:'支线', en:'Ray Tracing · Mesh · Video',
+      nodes:[
+        {id:'as', k:'pair', from:'VkAccelerationStructureCreateInfoKHR', to:'VkAccelerationStructureKHR',
+         note:'BLAS（几何）/ TLAS（实例）'},
+        {id:'rt', k:'struct', name:'VkRayTracingPipelineCreateInfoKHR',
+         note:'pGroups · pLibraryInfo · SBT（shader binding table）'},
+        {id:'mesh', k:'struct', name:'VkPhysicalDeviceMeshShaderFeaturesEXT',
+         note:'task + mesh · vkCmdDrawMeshTasksEXT'},
+        {id:'video', k:'struct', name:'VkVideoSessionCreateInfoKHR',
+         note:'decode / encode · DPB · VkVideoDecodeInfoKHR'}
+      ]
+    }
+  ];
+
+  /* ======================= 数据：连线 ======================= */
+  var EDGES = [
+    ['instCI','phys','res','enumerate'],
+    ['phys','devCI','res','features'],
+    ['qCI','devCI','res','queues'],
+    ['devCI','dev','flow',''],
+    ['dev','queue','flow','vkGetDeviceQueue'],
+
+    ['memReq','mem','flow','allocate'],
+    ['mem','bind','res','bind'],
+    ['buf','bind','res',''],
+    ['img','bind','res',''],
+    ['img','view','res','view'],
+    ['range','img','res','subresource'],
+    ['buf','write','res','uniform / storage'],
+    ['img','write','res','sampled / storage'],
+    ['samp','write','res','sampler'],
+
+    ['dsl','write','res',''],
+    ['dpool','dset','res','alloc'],
+    ['dsl','dset','res','layout'],
+    ['dset','write','flow','update'],
+    ['dsl','layout','res','setLayouts'],
+
+    ['sm','stage','res','module'],
+    ['stage','gfx','res','pStages'],
+    ['states','gfx','res','p*State'],
+    ['layout','gfx','res','layout'],
+    ['cache','gfx','res','cache'],
+    ['rp','gfx','res','renderPass'],
+    ['prc','gfx','res','pNext'],
+    ['comp','cmds','par','dispatch'],
+
+    ['att','rp','res',''],
+    ['ref','sub','res',''],
+    ['sub','rp','res',''],
+    ['subDep','rp','res',''],
+    ['rp','fb','res','compatible'],
+    ['view','fb','res','attachments'],
+    ['rpBegin','fb','res',''],
+    ['rpBegin','cmds','flow','vkCmdBeginRenderPass'],
+    ['ratt','rinfo','res',''],
+    ['view','ratt','res',''],
+    ['rinfo','cmds','flow','vkCmdBeginRendering'],
+
+    ['pool','cb','res','alloc'],
+    ['begin','cmds','flow','record'],
+    ['cmds','cb','flow',''],
+    ['cb','end','flow',''],
+    ['end','life','flow','executable'],
+    ['mt','cb','par','并行录制'],
+    ['cb','sub2','flow','pCommandBuffers'],
+
+    ['bar','depInfo','sync',''],
+    ['depInfo','cmds','sync','vkCmdPipelineBarrier2'],
+    ['fence','sub2','res','signal'],
+    ['sem','sub2','res','wait / signal'],
+    ['sub2','qsub','flow',''],
+    ['sub1','qsub','res','legacy'],
+    ['qsub','queue','flow','submit'],
+    ['queue','lanes','par','多队列并行'],
+    ['lanes','qsub','par',''],
+    ['wait','cb','sync','复位 / 重用'],
+    ['qsub','wait','sync',''],
+
+    ['surf','sc','res','surface'],
+    ['caps','sc','res',''],
+    ['sc','gimg','flow',''],
+    ['gimg','img','res','swapchain images'],
+    ['acq','begin','flow','imageIndex → 录制'],
+    ['pinfo','pres','flow',''],
+    ['pres','queue','flow','present'],
+    ['sc','pinfo','res',''],
+    ['pres','acq','loop','下一帧'],
+
+    ['as','rt','ext','geometry'],
+    ['rt','gfx','ext','VkPipeline'],
+    ['mesh','cmds','ext','draw tasks'],
+    ['video','cmds','ext','decode / encode']
+  ];
+
+  /* ======================= DOM 构建 ======================= */
+  var stage = document.getElementById('stage');
+  var svg = document.getElementById('edges');
+  var viewport = document.getElementById('viewport');
+
+  function el(tag, cls, html){
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (html != null) e.innerHTML = html;
+    return e;
+  }
+
+  function buildNode(n){
+    var d = el('div', 'node k-' + n.k);
+    d.id = n.id;
+    if (n.k === 'pair'){
+      d.innerHTML = '<div class="pair"><span class="from">' + n.from +
+        '</span><span class="arw">▸</span><span class="to">' + n.to + '</span></div>' +
+        (n.note ? '<div class="note">' + n.note + '</div>' : '');
+    } else if (n.k === 'group'){
+      d.innerHTML = '<div class="ghead">' + n.title + '<span class="gcount">' + n.chips.length +
+        '</span></div><div class="chips">' +
+        n.chips.map(function(c){ return '<span class="chip">' + c + '</span>'; }).join('') +
+        '</div>';
+    } else {
+      d.innerHTML = '<div class="name">' + n.name + '</div>' +
+        (n.note ? '<div class="note">' + n.note + '</div>' : '');
+    }
+    return d;
+  }
+
+  function buildRegion(r){
+    var s = el('section', 'region');
+    s.style.setProperty('--tone', r.tone);
+    s.innerHTML = '<header><span class="num">' + r.num + '</span><div class="rt">' +
+      '<h2>' + r.title + '</h2><p>' + r.en + '</p></div></header>';
+    var box = el('div', 'nodes');
+    r.nodes.forEach(function(n){ box.appendChild(buildNode(n)); });
+    s.appendChild(box);
+    return s;
+  }
+
+  var cols = [];
+  for (var i = 0; i < 4; i++){
+    var c = el('div', 'col');
+    c.style.left = COL_X[i] + 'px';
+    c.style.width = COL_W[i] + 'px';
+    c.style.top = TOP + 'px';
+    stage.appendChild(c);
+    cols.push(c);
+  }
+  REGIONS.forEach(function(r){ cols[r.col].appendChild(buildRegion(r)); });
+
+  /* ---- 底部阶段轴 ---- */
+  var STAGES = ['TOP_OF_PIPE','DRAW_INDIRECT','VERTEX_INPUT','VERTEX_SHADER','TESS_CONTROL',
+    'TESS_EVAL','GEOMETRY','FRAGMENT','EARLY_FRAGMENT_TESTS','LATE_FRAGMENT_TESTS',
+    'COLOR_ATTACHMENT_OUTPUT','BOTTOM_OF_PIPE'];
+
+  var maxBottom = 0;
+  cols.forEach(function(c){ maxBottom = Math.max(maxBottom, c.offsetTop + c.offsetHeight); });
+
+  var ribbon = el('div', 'ribbon');
+  ribbon.style.left = '40px';
+  ribbon.style.width = (STAGE_W - 120) + 'px';
+  ribbon.style.top = (maxBottom + 52) + 'px';
+  ribbon.innerHTML =
+    '<h3>⑩ 图元流水线阶段轴 · VkPipelineStageFlagBits2 / VkPipelineStageFlagBits</h3>' +
+    '<div class="stages">' +
+      STAGES.map(function(s, idx){
+        return (idx ? '<i>→</i>' : '') + '<span class="st">' + s + '</span>';
+      }).join('') +
+    '</div>' +
+    '<div class="lanesline"><span>旁路泳道：</span>' +
+      '<b>COMPUTE_SHADER</b><b>TRANSFER / COPY</b><b>RAY_TRACING</b><b>ALL_COMMANDS</b>' +
+      '<span style="margin-left:auto;color:#6f819b">阶段 = 屏障的“时间坐标系”</span></div>' +
+    '<div class="foot">所有 vkCmd* 只是把命令写进内存；真正的执行从 vkQueueSubmit2 开始，' +
+      '屏障描述“前一阶段写完 → 后一阶段才可读”的可见性契约。</div>';
+  stage.appendChild(ribbon);
+
+  /* ======================= 量测 & 连线 ======================= */
+  var stageRect = stage.getBoundingClientRect();
+  var boxes = {};
+  document.querySelectorAll('.node').forEach(function(n){
+    var r = n.getBoundingClientRect();
+    boxes[n.id] = {
+      x: r.left - stageRect.left,
+      y: r.top - stageRect.top,
+      w: r.width,
+      h: r.height
+    };
+  });
+
+  var stageH = ribbon.offsetTop + ribbon.offsetHeight + 60;
+  stage.style.height = stageH + 'px';
+  stage.style.width = STAGE_W + 'px';
+
+  svg.setAttribute('width', STAGE_W);
+  svg.setAttribute('height', stageH);
+  svg.setAttribute('viewBox', '0 0 ' + STAGE_W + ' ' + stageH);
+
+  var NS = 'http://www.w3.org/2000/svg';
+  var defs = document.createElementNS(NS, 'defs');
+  Object.keys(TYPES).forEach(function(t){
+    var m = document.createElementNS(NS, 'marker');
+    m.setAttribute('id', 'arw-' + t);
+    m.setAttribute('viewBox', '0 0 10 10');
+    m.setAttribute('refX', '9');
+    m.setAttribute('refY', '5');
+    m.setAttribute('markerWidth', '6');
+    m.setAttribute('markerHeight', '6');
+    m.setAttribute('orient', 'auto-start-reverse');
+    m.setAttribute('markerUnits', 'userSpaceOnUse');
+    var p = document.createElementNS(NS, 'path');
+    p.setAttribute('d', 'M0,1 L10,5 L0,9 z');
+    p.setAttribute('fill', TYPES[t].c);
+    m.appendChild(p);
+    defs.appendChild(m);
+  });
+  svg.appendChild(defs);
+
+  function center(b){ return { x: b.x + b.w / 2, y: b.y + b.h / 2 }; }
+
+  function anchor(b, side){
+    if (side === 'l') return { x: b.x - 3, y: b.y + b.h / 2 };
+    if (side === 'r') return { x: b.x + b.w + 3, y: b.y + b.h / 2 };
+    if (side === 't') return { x: b.x + b.w / 2, y: b.y - 3 };
+    return { x: b.x + b.w / 2, y: b.y + b.h + 3 };
+  }
+
+  function cubicAt(p0, c1, c2, p1, t){
+    var mt = 1 - t;
+    var a = mt * mt * mt, b = 3 * mt * mt * t, c = 3 * mt * t * t, d = t * t * t;
+    return {
+      x: a * p0.x + b * c1.x + c * c2.x + d * p1.x,
+      y: a * p0.y + b * c1.y + c * c2.y + d * p1.y
+    };
+  }
+
+  EDGES.forEach(function(e){
+    var a = boxes[e[0]], b = boxes[e[1]];
+    if (!a || !b) return;
+    var type = e[2] || 'flow', label = e[3] || '';
+    var p1, p2, c1, c2;
+
+    if (type === 'loop'){
+      // 同一列：沿右侧外缘绕一圈（帧循环）
+      p1 = anchor(a, 'r');
+      p2 = anchor(b, 'r');
+      c1 = { x: STAGE_W - 14, y: p1.y };
+      c2 = { x: STAGE_W - 14, y: p2.y };
+    } else {
+      var ca = center(a), cb = center(b);
+      var dx = cb.x - ca.x, dy = cb.y - ca.y;
+      var sa, ta;
+      if (Math.abs(dx) >= Math.abs(dy) * 1.05){ sa = dx >= 0 ? 'r' : 'l'; ta = dx >= 0 ? 'l' : 'r'; }
+      else { sa = dy >= 0 ? 'b' : 't'; ta = dy >= 0 ? 't' : 'b'; }
+      p1 = anchor(a, sa); p2 = anchor(b, ta);
+      if (sa === 'r' || sa === 'l'){
+        var mx = (p1.x + p2.x) / 2;
+        c1 = { x: mx, y: p1.y }; c2 = { x: mx, y: p2.y };
+      } else {
+        var my = (p1.y + p2.y) / 2;
+        c1 = { x: p1.x, y: my }; c2 = { x: p2.x, y: my };
+      }
+    }
+
+    var path = document.createElementNS(NS, 'path');
+    path.setAttribute('d', 'M' + p1.x + ',' + p1.y + ' C' + c1.x + ',' + c1.y + ' ' +
+      c2.x + ',' + c2.y + ' ' + p2.x + ',' + p2.y);
+    path.setAttribute('class', 'edge e-' + type);
+    path.setAttribute('marker-end', 'url(#arw-' + type + ')');
+    path.dataset.a = e[0];
+    path.dataset.b = e[1];
+    svg.appendChild(path);
+
+    if (label){
+      var m = cubicAt(p1, c1, c2, p2, 0.5);
+      var t = document.createElementNS(NS, 'text');
+      t.setAttribute('x', m.x);
+      t.setAttribute('y', m.y - 4);
+      t.setAttribute('text-anchor', 'middle');
+      t.setAttribute('class', 'elabel l-' + type);
+      t.textContent = label;
+      svg.appendChild(t);
+    }
+  });
+
+  /* ======================= 视图交互 ======================= */
+  var view = { x: 0, y: 0, k: 1 };
+
+  function apply(){
+    stage.style.transform = 'translate(' + view.x + 'px,' + view.y + 'px) scale(' + view.k + ')';
+  }
+
+  function fit(){
+    var vw = viewport.clientWidth, vh = viewport.clientHeight;
+    var k = Math.min((vw - 48) / STAGE_W, (vh - 48) / stageH);
+    k = Math.max(0.22, Math.min(1, k));
+    view.k = k;
+    view.x = (vw - STAGE_W * k) / 2;
+    view.y = (vh - stageH * k) / 2;
+    apply();
+  }
+
+  function zoomAt(factor, px, py){
+    var k2 = Math.max(0.15, Math.min(3, view.k * factor));
+    var rect = viewport.getBoundingClientRect();
+    var cx = (px == null) ? rect.width / 2 : px - rect.left;
+    var cy = (py == null) ? rect.height / 2 : py - rect.top;
+    view.x = cx - (cx - view.x) * (k2 / view.k);
+    view.y = cy - (cy - view.y) * (k2 / view.k);
+    view.k = k2;
+    apply();
+  }
+
+  viewport.addEventListener('wheel', function(ev){
+    ev.preventDefault();
+    zoomAt(Math.exp(-ev.deltaY * 0.0014), ev.clientX, ev.clientY);
+  }, { passive: false });
+
+  var drag = null;
+  viewport.addEventListener('pointerdown', function(ev){
+    if (ev.target.closest('.legend,.hint,.topbar')) return;
+    drag = { x: ev.clientX - view.x, y: ev.clientY - view.y };
+    viewport.classList.add('dragging');
+    viewport.setPointerCapture(ev.pointerId);
+  });
+  viewport.addEventListener('pointermove', function(ev){
+    if (!drag) return;
+    view.x = ev.clientX - drag.x;
+    view.y = ev.clientY - drag.y;
+    apply();
+  });
+  function endDrag(ev){
+    if (!drag) return;
+    drag = null;
+    viewport.classList.remove('dragging');
+    try { viewport.releasePointerCapture(ev.pointerId); } catch (e) {}
+  }
+  viewport.addEventListener('pointerup', endDrag);
+  viewport.addEventListener('pointercancel', endDrag);
+  viewport.addEventListener('dblclick', fit);
+
+  document.querySelectorAll('.ctrls button').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var z = btn.dataset.z;
+      if (z === 'in') zoomAt(1.18);
+      else if (z === 'out') zoomAt(1 / 1.18);
+      else fit();
+    });
+  });
+
+  document.querySelectorAll('.ctrls input[data-t]').forEach(function(cb){
+    cb.addEventListener('change', function(){
+      var t = cb.dataset.t;
+      svg.classList.toggle('hide-' + t, !cb.checked);
+    });
+  });
+
+  /* 节点悬停：高亮相关连线 */
+  document.querySelectorAll('.node').forEach(function(node){
+    node.addEventListener('mouseenter', function(){
+      svg.classList.add('dim');
+      svg.querySelectorAll('path.edge').forEach(function(p){
+        if (p.dataset.a === node.id || p.dataset.b === node.id) p.classList.add('hl');
+      });
+    });
+    node.addEventListener('mouseleave', function(){
+      svg.classList.remove('dim');
+      svg.querySelectorAll('path.edge.hl').forEach(function(p){ p.classList.remove('hl'); });
+    });
+  });
+
+  window.addEventListener('resize', fit);
+
+  fit();
+})();
+</script>
+</body>
+</html>
