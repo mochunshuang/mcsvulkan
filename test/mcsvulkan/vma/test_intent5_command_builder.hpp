@@ -1,26 +1,7 @@
 #pragma once
 
-// ============================================================================
-// test_intent5_command_builder.hpp
-//
-// 数据 + 算法，尽量少的状态：
-//   - cur_      正在构建的段（唯一会变的数据）
-//   - pushBase_ 客户端给的推送常量（cur_.pushData 里的地址是解析后的，含义不同）
-//   - 3 个写游标（位置，不是状态）
-//
-// 段的边界由“状态值变了”直接决定，没有隐式规则表。
-//
-// 骨架（顺序不许变）：
-//   builder.reset();
-//   builder.setPipeline / setLayout / setPushData / setMesh
-//   builder.setViewport / setScissor
-//   builder.addInstances(...)
-//   builder.end();
-//   command_emitter::emit(cmd, buffers, builder.stream());
-// ============================================================================
-
-#include "test_intent5_command_stream.hpp"
-#include "test_intent5_shader_buffers.hpp"
+#include "test_intent6_command_stream.hpp"
+#include "test_intent6_shader_buffers.hpp"
 
 #include <cassert>
 #include <cstdint>

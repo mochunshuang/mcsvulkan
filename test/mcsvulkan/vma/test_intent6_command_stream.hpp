@@ -11,7 +11,7 @@
 // 没有 arena、没有 slice：viewport/scissor 就是段自己的字段。
 // ============================================================================
 
-#include "test_intent5_shader_abi.hpp"
+#include "test_intent6_shader_abi.hpp"
 
 #include <cstdint>
 #include <span>

@@ -8,3 +8,4 @@
 #include "memory/create_resources.hpp"
 #include "memory/build_simple_resource.hpp"
 #include "memory/create_texture.hpp"
+#include "memory/buffer_resource_with_address.hpp"

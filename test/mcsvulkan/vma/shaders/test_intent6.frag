@@ -5,7 +5,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_nonuniform_qualifier : require
 
-#include "test_dod22.glsl"
+#include "test_intent6_abi.glsl"
 
 layout(set = 0, binding = 1) uniform texture2D textures[];
 layout(set = 0, binding = 2) uniform sampler samplers[];
@@ -28,27 +28,6 @@ const int FONT_MSDF = 4;
 const int FONT_MTSDF = 5;
 const int FONT_BITMAP = 6;
 const int FONT_NONE = 7;
-
-// ===== 表格专用实例（type 6）：与 C++ table_abi::Cell 一致（80B）=====
-#define CELL_SIZE 80
-struct Cell
-{
-    uint64_t data;
-    uint entity_index;
-    uint user_data;
-    vec4 quad;
-    vec4 fill;
-    vec4 border;
-    vec2 px;
-    float radius;
-    float border_w;
-};
-
-
-layout(buffer_reference, scalar) readonly buffer CellBuffer
-{
-    Cell cells[];
-};
 
 layout(push_constant) uniform PushConsts
 {
@@ -120,32 +99,6 @@ vec4 drawRect(vec2 uv, vec2 cardHalf, vec4 fillColor, Rectangle inst)
     return result;
 }
 
-// 单元格：填充 + 可选内描边（premultiplied，和 UI 管线的 ONE 混合匹配）
-vec4 drawCell(Cell inst)
-{
-    vec2 halfSize = inst.px * 0.5;
-    vec2 p = localPos * inst.px;
-    float d = roundedBoxSDF(p, halfSize, inst.radius);
-    float aa = max(fwidth(d), 0.75);
-
-    float fill_a = 1.0 - smoothstep(-aa, aa, d);
-
-    // 输出必须是 premultiplied：管线是 ONE / ONE_MINUS_SRC_ALPHA
-    float fa = inst.fill.a * fill_a;
-    vec4 col = vec4(inst.fill.rgb * fa, fa);
-
-    if (inst.border_w > 0.0 && inst.border.a > 0.0)
-    {
-        float bw = inst.border_w;
-        // 内描边：d ∈ [-bw, 0]
-        float ring = 1.0 - smoothstep(bw * 0.5 - aa, bw * 0.5 + aa, abs(d + bw * 0.5));
-        float ba = inst.border.a * ring;
-        vec4 b = vec4(inst.border.rgb * ba, ba);
-        col = b + col * (1.0 - b.a);
-    }
-    return col;
-}
-
 // 同一套绘制算法，数据来自 UI 图元（rect/params/color/color2）
 void main()
 {
@@ -209,16 +162,6 @@ void main()
     }
     break;
 
-    case 6: {
-        Cell inst = CellBuffer(instancePtr).cells[0];
-        outPicking = uvec4(inst.user_data, inst.entity_index, packed_z, ~0u);
-        // 最高位 = 只写拾取、不画
-        if ((inst.user_data & 0x01000000u) == 0u)   // state bit0 = 只写拾取
-            outColor = drawCell(inst);
-        else
-            outColor = vec4(0.0);
-    }
-    break;
     default:
         break;
     }

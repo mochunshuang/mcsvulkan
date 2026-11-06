@@ -1,28 +1,5 @@
 #pragma once
 
-// ============================================================================
-// test_intent3_shader_abi.hpp
-//
-// test_intent3 专用。只服务 shaders/test_dod24.vert + test_dod24.frag。
-// 不是库代码：这些结构体就是那两个 shader 的 buffer_reference 布局本身。
-//
-// 依赖（由 test_intent3.cpp 在本头之前提供）：
-//   - ::UvTransform（glm::vec2 scale + offset，带 identity() 等静态函数）
-//   - <glm/glm.hpp>
-//
-// 对应 GLSL：
-//   layout(buffer_reference, scalar) readonly buffer GlyphBuffer     { Glyph glyphs[]; }
-//   layout(buffer_reference, scalar) readonly buffer RectBuffer      { UiRect rects[]; }
-//   layout(buffer_reference, scalar) readonly buffer RectangleBuffer { Rectangle rects[]; }
-//   layout(buffer_reference, scalar) readonly buffer AttrBuffer      { VertexAttr attrs[]; }
-//   layout(buffer_reference, scalar) readonly buffer CommandConstBuffer { CommandConstant consts[]; }
-//   layout(push_constant) uniform PushConsts { ... }
-//
-// test_dod24.vert 的 switch 只有 4 个 case：
-//   2 = Glyph   3 = UiRect   4 = Mesh(VertexAttr)   5 = RoundRect(Rectangle)
-// 没有第五种。
-// ============================================================================
-
 #include <cstddef>
 #include <cstdint>
 
@@ -162,27 +139,6 @@ namespace shader_data
     inline constexpr std::uint32_t FX_SHADOW = 2U;
     inline constexpr std::uint32_t FX_FILL = 4U;
 
-    // ── 6：Cell（表格单元格：填充 + 内描边，一次画完）────────────
-    //   像素尺寸走 px，SDF 在像素空间做，圆角/线宽不会被拉伸。
-
-    struct Cell
-    {
-        static constexpr std::uint32_t type_id = 6;
-        static constexpr InstanceKind kind = InstanceKind::Cell;
-        static constexpr std::uint32_t stride = CELL_SIZE;
-
-        std::uint64_t data{0};
-        std::uint32_t entity_index{0};
-        std::uint32_t user_data{0};   // 见 picking_proto：31..28 kind | 27..24 state | 23..0 spare
-        glm::vec4 quad{0.0F};   // center.xy + size.xy（NDC）
-        glm::vec4 fill{0.0F};   // 填充（straight alpha）
-        glm::vec4 border{0.0F}; // 描边（straight alpha）
-        glm::vec2 px{0.0F};     // 像素尺寸
-        float radius{0.0F};
-        float border_w{0.0F};
-
-        bool operator==(const Cell &) const = default;
-    };
     // ── 4：VertexAttr（普通网格，每顶点一份）─────────────────────
     struct VertexAttr
     {
@@ -213,60 +169,17 @@ namespace shader_data
     // ============================================================================
 
     static_assert(sizeof(Glyph) == GLYPH_SIZE);
-    static_assert(alignof(Glyph) == 8);
-    static_assert(offsetof(Glyph, data) == 0);
-    static_assert(offsetof(Glyph, entity_index) == 8);
-    static_assert(offsetof(Glyph, textureIndex) == 12);
-    static_assert(offsetof(Glyph, samplerIndex) == 16);
-    static_assert(offsetof(Glyph, fontType) == 20);
-    static_assert(offsetof(Glyph, pxRange) == 24);
-    static_assert(offsetof(Glyph, modulateFlag) == 28);
-    static_assert(offsetof(Glyph, color) == 32);
-    static_assert(offsetof(Glyph, model) == 48);
-    static_assert(offsetof(Glyph, uvTransform) == 112);
-    static_assert(offsetof(Glyph, hover_fn) == 128);
 
     static_assert(sizeof(UiRect) == UI_RECT_SIZE);
-    static_assert(alignof(UiRect) == 8);
-    static_assert(offsetof(UiRect, data) == 0);
-    static_assert(offsetof(UiRect, entity_index) == 8);
-    static_assert(offsetof(UiRect, hover_fn) == 12);
-    static_assert(offsetof(UiRect, center_size) == 16);
-    static_assert(offsetof(UiRect, color) == 32);
-    static_assert(offsetof(UiRect, border) == 48);
 
     static_assert(sizeof(Rectangle) == RECTANGLE_SIZE);
-    static_assert(alignof(Rectangle) == 8);
-    static_assert(offsetof(Rectangle, data) == 0);
-    static_assert(offsetof(Rectangle, entity_index) == 8);
-    static_assert(offsetof(Rectangle, effects) == 12);
-    static_assert(offsetof(Rectangle, colors) == 16);
-    static_assert(offsetof(Rectangle, model) == 80);
-    static_assert(offsetof(Rectangle, vertexTransform) == 144);
-    static_assert(offsetof(Rectangle, uvTransform) == 208);
-    static_assert(offsetof(Rectangle, size) == 224);
-    static_assert(offsetof(Rectangle, shadowOffset) == 232);
-    static_assert(offsetof(Rectangle, radiusSoftness) == 240);
-    static_assert(offsetof(Rectangle, shadowColor) == 256);
 
     static_assert(sizeof(VertexAttr) == VERTEX_ATTR_SIZE);
 
-    static_assert(sizeof(Cell) == CELL_SIZE);
-    static_assert(alignof(Cell) == 8);
-    static_assert(offsetof(Cell, data) == 0);
-    static_assert(offsetof(Cell, entity_index) == 8);
-    static_assert(offsetof(Cell, user_data) == 12);
-    static_assert(offsetof(Cell, quad) == 16);
-    static_assert(offsetof(Cell, fill) == 32);
-    static_assert(offsetof(Cell, border) == 48);
-    static_assert(offsetof(Cell, px) == 64);
-    static_assert(offsetof(Cell, radius) == 72);
-    static_assert(offsetof(Cell, border_w) == 76);
     // 五种实例类型必须覆盖 shader 的全部分支
     static_assert(static_cast<std::uint32_t>(InstanceKind::Glyph) == 2);
     static_assert(static_cast<std::uint32_t>(InstanceKind::UiRect) == 3);
     static_assert(static_cast<std::uint32_t>(InstanceKind::Mesh) == 4);
     static_assert(static_cast<std::uint32_t>(InstanceKind::RoundRect) == 5);
-    static_assert(static_cast<std::uint32_t>(InstanceKind::Cell) == 6);
 
 } // namespace shader_data

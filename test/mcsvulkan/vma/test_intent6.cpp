@@ -490,9 +490,8 @@ struct picking_result
 static_assert(sizeof(picking_result) == 16);
 //diff: [test_dod16] end
 // test_intent5 独占的整条着色器管线（从 test_intent4 复制：type 6 = Cell）
-#include "test_intent5_shader_abi.hpp"
-#include "test_intent5_command_emitter.hpp"
-#include "test_intent5_frame_context.hpp"
+#include "test_intent6_frame_context.hpp"
+
 #include <nlohmann/json.hpp>
 constexpr auto inputInit(float aspect)
 {
@@ -9448,11 +9447,9 @@ try
 
     // diff: [test_indirectdraw] end
     // diff: [test_dod5] start
-    static constexpr auto mainPipeline = make_aggregate<
-        "mainPipeline", "transitionImageLayout", "beginRendering", "setPipelineState",
-        "draw", "endRendering">(
-        std::constant_wrapper<[](world_type &world, input_type &inputCtx,
-                                 data_type &soaCtx) {
+    static constexpr auto mainPipeline = make_aggregate<"mainPipeline">(
+        method<"transitionImageLayout">([](world_type &world, input_type &inputCtx,
+                                           data_type &soaCtx) {
             auto &globalCtx = world.globalCtx;
             auto &mainCtx = world.mainCtx;
             auto &recordCtx = world.recordCtx;
@@ -9528,9 +9525,9 @@ try
                             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}}
                 //diff: [test_indirectdraw_no_pick] end
             );
-        }>{},
-        std::constant_wrapper<[](world_type &world, input_type &inputCtx,
-                                 data_type &soaCtx) {
+        }),
+        method<"beginRendering">([](world_type &world, input_type &inputCtx,
+                                    data_type &soaCtx) {
             auto &globalCtx = world.globalCtx;
             auto &mainCtx = world.mainCtx;
             auto &recordCtx = world.recordCtx;
@@ -9601,9 +9598,9 @@ try
                  .pColorAttachments = attachments.data(),
                  //diff: [test_indirectdraw_no_pick] end
                  .pDepthAttachment = &depthAttachment});
-        }>{},
-        std::constant_wrapper<[](world_type &world, input_type &inputCtx,
-                                 data_type &soaCtx) {
+        }),
+        method<"setPipelineState">([](world_type &world, input_type &inputCtx,
+                                      data_type &soaCtx) {
             auto &globalCtx = world.globalCtx;
             auto &mainCtx = world.mainCtx;
             auto &recordCtx = world.recordCtx;
@@ -9640,9 +9637,8 @@ try
                 memcpy(uniformBuffers[currentFrame].mapPtr(), &ubo, sizeof(ubo));
             };
             uploadUniformBuffers();
-        }>{},
-        std::constant_wrapper<[](world_type &world, input_type &inputCtx,
-                                 data_type &soaCtx) {
+        }),
+        method<"draw">([](world_type &world, input_type &inputCtx, data_type &soaCtx) {
             auto &mainShaderCtx = world.mainShaderCtx;
             auto &recordCtx = world.recordCtx;
             auto &globalCtx = world.globalCtx;
@@ -9702,12 +9698,11 @@ try
             screen.recorderCmd(currentFrame, context);
 
             builder.end();
-            shader_data::command_emitter::emit(commandBuffer, frame.buffers,
+            shader_data::emit(commandBuffer, frame.buffers,
                                                builder.stream());
             // diff: [test_dod21] end
-        }>{},
-        std::constant_wrapper<[](world_type &world, input_type &inputCtx,
-                                 data_type &soaCtx) {
+        }),
+        method<"endRendering">([](world_type &world, input_type &inputCtx, data_type &soaCtx) {
             auto &mainShaderCtx = world.mainShaderCtx;
             auto &recordCtx = world.recordCtx;
             auto &globalCtx = world.globalCtx;
@@ -9763,7 +9758,7 @@ try
 
                 //diff: [test_indirectdraw_no_pick] end
             }
-        }>{});
+        }));
     // NOLINTNEXTLINE
     static constexpr auto recordCommandBuffer = [](world_type &world,
                                                    input_type &inputCtx,

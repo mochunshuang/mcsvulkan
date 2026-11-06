@@ -4,59 +4,38 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_ARB_shader_draw_parameters : enable
 
-#include "test_dod22.glsl"
+#include "test_intent6_abi.glsl"
 
 struct VertexData
 {
     vec3 pos;
     vec2 texCoord;
 };
-layout(buffer_reference, scalar) readonly buffer VertexBuffer
-{
-    VertexData vertices[];
-};
-
 struct CameraInfo
 {
     mat4 view;
     mat4 proj;
 };
-layout(set = 0, binding = 0) uniform UniformBufferObject
-{
-    CameraInfo cameraInfo[2];
-}
-ubo;
-
 struct CommandConstant
 {
     uint type_id;
     uint adddress_offset;
     uint slot_count;
 };
+
+layout(buffer_reference, scalar) readonly buffer VertexBuffer
+{
+    VertexData vertices[];
+};
+
+layout(set = 0, binding = 0) uniform UniformBufferObject
+{
+    CameraInfo cameraInfo[2];
+}
+ubo;
 layout(buffer_reference, scalar) readonly buffer CommandConstBuffer
 {
     CommandConstant consts[];
-};
-
-// ===== 表格专用实例（type 6）：一个格子 = 一条实例 =====
-// 与 C++ table_abi::Cell 逐字节一致（80B）
-#define CELL_SIZE 80
-struct Cell
-{
-    uint64_t data;
-    uint entity_index;
-    uint user_data;
-    vec4 quad;   // NDC: center.xy + size.xy
-    vec4 fill;   // 填充色（straight alpha）
-    vec4 border; // 描边色（straight alpha）
-    vec2 px;     // 像素尺寸（SDF 用）
-    float radius;
-    float border_w;
-};
-
-layout(buffer_reference, scalar) readonly buffer CellBuffer
-{
-    Cell cells[];
 };
 
 layout(push_constant) uniform PushConsts
@@ -81,7 +60,6 @@ const uint TYPE_GLYPH = 2u;
 const uint TYPE_RECT = 3u;
 const uint TYPE_MESH = 4u;
 const uint TYPE_ROUND_RECT = 5u;
-const uint TYPE_CELL = 6u;
 
 void main()
 {
@@ -155,17 +133,6 @@ void main()
         fragColor = attr.color;
         localPos = v.pos.xy;
         pos = v.pos;
-    }
-    break;
-
-    case TYPE_CELL: {
-        instancePtr = heapBaseStart + gl_InstanceIndex * CELL_SIZE;
-        Cell inst = CellBuffer(instancePtr).cells[0];
-        model = mat4(vec4(inst.quad.z, 0.0, 0.0, 0.0), vec4(0.0, inst.quad.w, 0.0, 0.0),
-                     vec4(0.0, 0.0, 1.0, 0.0), vec4(inst.quad.xy, 0.0, 1.0));
-        fragColor = inst.fill;
-        localPos = v.pos.xy;
-        pos.xy = v.pos.xy;
     }
     break;
     default:

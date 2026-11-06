@@ -1,71 +1,21 @@
 #pragma once
 
-#include <cassert>
-#include <cstddef>
-#include <cstring>
+#include "../head.hpp"
 
 namespace shader_data
 {
-
-    struct BufferResource
-    {
-        mcs::vulkan::memory::auto_map_buffer buffer{};
-        VkDeviceSize capacity{};
-
-        constexpr void write(std::size_t offset, const void *src,
-                             std::size_t size) noexcept
-        {
-            assert(offset + size <= capacity);
-            std::memcpy(static_cast<char *>(buffer.mapPtr()) + offset, src, size);
-        }
-
-        [[nodiscard]] constexpr void *data() noexcept
-        {
-            return buffer.mapPtr();
-        }
-
-        BufferResource() = default;
-        constexpr BufferResource(const LogicalDevice &device, VkDeviceSize capacity,
-                                 VkBufferUsageFlags usage, VkSharingMode sharingMode,
-                                 VkMemoryPropertyFlags properties)
-            : buffer{mcs::vulkan::memory::auto_map_buffer(
-                  mcs::vulkan::memory::create_simple_buffer(
-                      device,
-                      {.size = capacity, .usage = usage, .sharingMode = sharingMode},
-                      properties),
-                  capacity)},
-              capacity{capacity}
-        {
-        }
-    };
-
-    struct BufferResourceWithAddress : BufferResource
-    {
-        VkDeviceAddress address{};
-
-        BufferResourceWithAddress() = default;
-
-        constexpr BufferResourceWithAddress(const LogicalDevice &device,
-                                            VkDeviceSize capacity,
-                                            VkBufferUsageFlags usage,
-                                            VkSharingMode sharingMode,
-                                            VkMemoryPropertyFlags properties)
-            : BufferResource(device, capacity, usage, sharingMode, properties),
-              address{device.getBufferDeviceAddress(
-                  {.sType = sType<VkBufferDeviceAddressInfo>(),
-                   .buffer = buffer.buffer()})}
-        {
-        }
-    };
+    using mcs::vulkan::memory::buffer_resource;
+    using mcs::vulkan::memory::buffer_resource_with_address;
+    using mcs::vulkan::LogicalDevice;
 
     // shader 需要的数据
     struct ShaderBuffers
     {
-        BufferResourceWithAddress globalVertexBuffer{};
-        BufferResource globalIndexBuffer{};
-        BufferResourceWithAddress globalHeapBuffer{};
-        BufferResource indirectDrawBuffer{};
-        BufferResourceWithAddress commandConstantsBuffer{};
+        buffer_resource_with_address globalVertexBuffer{};
+        buffer_resource globalIndexBuffer{};
+        buffer_resource_with_address globalHeapBuffer{};
+        buffer_resource indirectDrawBuffer{};
+        buffer_resource_with_address commandConstantsBuffer{};
 
         ShaderBuffers() = default;
         constexpr ShaderBuffers(const LogicalDevice &device, VkDeviceSize vertexCapacity,
