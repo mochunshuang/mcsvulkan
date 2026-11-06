@@ -4,28 +4,20 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_ARB_shader_draw_parameters : enable
 
+// 共享 ABI：类型 id / 实例布局 / CommandConstant / push constant / 拾取打包
 #include "test_intent6_abi.glsl"
 
-struct VertexData
-{
-    vec3 pos;
-    vec2 texCoord;
-};
+// ───────────────────────────────────────────────────────────────────────────
+// 顶点阶段独占的输入
+//   相机与顶点缓冲只有顶点阶段用，所以不放进 ABI 头，
+//   否则片元阶段会凭空多出未使用的 descriptor。
+// ───────────────────────────────────────────────────────────────────────────
+
+// 相机 0 = 3D，1 = UI（与 pc.cameraIndex 对应）
 struct CameraInfo
 {
     mat4 view;
     mat4 proj;
-};
-struct CommandConstant
-{
-    uint type_id;
-    uint adddress_offset;
-    uint slot_count;
-};
-
-layout(buffer_reference, scalar) readonly buffer VertexBuffer
-{
-    VertexData vertices[];
 };
 
 layout(set = 0, binding = 0) uniform UniformBufferObject
@@ -33,33 +25,34 @@ layout(set = 0, binding = 0) uniform UniformBufferObject
     CameraInfo cameraInfo[2];
 }
 ubo;
+
+// 顶点本身：位置 + 纹理坐标
+struct VertexData
+{
+    vec3 pos;
+    vec2 texCoord;
+};
+
+layout(buffer_reference, scalar) readonly buffer VertexBuffer
+{
+    VertexData vertices[];
+};
+
+// 每条 indirect draw 一条命令（struct 定义在 ABI 头 §1）
 layout(buffer_reference, scalar) readonly buffer CommandConstBuffer
 {
     CommandConstant consts[];
 };
 
-layout(push_constant) uniform PushConsts
-{
-    uint64_t vertexAddress;
-    uint64_t dataAddress;
-    uint64_t commandConstantsAddress;
-    uint cameraIndex;
-    uint render_version;
-}
-pc;
-const int RENDER_VERSION_BIT_WIDTH = 16;
-
+// ───────────────────────────────────────────────────────────────────────────
+// 顶点 → 片元
+// ───────────────────────────────────────────────────────────────────────────
 layout(location = 0) out vec4 fragColor;
 layout(location = 1) out vec2 fragTexCoord;
 layout(location = 2) flat out uint type_id;
 layout(location = 3) flat out uint64_t instancePtr;
 layout(location = 4) out vec2 localPos;
 layout(location = 5) flat out uint instanceId;
-
-const uint TYPE_GLYPH = 2u;
-const uint TYPE_RECT = 3u;
-const uint TYPE_MESH = 4u;
-const uint TYPE_ROUND_RECT = 5u;
 
 void main()
 {
@@ -69,11 +62,12 @@ void main()
     vec3 pos = vec3(0.0);
     localPos = vec2(0.0);
 
+    // 这条 draw 的命令 + 实例堆基址
     CommandConstBuffer cmdConsts = CommandConstBuffer(pc.commandConstantsAddress);
     CommandConstant cc = cmdConsts.consts[gl_DrawIDARB];
     type_id = cc.type_id;
     instanceId = gl_InstanceIndex;
-    uint64_t heapBaseStart = pc.dataAddress + cc.adddress_offset;
+    uint64_t heapBaseStart = pc.dataAddress + cc.address_offset;
     CameraInfo cam = ubo.cameraInfo[pc.cameraIndex];
 
     VertexBuffer vertBuf = VertexBuffer(pc.vertexAddress);
@@ -129,7 +123,7 @@ void main()
     case TYPE_MESH: {
         uint slot = gl_VertexIndex - gl_BaseVertexARB;
         uint attrIdx = gl_InstanceIndex * cc.slot_count + slot;
-        VertexAttr attr = AttrBuffer(pc.dataAddress + cc.adddress_offset).attrs[attrIdx];
+        VertexAttr attr = AttrBuffer(pc.dataAddress + cc.address_offset).attrs[attrIdx];
         fragColor = attr.color;
         localPos = v.pos.xy;
         pos = v.pos;

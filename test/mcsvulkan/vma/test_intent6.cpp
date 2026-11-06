@@ -9599,45 +9599,45 @@ try
                  //diff: [test_indirectdraw_no_pick] end
                  .pDepthAttachment = &depthAttachment});
         }),
-        method<"setPipelineState">([](world_type &world, input_type &inputCtx,
-                                      data_type &soaCtx) {
-            auto &globalCtx = world.globalCtx;
-            auto &mainCtx = world.mainCtx;
-            auto &recordCtx = world.recordCtx;
-            auto &mainShaderCtx = world.mainShaderCtx;
+        method<"setPipelineState">(
+            [](world_type &world, input_type &inputCtx, data_type &soaCtx) {
+                auto &globalCtx = world.globalCtx;
+                auto &mainCtx = world.mainCtx;
+                auto &recordCtx = world.recordCtx;
+                auto &mainShaderCtx = world.mainShaderCtx;
 
-            auto &swapchain = globalCtx.swapchain;
-            auto &commandBuffers = globalCtx.commandBuffers;
+                auto &swapchain = globalCtx.swapchain;
+                auto &commandBuffers = globalCtx.commandBuffers;
 
-            const auto &[currentFrame, imageIndex] = recordCtx.info;
-            const auto &commandBuffer = commandBuffers[currentFrame];
+                const auto &[currentFrame, imageIndex] = recordCtx.info;
+                const auto &commandBuffer = commandBuffers[currentFrame];
 
-            auto imageExtent = swapchain.imageExtent();
-            auto &pipelineLayout = mainCtx.pipelineLayout;
+                auto imageExtent = swapchain.imageExtent();
+                auto &pipelineLayout = mainCtx.pipelineLayout;
 
-            auto &descriptorSets = mainShaderCtx.descriptorSets;
-            auto descriptorSet = descriptorSets[currentFrame];
+                auto &descriptorSets = mainShaderCtx.descriptorSets;
+                auto descriptorSet = descriptorSets[currentFrame];
 
-            auto &uniformBuffers = mainShaderCtx.uniformBuffers;
+                auto &uniformBuffers = mainShaderCtx.uniformBuffers;
 
-            // 绑定公共资源：索引缓冲、描述符集、推送常量公共部分（如缓冲地址）
-            commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                             *pipelineLayout, 0, 1, &(descriptorSet), 0,
-                                             nullptr);
+                // 绑定公共资源：索引缓冲、描述符集、推送常量公共部分（如缓冲地址）
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &(descriptorSet),
+                                                 0, nullptr);
 
-            auto uploadUniformBuffers = [&]() {
-                UniformBufferObject ubo;
-                // 3D 矩阵从 camera 获取
-                ubo.cameraInfo[0].view = inputCtx.camera.getViewMatrix();
-                ubo.cameraInfo[0].proj = inputCtx.camera.getProjMatrix();
-                // UI 矩阵从 uiCamera 获取
-                ubo.cameraInfo[1].view = inputCtx.uiCamera.getViewMatrix();
-                ubo.cameraInfo[1].proj = inputCtx.uiCamera.getProjMatrix();
+                auto uploadUniformBuffers = [&]() {
+                    UniformBufferObject ubo;
+                    // 3D 矩阵从 camera 获取
+                    ubo.cameraInfo[0].view = inputCtx.camera.getViewMatrix();
+                    ubo.cameraInfo[0].proj = inputCtx.camera.getProjMatrix();
+                    // UI 矩阵从 uiCamera 获取
+                    ubo.cameraInfo[1].view = inputCtx.uiCamera.getViewMatrix();
+                    ubo.cameraInfo[1].proj = inputCtx.uiCamera.getProjMatrix();
 
-                memcpy(uniformBuffers[currentFrame].mapPtr(), &ubo, sizeof(ubo));
-            };
-            uploadUniformBuffers();
-        }),
+                    memcpy(uniformBuffers[currentFrame].mapPtr(), &ubo, sizeof(ubo));
+                };
+                uploadUniformBuffers();
+            }),
         method<"draw">([](world_type &world, input_type &inputCtx, data_type &soaCtx) {
             auto &mainShaderCtx = world.mainShaderCtx;
             auto &recordCtx = world.recordCtx;
@@ -9698,11 +9698,11 @@ try
             screen.recorderCmd(currentFrame, context);
 
             builder.end();
-            shader_data::emit(commandBuffer, frame.buffers,
-                                               builder.stream());
+            shader_data::emit(commandBuffer, frame.buffers, builder.stream());
             // diff: [test_dod21] end
         }),
-        method<"endRendering">([](world_type &world, input_type &inputCtx, data_type &soaCtx) {
+        method<"endRendering">([](world_type &world, input_type &inputCtx,
+                                  data_type &soaCtx) {
             auto &mainShaderCtx = world.mainShaderCtx;
             auto &recordCtx = world.recordCtx;
             auto &globalCtx = world.globalCtx;

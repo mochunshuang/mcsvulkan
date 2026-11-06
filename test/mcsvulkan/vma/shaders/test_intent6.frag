@@ -5,11 +5,18 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_EXT_nonuniform_qualifier : require
 
+// 共享 ABI：类型 id / 实例布局 / push constant / 拾取打包
 #include "test_intent6_abi.glsl"
 
+// ───────────────────────────────────────────────────────────────────────────
+// 片元阶段独占的输入：bindless 纹理与采样器
+// ───────────────────────────────────────────────────────────────────────────
 layout(set = 0, binding = 1) uniform texture2D textures[];
 layout(set = 0, binding = 2) uniform sampler samplers[];
 
+// ───────────────────────────────────────────────────────────────────────────
+// 顶点 → 片元（与 test_intent6.vert 的 location 一一对应）
+// ───────────────────────────────────────────────────────────────────────────
 layout(location = 0) in vec4 fragColor;
 layout(location = 1) in vec2 fragTexCoord;
 layout(location = 2) flat in uint type_id;
@@ -20,32 +27,15 @@ layout(location = 5) flat in uint instanceId;
 layout(location = 0) out vec4 outColor;
 layout(location = 1) out uvec4 outPicking;
 
-const int FONT_HARD_MASK = 0;
-const int FONT_SOFT_MASK = 1;
-const int FONT_SDF = 2;
-const int FONT_PSDF = 3;
-const int FONT_MSDF = 4;
-const int FONT_MTSDF = 5;
-const int FONT_BITMAP = 6;
-const int FONT_NONE = 7;
-
-layout(push_constant) uniform PushConsts
-{
-    uint64_t vertexAddress;
-    uint64_t dataAddress;
-    uint64_t commandConstantsAddress;
-    uint cameraIndex;
-    uint render_version;
-}
-pc;
-const int RENDER_VERSION_BIT_WIDTH = 16;
-#define PRIMITIVE_MASK ((1u << (32 - RENDER_VERSION_BIT_WIDTH)) - 1u)
-
+// ───────────────────────────────────────────────────────────────────────────
+// 采样辅助
+// ───────────────────────────────────────────────────────────────────────────
 float median(float r, float g, float b)
 {
     return max(min(r, g), min(max(r, g), b));
 }
 
+// 把距离场单位换算成屏幕像素（MSDF 抗锯齿宽度）
 float screenPxRange(Glyph inst)
 {
     ivec2 texSize = textureSize(sampler2D(textures[nonuniformEXT(inst.textureIndex)],
@@ -61,6 +51,7 @@ float roundedBoxSDF(vec2 CenterPosition, vec2 HalfSize, float Radius)
     return length(max(abs(CenterPosition) - HalfSize + Radius, 0.0)) - Radius;
 }
 
+// 圆角 + 阴影 + 填充：一次 SDF 求值出最终颜色
 vec4 drawRect(vec2 uv, vec2 cardHalf, vec4 fillColor, Rectangle inst)
 {
     bool fxRounded = (inst.effects & FX_ROUNDED) != 0u || inst.radiusSoftness.x > 0.0;
@@ -99,7 +90,6 @@ vec4 drawRect(vec2 uv, vec2 cardHalf, vec4 fillColor, Rectangle inst)
     return result;
 }
 
-// 同一套绘制算法，数据来自 UI 图元（rect/params/color/color2）
 void main()
 {
     outColor = fragColor;
@@ -109,7 +99,7 @@ void main()
 
     switch (type_id)
     {
-    case 2: {
+    case TYPE_GLYPH: {
         Glyph inst = GlyphBuffer(instancePtr).glyphs[0];
         vec4 texColor = texture(sampler2D(textures[nonuniformEXT(inst.textureIndex)],
                                           samplers[nonuniformEXT(inst.samplerIndex)]),
@@ -140,7 +130,7 @@ void main()
         outPicking = uvec4(type_id, inst.entity_index, packed_z, inst.hover_fn);
     }
     break;
-    case 3: {
+    case TYPE_RECT: {
         UiRect inst = RectBuffer(instancePtr).rects[0];
         float strip = max(abs(localPos.x), abs(localPos.y));
         float alpha = smoothstep(0.5 - inst.border, 0.5, strip);
@@ -148,7 +138,7 @@ void main()
         outPicking = uvec4(type_id, inst.entity_index, packed_z, inst.hover_fn);
     }
     break;
-    case 5: {
+    case TYPE_ROUND_RECT: {
         Rectangle inst = RectangleBuffer(instancePtr).rects[0];
         vec2 cardHalf = inst.size * 0.5;
         vec2 uv = localPos * inst.size;
@@ -156,7 +146,7 @@ void main()
         outPicking = uvec4(type_id, inst.entity_index, packed_z, ~0u);
     }
     break;
-    case 4: {
+    case TYPE_MESH: {
         outColor = fragColor;
         outPicking = uvec4(type_id, instanceId, packed_z, ~0u);
     }
