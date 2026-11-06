@@ -201,6 +201,18 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_intent3 test_dod24.vert test_dod24.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
+# test_intent4 独占的着色器 ABI：新增 type 6 = 表格单元格（填充 + 描边）
+add_std_glsl_target(test_intent4 test_intent4.vert test_intent4.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
+# test_intent5：表 = 数据（列数运行时决定）。ABI / 着色器 / 表实现都独立一份。
+add_std_glsl_target(test_intent5 test_intent5.vert test_intent5.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
+add_std_glsl_target(test_intent6 test_intent6.vert test_intent6.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
+
 add_std_glsl_target(test_ui_ability test_ui_ability.vert test_ui_ability.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 

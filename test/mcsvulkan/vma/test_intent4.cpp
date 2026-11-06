@@ -489,9 +489,11 @@ struct picking_result
 };
 static_assert(sizeof(picking_result) == 16);
 //diff: [test_dod16] end
-#include "test_intent3_shader_abi.hpp"
-#include "test_intent3_frame_context.hpp"
-#include "test_intent3_command_emitter.hpp"
+// test_intent4 独占的整条着色器管线（从 test_intent3 复制后原地扩展 type 6 = Cell）
+#include "test_intent4_shader_abi.hpp"
+#include "test_intent4_command_emitter.hpp"
+#include "test_intent4_frame_context.hpp"
+#include <nlohmann/json.hpp>
 constexpr auto inputInit(float aspect)
 {
     auto camera = [&]() {
@@ -631,11 +633,11 @@ constexpr auto initDrawRecorder(const LogicalDevice &device,
 
     std::array<shader_data::FrameContext, MAX_FRAMES_IN_FLIGHT> drawRecorder{
         shader_data::FrameContext(device, deviceDynCaps, vertexCapacity, indexCapacity,
-                                  heapCapacity, indirectDrawCapacity,
-                                  commandConstantsCapacity),
+                                heapCapacity, indirectDrawCapacity,
+                                commandConstantsCapacity),
         shader_data::FrameContext(device, deviceDynCaps, vertexCapacity, indexCapacity,
-                                  heapCapacity, indirectDrawCapacity,
-                                  commandConstantsCapacity)};
+                                heapCapacity, indirectDrawCapacity,
+                                commandConstantsCapacity)};
     return drawRecorder;
 }
 //
@@ -1860,6 +1862,9 @@ constexpr auto &hoverPool() noexcept
 }
 struct render_context
 {
+        // 本帧 GPU 拾取结果（由绘制任务填入；每帧新建，不存在“旧值”）
+        picking_result last_pick{};
+
     shader_data::CommandBuilder &drawRecorder;
     glfw_input &input;
     FrameClock &clock;
@@ -2094,6 +2099,7 @@ namespace ui_new
     struct RenderObject
     {   
     virtual constexpr void render(ScreenWidget*screen,Widget* owner,render_context &context) = 0;
+        virtual constexpr void tick(double) {}
         virtual ~RenderObject() = default;
     };
 
@@ -2153,6 +2159,7 @@ namespace ui_new
     };
     struct ScreenWidget
     {
+
         constexpr render_version_t::underlying_t renderVersion() const noexcept { return renderVersion_ + static_cast<uint8_t>(versionDirty_);}
 
         constexpr void makeLayoutDirty(uint32_t frame) noexcept
@@ -2169,6 +2176,15 @@ namespace ui_new
         constexpr bool isRenderDirty(uint32_t frame) const noexcept
         { return renderDirty_[frame]; }
         constexpr bool hasDirty(uint32_t frame) const noexcept {return isLayoutDirty(frame) || isRenderDirty(frame); }
+
+        constexpr void tick(double now) noexcept
+        {
+            if (auto *p = root_.get())
+                p->visit([now](Widget &w) {
+                    if (w.renderObject)
+                        w.renderObject->tick(now);
+                });
+        }
 
         constexpr void layout()
         {
@@ -8748,6 +8764,12 @@ namespace render
         {
             agg.template invoke<"render">(s, owner, ctx);
         }
+
+        constexpr void tick(double now) override
+        {
+            if constexpr (requires() { agg.template invoke<"tick">(now); })
+                agg.template invoke<"tick">(now);
+        }
     };
     template <typename Agg, static_string hover_fn_name>
     struct HoverFn
@@ -8784,17 +8806,43 @@ namespace render
 //diff: [test_intent] end
 
 // ═══════════════════════════════════════════════════════════════════════
-// table_demo：一张“数据 + 算法”的表
+// table_demo：数据 + 算法 的表
 //
-//   类型层：column<...> 是 part，table_schema<...> 是 composed type
-//   对象层：make_table<Schema>(rows, font) 造出“数据 + 端口”的聚合
-//   算法层：solve_columns / window_for / shape_cell / push_rect / push_text
+//   ① model    rows + order（视图序 → 数据序）+ sort      —— 纯数据
+//   ② state    选择 / 焦点 / 滚动 / 列宽 / 编辑 / 光标     —— 纯状态
+//   ③ geometry solve_columns / visible_range / scrollbar  —— 纯函数（给定输入必得同一结果）
+//   ④ render   只读 model+state+geometry，只发可见实例    —— 无状态
+//   ⑤ events   glfw_input_translation → input_event → arbiter → on_*
 //
-//   没有为表新增任何基类；它和 TextBox 一样，只是一个带
-//   field<> + method<"render"> 的聚合，靠 asRenderObject 上桌。
+//   作用域固定四级：cell → row → column → table。
+//   渲染只发“看得见”的行列：visible_rows × visible_cols，其余不进缓冲。
+//
+//   ABI：表独占 shader_data::Cell（type 6，填充+描边一体），
+//        定义在 test_intent4_shader_abi.hpp，着色器 test_intent4.vert/.frag。
+//        test_intent3 的 ABI 与构建器一个字节都没动。
 // ═══════════════════════════════════════════════════════════════════════
 namespace table_demo
 {
+// ════════════════════════════════════════════════════════════════════════
+//  org（本文件的组织约定：数据 → 算法 → 状态 → 对象）
+//
+//   1. 类型层       column / table_schema        —— 编译期列定义（纯数据）
+//   2. 命中         region / hit                 —— 二维地址（纯数据）
+//   3. 几何         geometry / table_metrics     —— 一次求解的产物（纯数据）
+//   4. 状态         state                        —— 交互状态（MVP 的 view-model）
+//   5. 命中测试     hit_test                     —— 算法：坐标 → 地址
+//   6. 拾取协议     picking_proto / input_scope  —— 提交端与解析端共用的约定
+//   7. 文本整形     shape_cell / UTF-8           —— 算法：文本 → 字形
+//   8. 具体表       make_table<Schema>           —— 对象层：方法 = 对数据的操作
+//   9. 事件 Trait   click / drag / wheel / key   —— 输入契约
+//  10. 对象层      聚合体 + 绑定                 —— 数据 + 算法的组合
+//
+//  规则：
+//   · 数据只读由算法消费；写只发生在方法里
+//   · 跨函数共享的状态一律放 state，不做局部静态
+//   · 渲染只读状态，不写状态
+// ════════════════════════════════════════════════════════════════════════
+
     using namespace ui_new;
 
     // ── 1. 类型层：列 = part ────────────────────────────────────────
@@ -8806,7 +8854,6 @@ namespace table_demo
         static constexpr float weight = static_cast<float>(Weight);
     };
 
-    // ── 2. 类型层：表 = 列的 composed_type ──────────────────────────
     template <class... Cols>
     struct table_schema
     {
@@ -8816,7 +8863,6 @@ namespace table_demo
         static constexpr std::array<float, count> weights{Cols::weight...};
     };
 
-    // ── 3. 运行期数据 ──────────────────────────────────────────────
     template <std::size_t N>
     struct table_metrics
     {
@@ -8827,59 +8873,461 @@ namespace table_demo
     struct table_prefs
     {
         float pad = 12.0f;      // 列间距（px）
-        float row_h = 30.0f;    // 行高（px）
-        float row_gap = 2.0f;   // 行间距（px）
-        float header_h = 40.0f; // 表头高（px）
-        int selected = 3;       // 选中行（演示状态）
+        float row_h = 30.0f;    // 行高
+        float row_gap = 2.0f;   // 行间距
+        float header_h = 40.0f; // 表头高
+        float cell_pad = 10.0f; // 文本左内边距
+        float min_col_w = 56.0f;
+        float max_col_w = 640.0f;
+        float bar = 7.0f; // 滚动条粗细
     };
 
-    struct row_window
+    // ── 2. 命中：作用域 + 二维地址 ─────────────────────────────────
+    enum class region : std::uint8_t
     {
-        std::size_t first = 0;
-        std::size_t last = 0;
+        outside,
+        header,
+        cell,
+        separator,
+        vbar,
+        hbar,
     };
 
-    // ── 4. 算法层：列宽求解（fixed + flex，余数给最后一列）──────────
+    struct hit
+    {
+        region r{region::outside};
+        int row = -1;
+        int col = -1;
+        bool thumb = false;
+
+        [[nodiscard]] constexpr bool inside() const noexcept
+        {
+            return r != region::outside;
+        }
+        friend constexpr bool operator==(const hit &, const hit &) = default;
+    };
+
+    // ── 3. 几何：一次求解的产物（纯数据，事件层只读）──────────────
+    template <std::size_t N>
+    struct geometry
+    {
+        table_metrics<N> m{};
+        float x0 = 0, y0 = 0, w = 0, h = 0;
+        float header_h = 0, body_h = 0, cell_pad = 0, pad = 0, row_h = 0, row_gap = 0;
+        float scroll_x = 0, scroll_y = 0;
+        float max_x = 0, max_y = 0;
+        float content_w = 0, content_h = 0;
+
+        struct bar
+        {
+            float x = 0, y = 0, w = 0, h = 0; // 相对表原点
+            float thumb_off = 0, thumb_len = 0;
+        };
+        bar vb{}, hb{};
+        bool vb_on = false, hb_on = false;
+
+        int col0 = 0, col1 = 0; // 可见列 [col0, col1)
+        int row0 = 0, row1 = 0; // 可见行 [row0, row1)
+
+        bool valid = false;
+    };
+
+    // ── 4. 状态：交互状态（MVP 的 view-model）─────────────────────
+    template <std::size_t N>
+    struct state
+    {
+        // ── 列视图（数据列空间）──────────────────────────────
+        std::array<int, N> col_order{};       // 位次 → 数据列（全排列）
+        bool col_ready = false;
+        std::array<float, N> col_w{};         // 按数据列：>0 宽度，-1 隐藏
+
+        // ── 选择（视图行空间）────────────────────────────────
+        int selected = 3;
+        int anchor = 3;
+        std::vector<std::uint8_t> sel{};
+        int row = 3, col = 0;                 // 焦点：行 + 视图位次
+        // ── 单元格矩形选区（步骤 2：先只有数据，尚未启用）──────
+        bool sel_rect = false;                // 矩形选区是否生效
+        int sr0 = -1, sc0 = -1;               // 起点（视图行/位次）
+        int sr1 = -1, sc1 = -1;               // 终点（视图行/位次）
+        hit hover{};
+
+        // ── 视口 ─────────────────────────────────────────────
+        float scroll_x = 0.0f, scroll_y = 0.0f;
+
+        // ── 排序（数据列空间）────────────────────────────────
+        int sort_col = -1, sort_dir = 0;
+
+        // ── 编辑（视图位次）──────────────────────────────────
+        bool editing = false;
+        int edit_row = -1, edit_col = -1;
+        std::string buf{};
+        std::size_t caret = 0;
+        std::size_t edit_anchor = 0;
+
+        // ── 拖拽 / 菜单 ──────────────────────────────────────
+        int drag = 0;
+        int drag_col = -1, drag_pos = -1;
+        float drag_start_w = 0.0f, drag_grab = 0.0f;
+        bool menu_open = false;
+        int menu_pos = -1;
+        float menu_ax = 0.0f, menu_ay = 0.0f;
+        std::int64_t last_click = -100000;
+        // ── tooltip（计时 + 目标）─────────────────────────────
+        std::int64_t tt_t0 = 0;
+        int tt_state = 0;   // 0 无 / 1 计时中 / 2 已显示
+        int tick_count = 0; // 自测用：证明 tick 每帧被调用
+        std::string tt_text{};
+    };
+
+    // ════════════════════════════════════════════════════════════════
+    // 算法层：全部是纯函数（输入 → 输出，不碰全局）
+    // ════════════════════════════════════════════════════════════════
+
+    // 列宽：按**视图位次**求解；宽度/权重/覆盖都通过 order 取数据列
     template <class Schema>
-    table_metrics<Schema::count> solve_columns(float avail, const table_prefs &prefs,
-                                               float scale = 1.0f)
+    table_metrics<Schema::count>
+    solve_columns(float avail, const table_prefs &p,
+                  const std::array<float, Schema::count> &override_w,
+                  const std::array<int, Schema::count> &order)
     {
         constexpr std::size_t N = Schema::count;
         table_metrics<N> m{};
+
+        std::array<float, N> target{};
         float fixed = 0.0f, weight = 0.0f;
         for (std::size_t i = 0; i < N; ++i)
         {
-            if (Schema::weights[i] > 0.0f)
-                weight += Schema::weights[i];
+            const int d = order[i];
+            if (override_w[d] < 0.0f)
+                target[i] = 0.0f;
+            else if (override_w[d] > 0.0f)
+                target[i] = override_w[d];
+            else if (Schema::weights[d] > 0.0f)
+                target[i] = -1.0f;
             else
-                fixed += Schema::widths[i] * scale;
+                target[i] = Schema::widths[d];
+
+            if (target[i] > 0.0f)
+                fixed += target[i];
+            else
+                weight += Schema::weights[d];
         }
-        const float inner = std::max(0.0f, avail - prefs.pad * static_cast<float>(N + 1));
-        const float flex = std::max(0.0f, inner - fixed);
-        float x = prefs.pad;
+
+        const float inner =
+            std::max(0.0f, avail - p.pad * static_cast<float>(N + 1));
+        constexpr float flex_min = 140.0f;
+        const float flex =
+            std::max(inner - fixed, weight > 0.0f ? flex_min : 0.0f);
+
+        float x = p.pad;
         for (std::size_t i = 0; i < N; ++i)
         {
-            const float w = Schema::weights[i] > 0.0f ? flex * Schema::weights[i] / weight
-                                                      : Schema::widths[i] * scale;
+            const int d = order[i];
+            const float w =
+                target[i] >= 0.0f
+                    ? target[i]
+                    : (weight > 0.0f ? flex * Schema::weights[d] / weight : 0.0f);
             m.x[i] = x;
             m.w[i] = static_cast<float>(static_cast<int>(w));
-            x += m.w[i] + prefs.pad;
+            x += m.w[i] + p.pad;
         }
-        m.w[N - 1] += std::max(0.0f, avail - x);
+        // 有富余就填满视口；不够就让它溢出（横向滚动条负责）
+        if (const float rest = avail - x; rest > 0.0f)
+            m.w[N - 1] += rest;
         return m;
     }
 
-    // ── 5. 算法层：可见行窗口（定高，O(1)）─────────────────────────
-    inline row_window window_for(float scroll, float body_h, std::size_t n, float step)
+    template <std::size_t N>
+    inline int column_at(const table_metrics<N> &m, float px) noexcept
     {
-        if (n == 0 || step <= 0.0f)
-            return {};
-        const std::size_t first = static_cast<std::size_t>(scroll / step);
-        const std::size_t span = static_cast<std::size_t>(body_h / step) + 2;
-        return {std::min(first, n), std::min(n, first + span)};
+        int best = -1;
+        for (std::size_t c = 0; c < N; ++c)
+            if (m.w[c] > 0.0f && px >= m.x[c])
+                best = static_cast<int>(c);
+        return best;
     }
 
-    // ── 6. 算法层：一个单元格 → glyph 模板（相对 cell 原点）──────────
+    // 数据列 → 视图位次（列重排后两者不再相等）
+    template <std::size_t N>
+    inline int pos_of(const std::array<int, N> &order, int data_col) noexcept
+    {
+        for (std::size_t i = 0; i < N; ++i)
+            if (order[i] == data_col)
+                return static_cast<int>(i);
+        return -1;
+    }
+
+    // 可见列：起点列 + 向右扫到视口右边
+    template <std::size_t N>
+    inline void visible_cols(const table_metrics<N> &m, float sx, float w, int &c0,
+                             int &c1) noexcept
+    {
+        constexpr int Nn = static_cast<int>(N);
+        c0 = std::clamp(column_at(m, sx), 0, Nn - 1);
+        c1 = c0;
+        while (c1 < Nn && m.x[c1] < sx + w)
+            ++c1;
+    }
+
+    inline void visible_rows(float sy, float body_h, std::size_t n, float step, int &r0,
+                             int &r1) noexcept
+    {
+        if (n == 0 || step <= 0.0f)
+        {
+            r0 = r1 = 0;
+            return;
+        }
+        const int total = static_cast<int>(n);
+        r0 = std::clamp(static_cast<int>(sy / step), 0, total);
+        r1 = std::min(total, r0 + static_cast<int>(body_h / step) + 2);
+    }
+
+    // 一个滚动条的几何：track + thumb
+    struct bar_geom
+    {
+        float x = 0, y = 0, w = 0, h = 0;
+        float thumb_off = 0, thumb_len = 0;
+        bool on = false;
+    };
+
+    // track_len：滚动条“长边”的长度（竖条 = 高，横条 = 宽）。
+    // 注意 thumb 长度必须按 track_len 算，且下限要 clamp 到 track_len 以内，
+    // 否则 std::clamp(v, 28, track_len) 在 track_len < 28 时是 UB（横条就是这种）。
+    inline bar_geom make_bar(float x, float y, float w, float h, float track_len,
+                             float content, float visible, float scroll) noexcept
+    {
+        bar_geom b{};
+        b.on = content > visible + 0.5f;
+        if (!b.on || track_len <= 0.0f)
+            return b;
+        b.x = x;
+        b.y = y;
+        b.w = w;
+        b.h = h;
+        const float lo = std::min(28.0f, track_len);
+        b.thumb_len = std::clamp(track_len * visible / content, lo, track_len);
+        const float maxs = content - visible;
+        b.thumb_off = maxs > 0.0f ? (scroll / maxs) * (track_len - b.thumb_len) : 0.0f;
+        return b;
+    }
+
+    // ── 5. 命中测试 ────────────────────────────────────────────────
+    // ── 浮层定位（菜单 / tooltip 共用）──────────────────────
+    // ── 输入作用域（事件归属的管理层）──────────────────────────
+    // ── 6. 拾取协议 / 输入作用域 ──────────────────────────────────
+
+    enum class scope_kind : std::uint8_t
+    {
+        window,
+        panel,
+        modal
+    };
+
+    // 表在窗口里的布局（唯一来源：渲染与作用域登记共用）
+    inline constexpr float kTableMargin = 40.0f;
+    inline constexpr float kTableTop = 100.0f;
+
+    struct input_scope
+    {
+        std::uint32_t id = 0;
+        scope_kind kind = scope_kind::panel;
+        int priority = 0;
+        float x = 0, y = 0, w = 0, h = 0;
+        bool modal = false;
+        bool captures_pointer = false;
+        bool captures_keys = false;
+    };
+
+    // 应用级作用域注册表（组件在首次布局后登记自身）
+    inline std::vector<input_scope> g_scope_registry;
+
+
+    // ═══ picking 协议 ══════════════════════════════════════════════════════
+    // 提交端按此写字段，解析端按此读字段（同一份定义，不得各自写魔法数）
+    //   hover_fn     : 作用域（注册序号，全局唯一、单调递增）
+    //   user_data    : 31..28 kind | 27..24 state | 23..0 spare
+    //   entity_index : 该 kind 下的索引（body: row*N+pos，header: pos，…）
+    namespace picking_proto
+    {
+        enum kind : std::uint32_t
+        {
+            kHeader = 1,
+            kBody = 2,
+            kFooter = 3,
+            kThumb = 4,
+            kTrack = 5,
+            kMenu = 6
+        };
+        enum state_bit : std::uint32_t
+        {
+            kPickOnly = 1u << 0,
+            kRounded = 1u << 1,
+            kDisabled = 1u << 2,
+            kSelected = 1u << 3
+        };
+        constexpr std::uint32_t make_user_data(std::uint32_t kind,
+                                               std::uint32_t state = 0) noexcept
+        {
+            return (kind << 28) | ((state & 0xFu) << 24);
+        }
+        constexpr std::uint32_t kind_of(std::uint32_t ud) noexcept
+        {
+            return (ud >> 28) & 0xFu;
+        }
+        constexpr std::uint32_t state_of(std::uint32_t ud) noexcept
+        {
+            return (ud >> 24) & 0xFu;
+        }
+    } // namespace picking_proto
+
+    // 拾取解码：entity = 1 + row*cols + pos（纯函数，无需 GPU 即可测）
+    inline hit hit_from_pick(std::uint32_t type_id, std::uint32_t entity, int cols,
+                             std::size_t rows) noexcept
+    {
+        if (picking_proto::kind_of(type_id) != picking_proto::kBody || cols <= 0)
+            return hit{};
+        const std::uint32_t id = entity;
+        const int row = static_cast<int>(id / static_cast<std::uint32_t>(cols));
+        const int pos = static_cast<int>(id % static_cast<std::uint32_t>(cols));
+        if (row < 0 || static_cast<std::size_t>(row) >= rows)
+            return hit{};
+        return hit{region::cell, row, pos};
+    }
+
+    // 命中：返回作用域表下标（-1 = 无）。最内层 = priority 最大
+    inline int scope_at(std::span<const input_scope> scopes, float px,
+                        float py) noexcept
+    {
+        int best = -1, best_pri = 0;
+        for (std::size_t i = 0; i < scopes.size(); ++i)
+        {
+            const auto &s = scopes[i];
+            if (px < s.x || px > s.x + s.w || py < s.y || py > s.y + s.h)
+                continue;
+            if (best < 0 || s.priority > best_pri)
+            {
+                best = static_cast<int>(i);
+                best_pri = s.priority;
+            }
+        }
+        return best;
+    }
+
+    // 归属：模态存在时事件一律归模态（点外面 = 关闭），否则按命中
+    inline int scope_owner(std::span<const input_scope> scopes, float px,
+                           float py) noexcept
+    {
+        int modal = -1, modal_pri = 0;
+        for (std::size_t i = 0; i < scopes.size(); ++i)
+            if (scopes[i].modal && (modal < 0 || scopes[i].priority > modal_pri))
+            {
+                modal = static_cast<int>(i);
+                modal_pri = scopes[i].priority;
+            }
+        return modal >= 0 ? modal : scope_at(scopes, px, py);
+    }
+
+    struct overlay_rect
+    {
+        float x = 0, y = 0, w = 0, h = 0;
+    };
+
+    inline overlay_rect overlay_at(float ax, float ay, float w, float h, float x0,
+                                   float y0, float tw, float th, float off_x = 0.0f,
+                                   float off_y = 6.0f) noexcept
+    {
+        overlay_rect r{};
+        r.w = w;
+        r.h = h;
+        r.x = std::clamp(ax + off_x, x0 + 4.0f, x0 + tw - w - 4.0f);
+        r.y = ay + off_y;
+        if (r.y + h > y0 + th)
+            r.y = ay - h - off_y;
+        return r;
+    }
+
+    template <std::size_t N>
+    inline hit hit_test(const geometry<N> &g, std::size_t row_count, double px,
+                        double py) noexcept
+    {
+        if (!g.valid || g.w <= 0.0f || g.h <= 0.0f)
+            return {};
+
+        const double lx = px - g.x0;
+        const double ly = py - g.y0;
+        if (lx < 0.0 || ly < 0.0 || lx > g.w || ly > g.h)
+            return {};
+
+        // 竖向滚动条（表体右侧）
+        if (g.vb_on && lx >= g.vb.x - 2.0 && ly >= g.header_h)
+        {
+            const bool thumb = ly >= g.vb.y + g.vb.thumb_off &&
+                               ly <= g.vb.y + g.vb.thumb_off + g.vb.thumb_len;
+            return {region::vbar, -1, -1, thumb};
+        }
+        // 横向滚动条（表体底部）
+        if (g.hb_on && ly >= g.hb.y - 2.0)
+        {
+            const bool thumb = lx >= g.hb.x + g.hb.thumb_off &&
+                               lx <= g.hb.x + g.hb.thumb_off + g.hb.thumb_len;
+            return {region::hbar, -1, -1, thumb};
+        }
+
+        // 列分隔条（表头 + 表体都能抓）
+        // 冻结列：位次 0 钉在左边，不随 scroll_x 移动
+        const double frozen = static_cast<double>(g.m.x[1]);
+        if (lx < frozen)
+        {
+            const double sep = frozen - static_cast<double>(g.pad) * 0.5;
+            if (lx >= sep - 4.0 && lx <= sep + 4.0)
+                return {region::separator, -1, 0};
+            if (ly < static_cast<double>(g.header_h))
+                return {region::header, -1, 0};
+            const double step = static_cast<double>(g.row_h + g.row_gap);
+            const double body_y =
+                ly - static_cast<double>(g.header_h) + g.scroll_y;
+            if (body_y < 0.0)
+                return {};
+            const auto row = static_cast<long long>(body_y / step);
+            if (row < 0 || static_cast<std::size_t>(row) >= row_count)
+                return {};
+            const double in_row = body_y - static_cast<double>(row) * step;
+            if (in_row > static_cast<double>(g.row_h))
+                return {region::outside, -1, -1};
+            return {region::cell, static_cast<int>(row), 0};
+        }
+        for (std::size_t c = 2; c < N; ++c)
+        {
+            const double sx =
+                static_cast<double>(g.m.x[c] - g.pad * 0.5f) - g.scroll_x;
+            const double d = lx - sx;
+            if (d >= -4.0 && d <= 4.0)
+                return {region::separator, -1, static_cast<int>(c) - 1};
+        }
+
+        if (ly < static_cast<double>(g.header_h))
+            return {region::header, -1,
+                    column_at(g.m, static_cast<float>(lx + g.scroll_x))};
+
+        const double step = static_cast<double>(g.row_h + g.row_gap);
+        const double body_y = ly - static_cast<double>(g.header_h) + g.scroll_y;
+        if (body_y < 0.0)
+            return {};
+
+        const auto row = static_cast<long long>(body_y / step);
+        if (row < 0 || static_cast<std::size_t>(row) >= row_count)
+            return {};
+
+        const double in_row = body_y - static_cast<double>(row) * step;
+        if (in_row > static_cast<double>(g.row_h))
+            return {region::outside, -1, -1};
+
+        return {region::cell, static_cast<int>(row),
+                column_at(g.m, static_cast<float>(lx + g.scroll_x))};
+    }
+
+    // ── 7. 文本整形 / UTF-8 ────────────────────────────────────────
     struct cell_glyphs
     {
         std::vector<shader_data::Glyph> glyphs;
@@ -8915,28 +9363,70 @@ namespace table_demo
         return out;
     }
 
-    // ── 7. 发射器：像素矩形 → Rectangle 实例 ───────────────────────
-    inline void push_rect(std::vector<shader_data::Rectangle> &out, float x, float y,
-                          float w, float h, glm::vec4 color, float vw, float vh,
-                          float radius = 0.0f)
+    inline std::size_t utf8_prev(std::string_view s, std::size_t i) noexcept
     {
-        shader_data::Rectangle r{};
-        r.effects = shader_data::FX_ROUNDED | shader_data::FX_FILL;
-        for (auto &c : r.colors)
-            c = color;
-        const float cx = (x + w * 0.5f) / vw * 2.0f - 1.0f;
-        const float cy = (y + h * 0.5f) / vh * 2.0f - 1.0f;
-        const float sx = w / vw * 2.0f;
-        const float sy = h / vh * 2.0f;
-        r.model = glm::translate(glm::mat4(1.0f), glm::vec3(cx, cy, 0.0f));
-        r.vertexTransform.matrix = glm::scale(glm::mat4(1.0f), glm::vec3(sx, sy, 1.0f));
-        r.uvTransform = UvTransform::identity();
-        r.size = glm::vec2(sx, sy);
-        r.radiusSoftness = glm::vec4(radius, 0.0015f, 0.0f, 0.0f);
-        out.push_back(r);
+        if (i == 0)
+            return 0;
+        --i;
+        while (i > 0 && (static_cast<unsigned char>(s[i]) & 0xC0) == 0x80)
+            --i;
+        return i;
     }
 
-    // ── 8. 发射器：glyph 模板 + 像素平移 → Glyph 实例 ───────────────
+    inline std::size_t utf8_next(std::string_view s, std::size_t i) noexcept
+    {
+        if (i >= s.size())
+            return s.size();
+        ++i;
+        while (i < s.size() && (static_cast<unsigned char>(s[i]) & 0xC0) == 0x80)
+            ++i;
+        return i;
+    }
+
+    inline void append_utf8(std::string &s, std::uint32_t cp) noexcept
+    {
+        if (cp < 0x80)
+            s.push_back(static_cast<char>(cp));
+        else if (cp < 0x800)
+        {
+            s.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+            s.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+        else if (cp < 0x10000)
+        {
+            s.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+            s.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            s.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+        else
+        {
+            s.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+            s.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+            s.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+            s.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+        }
+    }
+
+    inline void push_cell(std::vector<shader_data::Cell> &out, float x, float y, float w,
+                          float h, glm::vec4 fill, float radius, float vw, float vh,
+                          glm::vec4 border = {}, float border_w = 0.0f,
+                          std::uint32_t entity = 0)
+    {
+        if (w <= 0.5f || h <= 0.5f)
+            return;
+        shader_data::Cell c{};
+        c.entity_index = entity;
+        c.quad = glm::vec4(((x + w * 0.5f) / vw) * 2.0f - 1.0f,
+                           ((y + h * 0.5f) / vh) * 2.0f - 1.0f, (w / vw) * 2.0f,
+                           (h / vh) * 2.0f);
+        c.px = glm::vec2(w, h);
+        c.fill = fill;
+        c.border = border;
+        c.border_w = border_w;
+        c.radius = radius;
+        out.push_back(c);
+    }
+
     inline void push_text(std::vector<shader_data::Glyph> &out, const cell_glyphs &cg,
                           float x, float baseline, float vw, float vh, glm::vec4 color)
     {
@@ -8953,68 +9443,1111 @@ namespace table_demo
         }
     }
 
-    // ── 9. 具体表：列 schema + 行数据 ──────────────────────────────
+    // ── 8. 具体表 ──────────────────────────────────────────────────
     using demo_schema =
         table_schema<column<"Name", 220>, column<"Status", 0, 1>, column<"Size", 80>,
                      column<"Modified", 130>, column<"Action", 70>>;
 
     using demo_row = std::array<std::string, demo_schema::count>;
 
-    inline std::vector<demo_row> demo_rows()
+    inline nlohmann::json demo_rows()
     {
-        std::vector<demo_row> rows;
-        const char *names[] = {"atlas.msdf", "ui.frag", "table.vert", "scene.gltf",
-                               "font.json"};
-        const char *status[] = {"ready", "busy", "ready", "error", "ready"};
-        for (int i = 0; i < 18; ++i)
-        {
-            rows.push_back(demo_row{
-                std::string(names[i % 5]) + "#" + std::to_string(i),
-                status[i % 5],
-                std::to_string(12 + i * 7) + ".5 KB",
-                "2026-10-" + std::to_string(10 + i % 20),
-                (i % 3) ? "open" : "edit",
-            });
-        }
-        return rows;
+        static const char *kTableJson = R"json([
+  {"Name":"atlas.msdf#0","Status":"ready","Size":"12.5 KB","Modified":"2026-10-10","Action":"edit"},
+  {"Name":"ui.frag#1","Status":"busy","Size":"19.5 KB","Modified":"2026-10-11","Action":"open"},
+  {"Name":"table.vert#2","Status":"ready","Size":"26.5 KB","Modified":"2026-10-12","Action":"open"},
+  {"Name":"scene.gltf#3","Status":"error","Size":"33.5 KB","Modified":"2026-10-13","Action":"edit"},
+  {"Name":"font.json#4","Status":"ready","Size":"40.5 KB","Modified":"2026-10-14","Action":"open"},
+  {"Name":"atlas.msdf#5","Status":"ready","Size":"47.5 KB","Modified":"2026-10-15","Action":"open","tooltip":"pinned by CI","cells":{"Size":"cache: 3 blocks"}},
+  {"Name":"ui.frag#6","Status":"busy","Size":"54.5 KB","Modified":"2026-10-16","Action":"edit"},
+  {"Name":"table.vert#7","Status":"ready","Size":"61.5 KB","Modified":"2026-10-17","Action":"open"},
+  {"Name":"scene.gltf#8","Status":"error","Size":"68.5 KB","Modified":"2026-10-18","Action":"open"},
+  {"Name":"font.json#9","Status":"ready","Size":"75.5 KB","Modified":"2026-10-19","Action":"edit"},
+  {"Name":"atlas.msdf#10","Status":"ready","Size":"82.5 KB","Modified":"2026-10-20","Action":"open"},
+  {"Name":"ui.frag#11","Status":"busy","Size":"89.5 KB","Modified":"2026-10-21","Action":"open"},
+  {"Name":"table.vert#12","Status":"ready","Size":"96.5 KB","Modified":"2026-10-22","Action":"edit"},
+  {"Name":"scene.gltf#13","Status":"error","Size":"103.5 KB","Modified":"2026-10-23","Action":"open"},
+  {"Name":"font.json#14","Status":"ready","Size":"110.5 KB","Modified":"2026-10-24","Action":"open"},
+  {"Name":"atlas.msdf#15","Status":"ready","Size":"117.5 KB","Modified":"2026-10-25","Action":"edit"},
+  {"Name":"ui.frag#16","Status":"busy","Size":"124.5 KB","Modified":"2026-10-26","Action":"open"},
+  {"Name":"table.vert#17","Status":"ready","Size":"131.5 KB","Modified":"2026-10-27","Action":"open"}
+])json";
+        return nlohmann::json::parse(kTableJson);
     }
 
-    // ── 10. 对象层：表 = 数据 + 端口 ───────────────────────────────
+    // ── 9. 事件 Trait ──────────────────────────────────────────────
+    struct table_click_payload
+    {
+        double x{}, y{};
+        intent::time_point at{};
+    };
+
+    struct TableClickTrait
+        : gesture::trait_base<table_click_payload, static_string{"click"},
+                              static_string{"on_click"}, app::policy::click>
+    {
+        static void collect(intent::time_point, payload_t &d,
+                            const gesture::click_event &e) noexcept
+        {
+            d = {e.x, e.y, e.at};
+        }
+    };
+
+    struct table_drag_payload
+    {
+        gesture::drag_phase phase{};
+        double x{}, y{}, dx{}, dy{}, total_dx{}, total_dy{};
+    };
+
+    struct TableDragTrait
+        : gesture::trait_base<table_drag_payload, static_string{"drag"},
+                              static_string{"on_drag"}, app::policy::drag>
+    {
+        static void collect(intent::time_point, payload_t &d,
+                            const gesture::drag_event &e) noexcept
+        {
+            d = {e.phase, e.x, e.y, e.dx, e.dy, e.total_dx, e.total_dy};
+        }
+    };
+
+    struct table_wheel_payload
+    {
+        int delta{};
+    };
+
+    struct TableWheelTrait
+        : gesture::trait_base<table_wheel_payload, static_string{"wheel"},
+                              static_string{"on_wheel"}, app::policy::wheel>
+    {
+        static void collect(intent::time_point, payload_t &d,
+                            const gesture::wheel_event &e) noexcept
+        {
+            d = {e.delta};
+        }
+    };
+
+    struct table_key_payload
+    {
+        Key key{};
+        input_frame::Transition transition{};
+    };
+
+    struct TableKeyTrait
+        : gesture::trait_base<table_key_payload, static_string{"table_key"},
+                              static_string{"on_table_key"}, app::policy::hover>
+    {
+        static void collect(intent::time_point, payload_t &d,
+                            const gesture::key_event &e) noexcept
+        {
+            d = {e.key, e.transition};
+        }
+    };
+
+    using table_event_tree =
+        intent::all_of<intent::leaf<gesture::click_template<TableClickTrait>>,
+                       intent::leaf<gesture::drag_template<TableDragTrait>>,
+                       intent::leaf<gesture::wheel_template<TableWheelTrait>>,
+                       intent::leaf<gesture::key_observer_template<TableKeyTrait>>>;
+
+    // ── 10. 对象层 ─────────────────────────────────────────────────
     template <class Schema>
-    auto make_table(std::vector<std::array<std::string, Schema::count>> rows,
+    auto make_table(nlohmann::json doc,
                     FontSelect *font)
     {
         using metrics_t = table_metrics<Schema::count>;
+        using geom_t = geometry<Schema::count>;
+        using state_t = state<Schema::count>;
+        // 数据唯一真相 = doc；rows 只是投影（下一步会被 row_text 取代）
+        std::vector<std::array<std::string, Schema::count>> rows;
+        rows.reserve(doc.size());
+        for (const auto &r : doc)
+        {
+            std::array<std::string, Schema::count> row{};
+            for (std::size_t c = 0; c < Schema::count; ++c)
+            {
+                const std::string key(Schema::names[c].view());
+                row[c] = (r.at(key)).get<std::string>();
+            }
+            rows.push_back(std::move(row));
+        }
+        constexpr std::size_t N = Schema::count;
+
         return make_aggregate<"Table">(
-            field<"rows">(std::move(rows)), field<"font">(font),
-            field<"prefs">(table_prefs{}), field<"metrics">(metrics_t{}),
+            field<"rows">(std::move(rows)), field<"doc">(std::move(doc)),
+            field<"order">(std::vector<std::uint32_t>{}),
+            field<"font">(font), field<"prefs">(table_prefs{}),
             field<"headers">(std::vector<cell_glyphs>{}),
             field<"cells">(std::vector<cell_glyphs>{}),
             field<"viewport">(glm::vec2{0.0f, 0.0f}), field<"built">(false),
 
-            // 缓存：viewport 变了才重新整形
+            field<"state">(state_t{}), field<"geom">(geom_t{}),
+            field<"pointer">(glm::dvec2{-1.0, -1.0}),
+            field<"screen">(static_cast<ui_new::ScreenWidget *>(nullptr)),
+
+            field<"edit_cell">(cell_glyphs{}), field<"edit_caret_x">(0.0f), field<"edit_anchor_x">(0.0f),
+            field<"edit_dirty">(false),
+
+            field<"hover_prev">(hit{}), field<"press_hit">(hit{}), field<"press_pos">(glm::dvec2{-1.0, -1.0}),
+            field<"last_click">(std::int64_t{-100000}), field<"last_row">(-1),
+            field<"last_col">(-1),
+
+            field<"arbiter">(intent::debug_arbiter<table_event_tree>{}),
+            field<"input_state">(input_frame::event_context{}),
+            field<"input_binding">(glfw_input_translation::scoped_binding{}),
+
+            // ── 失效 ───────────────────────────────────────────
+            method<"invalidate">([](auto &self) noexcept {
+                if (auto *s = self.screen)
+                    for (std::uint32_t f = 0; f < MAX_FRAMES_IN_FLIGHT; ++f)
+                        s->makeRenderDirty(f);
+            }),
+
+            // ── 重建：order / viewport / 文本变了才做 ───────────
             method<"rebuild">([](auto &self, float vw, float vh) {
                 self.viewport = glm::vec2{vw, vh};
+                const std::size_t n = self.rows.size();
+                if (self.order.size() != n)
+                {
+                    self.order.resize(n);
+                    for (std::size_t i = 0; i < n; ++i)
+                        self.order[i] = static_cast<std::uint32_t>(i);
+                }
                 self.headers.clear();
                 self.cells.clear();
-                self.headers.reserve(Schema::count);
-                self.cells.reserve(self.rows.size() * Schema::count);
-                for (std::size_t c = 0; c < Schema::count; ++c)
+                self.headers.reserve(N);
+                self.cells.reserve(n * N);
+                for (std::size_t c = 0; c < N; ++c)
                     self.headers.push_back(
                         shape_cell(*self.font, Schema::names[c].view(), 15.0f, vw, vh));
-                for (const auto &row : self.rows)
-                    for (std::size_t c = 0; c < Schema::count; ++c)
-                        self.cells.push_back(
-                            shape_cell(*self.font, row[c], 15.0f, vw, vh));
+                for (std::size_t i = 0; i < n; ++i)
+                {
+                    const auto &row = self.rows[self.order[i]];
+                    for (std::size_t c = 0; c < N; ++c)
+                        self.cells.push_back(shape_cell(*self.font, row[c], 15.0f, vw,
+                                                        vh));
+                }
+                if (self.state.sel.size() != n)
+                {
+                    self.state.sel.assign(n, 0);
+                    if (n > 0)
+                        self.state.sel[std::clamp(self.state.selected, 0,
+                                                  static_cast<int>(n) - 1)] = 1;
+                }
                 self.built = true;
             }),
 
-            method<"render">([](auto &self, ui_new::ScreenWidget *, ui_new::Widget *owner,
-                                render_context &ctx) {
+            // ── 排序：只动 order ────────────────────────────────
+            method<"apply_sort">([](auto &self) {
+                const std::size_t n = self.rows.size();
+                self.order.resize(n);
+                for (std::size_t i = 0; i < n; ++i)
+                    self.order[i] = static_cast<std::uint32_t>(i);
+                if (self.state.sort_col < 0 || self.state.sort_dir == 0)
+                    return;
+                const int col = self.state.sort_col;
+                const int dir = self.state.sort_dir;
+                std::stable_sort(self.order.begin(), self.order.end(),
+                                 [&self, col, dir](std::uint32_t a, std::uint32_t b) {
+                                     const auto &sa = self.rows[a][col];
+                                     const auto &sb = self.rows[b][col];
+                                     return dir > 0 ? sa < sb : sa > sb;
+                                 });
+            }),
+
+            method<"hit_test">([](auto &self, double x, double y) noexcept {
+                return hit_test(self.geom, self.rows.size(), x, y);
+            }),
+
+            method<"update_hover">([](auto &self) noexcept {
+                const auto h =
+                    self.template invoke<"hit_test">(self.pointer.x, self.pointer.y);
+                if (h == self.state.hover)
+                    return;
+                self.state.hover = h;
+                self.template invoke<"invalidate">();
+            }),
+
+            // ── 滚动：行列共用一套夹取 ──────────────────────────
+            method<"scroll_to">([](auto &self, float sx, float sy) noexcept {
+                auto &g = self.geom;
+                if (!g.valid)
+                    return;
+                const float nx = std::clamp(sx, 0.0f, g.max_x);
+                const float ny = std::clamp(sy, 0.0f, g.max_y);
+                if (nx == self.state.scroll_x && ny == self.state.scroll_y)
+                    return;
+                self.state.scroll_x = nx;
+                std::println("[table] scroll x={:.0f} y={:.0f}", nx, ny);
+                self.state.scroll_y = ny;
+                self.template invoke<"invalidate">();
+            }),
+
+            method<"ensure_visible">([](auto &self, int row) noexcept {
+                auto &g = self.geom;
+                if (!g.valid || row < 0)
+                    return;
+                const float step = self.prefs.row_h + self.prefs.row_gap;
+                const float top = static_cast<float>(row) * step;
+                const float bottom = top + step;
+                float sy = self.state.scroll_y;
+                if (top < sy)
+                    sy = top;
+                else if (bottom > sy + g.body_h)
+                    sy = bottom - g.body_h;
+                self.template invoke<"scroll_to">(self.state.scroll_x, sy);
+            }),
+
+            // 选区：mode 0 = 单选 / 1 = Shift 范围 / 2 = Ctrl 切换
+            method<"select_row">([](auto &self, int row, int mode) noexcept {
+                const int n = static_cast<int>(self.rows.size());
+                if (n <= 0)
+                    return;
+                auto &st = self.state;
+                row = std::clamp(row, 0, n - 1);
+                if (st.sel.size() != static_cast<std::size_t>(n))
+                    st.sel.assign(static_cast<std::size_t>(n), 0);
+
+                if (mode == 2)
+                {
+                    st.sel[row] = st.sel[row] ? 0 : 1;
+                    st.anchor = row;
+                }
+                else if (mode == 1)
+                {
+                    std::fill(st.sel.begin(), st.sel.end(), 0);
+                    const int a = std::min(st.anchor, row);
+                    const int b = std::max(st.anchor, row);
+                    for (int r = a; r <= b; ++r)
+                        st.sel[r] = 1;
+                }
+                else
+                {
+                    std::fill(st.sel.begin(), st.sel.end(), 0);
+                    st.sel[row] = 1;
+                    st.anchor = row;
+                }
+                st.selected = row;
+                st.row = row;
+                {
+                    int cnt = 0;
+                    for (auto v : st.sel) cnt += v ? 1 : 0;
+                    std::println("[table] select row={} mode={} count={}", row, mode, cnt);
+                }
+                self.template invoke<"ensure_visible">(row);
+                self.template invoke<"invalidate">();
+            }),
+
+            // ── 数据接口：只读、纯查询（外部只该通过这里取表里的数据）──
+            // 唯一的数据读取入口：doc → string_view（不复制）
+            method<"row_text">([](auto &self, std::uint32_t row_id,
+                                  int data_col) -> std::string_view {
+                // 表数据唯一真相 = rows；doc 只承载 tooltip/cells 等元数据
+                return self.rows[row_id][static_cast<std::size_t>(data_col)];
+            }),
+            method<"selected_rows">([](auto &self) {
+                const auto &st = self.state;
+                std::vector<std::uint32_t> ids;
+                if (st.sel_rect)   // 矩形选区：行范围
+                {
+                    const int r0 = std::min(st.sr0, st.sr1);
+                    const int r1 = std::max(st.sr0, st.sr1);
+                    for (int r = std::max(0, r0);
+                         r <= r1 && r < static_cast<int>(self.rows.size()); ++r)
+                        ids.push_back(self.order[static_cast<std::size_t>(r)]);
+                    return ids;
+                }
+                ids.reserve(self.rows.size());
+                for (std::size_t i = 0; i < self.rows.size(); ++i)
+                    if (i < st.sel.size() && st.sel[i] != 0)
+                        ids.push_back(self.order[i]);
+                return ids;
+            }),
+
+            method<"column_values">([](auto &self, int data_col,
+                                       const std::vector<std::uint32_t> &ids) {
+                std::vector<std::string_view> out;
+                out.reserve(ids.size());
+                for (auto id : ids)
+                    out.push_back(self.rows[id][static_cast<std::size_t>(data_col)]);
+                return out;
+            }),
+
+            method<"select_all">([](auto &self) {
+                const std::size_t n = self.rows.size();
+                if (n == 0)
+                    return;
+                if (self.state.sel.size() != n)
+                    self.state.sel.assign(n, 0);
+                std::fill(self.state.sel.begin(), self.state.sel.end(), 1);
+                self.state.selected = 0;
+                self.state.row = 0;
+                self.template invoke<"invalidate">();
+            }),
+            method<"move_focus">([](auto &self, int row, int col, bool extend) {
+                if (self.rows.empty())
+                    return;
+                self.template invoke<"select_row">(row, extend ? 1 : 0);
+                self.state.col = std::clamp(col, 0, static_cast<int>(N) - 1);
+                self.template invoke<"invalidate">();
+            }),
+
+            method<"set_focus">([](auto &self, int row, int col) {
+                if (self.rows.empty())
+                    return;
+                self.template invoke<"select_row">(row, 0);
+                self.state.col = std::clamp(col, 0, static_cast<int>(N) - 1);
+                self.template invoke<"invalidate">();
+            }),
+
+            // ── 编辑 ────────────────────────────────────────────
+            method<"start_edit">([](auto &self, int row, int col, bool clear) {
+                if (row < 0 || col < 0 || row >= static_cast<int>(self.rows.size()))
+                    return;
+                auto &st = self.state;
+                st.editing = true;
+                st.edit_row = row;
+                st.edit_col = col;
+                st.buf = clear ? std::string{} : self.rows[self.order[row]][self.state.col_order[col]];
+                st.caret = st.buf.size();
+                st.edit_anchor = st.caret;
+                self.edit_dirty = true;
+                self.template invoke<"invalidate">();
+            }),
+
+            method<"commit_edit">([](auto &self) {
+                auto &st = self.state;
+                if (!st.editing)
+                    return;
+                if (st.edit_row >= 0 &&
+                    st.edit_row < static_cast<int>(self.order.size()))
+                    self.rows[self.order[st.edit_row]][self.state.col_order[st.edit_col]] = st.buf;
+                std::println("[table] commit ({},{}) = \"{}\"", st.edit_row, st.edit_col,
+                             st.buf);
+                st.editing = false;
+                st.edit_row = -1;
+                st.edit_col = -1;
+                self.built = false;
+                self.template invoke<"invalidate">();
+            }),
+
+            method<"cancel_edit">([](auto &self) noexcept {
+                self.state.editing = false;
+                self.state.edit_row = -1;
+                self.state.edit_col = -1;
+                self.template invoke<"invalidate">();
+            }),
+
+            // 按内容自适应列宽（双击列边界触发）
+            // 每帧一次：时间状态（tooltip 计时）只在这里推进
+            method<"tick">([](auto &self, double now) {
+                auto &st = self.state;
+                if (++st.tick_count == 100)
+                    std::println("[table] tick 100");
+                if (!(st.hover == self.hover_prev))
+                {
+                    if (st.tt_state == 2)
+                    {
+                        st.tt_text.clear();
+                        std::println("[table] tooltip hide");
+                    }
+                    self.hover_prev = st.hover;
+                    st.tt_t0 = static_cast<std::int64_t>(now);
+                    st.tt_state = st.hover.inside() ? 1 : 0;
+                    self.template invoke<"invalidate">();
+                }
+                else if (st.tt_state == 1 &&
+                         static_cast<std::int64_t>(now) - st.tt_t0 >= 500)
+                {
+                    st.tt_state = 2;
+                    int dc = 0;
+                    if (st.hover.col >= 0 && st.hover.col < static_cast<int>(N) &&
+                        st.col_ready)
+                        dc = st.col_order[st.hover.col];
+                    if (st.hover.row >= 0 &&
+                        st.hover.row < static_cast<int>(self.rows.size()))
+                    {
+                        st.tt_text = std::string(Schema::names[dc].view()) + ": " +
+                                     std::string(self.template invoke<"row_text">(
+                                         self.order[st.hover.row], dc));
+                        // 优先级：cell → row → column
+                        const std::string ckey(Schema::names[dc].view());
+                        const nlohmann::json rj = self.doc.at(self.order[st.hover.row]);
+                        if (rj.contains("cells") && rj.at("cells").contains(ckey))
+                            st.tt_text =
+                                rj.at("cells").at(ckey).get<std::string>();
+                        else if (rj.contains("tooltip"))
+                            st.tt_text = rj.at("tooltip").get<std::string>();
+                    }
+                    std::println("[table] tooltip show row={} col={} text=\"{}\"",
+                                 st.hover.row, st.hover.col, st.tt_text);
+                    self.template invoke<"invalidate">();
+                }
+            }),
+
+            method<"auto_fit">([](auto &self, int pos) {
+                if (pos < 0 || pos >= static_cast<int>(N) || self.cells.empty())
+                    return;
+                const int dc = self.state.col_order[pos];
+                float w = 40.0f;
+                for (std::size_t r = 0; r < self.rows.size(); ++r)
+                    w = std::max(w, self.cells[r * N + dc].advance +
+                                        self.prefs.cell_pad * 2.0f + 8.0f);
+                w = std::max(w, self.headers[dc].advance + self.prefs.cell_pad * 2.0f +
+                                    26.0f);
+                self.state.col_w[dc] =
+                    std::clamp(w, self.prefs.min_col_w, self.prefs.max_col_w);
+                self.template invoke<"invalidate">();
+            }),
+            method<"edit_touch">([](auto &self) noexcept {
+                self.edit_dirty = true;
+                self.template invoke<"invalidate">();
+            }),
+
+            // ── 点击 ────────────────────────────────────────────
+            method<"on_click">([](auto &self, const table_click_payload &e) noexcept {
+                if (self.state.menu_open)
+                {
+                    auto &st = self.state;
+                    const float mw = 150.0f, mh = 112.0f;
+                    const auto mo = overlay_at(st.menu_ax, st.menu_ay, mw, mh,
+                                               self.geom.x0, self.geom.y0,
+                                               self.geom.w, self.geom.h);
+                    const float mx = mo.x;
+                    const float my = mo.y;
+                    int item = -1;
+                    if (e.x >= mx && e.x <= mx + mw && e.y >= my && e.y <= my + mh)
+                        item = static_cast<int>((e.y - my - 4.0f) / 26.0f);
+                    st.menu_open = false;
+                    if (item == 0)
+                    {
+                        self.template invoke<"auto_fit">(st.menu_pos);
+                        std::println("[table] menu fit pos={}", st.menu_pos);
+                    }
+                    else if (item == 2)
+                    {
+                        const int dc = st.col_order[st.menu_pos];
+                        st.col_w[dc] = -1.0f;
+                        int vis = 0;
+                        for (auto w2 : st.col_w) vis += (w2 < 0 ? 0 : 1);
+                        self.built = false;
+                        std::println("[table] menu hide pos={} columns={}", st.menu_pos, vis);
+                    }
+                    else if (item == 3)
+                    {
+                        st.col_w.fill(0.0f);
+                        self.built = false;
+                        std::println("[table] menu show-all columns={}", static_cast<int>(N));
+                    }
+                    else if (item == 1)
+                    {
+                        st.sort_col = -1;
+                        st.sort_dir = 0;
+                        self.template invoke<"apply_sort">();
+                        self.built = false;
+                        std::println("[table] menu reset-sort");
+                    }
+                    self.template invoke<"invalidate">();
+                    return;
+                }
+                const auto h = self.template invoke<"hit_test">(e.x, e.y);
+
+                if (self.state.editing &&
+                    !(h.r == region::cell && h.row == self.state.edit_row &&
+                      h.col == self.state.edit_col))
+                    self.template invoke<"commit_edit">();
+
+                const auto now = e.at.count();
+                const bool dbl = (h.r == region::cell || h.r == region::separator) &&
+                                 now - self.last_click < 320 &&
+                                 h.row == self.last_row && h.col == self.last_col;
+                self.last_click = now;
+                self.last_row = h.row;
+                self.last_col = h.col;
+
+                switch (h.r)
+                {
+                case region::cell:
+                    {
+                        const bool shift =
+                            self.input_state.modifier.hasAll(ModifierKey::Shift());
+                        const bool ctrl =
+                            self.input_state.modifier.hasAll(ModifierKey::Control());
+                        self.template invoke<"select_row">(h.row, ctrl ? 2 : (shift ? 1 : 0));
+                        self.state.col = h.col;
+                        self.template invoke<"invalidate">();
+                    }
+                    if (dbl)
+                    {
+                        self.template invoke<"start_edit">(h.row, h.col, false);
+                        std::println("[table] edit ({},{})", h.row, h.col);
+                    }
+                    else
+                        std::println("[table] select ({},{})", h.row, h.col);
+                    break;
+
+                case region::header:
+                    if (h.col < 0)
+                        break;
+                    {
+                        // h.col 是视图位次；排序键是数据列
+                        const int dc = self.state.col_order[h.col];
+                        if (self.state.sort_col != dc)
+                        {
+                            self.state.sort_col = dc;
+                            self.state.sort_dir = 1;
+                        }
+                        else if (self.state.sort_dir > 0)
+                            self.state.sort_dir = -1;
+                        else
+                        {
+                            self.state.sort_col = -1;
+                            self.state.sort_dir = 0;
+                        }
+                        self.template invoke<"apply_sort">();
+                        self.built = false;
+                        self.template invoke<"invalidate">();
+                        std::println("[table] sort col={} dir={}", self.state.sort_col,
+                                     self.state.sort_dir);
+                    }
+                    break;
+
+                case region::separator:
+                    // 双击列边界 = 按内容自适应列宽（Excel 习惯）
+                    if (dbl && h.col >= 0)
+                    {
+                        self.template invoke<"auto_fit">(h.col);
+                        std::println("[table] auto-fit pos={} width={:.0f}", h.col,
+                                     self.state.col_w[self.state.col_order[h.col]]);
+                    }
+                    break;
+
+                case region::vbar:
+                case region::hbar:
+                    if (!h.thumb)
+                    {
+                        const auto &g = self.geom;
+                        if (h.r == region::vbar)
+                            self.template invoke<"scroll_to">(
+                                self.state.scroll_x,
+                                self.state.scroll_y +
+                                    (e.y < g.y0 + g.vb.y + g.vb.thumb_off
+                                         ? -g.body_h * 0.9f
+                                         : g.body_h * 0.9f));
+                        else
+                            self.template invoke<"scroll_to">(
+                                self.state.scroll_x +
+                                    (e.x < g.x0 + g.hb.x + g.hb.thumb_off
+                                         ? -g.w * 0.9f
+                                         : g.w * 0.9f),
+                                self.state.scroll_y);
+                    }
+                    break;
+
+                default:
+                    break;
+                }
+            }),
+
+            // ── 拖拽：列宽 / 横竖滚动条 ─────────────────────────
+            method<"on_drag">([](auto &self, const table_drag_payload &e) noexcept {
+                const auto &ph = self.press_hit;
+                switch (e.phase)
+                {
+                case gesture::drag_phase::begin:
+                    {   // 矩形选区：在单元格上起拖
+                        const auto rh = self.template invoke<"hit_test">(e.x, e.y);
+                        if (rh.r == region::cell && rh.row >= 0 && rh.col >= 0)
+                        {
+                            auto &st = self.state;
+                            st.sel_rect = true;
+                            st.sr0 = st.sr1 = rh.row;
+                            st.sc0 = st.sc1 = rh.col;
+                        }
+                    }
+                    if (ph.r == region::separator && ph.col >= 0)
+                    {
+                        self.state.drag = 1;
+                        self.state.drag_col = self.state.col_order[ph.col];
+                        self.state.drag_start_w = self.geom.m.w[ph.col];
+                    }
+                    else if (ph.r == region::header && ph.col >= 0)
+                    {
+                        // 拖表头 = 移动列（位次）
+                        self.state.drag = 4;
+                        self.state.drag_pos = ph.col;
+                    }
+                    else if (ph.r == region::vbar && ph.thumb)
+                    {
+                        self.state.drag = 2;
+                        self.state.drag_grab = static_cast<float>(
+                            self.press_pos.y - (self.geom.y0 + self.geom.vb.y));
+                    }
+                    else if (ph.r == region::hbar && ph.thumb)
+                    {
+                        self.state.drag = 3;
+                        self.state.drag_grab = static_cast<float>(
+                            self.press_pos.x - (self.geom.x0 + self.geom.hb.x));
+                    }
+                    break;
+
+                case gesture::drag_phase::move:
+                    {
+                        auto &st = self.state;
+                        if (st.sel_rect)
+                        {
+                            const auto rh = self.template invoke<"hit_test">(e.x, e.y);
+                            if (rh.col >= 0)
+                                st.sc1 = rh.col;
+                            const int last_row = static_cast<int>(self.rows.size()) - 1;
+                            if (rh.row >= 0)
+                                st.sr1 = rh.row;
+                            else if (last_row >= 0)
+                                st.sr1 = std::clamp(st.sr1, 0, last_row);
+                        }
+                    }
+                    if (self.state.drag == 4)
+                    {
+                        // 列重排：把拖动的位次挪到光标下的位次
+                        auto &g = self.geom;
+                        const int p = column_at(
+                            g.m, static_cast<float>(e.x - g.x0 + g.scroll_x));
+                        if (p >= 0 && p != self.state.drag_pos)
+                        {
+                            const int v = self.state.col_order[self.state.drag_pos];
+                            if (p < self.state.drag_pos)
+                                for (int k = self.state.drag_pos; k > p; --k)
+                                    self.state.col_order[k] =
+                                        self.state.col_order[k - 1];
+                            else
+                                for (int k = self.state.drag_pos; k < p; ++k)
+                                    self.state.col_order[k] =
+                                        self.state.col_order[k + 1];
+                            self.state.col_order[p] = v;
+                            self.state.drag_pos = p;
+                            self.template invoke<"invalidate">();
+                        }
+                    }
+                    else if (self.state.drag == 1)
+                    {
+                        const int c = self.state.drag_col;
+                        const float nw = self.state.drag_start_w +
+                                         static_cast<float>(e.total_dx);
+                        self.state.col_w[c] =
+                            std::clamp(nw, self.prefs.min_col_w, self.prefs.max_col_w);
+                        self.template invoke<"invalidate">();
+                    }
+                    else if (self.state.drag == 2)
+                    {
+                        const auto &g = self.geom;
+                        const float span = g.vb.h - g.vb.thumb_len;
+                        if (span > 1.0f)
+                        {
+                            const float t = std::clamp(
+                                static_cast<float>(e.y - g.y0 - g.vb.y -
+                                                   self.state.drag_grab) /
+                                    span,
+                                0.0f, 1.0f);
+                            self.template invoke<"scroll_to">(
+                                self.state.scroll_x, t * g.max_y);
+                        }
+                    }
+                    else if (self.state.drag == 3)
+                    {
+                        const auto &g = self.geom;
+                        const float span = g.hb.w - g.hb.thumb_len;
+                        if (span > 1.0f)
+                        {
+                            const float t = std::clamp(
+                                static_cast<float>(e.x - g.x0 - g.hb.x -
+                                                   self.state.drag_grab) /
+                                    span,
+                                0.0f, 1.0f);
+                            self.template invoke<"scroll_to">(t * g.max_x,
+                                                              self.state.scroll_y);
+                        }
+                    }
+                    break;
+
+                case gesture::drag_phase::end:
+                    {
+                        auto &st = self.state;
+                        if (st.sel_rect)
+                            std::println("[table] rect ({},{})-({},{})", st.sr0, st.sc0,
+                                         st.sr1, st.sc1);
+                    }
+                    if (self.state.drag == 1)
+                        std::println("[table] column {} width -> {:.0f}",
+                                     self.state.drag_col,
+                                     self.state.col_w[self.state.drag_col]);
+                    else if (self.state.drag == 4)
+                        std::println("[table] move column to pos {}", self.state.drag_pos);
+                    self.state.drag = 0;
+                    self.state.drag_pos = -1;
+                    break;
+                }
+            }),
+
+            // ── 滚轮：默认竖向，Shift 横向 ──────────────────────
+            method<"on_wheel">([](auto &self, const table_wheel_payload &e) noexcept {
+                auto &g = self.geom;
+                if (!g.valid)
+                    return;
+                const auto h =
+                    self.template invoke<"hit_test">(self.pointer.x, self.pointer.y);
+                if (!h.inside())
+                    return;
+                const float step = self.prefs.row_h + self.prefs.row_gap;
+                const bool shift =
+                    self.input_state.modifier.hasAll(ModifierKey::Shift());
+                if (shift && g.max_x > 0.0f)
+                    self.template invoke<"scroll_to">(
+                        self.state.scroll_x - static_cast<float>(e.delta) * 48.0f,
+                        self.state.scroll_y);
+                else
+                    self.template invoke<"scroll_to">(
+                        self.state.scroll_x,
+                        self.state.scroll_y - static_cast<float>(e.delta) * step * 3.0f);
+            }),
+
+            // ── 键盘 ────────────────────────────────────────────
+            method<"on_table_key">([](auto &self,
+                                      const table_key_payload &e) noexcept {
+                if (e.transition != input_frame::Transition::Press)
+                    return;
+                auto &st = self.state;
+
+                // 编辑态
+                if (st.editing)
+                {
+                    const bool shift =
+                        self.input_state.modifier.hasAll(ModifierKey::Shift());
+                    const auto erase_sel = [&]() {
+                        const auto a = std::min(st.caret, st.edit_anchor);
+                        const auto b = std::max(st.caret, st.edit_anchor);
+                        if (a != b)
+                        {
+                            st.buf.erase(a, b - a);
+                            st.caret = a;
+                            st.edit_anchor = a;
+                        }
+                    };
+                    switch (e.key)
+                    {
+                    case Key::eENTER:
+                        self.template invoke<"commit_edit">();
+                        break;
+                    case Key::eESCAPE:
+                        self.template invoke<"cancel_edit">();
+                        break;
+                    case Key::eTAB: {
+                        const int er = st.edit_row;
+                        const int ec = st.edit_col;
+                        self.template invoke<"commit_edit">();
+                        self.template invoke<"set_focus">(er, ec + 1);
+                        break;
+                    }
+                    case Key::eLEFT:
+                        st.caret = utf8_prev(st.buf, st.caret);
+                        if (!shift)
+                            st.edit_anchor = st.caret;
+                        self.template invoke<"edit_touch">();
+                        break;
+                    case Key::eRIGHT:
+                        st.caret = utf8_next(st.buf, st.caret);
+                        if (!shift)
+                            st.edit_anchor = st.caret;
+                        self.template invoke<"edit_touch">();
+                        break;
+                    case Key::eHOME:
+                        st.caret = 0;
+                        if (!shift)
+                            st.edit_anchor = 0;
+                        self.template invoke<"edit_touch">();
+                        break;
+                    case Key::eEND:
+                        st.caret = st.buf.size();
+                        if (!shift)
+                            st.edit_anchor = st.caret;
+                        self.template invoke<"edit_touch">();
+                        break;
+                    case Key::eBACKSPACE:
+                        if (st.caret != st.edit_anchor)
+                            erase_sel();
+                        else if (st.caret > 0)
+                        {
+                            const auto p0 = utf8_prev(st.buf, st.caret);
+                            st.buf.erase(p0, st.caret - p0);
+                            st.caret = p0;
+                            st.edit_anchor = p0;
+                            self.template invoke<"edit_touch">();
+                        }
+                        break;
+                    case Key::eDELETE:
+                        if (st.caret != st.edit_anchor)
+                            erase_sel();
+                        else if (st.caret < st.buf.size())
+                        {
+                            const auto n2 = utf8_next(st.buf, st.caret);
+                            st.buf.erase(st.caret, n2 - st.caret);
+                            st.edit_anchor = st.caret;
+                            self.template invoke<"edit_touch">();
+                        }
+                        break;
+                    default:
+                        break;
+                    }
+                    return;
+                }
+                if (self.rows.empty())
+                    return;
+                const int n = static_cast<int>(self.rows.size());
+                constexpr int Nn = static_cast<int>(N);
+                const int r = st.row;
+                const int c = st.col;
+                const bool shift =
+                    self.input_state.modifier.hasAll(ModifierKey::Shift());
+                const float step = self.prefs.row_h + self.prefs.row_gap;
+                const int page = std::max(
+                    1, static_cast<int>(self.geom.body_h / std::max(1.0f, step)));
+
+                switch (e.key)
+                {
+                case Key::eUP:
+                    self.template invoke<"move_focus">(r - 1, c, shift);
+                    break;
+                case Key::eDOWN:
+                    self.template invoke<"move_focus">(r + 1, c, shift);
+                    break;
+                case Key::eLEFT:
+                    self.template invoke<"move_focus">(r, c - 1, shift);
+                    break;
+                case Key::eRIGHT:
+                    self.template invoke<"move_focus">(r, c + 1, shift);
+                    break;
+                case Key::eTAB:
+                    if (c + 1 < Nn)
+                        self.template invoke<"move_focus">(r, c + 1, shift);
+                    else
+                        self.template invoke<"set_focus">(r + 1, 0);
+                    break;
+                case Key::ePAGE_UP:
+                    self.template invoke<"move_focus">(r - page, c, shift);
+                    break;
+                case Key::ePAGE_DOWN:
+                    self.template invoke<"move_focus">(r + page, c, shift);
+                    break;
+                case Key::eHOME:
+                    self.template invoke<"move_focus">(
+                        self.input_state.modifier.hasAll(ModifierKey::Control()) ? 0 : r,
+                        0, shift);
+                    break;
+                case Key::eEND:
+                    self.template invoke<"move_focus">(
+                        self.input_state.modifier.hasAll(ModifierKey::Control())
+                            ? static_cast<int>(self.rows.size()) - 1
+                            : r,
+                        Nn - 1, shift);
+                    break;
+                case Key::eENTER:
+                    self.template invoke<"start_edit">(r, c, false);
+                    break;
+                case Key::eA:
+                    if (self.input_state.modifier.hasAll(ModifierKey::Control()))
+                        self.template invoke<"select_all">();
+                    break;
+                case Key::eF10:
+                    if (std::getenv("TABLE_SELFTEST") != nullptr)
+                    {
+                        st.sel_rect = true;
+                        st.sr0 = 2;
+                        st.sc0 = 1;
+                        st.sr1 = 4;
+                        st.sc1 = 3;
+                    }
+                    break;
+                case Key::eC:
+                {
+                    if (!self.input_state.modifier.hasAll(ModifierKey::Control()))
+                        break;
+                    // 面向数据：从“视图选区”取出“数据行”，再按数据列取值
+                    // 面向数据：选区 → 数据行（统一走 selected_rows）
+                    const auto ids = self.template invoke<"selected_rows">();
+                    if (st.sel_rect)   // 矩形：按列范围输出 TSV
+                    {
+                        const int c0x = std::min(st.sc0, st.sc1);
+                        const int c1x = std::max(st.sc0, st.sc1);
+                        const int r0 = std::min(st.sr0, st.sr1);
+                        const int r1 = std::max(st.sr0, st.sr1);
+                        std::println("[table] copy rect ({},{})-({},{})", r0, c0x, r1, c1x);
+                        int li = 0;
+                        for (int r = r0; r <= r1 && li < static_cast<int>(ids.size());
+                             ++r, ++li)
+                        {
+                            std::print("[table] tsv:");
+                            for (int q = c0x; q <= c1x; ++q)
+                            {
+                                const int dc =
+                                    st.col_order[static_cast<std::size_t>(q)];
+                                std::print("{}{}", q == c0x ? " " : "\\t",
+                                           self.rows[ids[static_cast<std::size_t>(li)]]
+                                                    [static_cast<std::size_t>(dc)]);
+                            }
+                            std::println("");
+                        }
+                        return;
+                    }
+                    std::print("[table] copy {} rows:", ids.size());
+                    for (auto id : ids)
+                        std::print(" {}", id);
+                    std::println("");
+                    std::print("[table] names:");
+                    for (auto id : ids)
+                        std::print(" '{}'", self.rows[id][0]);
+                    std::println("");
+                    return;
+                }
+                case Key::eDELETE:
+                    if (r >= 0 && r < n)
+                    {
+                        self.rows[self.order[r]][self.state.col_order[c]].clear();
+                        self.built = false;
+                        self.template invoke<"invalidate">();
+                    }
+                    break;
+                default:
+                    break;
+                }
+            }),
+
+            // ── 字符输入 ────────────────────────────────────────
+            method<"on_char">([](auto &self, std::uint32_t cp) noexcept {
+                if (cp < 32 || cp == 127)
+                    return;
+                auto &st = self.state;
+                if (!st.editing)
+                {
+                    if (st.row < 0)
+                        return;
+                    self.template invoke<"start_edit">(st.row, st.col, true);
+                }
+                if (st.caret != st.edit_anchor)
+                {
+                    const auto a = std::min(st.caret, st.edit_anchor);
+                    const auto b = std::max(st.caret, st.edit_anchor);
+                    st.buf.erase(a, b - a);
+                    st.caret = a;
+                    st.edit_anchor = a;
+                }
+                std::string piece;
+                append_utf8(piece, cp);
+                st.buf.insert(st.caret, piece);
+                st.caret += piece.size();
+                self.template invoke<"edit_touch">();
+            }),
+
+            // ── 原始事件 ────────────────────────────────────────
+            method<"input_event">([](auto &self, auto e) noexcept {
+                using T = std::remove_cvref_t<decltype(e)>;
+
+                if constexpr (std::same_as<T, mousebutton_event>)
+                {
+                    if (e.button == MouseButtons::eMOUSE_BUTTON_RIGHT && e.press() &&
+                        !e.repeat())
+                    {
+                        const auto mh =
+                            self.template invoke<"hit_test">(self.pointer.x, self.pointer.y);
+                        if (mh.r == region::header && mh.col >= 0)
+                        {
+                            self.state.menu_open = true;
+                            self.state.menu_pos = mh.col;
+                            self.state.menu_ax = static_cast<float>(self.pointer.x);
+                            self.state.menu_ay = static_cast<float>(self.pointer.y);
+                            std::println("[table] menu open pos={}", mh.col);
+                            self.template invoke<"invalidate">();
+                        }
+                    }
+                }
+
+                // 事件归属：只处理落在自己作用域内的指针事件
+                if constexpr (std::same_as<T, position2d_event> ||
+                              std::same_as<T, mousebutton_event> ||
+                              std::same_as<T, scroll_event>)
+                {
+                    float px = static_cast<float>(self.pointer.x);
+                    float py = static_cast<float>(self.pointer.y);
+                    if constexpr (std::same_as<T, position2d_event>)
+                    {
+                        px = static_cast<float>(e.xpos);
+                        py = static_cast<float>(e.ypos);
+                    }
+                    if (!g_scope_registry.empty())
+                    {
+                        const int owner = scope_owner(g_scope_registry, px, py);
+                        if (owner < 0 ||
+                            g_scope_registry[static_cast<std::size_t>(owner)].id != 11u)
+                        {
+                            static bool ignore_logged = false;
+                            if (!ignore_logged)
+                            {
+                                ignore_logged = true;
+                                std::println("[table] ignore outside ({:.0f},{:.0f})", px, py);
+                            }
+                            if (self.state.menu_open)
+                            {
+                                self.state.menu_open = false;
+                                std::println("[table] menu close (outside)");
+                                self.template invoke<"invalidate">();
+                            }
+                            return;
+                        }
+                    }
+                }
+
+                if constexpr (std::same_as<T, position2d_event>)
+                {
+                    self.pointer = {e.xpos, e.ypos};
+                    self.template invoke<"update_hover">();
+                }
+                else if constexpr (std::same_as<T, cursor_enter_event>)
+                {
+                    if (!e.value && self.state.hover.inside())
+                    {
+                        self.state.hover = {};
+                        self.template invoke<"invalidate">();
+                    }
+                }
+                else if constexpr (std::same_as<T, mousebutton_event>)
+                {
+                    if (e.button == MouseButtons::eMOUSE_BUTTON_LEFT &&
+                        e.press() && !e.repeat())
+                    {
+                        self.press_hit = self.template invoke<"hit_test">(
+                            self.pointer.x, self.pointer.y);
+                        self.press_pos = self.pointer;
+                    }
+                }
+                else if constexpr (std::same_as<T, mcs::vulkan::event::char_event>)
+                {
+                    self.template invoke<"on_char">(e.codepoint);
+                }
+
+                using frame_t =
+                    decltype(input_frame::build_change(self.input_state, e));
+                if constexpr (!std::is_void_v<frame_t>)
+                {
+                    auto f = input_frame::build_change(self.input_state, e);
+                    self.arbiter.feed(self, f, app::now_ms());
+                    input_frame::apply_change(self.input_state, f);
+                }
+            }),
+
+            // ── 渲染 ────────────────────────────────────────────
+            method<"render">([](auto &self, ui_new::ScreenWidget *screen,
+                                ui_new::Widget *owner, render_context &ctx) {
+                self.screen = screen;
                 if (!ctx.drawRecorder.hasViewport())
                     return;
                 const auto viewport = ctx.drawRecorder.currentViewport();
-                // 用真实 framebuffer 尺寸，不用 ScreenWidget 的逻辑尺寸
                 const float vw = viewport.width;
                 const float vh = viewport.height;
                 if (!self.built || self.viewport.x != vw || self.viewport.y != vh)
@@ -9022,116 +10555,497 @@ namespace table_demo
                 if (self.rows.empty())
                     return;
 
-                constexpr std::size_t N = Schema::count;
                 const auto &prefs = self.prefs;
-                const float margin = 40.0f;
-                const float top = 100.0f;
-                const float x0 = static_cast<float>(owner->offset.x) + margin;
-                const float y0 = static_cast<float>(owner->offset.y) + top;
-                const float w = vw - margin * 2.0f;
-                const float h = vh - top - margin;
-                if (w < 260.0f || h < 160.0f)
-                    return;
-
-                const float scale = vw / 800.0f;
-                self.metrics = solve_columns<Schema>(w, prefs, scale);
-                const auto &m = self.metrics;
+                auto &st = self.state;
+                auto &g = self.geom;
+                const int n = static_cast<int>(self.rows.size());
                 const float step = prefs.row_h + prefs.row_gap;
-                const float body_h = h - prefs.header_h;
-                // 不要在 render 里读 clock：两个 frame-in-flight 的 recorder
-                // 是在不同时刻录的，会各自存下不同的 scroll；交替呈现时
-                // 整张表就在两个位置之间抖。ABCDE 是静态的，所以没事。
-                // 要做动画，应由每帧唯一的 tick 更新 scroll，并每帧重录。
-                const float scroll = 0.0f;
-                const auto win = window_for(scroll, body_h, self.rows.size(), step);
 
-                // ── 阶段 1：外框 + 表头（全屏裁剪）─────────────────
-                std::vector<shader_data::Rectangle> rects;
-                std::vector<shader_data::Glyph> glyphs;
-                rects.reserve(32);
-                glyphs.reserve(N * 8);
-
-                push_rect(rects, x0, y0, w, h, {0.10f, 0.11f, 0.14f, 0.97f}, vw, vh,
-                          0.018f);
-                push_rect(rects, x0, y0, w, prefs.header_h, {0.17f, 0.19f, 0.25f, 1.0f},
-                          vw, vh, 0.01f);
-                for (std::size_t c = 0; c < N; ++c)
-                    push_text(glyphs, self.headers[c], x0 + m.x[c], y0 + 26.0f, vw, vh,
-                              {0.85f, 0.87f, 0.92f, 1.0f});
-                for (std::size_t c = 1; c < N; ++c)
-                    push_rect(rects, x0 + m.x[c] - prefs.pad * 0.5f, y0 + 6.0f, 1.0f,
-                              prefs.header_h - 12.0f, {1, 1, 1, 0.08f}, vw, vh);
-                if (!rects.empty())
-                    ctx.drawRecorder.addInstances(
-                        std::span<const shader_data::Rectangle>{rects});
-                if (!glyphs.empty())
-                    ctx.drawRecorder.addInstances(
-                        std::span<const shader_data::Glyph>{glyphs});
-
-                // ── 阶段 2：行内容（裁剪到 body）───────────────────
-                rects.clear();
-                glyphs.clear();
-                const VkRect2D body_sc{
-                    .offset = {static_cast<int32_t>(x0),
-                               static_cast<int32_t>(y0 + prefs.header_h)},
-                    .extent = {static_cast<uint32_t>(w), static_cast<uint32_t>(body_h)}};
-                const auto saved = ctx.drawRecorder.currentScissor();
-                ctx.drawRecorder.setScissor(body_sc);
-
-                const int hot_row = -1;
-                for (std::size_t i = win.first; i < win.last; ++i)
+                // 表框 = panel ∩ viewport
+                const float margin = kTableMargin, top = kTableTop;
+                const float panel_w = static_cast<float>(owner->size.width);
+                const float panel_h = static_cast<float>(owner->size.height);
+                const bool has_panel = panel_w > 0.0f && panel_h > 0.0f;
+                const float x0 =
+                    (has_panel ? static_cast<float>(owner->offset.x) : 0.0f) + margin;
+                const float y0 =
+                    (has_panel ? static_cast<float>(owner->offset.y) : 0.0f) + top;
+                const float w = std::min(
+                    has_panel ? panel_w - margin * 2.0f : vw - margin * 2.0f,
+                    vw - x0 - margin);
+                const float h = std::min(
+                    has_panel ? panel_h - top - margin : vh - top - margin,
+                    vh - y0 - margin);
+                if (w < 260.0f || h < 160.0f)
                 {
-                    const float ry =
-                        y0 + prefs.header_h + static_cast<float>(i) * step - scroll;
-                    glm::vec4 bg = (i % 2) ? glm::vec4{0.13f, 0.14f, 0.18f, 0.95f}
-                                           : glm::vec4{0.15f, 0.16f, 0.21f, 0.95f};
-                    if (static_cast<int>(i) == hot_row)
-                        bg = {0.19f, 0.22f, 0.30f, 0.98f};
-                    if (static_cast<int>(i) == prefs.selected)
-                        bg = {0.19f, 0.31f, 0.44f, 0.98f};
-                    push_rect(rects, x0, ry, w, prefs.row_h, bg, vw, vh, 0.004f);
+                    g.valid = false;
+                    return;
+                }
 
-                    for (std::size_t c = 0; c < N; ++c)
+                // ── ① 几何求解 ─────────────────────────────────
+                // 首次渲染时初始化列序（位次 → 数据列）
+                if (!st.col_ready)
+                {
+                    for (std::size_t i = 0; i < N; ++i)
+                        st.col_order[i] = static_cast<int>(i);
+                    st.col_ready = true;
+                }
+                g.m = solve_columns<Schema>(w, prefs, st.col_w, st.col_order);
+                g.content_w = g.m.x[N - 1] + g.m.w[N - 1] + prefs.pad;
+                g.max_x = std::max(0.0f, g.content_w - w);
+                g.hb_on = g.max_x > 0.5f;
+                const float hbar_h = g.hb_on ? prefs.bar + 4.0f : 0.0f;
+                g.body_h = h - prefs.header_h - hbar_h;
+                g.content_h = static_cast<float>(n) * step;
+                g.max_y = std::max(0.0f, g.content_h - g.body_h);
+                g.vb_on = g.max_y > 0.5f;
+
+                st.scroll_x = std::clamp(st.scroll_x, 0.0f, g.max_x);
+                st.scroll_y = std::clamp(st.scroll_y, 0.0f, g.max_y);
+
+                g.x0 = x0;
+                g.y0 = y0;
+                g.w = w;
+                g.h = h;
+                g.header_h = prefs.header_h;
+                g.cell_pad = prefs.cell_pad;
+                g.pad = prefs.pad;
+                g.row_h = prefs.row_h;
+                g.row_gap = prefs.row_gap;
+                g.scroll_x = st.scroll_x;
+                g.scroll_y = st.scroll_y;
+
+                const float bar = prefs.bar;
+                const float vb_w = g.vb_on ? bar : 0.0f;
+                auto vb = make_bar(w - bar - 4.0f, prefs.header_h + 4.0f, bar,
+                                   g.body_h - 8.0f, g.body_h - 8.0f, g.content_h,
+                                   g.body_h, st.scroll_y);
+                g.vb = {.x = vb.x, .y = vb.y, .w = vb.w, .h = vb.h,
+                        .thumb_off = vb.thumb_off, .thumb_len = vb.thumb_len};
+                g.vb_on = vb.on;
+
+                auto hb = make_bar(4.0f, h - bar - 4.0f,
+                                   w - vb_w - bar - 8.0f, bar,
+                                   w - vb_w - bar - 8.0f, g.content_w, w,
+                                   st.scroll_x);
+                g.hb = {.x = hb.x, .y = hb.y, .w = hb.w, .h = hb.h,
+                        .thumb_off = hb.thumb_off, .thumb_len = hb.thumb_len};
+                g.hb_on = hb.on;
+
+                visible_cols(g.m, st.scroll_x, w, g.col0, g.col1);
+                visible_rows(st.scroll_y, g.body_h, self.rows.size(), step, g.row0,
+                             g.row1);
+                static bool scope_registered = false;
+                if (!scope_registered)   // 首次布局完成后登记
+                {
+                    scope_registered = true;
+                    g_scope_registry.push_back(input_scope{.id = 11,
+                                                           .kind = scope_kind::panel,
+                                                           .priority = 2,
+                                                           .x = x0,
+                                                           .y = y0,
+                                                           .w = w,
+                                                           .h = h});
+                    std::println(
+                        "[table] scope registered id=11 rect={:.0f},{:.0f},{:.0f},{:.0f}",
+                        x0, y0, w, h);
+                }
+                // 拾取是 hover 的权威来源；自测模式把 ctx.last_pick 置空，退回事件驱动
+                if (ctx.last_pick.key.object_type == 6u &&
+                    ctx.last_pick.key.entity_index >= 1u)
+                {
+                    const auto ph = hit_from_pick(
+                        ctx.last_pick.key.object_type, ctx.last_pick.key.entity_index,
+                        static_cast<int>(N), self.rows.size());
+                    if (ph.inside())
+                        st.hover = ph;
+                }
+                g.valid = true;
+                if (st.editing && self.edit_dirty)
+                {
+                    std::string_view sv{st.buf};
+                    self.edit_cell = shape_cell(*self.font, sv, 15.0f, vw, vh);
+                    auto pre = shape_cell(*self.font, sv.substr(0, st.caret), 15.0f, vw,
+                                          vh);
+                    self.edit_caret_x = pre.advance;
+                    auto pre2 = shape_cell(*self.font, sv.substr(0, st.edit_anchor),
+                                          15.0f, vw, vh);
+                    self.edit_anchor_x = pre2.advance;
+                    self.edit_dirty = false;
+                }
+
+                const auto hover = st.hover;
+                const int selected = st.selected;
+                const glm::vec4 accent{0.45f, 0.72f, 1.0f, 0.95f};
+
+                std::vector<shader_data::Cell> cells;
+                std::vector<shader_data::Glyph> glyphs;
+                cells.reserve(160);
+                glyphs.reserve(240);
+
+                const auto flush_all = [&]() {
+                    if (!cells.empty())
+                        ctx.drawRecorder.addInstances(
+                            std::span<const shader_data::Cell>{cells});
+                        ctx.drawRecorder.addInstances(
+                            std::span<const shader_data::Glyph>{glyphs});
+                    cells.clear();
+                    glyphs.clear();
+                };
+
+                const auto full_sc = ctx.drawRecorder.currentScissor();
+
+                // ── ② 面板底 ───────────────────────────────────
+                ctx.drawRecorder.setScissor(full_sc);
+                push_cell(cells, x0, y0, w, h, {0.10f, 0.11f, 0.14f, 0.97f}, 10.0f, vw,
+                          vh);
+                flush_all();
+
+                // ── ③ 表头（冻结位次 0 + 横向裁剪）──────────────
+                const float frozen_w = g.m.x[1];
+                if (st.scroll_x > 0.0f)
+                {
+                    static bool frozen_logged = false;   // 自测断言点
+                    if (!frozen_logged)
                     {
-                        glm::vec4 fg{0.84f, 0.86f, 0.91f, 1.0f};
-                        if (c == 1)
-                        {
-                            if (self.rows[i][c] == "ready")
-                                fg = {0.45f, 0.85f, 0.55f, 1.0f};
-                            else if (self.rows[i][c] == "busy")
-                                fg = {0.95f, 0.75f, 0.35f, 1.0f};
-                            else
-                                fg = {0.95f, 0.45f, 0.45f, 1.0f};
-                        }
-                        if (c == 4)
-                            fg = {0.55f, 0.72f, 0.95f, 1.0f};
-                        push_text(glyphs, self.cells[i * N + c], x0 + m.x[c], ry + 21.0f,
-                                  vw, vh, fg);
+                        frozen_logged = true;
+                        std::println("[table] frozen x={:.0f} w={:.0f} scroll={:.0f}",
+                                     x0 + g.m.x[0], frozen_w, st.scroll_x);
                     }
                 }
-                if (!rects.empty())
-                    ctx.drawRecorder.addInstances(
-                        std::span<const shader_data::Rectangle>{rects});
-                if (!glyphs.empty())
-                    ctx.drawRecorder.addInstances(
-                        std::span<const shader_data::Glyph>{glyphs});
-                ctx.drawRecorder.setScissor(saved);
+                const int p_first = std::max(1, g.col0);
+                const auto row_bg = [&](int r, bool is_sel) {
+                    glm::vec4 bg = (r % 2) ? glm::vec4{0.13f, 0.14f, 0.18f, 0.95f}
+                                           : glm::vec4{0.15f, 0.16f, 0.21f, 0.95f};
+                    if (is_sel)
+                        bg = {0.19f, 0.31f, 0.44f, 0.98f};
+                    else if (hover.r == region::cell && hover.row == r)
+                        bg = {0.19f, 0.22f, 0.30f, 0.98f};
+                    return bg;
+                };
+                const auto cell_fg = [&](int dc, const std::string &text, bool is_sel) {
+                    glm::vec4 fg{0.86f, 0.88f, 0.93f, 1.0f};
+                    if (dc == 1)
+                    {
+                        if (text == "ready")
+                            fg = {0.45f, 0.85f, 0.55f, 1.0f};
+                        else if (text == "busy")
+                            fg = {0.95f, 0.75f, 0.35f, 1.0f};
+                        else
+                            fg = {0.95f, 0.45f, 0.45f, 1.0f};
+                    }
+                    if (dc == 4)
+                        fg = {0.55f, 0.72f, 0.95f, 1.0f};
+                    if (is_sel)
+                        fg = glm::min(fg + glm::vec4(0.10f), glm::vec4(1.0f));
+                    return fg;
+                };
 
-                // ── 阶段 3：外框线 + 列线 + 滚动条（全屏裁剪）───────
-                rects.clear();
-                const glm::vec4 line{1, 1, 1, 0.16f};
-                push_rect(rects, x0, y0, w, 1.0f, line, vw, vh);
-                push_rect(rects, x0, y0 + h - 1.0f, w, 1.0f, line, vw, vh);
-                push_rect(rects, x0, y0, 1.0f, h, line, vw, vh);
-                push_rect(rects, x0 + w - 1.0f, y0, 1.0f, h, line, vw, vh);
-                for (std::size_t c = 1; c < N; ++c)
-                    push_rect(rects, x0 + m.x[c] - prefs.pad * 0.5f, y0 + prefs.header_h,
-                              1.0f, h - prefs.header_h, {1, 1, 1, 0.07f}, vw, vh);
+                // —— 冻结列表头 ——
+                ctx.drawRecorder.setScissor(
+                    VkRect2D{.offset = {static_cast<int32_t>(x0), static_cast<int32_t>(y0)},
+                             .extent = {static_cast<uint32_t>(std::max(0.0f, frozen_w)),
+                                        static_cast<uint32_t>(prefs.header_h)}});
+                push_cell(cells, x0, y0, frozen_w, prefs.header_h,
+                          {0.17f, 0.19f, 0.25f, 1.0f}, 10.0f, vw, vh);
+                if (st.sort_col == st.col_order[0])
+                    push_cell(cells, x0 + g.m.x[0], y0, g.m.w[0] - prefs.pad,
+                              prefs.header_h, {0.45f, 0.72f, 1.0f, 0.10f}, 6.0f, vw, vh);
+                push_text(glyphs, self.headers[st.col_order[0]],
+                          x0 + g.m.x[0] + prefs.cell_pad, y0 + 26.0f, vw, vh,
+                          (st.sort_col == st.col_order[0] && st.sort_dir != 0)
+                              ? glm::vec4{0.72f, 0.86f, 1.0f, 1.0f}
+                              : glm::vec4{0.85f, 0.87f, 0.92f, 1.0f});
+                {
+                    const float sep = x0 + frozen_w - prefs.pad * 0.5f;
+                    const bool hot =
+                        (hover.r == region::separator && hover.col == 0) ||
+                        (st.drag == 1 && st.drag_col == st.col_order[0]);
+                    push_cell(cells, hot ? sep - 1.0f : sep, y0 + 6.0f,
+                              hot ? 3.0f : 1.0f, prefs.header_h - 12.0f,
+                              hot ? accent : glm::vec4{1.0f, 1.0f, 1.0f, 0.08f}, 0.5f,
+                              vw, vh);
+                }
+                flush_all();
 
-                // 静态表：先不画滚动条（没有滚动状态时画了反而误导）
-                if (!rects.empty())
-                    ctx.drawRecorder.addInstances(
-                        std::span<const shader_data::Rectangle>{rects});
+                // —— 滚动区表头 ——
+                ctx.drawRecorder.setScissor(
+                    VkRect2D{.offset = {static_cast<int32_t>(x0 + frozen_w),
+                                        static_cast<int32_t>(y0)},
+                             .extent = {static_cast<uint32_t>(
+                                            std::max(0.0f, w - frozen_w - vb_w)),
+                                        static_cast<uint32_t>(prefs.header_h)}});
+                push_cell(cells, x0 + frozen_w, y0, w - frozen_w - vb_w, prefs.header_h,                           {0.17f, 0.19f, 0.25f, 1.0f}, 10.0f, vw, vh,                           {picking_proto::make_user_data(picking_proto::kHeader), 0u, 0u,                            0xFFFFFFFFu});
+                if (hover.col >= 1 && hover.col < static_cast<int>(N) &&
+                    (hover.r == region::header || hover.r == region::cell))
+                    push_cell(cells, x0 + g.m.x[hover.col] - st.scroll_x, y0,
+                              g.m.w[hover.col] - prefs.pad, prefs.header_h,
+                              {1.0f, 1.0f, 1.0f, 0.05f}, 6.0f, vw, vh);
+                if (st.sort_col >= 0)
+                {
+                    const int sp = pos_of(st.col_order, st.sort_col);
+                    if (sp >= 1)
+                        push_cell(cells, x0 + g.m.x[sp] - st.scroll_x, y0,
+                                  g.m.w[sp] - prefs.pad, prefs.header_h,
+                                  {0.45f, 0.72f, 1.0f, 0.10f}, 6.0f, vw, vh);
+                }
+                for (int p = p_first; p < g.col1; ++p)
+                {
+                    const int dc = st.col_order[p];
+                    if (g.m.w[p] <= 0.5f)
+                        continue;
+                    const float cx = x0 + g.m.x[p] - st.scroll_x;
+                    push_text(glyphs, self.headers[dc], cx + prefs.cell_pad,
+                              y0 + 26.0f, vw, vh,
+                              (dc == st.sort_col && st.sort_dir != 0)
+                                  ? glm::vec4{0.72f, 0.86f, 1.0f, 1.0f}
+                                  : glm::vec4{0.85f, 0.87f, 0.92f, 1.0f});
+                    if (dc == st.sort_col && st.sort_dir != 0)
+                    {
+                        const float ax =
+                            cx + prefs.cell_pad + self.headers[dc].advance + 8.0f;
+                        const float ay = y0 + 26.0f - 9.0f;
+                        for (int k = 0; k < 3; ++k)
+                        {
+                            const float bw = 8.0f - k * 2.0f;
+                            const float by = st.sort_dir > 0 ? ay + k * 3.0f
+                                                             : ay + (2 - k) * 3.0f;
+                            push_cell(cells, ax + (8.0f - bw) * 0.5f, by, bw, 2.0f,
+                                      accent, 1.0f, vw, vh);
+                        }
+                    }
+                }
+                for (int p = 2; p < static_cast<int>(N); ++p)
+                {
+                    const bool hot =
+                        (hover.r == region::separator && hover.col == p - 1) ||
+                        (st.drag == 1 && st.drag_col == st.col_order[p - 1]);
+                    const float sx = x0 + g.m.x[p] - prefs.pad * 0.5f - st.scroll_x;
+                    push_cell(cells, hot ? sx - 1.0f : sx, y0 + 6.0f, hot ? 3.0f : 1.0f,
+                              prefs.header_h - 12.0f,
+                              hot ? accent : glm::vec4{1.0f, 1.0f, 1.0f, 0.08f}, 0.5f,
+                              vw, vh);
+                }
+                flush_all();
+
+                // ── ④ 表体：冻结段 ─────────────────────────────
+                ctx.drawRecorder.setScissor(
+                    VkRect2D{.offset = {static_cast<int32_t>(x0),
+                                        static_cast<int32_t>(y0 + prefs.header_h)},
+                             .extent = {static_cast<uint32_t>(std::max(0.0f, frozen_w)),
+                                        static_cast<uint32_t>(std::max(0.0f, g.body_h))}});
+                for (int r = g.row0; r < g.row1; ++r)
+                {
+                    const float ry = y0 + prefs.header_h +
+                                     static_cast<float>(r) * step - st.scroll_y;
+                    const bool is_sel =
+                        static_cast<std::size_t>(r) < st.sel.size() &&
+                        st.sel[static_cast<std::size_t>(r)] != 0;
+                    push_cell(cells, x0, ry, frozen_w, prefs.row_h, row_bg(r, is_sel), 4.0f, vw, vh);
+                    if (hover.r == region::cell && hover.row == r && hover.col == 0)
+                        push_cell(cells, x0 + g.m.x[0], ry, g.m.w[0] - prefs.pad,
+                                  prefs.row_h, {1.0f, 1.0f, 1.0f, 0.05f}, 4.0f, vw, vh);
+                    if (!(st.editing && st.edit_row == r && st.edit_col == 0))
+                        push_text(glyphs, self.cells[r * N + st.col_order[0]],
+                                  x0 + g.m.x[0] + prefs.cell_pad, ry + 21.0f, vw, vh,
+                                  cell_fg(st.col_order[0],
+                                          self.rows[self.order[r]][st.col_order[0]],
+                                          is_sel));
+                    if (!st.editing && st.row == r && pos_of(st.col_order, st.col) == 0)
+                        push_cell(cells, x0 + g.m.x[0], ry, g.m.w[0] - prefs.pad,
+                                  prefs.row_h, glm::vec4{0.0f}, 4.0f, vw, vh, accent,
+                                  2.0f);
+                    if (st.editing && st.edit_row == r && st.edit_col == 0)
+                    {
+                        push_cell(cells, x0 + g.m.x[0], ry, g.m.w[0] - prefs.pad,
+                                  prefs.row_h, {0.08f, 0.10f, 0.14f, 1.0f}, 4.0f, vw,
+                                  vh);
+                    {
+                        const float a0 = std::min(self.edit_anchor_x, self.edit_caret_x);
+                        const float b0 = std::max(self.edit_anchor_x, self.edit_caret_x);
+                        if (b0 - a0 > 0.5f)
+                            push_cell(cells, x0 + g.m.x[0] + prefs.cell_pad + a0,
+                                      ry + 3.0f, b0 - a0, prefs.row_h - 6.0f,
+                                      {0.45f, 0.72f, 1.0f, 0.28f}, 2.0f, vw, vh);
+                    }
+                        push_text(glyphs, self.edit_cell,
+                                  x0 + g.m.x[0] + prefs.cell_pad, ry + 21.0f, vw, vh,
+                                  {1.0f, 1.0f, 1.0f, 1.0f});
+                        push_cell(cells,
+                                  x0 + g.m.x[0] + prefs.cell_pad + self.edit_caret_x,
+                                  ry + 6.0f, 1.5f, prefs.row_h - 12.0f, accent, 0.75f,
+                                  vw, vh);
+                        push_cell(cells, x0 + g.m.x[0], ry, g.m.w[0] - prefs.pad,
+                                  prefs.row_h, glm::vec4{0.0f}, 4.0f, vw, vh, accent,
+                                  2.0f);
+                    }
+                }
+                flush_all();
+
+                // ── ④ 表体：滚动段 ─────────────────────────────
+                ctx.drawRecorder.setScissor(
+                    VkRect2D{.offset = {static_cast<int32_t>(x0 + frozen_w),
+                                        static_cast<int32_t>(y0 + prefs.header_h)},
+                             .extent = {static_cast<uint32_t>(
+                                            std::max(0.0f, w - frozen_w - vb_w)),
+                                        static_cast<uint32_t>(std::max(0.0f, g.body_h))}});
+                for (int r = g.row0; r < g.row1; ++r)
+                {
+                    const float ry = y0 + prefs.header_h +
+                                     static_cast<float>(r) * step - st.scroll_y;
+                    const bool is_sel =
+                        static_cast<std::size_t>(r) < st.sel.size() &&
+                        st.sel[static_cast<std::size_t>(r)] != 0;
+                    push_cell(cells, x0 + frozen_w, ry, w - frozen_w - vb_w, prefs.row_h, row_bg(r, is_sel), 4.0f, vw, vh);
+
+                    for (int p = p_first; p < g.col1; ++p)
+                    {
+                        const int dc = st.col_order[p];
+                        if (g.m.w[p] <= 0.5f)
+                            continue;
+                        const float cx = x0 + g.m.x[p] - st.scroll_x;
+                        const float cw = g.m.w[p] - prefs.pad;
+                        // 每格一个“只写拾取”的代理：kind=kBody, state=kPickOnly, index=row*N+pos                         {                             push_cell(cells, cx, ry, cw, prefs.row_h, glm::vec4{0.0f}, 0.0f, vw, vh);                             if (!cells.empty())                             {                                 cells.back().user_data = picking_proto::make_user_data(picking_proto::kBody, picking_proto::kPickOnly);                                 cells.back().entity_index = static_cast<std::uint32_t>(                                     r * static_cast<int>(N) + p);                             }                         }
+                        if (hover.r == region::cell && hover.row == r && hover.col == p)
+                            push_cell(cells, cx, ry, cw, prefs.row_h,
+                                      {1.0f, 1.0f, 1.0f, 0.05f}, 4.0f, vw, vh);
+                        if (st.editing && st.edit_row == r && st.edit_col == p)
+                            continue;
+                        push_text(glyphs, self.cells[r * N + dc], cx + prefs.cell_pad,
+                                  ry + 21.0f, vw, vh,
+                                  cell_fg(dc, self.rows[self.order[r]][dc], is_sel));
+                    }
+
+                    if (!st.editing && st.row == r)
+                    {
+                        const int fp = pos_of(st.col_order, st.col);
+                        if (fp >= p_first)
+                            push_cell(cells, x0 + g.m.x[fp] - st.scroll_x, ry,
+                                      g.m.w[fp] - prefs.pad, prefs.row_h,
+                                      glm::vec4{0.0f}, 4.0f, vw, vh, accent, 2.0f);
+                    }
+                    if (st.editing && st.edit_row == r && st.edit_col >= p_first &&
+                        st.edit_col < g.col1)
+                    {
+                        const float cx = x0 + g.m.x[st.edit_col] - st.scroll_x;
+                        const float cw = g.m.w[st.edit_col] - prefs.pad;
+                        push_cell(cells, cx, ry, cw, prefs.row_h,
+                                  {0.08f, 0.10f, 0.14f, 1.0f}, 4.0f, vw, vh);
+                    {
+                        const float a0 = std::min(self.edit_anchor_x, self.edit_caret_x);
+                        const float b0 = std::max(self.edit_anchor_x, self.edit_caret_x);
+                        if (b0 - a0 > 0.5f)
+                            push_cell(cells, cx + prefs.cell_pad + a0, ry + 3.0f,
+                                      b0 - a0, prefs.row_h - 6.0f,
+                                      {0.45f, 0.72f, 1.0f, 0.28f}, 2.0f, vw, vh);
+                    }
+                        push_text(glyphs, self.edit_cell, cx + prefs.cell_pad,
+                                  ry + 21.0f, vw, vh, {1.0f, 1.0f, 1.0f, 1.0f});
+                        push_cell(cells, cx + prefs.cell_pad + self.edit_caret_x,
+                                  ry + 6.0f, 1.5f, prefs.row_h - 12.0f, accent, 0.75f,
+                                  vw, vh);
+                        push_cell(cells, cx, ry, cw, prefs.row_h, glm::vec4{0.0f},
+                                  4.0f, vw, vh, accent, 2.0f);
+                    }
+                }
+                flush_all();
+                // ── ⑤ 滚动条 / 外框 ─────────────────────────────
+                ctx.drawRecorder.setScissor(full_sc);
+
+                if (g.vb_on)
+                {
+                    const bool hot = (hover.r == region::vbar && hover.thumb) ||
+                                     st.drag == 2;
+                    push_cell(cells, x0 + g.vb.x, y0 + g.vb.y, g.vb.w, g.vb.h,
+                              {1, 1, 1, 0.06f}, g.vb.w * 0.5f, vw, vh);
+                    push_cell(cells, x0 + g.vb.x, y0 + g.vb.y + g.vb.thumb_off, g.vb.w,
+                              g.vb.thumb_len,
+                              hot ? glm::vec4{0.62f, 0.80f, 1.0f, 0.85f}
+                                  : glm::vec4{0.55f, 0.72f, 0.95f, 0.55f},
+                              g.vb.w * 0.5f, vw, vh);
+                }
+                if (g.hb_on)
+                {
+                    const bool hot = (hover.r == region::hbar && hover.thumb) ||
+                                     st.drag == 3;
+                    push_cell(cells, x0 + g.hb.x, y0 + g.hb.y, g.hb.w, g.hb.h,
+                              {1, 1, 1, 0.06f}, g.hb.h * 0.5f, vw, vh);
+                    push_cell(cells, x0 + g.hb.x + g.hb.thumb_off, y0 + g.hb.y,
+                              g.hb.thumb_len, g.hb.h,
+                              hot ? glm::vec4{0.62f, 0.80f, 1.0f, 0.85f}
+                                  : glm::vec4{0.55f, 0.72f, 0.95f, 0.55f},
+                              g.hb.h * 0.5f, vw, vh);
+                }
+
+                const glm::vec4 line{1, 1, 1, 0.14f};
+                push_cell(cells, x0, y0, w, 1.0f, line, 0.0f, vw, vh);
+                push_cell(cells, x0, y0 + h - 1.0f, w, 1.0f, line, 0.0f, vw, vh);
+                push_cell(cells, x0, y0, 1.0f, h, line, 0.0f, vw, vh);
+                push_cell(cells, x0 + w - 1.0f, y0, 1.0f, h, line, 0.0f, vw, vh);
+
+                if (st.tt_state == 2 && st.hover.inside() && !st.menu_open)
+                {
+                    const auto tg = shape_cell(*self.font, st.tt_text, 13.0f, vw, vh);
+                    const float pad = 8.0f;
+                    const float tw = tg.advance + pad * 2.0f;
+                    const float th = 24.0f;
+                    const auto to =
+                        overlay_at(static_cast<float>(self.pointer.x),
+                                   static_cast<float>(self.pointer.y), tw, th, x0, y0,
+                                   w, h, 12.0f, 14.0f);
+                    const float tx = to.x;
+                    const float ty = to.y;
+                    push_cell(cells, tx, ty, tw, th, {0.08f, 0.09f, 0.12f, 0.97f}, 4.0f,
+                              vw, vh, {1.0f, 1.0f, 1.0f, 0.15f}, 1.0f);
+                    push_text(glyphs, tg, tx + pad, ty + 17.0f, vw, vh,
+                              {0.92f, 0.94f, 0.98f, 1.0f});
+                }
+                if (st.menu_open)
+                {
+                    const float mw = 150.0f, mh = 112.0f;
+                    const auto mo =
+                        overlay_at(st.menu_ax, st.menu_ay, mw, mh, x0, y0, w, h);
+                    const float mx = mo.x;
+                    const float my = mo.y;
+                    push_cell(cells, mx, my, mw, mh, {0.12f, 0.13f, 0.17f, 0.99f}, 6.0f,
+                              vw, vh, {1.0f, 1.0f, 1.0f, 0.12f}, 1.0f);
+                    // 菜单项 hover：无状态，直接用指针算（与点击同一套几何）
+                    {
+                        int mi = -1;
+                        if (self.pointer.x >= mx && self.pointer.x <= mx + mw &&
+                            self.pointer.y >= my + 4.0f &&
+                            self.pointer.y <= my + mh - 4.0f)
+                            mi = static_cast<int>((self.pointer.y - my - 4.0f) / 26.0f);
+                        if (mi >= 0 && mi < 4)
+                            push_cell(cells, mx + 4.0f,
+                                      my + 4.0f + static_cast<float>(mi) * 26.0f,
+                                      mw - 8.0f, 26.0f, {0.45f, 0.72f, 1.0f, 0.22f},
+                                      4.0f, vw, vh);
+                    }
+                    // 菜单项 hover：无状态，直接用指针算（与点击同一套几何）
+                    int mi = -1;
+                    if (self.pointer.x >= mx && self.pointer.x <= mx + mw &&
+                        self.pointer.y >= my + 4.0f &&
+                        self.pointer.y <= my + mh - 4.0f)
+                        mi = static_cast<int>((self.pointer.y - my - 4.0f) / 26.0f);
+                    if (mi >= 0 && mi < 4)
+                        push_cell(cells, mx + 4.0f, my + 4.0f + static_cast<float>(mi) * 26.0f,
+                                  mw - 8.0f, 26.0f, {0.45f, 0.72f, 1.0f, 0.22f}, 4.0f, vw,
+                                  vh);
+                    const auto l0 = shape_cell(*self.font, "Fit width", 14.0f, vw, vh);
+                    const auto l1 = shape_cell(*self.font, "Reset sort", 14.0f, vw, vh);
+                    push_text(glyphs, l0, mx + 12.0f, my + 18.0f, vw, vh,
+                              {0.90f, 0.92f, 0.96f, 1.0f});
+                    push_text(glyphs, l1, mx + 12.0f, my + 44.0f, vw, vh,
+                              {0.90f, 0.92f, 0.96f, 1.0f});
+                    const auto l2 = shape_cell(*self.font, "Hide column", 14.0f, vw, vh);
+                    push_text(glyphs, l2, mx + 12.0f, my + 70.0f, vw, vh,
+                              {0.90f, 0.92f, 0.96f, 1.0f});
+                    const auto l3 = shape_cell(*self.font, "Show all", 14.0f, vw, vh);
+                    push_text(glyphs, l3, mx + 12.0f, my + 96.0f, vw, vh,
+                              {0.90f, 0.92f, 0.96f, 1.0f});
+                }
+                flush_all();
             }));
     }
 } // namespace table_demo
@@ -9139,6 +11053,10 @@ namespace table_demo
 int main()
 try
 {
+    // 自测模式下逐条刷新：崩溃时不会丢掉已打印的断言
+    if (std::getenv("TABLE_SELFTEST") != nullptr)
+        std::setvbuf(stdout, nullptr, _IONBF, 0);   // std::print 走 C stdio
+
 #ifdef VERT_SHADER_PATH
     std::cout << "VERT_SHADER_PATH: " << VERT_SHADER_PATH << '\n';
 #endif
@@ -9440,13 +11358,44 @@ try
         //
     );
     // 表：schema 在类型层，rows/prefs 在对象层，render 里只调算法
+    // 启动期纯计算自检：不依赖窗口/帧时序
+    if (std::getenv("TABLE_SELFTEST") != nullptr)
+    {
+        const table_demo::input_scope sc[] = {
+            {.id = 1, .priority = 0, .x = 0, .y = 0, .w = 800, .h = 600},
+            {.id = 2, .priority = 1, .x = 100, .y = 100, .w = 400, .h = 300},
+            {.id = 3, .priority = 5, .x = 900, .y = 900, .w = 10, .h = 10, .modal = true},
+        };
+        std::println("[table] scope_at(150,150)={}", table_demo::scope_at(sc, 150, 150));
+        std::println("[table] scope_at(1200,1200)={}", table_demo::scope_at(sc, 1200, 1200));
+        std::println("[table] scope_owner(1200,1200)={}",
+                     table_demo::scope_owner(sc, 1200, 1200));
+        const table_demo::input_scope lay[] = {
+            {.id = 10, .kind = table_demo::scope_kind::window, .priority = 0, .x = 0,
+             .y = 0, .w = 800, .h = 600},
+            {.id = 11, .kind = table_demo::scope_kind::panel, .priority = 2, .x = 40,
+             .y = 100, .w = 720, .h = 460},
+        };
+        std::println("[table] layout_at(100,150)={}", table_demo::scope_at(lay, 100, 150));
+        std::println("[table] layout_at(5,5)={}", table_demo::scope_at(lay, 5, 5));
+        const auto ph1 = table_demo::hit_from_pick(table_demo::picking_proto::make_user_data(2u, 1u), 2u * 5u + 3u, 5, 18);
+        std::println("[table] pick->row={} col={}", ph1.row, ph1.col);
+        const auto ph2 = table_demo::hit_from_pick(0u, 0u, 5, 18);
+        std::println("[table] pick->row={} col={} outside", ph2.row, ph2.col);
+        std::println("[table] scope id=11 rect={:.0f},{:.0f},{:.0f},{:.0f}",
+                     table_demo::kTableMargin, table_demo::kTableTop,
+                     800.0f - table_demo::kTableMargin * 2.0f,
+                     600.0f - table_demo::kTableTop - table_demo::kTableMargin);
+    }
+
     auto tableBox = table_demo::make_table<table_demo::demo_schema>(
         table_demo::demo_rows(), &fontSelect);
 
     ui_new::ScreenWidget screen{ui_new::Size{WIDTH, HEIGHT},
                                 ui_new::Container("panel")
-                                    .renderObject(render::asRenderObject(
-                                        std::move(tableBox), [](auto &) noexcept {}))
+                                    // 表自己接事件：input_event → arbiter
+                                    .renderObject(
+                                        render::asRenderObject(std::move(tableBox)))
                                     .child(ui_new::Container("rectBox").renderObject(
                                         render::asRenderObject(std::move(textBox))))};
 
@@ -10027,10 +11976,12 @@ try
                 });
             }
 
-            render_context context{.drawRecorder = builder,
+        render_context context{.last_pick = world.hoverManager.cur,
+                                   .drawRecorder = builder,
                                    .input = inputCtx.input,
                                    .clock = inputCtx.clock,
                                    .fontSelect = fontCtx.fontSelect};
+            if (std::getenv("TABLE_SELFTEST") != nullptr)                 context.last_pick = {};   // 自测禁用真实拾取，保证确定性
             screen.recorderCmd(currentFrame, context);
 
             builder.end();
@@ -10289,7 +12240,286 @@ try
                                  limit_frame_rate(inputCtx,
                                                   60.0f); // ② 帧率限制（可选）
                                  InputController(world, inputCtx, soaCtx);
+
+                                 // ── 自测：直接往事件分发器灌合成输入 ──
+                                 //    绕过窗口消息（DPI 无关），路径与真实输入完全一致
+                                 static int selftest_frame = 0;
+                                 if (std::getenv("TABLE_SELFTEST") != nullptr &&
+                                     ++selftest_frame == 6)
+                                 {
+                                     using namespace mcs::vulkan::event;
+                                     auto move = [](double x, double y) {
+                                         position2d_event_dispatcher::instance()
+                                             .distribute({.xpos = x, .ypos = y});
+                                     };
+                                     auto click = [](ModifierKey mod) {
+                                         mousebutton_event_dispatcher::instance()
+                                             .distribute({.button = MouseButtons::eMOUSE_BUTTON_LEFT,
+                                                          .action = Action::ePRESS,
+                                                          .modifier_key = mod});
+                                         mousebutton_event_dispatcher::instance()
+                                             .distribute({.button = MouseButtons::eMOUSE_BUTTON_LEFT,
+                                                          .action = Action::eRELEASE,
+                                                          .modifier_key = mod});
+                                     };
+                                     move(82, 187);  click(ModifierKey::None());   // 单选 1
+                                     move(82, 315);  click(ModifierKey::Shift());  // 1..5
+                                     move(82, 251);  click(ModifierKey::Control()); // 切换 3
+                                     keyboard_event_dispatcher::instance().distribute(
+                                         {.key = Key::eC, .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::Control()});
+                                     keyboard_event_dispatcher::instance().distribute(
+                                         {.key = Key::eA, .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::Control()});
+                                     keyboard_event_dispatcher::instance().distribute(
+                                         {.key = Key::eC, .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::Control()});
+                                     // 编辑选区：Enter 编辑 → Shift+←×3 → X 替换 → Enter 提交
+                                     keyboard_event_dispatcher::instance().distribute(
+                                         {.key = Key::eENTER, .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::None()});
+                                     keyboard_event_dispatcher::instance().distribute(
+                                         {.key = Key::eLEFT_SHIFT, .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::Shift()});
+                                     for (int k = 0; k < 3; ++k)
+                                         keyboard_event_dispatcher::instance().distribute(
+                                             {.key = Key::eLEFT, .action = Action::ePRESS,
+                                              .modifier_key = ModifierKey::Shift()});
+                                     char_event_dispatcher::instance().distribute(
+                                         {.codepoint = static_cast<std::uint32_t>('X')});
+                                     keyboard_event_dispatcher::instance().distribute(
+                                         {.key = Key::eENTER, .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::None()});
+                                 }
+
+                                 if (std::getenv("TABLE_SELFTEST") != nullptr &&
+                                     selftest_frame == 70)
+                                 {
+                                     using namespace mcs::vulkan::event;
+                                     keyboard_event_dispatcher::instance().distribute(
+                                         {.key = Key::eF10, .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::None()});
+                                     keyboard_event_dispatcher::instance().distribute(
+                                         {.key = Key::eLEFT_CONTROL, .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::Control()});
+                                     keyboard_event_dispatcher::instance().distribute(
+                                         {.key = Key::eC, .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::Control()});
+                                 }
+
+                                 if (std::getenv("TABLE_SELFTEST") != nullptr &&
+                                     selftest_frame == 72)
+                                 {
+                                     using namespace mcs::vulkan::event;
+                                     position2d_event_dispatcher::instance().distribute(
+                                         {.xpos = 5.0, .ypos = 5.0});
+                                     mousebutton_event_dispatcher::instance().distribute(
+                                         {.button = MouseButtons::eMOUSE_BUTTON_RIGHT,
+                                          .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::None()});
+                                 }
+
+                                 if (std::getenv("TABLE_SELFTEST") != nullptr &&
+                                     selftest_frame == 120)
+                                 {
+                                     using namespace mcs::vulkan::event;
+                                     position2d_event_dispatcher::instance().distribute(
+                                         {.xpos = 100.0, .ypos = 120.0});
+                                     mousebutton_event_dispatcher::instance().distribute(
+                                         {.button = MouseButtons::eMOUSE_BUTTON_RIGHT,
+                                          .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::None()});
+                                 }
+
+                                 if (std::getenv("TABLE_SELFTEST") != nullptr &&
+                                     selftest_frame == 122)
+                                 {
+                                     using namespace mcs::vulkan::event;
+                                     position2d_event_dispatcher::instance().distribute(
+                                         {.xpos = 5.0, .ypos = 5.0});
+                                     mousebutton_event_dispatcher::instance().distribute(
+                                         {.button = MouseButtons::eMOUSE_BUTTON_LEFT,
+                                          .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::None()});
+                                     mousebutton_event_dispatcher::instance().distribute(
+                                         {.button = MouseButtons::eMOUSE_BUTTON_LEFT,
+                                          .action = Action::eRELEASE,
+                                          .modifier_key = ModifierKey::None()});
+                                 }
+
+                                 // ── 帧 8：拖列宽（分隔条 1 在 278，拖到 378）──
+                                 if (std::getenv("TABLE_SELFTEST") != nullptr &&
+                                     selftest_frame == 8)
+                                 {
+                                     using namespace mcs::vulkan::event;
+                                     auto move = [](double x, double y) {
+                                         position2d_event_dispatcher::instance()
+                                             .distribute({.xpos = x, .ypos = y});
+                                     };
+                                     auto btn = [](Action a) {
+                                         mousebutton_event_dispatcher::instance()
+                                             .distribute({.button = MouseButtons::eMOUSE_BUTTON_LEFT,
+                                                          .action = a,
+                                                          .modifier_key = ModifierKey::None()});
+                                     };
+                                     move(278, 120);
+                                     btn(Action::ePRESS);
+                                     move(328, 120);
+                                     move(378, 120);
+                                     btn(Action::eRELEASE);
+                                 }
+
+                                 // ── 帧 10：拖表头重排（Status 拉到最左）──
+                                 if (std::getenv("TABLE_SELFTEST") != nullptr &&
+                                     selftest_frame == 10)
+                                 {
+                                     using namespace mcs::vulkan::event;
+                                     auto move = [](double x, double y) {
+                                         position2d_event_dispatcher::instance()
+                                             .distribute({.xpos = x, .ypos = y});
+                                     };
+                                     auto btn = [](Action a) {
+                                         mousebutton_event_dispatcher::instance()
+                                             .distribute({.button = MouseButtons::eMOUSE_BUTTON_LEFT,
+                                                          .action = a,
+                                                          .modifier_key = ModifierKey::None()});
+                                     };
+                                     move(424, 120);
+                                     btn(Action::ePRESS);
+                                     move(220, 120);
+                                     move(120, 120);
+                                     btn(Action::eRELEASE);
+                                 }
+
+                                 if (std::getenv("TABLE_SELFTEST") != nullptr &&
+                                     selftest_frame == 12)
+                                 {
+                                     using namespace mcs::vulkan::event;
+                                     position2d_event_dispatcher::instance().distribute(
+                                         {.xpos = 100.0, .ypos = 120.0});
+                                     mousebutton_event_dispatcher::instance().distribute(
+                                         {.button = MouseButtons::eMOUSE_BUTTON_RIGHT,
+                                          .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::None()});
+                                     position2d_event_dispatcher::instance().distribute(
+                                         {.xpos = 140.0, .ypos = 143.0});
+                                     mousebutton_event_dispatcher::instance().distribute(
+                                         {.button = MouseButtons::eMOUSE_BUTTON_LEFT,
+                                          .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::None()});
+                                     mousebutton_event_dispatcher::instance().distribute(
+                                         {.button = MouseButtons::eMOUSE_BUTTON_LEFT,
+                                          .action = Action::eRELEASE,
+                                          .modifier_key = ModifierKey::None()});
+                                 }
+
+                                 if (std::getenv("TABLE_SELFTEST") != nullptr &&
+                                     selftest_frame == 14)
+                                 {
+                                     using namespace mcs::vulkan::event;
+                                     keyboard_event_dispatcher::instance().distribute(
+                                         {.key = Key::eLEFT_SHIFT, .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::Shift()});
+                                     scroll_event_dispatcher::instance().distribute(
+                                         {.xoffset = 0.0, .yoffset = -5.0});
+                                 }
+
+                                 // ── 帧 16：右键菜单第二项 Reset sort ──
+                                 if (std::getenv("TABLE_SELFTEST") != nullptr &&
+                                     selftest_frame == 16)
+                                 {
+                                     using namespace mcs::vulkan::event;
+                                     position2d_event_dispatcher::instance().distribute(
+                                         {.xpos = 100.0, .ypos = 120.0});
+                                     mousebutton_event_dispatcher::instance().distribute(
+                                         {.button = MouseButtons::eMOUSE_BUTTON_RIGHT,
+                                          .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::None()});
+                                     position2d_event_dispatcher::instance().distribute(
+                                         {.xpos = 140.0, .ypos = 169.0});
+                                     mousebutton_event_dispatcher::instance().distribute(
+                                         {.button = MouseButtons::eMOUSE_BUTTON_LEFT,
+                                          .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::None()});
+                                     mousebutton_event_dispatcher::instance().distribute(
+                                         {.button = MouseButtons::eMOUSE_BUTTON_LEFT,
+                                          .action = Action::eRELEASE,
+                                          .modifier_key = ModifierKey::None()});
+                                 }
+
+                                 if (std::getenv("TABLE_SELFTEST") != nullptr &&
+                                     selftest_frame == 18)
+                                 {
+                                     using namespace mcs::vulkan::event;
+                                     position2d_event_dispatcher::instance().distribute(
+                                         {.xpos = 100.0, .ypos = 120.0});
+                                     mousebutton_event_dispatcher::instance().distribute(
+                                         {.button = MouseButtons::eMOUSE_BUTTON_RIGHT,
+                                          .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::None()});
+                                     position2d_event_dispatcher::instance().distribute(
+                                         {.xpos = 140.0, .ypos = 191.0});
+                                     mousebutton_event_dispatcher::instance().distribute(
+                                         {.button = MouseButtons::eMOUSE_BUTTON_LEFT,
+                                          .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::None()});
+                                     mousebutton_event_dispatcher::instance().distribute(
+                                         {.button = MouseButtons::eMOUSE_BUTTON_LEFT,
+                                          .action = Action::eRELEASE,
+                                          .modifier_key = ModifierKey::None()});
+                                 }
+
+                                 if (std::getenv("TABLE_SELFTEST") != nullptr &&
+                                     selftest_frame == 20)
+                                 {
+                                     using namespace mcs::vulkan::event;
+                                     position2d_event_dispatcher::instance().distribute(
+                                         {.xpos = 100.0, .ypos = 120.0});
+                                     mousebutton_event_dispatcher::instance().distribute(
+                                         {.button = MouseButtons::eMOUSE_BUTTON_RIGHT,
+                                          .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::None()});
+                                     position2d_event_dispatcher::instance().distribute(
+                                         {.xpos = 140.0, .ypos = 221.0});
+                                     mousebutton_event_dispatcher::instance().distribute(
+                                         {.button = MouseButtons::eMOUSE_BUTTON_LEFT,
+                                          .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::None()});
+                                     mousebutton_event_dispatcher::instance().distribute(
+                                         {.button = MouseButtons::eMOUSE_BUTTON_LEFT,
+                                          .action = Action::eRELEASE,
+                                          .modifier_key = ModifierKey::None()});
+                                 }
+
+                                 if (std::getenv("TABLE_SELFTEST") != nullptr &&
+                                     selftest_frame == 22)
+                                 {
+                                     using namespace mcs::vulkan::event;
+                                     position2d_event_dispatcher::instance().distribute(
+                                         {.xpos = 354.0, .ypos = 219.0});
+                                 }
+
+                                 if (std::getenv("TABLE_SELFTEST") != nullptr &&
+                                     selftest_frame == 60)
+                                 {
+                                     using namespace mcs::vulkan::event;
+                                     position2d_event_dispatcher::instance().distribute(
+                                         {.xpos = 500.0, .ypos = 300.0});
+                                 }
+
+                                 if (std::getenv("TABLE_SELFTEST") != nullptr &&
+                                     selftest_frame == 62)
+                                 {
+                                     using namespace mcs::vulkan::event;
+                                     keyboard_event_dispatcher::instance().distribute(
+                                         {.key = Key::eLEFT_CONTROL, .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::Control()});
+                                     keyboard_event_dispatcher::instance().distribute(
+                                         {.key = Key::eEND, .action = Action::ePRESS,
+                                          .modifier_key = ModifierKey::Control()});
+                                 }
                                  views_matrix_update(world, inputCtx, soaCtx);
+        soaCtx.screen.tick(static_cast<double>(app::now_ms().count()));
                                  views_perspective_update(world, inputCtx, soaCtx);
                                  views_ui_camera_update(world, inputCtx, soaCtx);
                                  // model_update 已空，可删除此行
@@ -10477,3 +12707,4 @@ catch (std::exception &e)
 {
     std::println("main catch exception: {}", e.what());
 }
+
