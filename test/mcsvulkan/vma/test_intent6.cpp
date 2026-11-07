@@ -492,6 +492,9 @@ static_assert(sizeof(picking_result) == 16);
 // test_intent5 独占的整条着色器管线（从 test_intent4 复制：type 6 = Cell）
 #include "test_intent6_frame_context.hpp"
 
+// UI 三层：controller（特性）→ service（add/计数）→ dao（编码 ABI 行）
+#include "test_intent6_ui_controller.hpp"
+
 #include <nlohmann/json.hpp>
 constexpr auto inputInit(float aspect)
 {
@@ -2193,6 +2196,7 @@ namespace ui_new
                 ptr->updateOffset({0,0});
             }
         }
+        [[nodiscard]] constexpr Size size() const noexcept { return size_; }
         constexpr void updateSize(double width, double height) noexcept
         {
             if (size_.width == width && size_.height == height)
@@ -8804,6 +8808,11 @@ namespace render
 }; // namespace render
 //diff: [test_intent] end
 
+
+// 前端 Widget：把 controller 的特性组合成一个 Widget（定义在独立文件）
+#include "test_intent6_ui_widget.hpp"
+
+
 int main()
 try
 {
@@ -9112,7 +9121,7 @@ try
     ui_new::ScreenWidget screen{
         ui_new::Size{WIDTH, HEIGHT},
         ui_new::Container("panel").child(ui_new::Container("rectBox").renderObject(
-            render::asRenderObject(std::move(textBox))))};
+            std::make_unique<ui_new::arch_render_object>()))};
 
     shader_data::hover_manager hoverManager{.screen = &screen};
     // 新的 soaCtx 仅包含 uiRects 和 uiWireRects
