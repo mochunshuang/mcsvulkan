@@ -212,6 +212,10 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_intent6 test_intent6.vert test_intent6.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
+# test_intent7：pass 为单位；PassManager/PassCompiler；shader/DAO 独立一份。
+add_std_glsl_target(test_intent7 test_intent7.vert test_intent7.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
 
 add_std_glsl_target(test_ui_ability test_ui_ability.vert test_ui_ability.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
