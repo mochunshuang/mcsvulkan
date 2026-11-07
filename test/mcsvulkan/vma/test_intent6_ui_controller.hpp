@@ -38,22 +38,22 @@ class client
     [[nodiscard]] const palette &colors() const noexcept { return p_; }
     [[nodiscard]] std::uint32_t count() const noexcept { return canvas_.count(); }
 
-    // 面板：填充 + 1px 边框 + 外阴影
+    // 面板：填充 + 1px 边框 + 外阴影（同一个 Shape 程序）
     void panel(const ui_dao::rect_px &r, float radius)
     {
-        canvas_.round_rect(ui_dao::round_rect(r, canvas_.view(), radius, p_.surface,
-                                              p_.shadow, 0.0F, 4.0F, 12.0F, 1.0F));
-        canvas_.ui_rect(ui_dao::ui_rect(r, canvas_.view(), p_.border, 1.0F));
+        canvas_.shape(ui_dao::sdf_shape(r, canvas_.view(), radius, p_.surface,
+                                        p_.shadow, 4.0F, 12.0F));
+        canvas_.shape(ui_dao::shape_border(r, canvas_.view(), radius, p_.border, 1.0F));
     }
 
     // 按钮：阴影 + 填充 + 边框
     void button(const ui_dao::rect_px &r, float radius, bool pressed, bool hovered)
     {
         const glm::vec4 fill = hovered ? p_.accent : p_.surface_alt;
-        canvas_.round_rect(ui_dao::round_rect(r, canvas_.view(), radius, fill, p_.shadow,
-                                              0.0F, pressed ? 1.0F : 3.0F,
-                                              pressed ? 2.0F : 6.0F, 1.0F));
-        canvas_.ui_rect(ui_dao::ui_rect(r, canvas_.view(), p_.border, 1.0F));
+        canvas_.shape(ui_dao::sdf_shape(r, canvas_.view(), radius, fill, p_.shadow,
+                                        pressed ? 1.0F : 3.0F,
+                                        pressed ? 2.0F : 6.0F));
+        canvas_.shape(ui_dao::shape_border(r, canvas_.view(), radius, p_.border, 1.0F));
     }
 
     // 单元格：选中/悬停改填充
@@ -64,22 +64,22 @@ class client
             fill = glm::vec4{0.19F, 0.31F, 0.44F, 0.98F};
         else if (hovered)
             fill = glm::vec4{0.19F, 0.22F, 0.30F, 0.98F};
-        canvas_.round_rect(ui_dao::round_rect(r, canvas_.view(), radius, fill));
-        canvas_.ui_rect(ui_dao::ui_rect(r, canvas_.view(), p_.border, 1.0F));
+        canvas_.shape(ui_dao::sdf_shape(r, canvas_.view(), radius, fill));
+        canvas_.shape(ui_dao::shape_border(r, canvas_.view(), radius, p_.border, 1.0F));
     }
 
     void divider(const ui_dao::rect_px &r)
     {
-        canvas_.round_rect(ui_dao::round_rect(r, canvas_.view(), 0.0F, p_.border));
+        canvas_.shape(ui_dao::sdf_shape(r, canvas_.view(), 0.0F, p_.border));
     }
 
     void focus_ring(const ui_dao::rect_px &r)
     {
-        canvas_.ui_rect(ui_dao::ui_rect(r, canvas_.view(), p_.accent, 2.0F));
+        canvas_.shape(ui_dao::shape_border(r, canvas_.view(), 8.0F, p_.accent, 2.0F));
     }
 
     // 文本：字形由前端整形后送来（controller 不依赖字体系统）
-    void glyphs(std::span<const shader_data::Glyph> g)
+    void glyphs(std::span<const shader_data::TexQuad> g)
     {
         for (const auto &one : g)
             canvas_.glyph(one);

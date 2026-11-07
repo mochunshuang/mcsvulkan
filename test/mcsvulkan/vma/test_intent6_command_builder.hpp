@@ -1,4 +1,3 @@
-
 #pragma once
 
 #include "test_intent6_command_stream.hpp"
@@ -7,6 +6,7 @@
 #include <cassert>
 #include <cstdint>
 #include <span>
+#include <vector>
 
 namespace shader_data
 {
@@ -15,9 +15,8 @@ namespace shader_data
       public:
         mesh_data currentMesh{};
 
-        constexpr explicit CommandBuilder(ShaderBuffers &buffers,
-                                          DynamicStateCaps caps) noexcept
-            : buffers_{&buffers}, caps_{caps}
+        explicit constexpr CommandBuilder(ShaderBuffers &buffers) noexcept
+            : buffers_{&buffers}
         {
             segments_.reserve(128);
         }
@@ -27,24 +26,13 @@ namespace shader_data
             buffers_ = &buffers;
         }
 
-        // 客户端可读：直接给值，不暴露存储
-        // 状态是否“已定义”（对应 md 里的 defined 位掩码）
         [[nodiscard]] constexpr bool hasViewport() const noexcept
         {
-            return cur_.regs.viewportCount != 0;
+            return hasViewport_;
         }
-        [[nodiscard]] constexpr bool hasScissor() const noexcept
-        {
-            return cur_.regs.scissorCount != 0;
-        }
-
         [[nodiscard]] constexpr VkViewport currentViewport() const noexcept
         {
-            return cur_.regs.viewports[0];
-        }
-        [[nodiscard]] constexpr VkRect2D currentScissor() const noexcept
-        {
-            return cur_.regs.scissors[0];
+            return cur_.regs.viewport;
         }
 
         [[nodiscard]] constexpr CommandStream stream() const noexcept
@@ -52,8 +40,6 @@ namespace shader_data
             return {.segments = &segments_};
         }
 
-        // ── 每帧开始 ────────────────────────────────────────────
-        // ── 录制重建：reset + 环境，一次做完 ────────────────────
         constexpr void begin(const FrameState &state)
         {
             assert(state.pipeline != VK_NULL_HANDLE);
@@ -64,274 +50,79 @@ namespace shader_data
 
             cur_.handles.pipeline = state.pipeline;
             cur_.handles.layout = state.layout;
-            cur_.handles.dynamicStateMask = state.pipelineDynMask;
-
             pushBase_ = state.pushData;
             currentMesh = state.mesh;
-
-            cur_.regs.viewports[0] = state.viewport;
-            cur_.regs.viewportCount = 1;
-            cur_.regs.scissors[0] = state.scissor;
-            cur_.regs.scissorCount = 1;
+            cur_.regs.viewport = state.viewport;
+            cur_.regs.scissor = state.scissor;
+            hasViewport_ = true;
         }
 
-      private:
-        constexpr void reset() noexcept
+        constexpr void addInstances(std::span<const Shape> instances)
         {
-            heapCursor = 0;
-            indirectCursor = 0;
-            constantCursor = 0;
-
-            segments_.clear();
-            currentMesh = {};
-            pushBase_ = {};
-            cur_ = {};
-        }
-
-      public:
-        // ── bind（状态变化 = 段边界）────────────────────────────
-        constexpr void setPipeline(VkPipeline pipeline, DynamicStateMask dynMask = 0)
-        {
-            if (cur_.handles.pipeline == pipeline)
-                return;
-            flush();
-            cur_.handles.pipeline = pipeline;
-        }
-
-        constexpr void setLayout(VkPipelineLayout layout)
-        {
-            if (cur_.handles.layout == layout)
-                return;
-            flush(); // 推送常量带 layout
-            cur_.handles.layout = layout;
-        }
-
-        constexpr void setPushData(const PushData &pushData)
-        {
-            if (pushBase_ == pushData)
-                return;
-            flush(); // 每段开头会重新推送
-            pushBase_ = pushData;
-        }
-
-        // Vulkan 没有“当前 mesh”这个状态；这里只是 addInstances(span) 的缺省值
-        constexpr void setMesh(const mesh_data &mesh)
-        {
-            currentMesh = mesh;
-        }
-
-        // 描述符绑定：sets 是资源，span 引用调用方的存储（须活到 emit）。
-        // 动态偏移是值，按份存。
-        constexpr void bindDescriptorSets(VkPipelineLayout layout,
-                                          std::span<const VkDescriptorSet> sets,
-                                          std::uint32_t firstSet = 0)
-        {
-            flush();
-            cur_.handles.layout = layout;
-            cur_.handles.sets = sets;
-            cur_.handles.firstSet = firstSet;
-            cur_.regs.dynamicOffset = 0;
-            cur_.regs.dynamicOffsetCount = 0;
-        }
-
-        constexpr void bindDescriptorSets(VkPipelineLayout layout,
-                                          std::span<const VkDescriptorSet> sets,
-                                          std::uint32_t firstSet,
-                                          std::uint32_t dynamicOffset)
-        {
-            flush();
-            cur_.handles.layout = layout;
-            cur_.handles.sets = sets;
-            cur_.handles.firstSet = firstSet;
-            cur_.regs.dynamicOffset = dynamicOffset;
-            cur_.regs.dynamicOffsetCount = 1;
-        }
-
-        // ── setDynamic（状态变化 = 段边界）──────────────────────
-        constexpr void setViewport(const VkViewport &value)
-        {
-            setViewports(std::span{&value, 1});
-        }
-
-        constexpr void setScissor(const VkRect2D &value)
-        {
-            setScissors(std::span{&value, 1});
-        }
-
-        constexpr void setViewports(std::span<const VkViewport> value)
-        {
-            const std::uint32_t n = static_cast<std::uint32_t>(
-                std::min<std::size_t>(value.size(), kMaxViewports));
-            assert(value.size() <= kMaxViewports && "capacity: bump kMaxViewports");
-            if (same_viewports(cur_.regs.viewports, cur_.regs.viewportCount, value))
-                return;
-            flush();
-            cur_.regs.viewportCount = n;
-            for (std::uint32_t i = 0; i < n; ++i)
-                cur_.regs.viewports[i] = value[i];
-        }
-
-        constexpr void setScissors(std::span<const VkRect2D> value)
-        {
-            const std::uint32_t n = static_cast<std::uint32_t>(
-                std::min<std::size_t>(value.size(), kMaxViewports));
-            assert(value.size() <= kMaxViewports && "capacity: bump kMaxViewports");
-            if (same_scissors(cur_.regs.scissors, cur_.regs.scissorCount, value))
-                return;
-            flush();
-            cur_.regs.scissorCount = n;
-            for (std::uint32_t i = 0; i < n; ++i)
-                cur_.regs.scissors[i] = value[i];
-        }
-
-        // ── 扩展动态状态：设备没开就断言并忽略；值变才 flush ─────
-        constexpr void setDepthTestEnable(bool value)
-        {
-            if (!caps_.has(kDynDepthTest))
-            {
-                assert(false && "device: extendedDynamicState 未启用");
-                return;
-            }
-            const std::uint32_t v = value ? 1U : 0U;
-            const DynamicStateMask bit = kDynDepthTest;
-            if (cur_.regs.depthTestEnable == v && (cur_.regs.dynamicMask & bit))
-                return;
-            flush();
-            cur_.regs.depthTestEnable = v;
-            cur_.regs.dynamicMask |= bit;
-        }
-
-        constexpr void setDepthWriteEnable(bool value)
-        {
-            if (!caps_.has(kDynDepthWrite))
-            {
-                assert(false && "device: extendedDynamicState 未启用");
-                return;
-            }
-            const std::uint32_t v = value ? 1U : 0U;
-            const DynamicStateMask bit = kDynDepthWrite;
-            if (cur_.regs.depthWriteEnable == v && (cur_.regs.dynamicMask & bit))
-                return;
-            flush();
-            cur_.regs.depthWriteEnable = v;
-            cur_.regs.dynamicMask |= bit;
-        }
-
-        constexpr void setPrimitiveTopology(VkPrimitiveTopology value)
-        {
-            if (!caps_.has(kDynTopology))
-            {
-                assert(false && "device: extendedDynamicState 未启用");
-                return;
-            }
-            const DynamicStateMask bit = kDynTopology;
-            if (cur_.regs.topology == value && (cur_.regs.dynamicMask & bit))
-                return;
-            flush();
-            cur_.regs.topology = value;
-            cur_.regs.dynamicMask |= bit;
-        }
-
-        constexpr void setLineWidth(float value)
-        {
-            if (!caps_.has(kDynLineWidth))
-            {
-                assert(false && "device: lineWidth 动态状态未启用");
-                return;
-            }
-            const DynamicStateMask bit = kDynLineWidth;
-            if (cur_.regs.lineWidth == value && (cur_.regs.dynamicMask & bit))
-                return;
-            flush();
-            cur_.regs.lineWidth = value;
-            cur_.regs.dynamicMask |= bit;
-        }
-
-        constexpr void setStencilReference(VkStencilFaceFlags face, std::uint32_t value)
-        {
-            if (!caps_.has(kDynStencilRef))
-            {
-                assert(false && "device: stencilReference 动态状态未启用");
-                return;
-            }
-            const DynamicStateMask bit = kDynStencilRef;
-            if (cur_.regs.stencilRef == value && cur_.regs.stencilFace == face &&
-                (cur_.regs.dynamicMask & bit))
-                return;
-            flush();
-            cur_.regs.stencilFace = face;
-            cur_.regs.stencilRef = value;
-            cur_.regs.dynamicMask |= bit;
-        }
-
-        // ── draw（只改 cur_ 和 buffer，不提交）──────────────────
-        constexpr void addInstances(std::span<const Glyph> instances)
-        {
-            addBatch(InstanceKind::Glyph, currentMesh, instances.data(),
+            addBatch(Program::Shape, currentMesh, instances.data(),
                      static_cast<std::uint32_t>(instances.size()));
         }
-        constexpr void addInstances(std::span<const UiRect> instances)
+        constexpr void addInstances(std::span<const PathFill> instances)
         {
-            addBatch(InstanceKind::UiRect, currentMesh, instances.data(),
+            addBatch(Program::PathFill, currentMesh, instances.data(),
                      static_cast<std::uint32_t>(instances.size()));
         }
-        constexpr void addInstances(std::span<const Rectangle> instances)
+        constexpr void addInstances(std::span<const PathStroke> instances)
         {
-            addBatch(InstanceKind::RoundRect, currentMesh, instances.data(),
+            addBatch(Program::PathStroke, currentMesh, instances.data(),
+                     static_cast<std::uint32_t>(instances.size()));
+        }
+        constexpr void addInstances(std::span<const TexQuad> instances)
+        {
+            addBatch(Program::Texture, currentMesh, instances.data(),
+                     static_cast<std::uint32_t>(instances.size()));
+        }
+        constexpr void addInstances(std::span<const BlurQuad> instances)
+        {
+            addBatch(Program::Blur, currentMesh, instances.data(),
+                     static_cast<std::uint32_t>(instances.size()));
+        }
+        constexpr void addInstances(std::span<const ColorMatrix> instances)
+        {
+            addBatch(Program::ColorMatrix, currentMesh, instances.data(),
+                     static_cast<std::uint32_t>(instances.size()));
+        }
+        constexpr void addInstances(std::span<const NoiseQuad> instances)
+        {
+            addBatch(Program::Noise, currentMesh, instances.data(),
                      static_cast<std::uint32_t>(instances.size()));
         }
 
-        constexpr void addInstances(std::span<const VertexAttr> instances)
-        {
-            addBatch(InstanceKind::Mesh, currentMesh, instances.data(),
-                     static_cast<std::uint32_t>(instances.size()));
-        }
-
-        constexpr void addInstances(const mesh_data &mesh,
-                                    std::span<const Glyph> instances)
-        {
-            addBatch(InstanceKind::Glyph, mesh, instances.data(),
-                     static_cast<std::uint32_t>(instances.size()));
-        }
-        constexpr void addInstances(const mesh_data &mesh,
-                                    std::span<const UiRect> instances)
-        {
-            addBatch(InstanceKind::UiRect, mesh, instances.data(),
-                     static_cast<std::uint32_t>(instances.size()));
-        }
-        constexpr void addInstances(const mesh_data &mesh,
-                                    std::span<const Rectangle> instances)
-        {
-            addBatch(InstanceKind::RoundRect, mesh, instances.data(),
-                     static_cast<std::uint32_t>(instances.size()));
-        }
-
-        constexpr void addInstances(const mesh_data &mesh,
-                                    std::span<const VertexAttr> instances)
-        {
-            addBatch(InstanceKind::Mesh, mesh, instances.data(),
-                     static_cast<std::uint32_t>(instances.size()));
-        }
-
-        constexpr void addInstance(const Glyph &v)
+        constexpr void addInstance(const Shape &v)
         {
             addInstances(std::span{&v, 1});
         }
-        constexpr void addInstance(const UiRect &v)
+        constexpr void addInstance(const PathFill &v)
         {
             addInstances(std::span{&v, 1});
         }
-        constexpr void addInstance(const Rectangle &v)
+        constexpr void addInstance(const PathStroke &v)
         {
             addInstances(std::span{&v, 1});
         }
-        constexpr void addInstance(const VertexAttr &v)
+        constexpr void addInstance(const TexQuad &v)
+        {
+            addInstances(std::span{&v, 1});
+        }
+        constexpr void addInstance(const BlurQuad &v)
+        {
+            addInstances(std::span{&v, 1});
+        }
+        constexpr void addInstance(const ColorMatrix &v)
+        {
+            addInstances(std::span{&v, 1});
+        }
+        constexpr void addInstance(const NoiseQuad &v)
         {
             addInstances(std::span{&v, 1});
         }
 
-        // ── 基座：非模板 ────────────────────────────────────────
-        constexpr void addBatch(InstanceKind kind, const mesh_data &mesh,
+        constexpr void addBatch(Program program, const mesh_data &mesh,
                                 const void *data, std::uint32_t count,
                                 std::uint32_t stride = 0)
         {
@@ -343,20 +134,17 @@ namespace shader_data
             assert(pushBase_.valid());
             assert(mesh.valid());
             if (stride == 0)
-                stride = sizeOf(kind);
-            assert(stride == sizeOf(kind));
+                stride = sizeOf(program);
+            assert(stride == sizeOf(program));
 
-            // 1) 实例数据直接写 heap（合不合并都连续）
             const std::uint32_t addressOffset = heapCursor;
             buffers_->globalHeapBuffer.write(heapCursor, data,
                                              static_cast<std::size_t>(count) * stride);
             heapCursor += count * stride;
 
-            // 2) 段内最后一条能合并就只改 instanceCount
-            if (cur_.draw.commandCount > 0 && tryMergeLast(mesh, kind, count))
+            if (cur_.draw.commandCount > 0 && tryMergeLast(mesh, program, count))
                 return;
 
-            // 3) 段的第一条命令：记下命令区/常量区起点，解析推送常量地址
             if (cur_.draw.commandCount == 0)
             {
                 cur_.draw.indirectOffset = indirectCursor;
@@ -365,12 +153,10 @@ namespace shader_data
                     buffers_->commandConstantsBuffer.address + constantCursor;
             }
 
-            // 4) 追加命令 + 常量
             const auto cmd = mesh.getDrawCommand(count);
             buffers_->indirectDrawBuffer.write(indirectCursor, &cmd, sizeof cmd);
-            const CommandConstant constant{.type_id = static_cast<std::uint32_t>(kind),
-                                           .address_offset = addressOffset,
-                                           .slot_count = 0};
+            const CommandConstant constant{.program = static_cast<std::uint32_t>(program),
+                                           .address_offset = addressOffset};
             buffers_->commandConstantsBuffer.write(constantCursor, &constant,
                                                    sizeof constant);
             indirectCursor += sizeof(VkDrawIndexedIndirectCommand);
@@ -378,13 +164,6 @@ namespace shader_data
             ++cur_.draw.commandCount;
         }
 
-        constexpr void addBatch(InstanceKind kind, const void *data, std::uint32_t count,
-                                std::uint32_t stride = 0)
-        {
-            addBatch(kind, currentMesh, data, count, stride);
-        }
-
-        // ── 收口 ────────────────────────────────────────────────
         constexpr void end()
         {
             flush();
@@ -392,15 +171,27 @@ namespace shader_data
 
       private:
         ShaderBuffers *buffers_{};
-        DynamicStateCaps caps_{};
 
-        DrawSegment cur_{};                 // 正在构建的段
-        PushData pushBase_{};               // 客户端给的推送常量（地址未解析）
-        std::vector<DrawSegment> segments_; // 已完成的段
+        DrawSegment cur_{};
+        PushData pushBase_{};
+        std::vector<DrawSegment> segments_;
+        bool hasViewport_{false};
 
         std::uint32_t heapCursor{0};
         std::uint32_t indirectCursor{0};
         std::uint32_t constantCursor{0};
+
+        constexpr void reset() noexcept
+        {
+            heapCursor = 0;
+            indirectCursor = 0;
+            constantCursor = 0;
+            segments_.clear();
+            currentMesh = {};
+            pushBase_ = {};
+            cur_ = {};
+            hasViewport_ = false;
+        }
 
         constexpr void flush()
         {
@@ -423,7 +214,7 @@ namespace shader_data
             return reinterpret_cast<CommandConstant *>(base + byteOffset);
         }
 
-        constexpr bool tryMergeLast(const mesh_data &mesh, InstanceKind kind,
+        constexpr bool tryMergeLast(const mesh_data &mesh, Program program,
                                     std::uint32_t count)
         {
             const std::uint32_t cmdOffset =
@@ -443,7 +234,7 @@ namespace shader_data
                 lastCmd->firstIndex == candidate.firstIndex &&
                 lastCmd->vertexOffset == candidate.vertexOffset &&
                 lastCmd->firstInstance == candidate.firstInstance &&
-                lastConst->type_id == static_cast<std::uint32_t>(kind))
+                lastConst->program == static_cast<std::uint32_t>(program))
             {
                 lastCmd->instanceCount += count;
                 return true;

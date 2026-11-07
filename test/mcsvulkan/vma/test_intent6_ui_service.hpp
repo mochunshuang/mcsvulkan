@@ -4,7 +4,7 @@
 //
 //   这一层只做三件事：
 //     1. 持有 builder 和视口（像素 → NDC 的换算在 DAO 里用 view 完成）；
-//     2. 类型化 add（glyph / round_rect / ui_rect / mesh）；
+//     2. 类型化 add（glyph / shape）；
 //     3. 计数（给上层/自测用）。
 //   合批/间接绘制在 CommandBuilder 里，这里不重复实现。
 // ═══════════════════════════════════════════════════════════════════════════
@@ -28,24 +28,14 @@ class canvas
     [[nodiscard]] const ui_dao::view &view() const noexcept { return view_; }
     [[nodiscard]] std::uint32_t count() const noexcept { return count_; }
 
-    void glyph(const shader_data::Glyph &g)
+    void glyph(const shader_data::TexQuad &g)
     {
         builder_.addInstance(g);
         ++count_;
     }
-    void round_rect(const shader_data::Rectangle &r)
+    void shape(const shader_data::Shape &s)
     {
-        builder_.addInstance(r);
-        ++count_;
-    }
-    void ui_rect(const shader_data::UiRect &u)
-    {
-        builder_.addInstance(u);
-        ++count_;
-    }
-    void mesh(const shader_data::VertexAttr &v)
-    {
-        builder_.addInstance(v);
+        builder_.addInstance(s);
         ++count_;
     }
 
