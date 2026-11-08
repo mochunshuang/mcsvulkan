@@ -116,6 +116,20 @@ vkspec 核对结果：
 
 结论：`test_ui_ability2` 的 pass 录制能力可以迁移到本框架；尚未实际改写 `test_ui_ability2.cpp` 源码。
 
+### 1.6 Widget 级迁移落地
+
+`test_intent7_ability_test.hpp` 的 `ability_test_scene` 已替代 `pass_test_scene` 作为 test_intent7 当前场景：
+
+- pass 0 base：背景 + 18 个 card frame + composed frame。
+- pass 1 shape/path：11 个 shape/path tile。
+- pass 2 texture/effect：7 个 texture/effect tile + composed UI；该 pass 由 secondary command buffer 执行。
+- pass 3 text overlay：MSDF glyph；`LOAD/DONT_CARE`。
+- `CommandBuilder::setPipeline` 切换 opaque / alpha / add / multiply 四种 pipeline。
+- `CommandBuilder::setScissor` 做 per-tile clip（逐 segment）；`pushScissor/popScissor` 做嵌套 clip 交集。
+- `ui_dao` 使用 7 个 program：Shape / PathFill / PathStroke / Texture / Blur / ColorMatrix / Noise。
+- 特性覆盖：linear/radial/conic/per-corner/ring/arc、triangle+AA/star/dash/rotate/skew、nine-slice/masked/mipmap、inner shadow/blur/sepia/noise/text。
+- 运行日志：`[ability-test] passes=4 glyphs=397`；第 3 个 effect pass 由 secondary command buffer 执行（`sources[3]`），`vkCmdExecuteCommands` 出现在 dump。
+
 ## 2. 三轴模型
 
 - **纵向：数据流**（官方 Pipelines 章的 block diagram）
@@ -142,6 +156,7 @@ vkspec 核对结果：
 | `test_intent7_pass_abi.hpp` | `PipelineState` / `Pass` / `PassManager` / `PassSource`：每帧 extra pass 的数据与 GPU buffer。 |
 | `test_intent7_frame_context.hpp` | `ShaderBuffers` + `CommandBuilder` + `shader_data::emit()`：UI 意图 -> 操作。 |
 | `test_intent7_pass_tests.hpp` | 可视化用例：main 背景 + 3 个 card pass + 1 个 overlay pass。 |
+| `test_intent7_ability_test.hpp` | **test_ui_ability2 的 Widget 级迁移**：7 个 program、18 个特性 tile、clip/layer/blend/mipmap/text；通过 `PassManager + FrameBuilder` 走完整 `[pass...pass]`。 |
 | `shaders/test_intent7.comp` | 最小 compute shader：push constants + 空 body，用于 `beginComputePass + BindPipeline(COMPUTE) + Dispatch`。 |
 | `test_intent7.cpp` | 主 pass target、FrameBuilder、pass sources、dump、submit。 |
 
@@ -322,7 +337,7 @@ E:\0_github_project\mcsvulkan\output\test_program\mcsvulkan\vma\test_intent7.exe
 ```
 
 验证层无 `VUID` 错误。  
-最终画面：`output/intent7_exec.png`（或重新截图）。
+最终画面：`output/intent7_ability.png`（ability_test_scene），旧 pass 测试截图保留为 `output/intent7_exec.png`。
 
 ## 11. 设计审计（2026-11-08）
 

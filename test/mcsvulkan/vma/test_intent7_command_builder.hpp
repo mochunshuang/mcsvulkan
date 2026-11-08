@@ -3,6 +3,7 @@
 #include "test_intent7_command_stream.hpp"
 #include "test_intent7_shader_buffers.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <span>
@@ -19,6 +20,7 @@ namespace shader_data
             : buffers_{&buffers}
         {
             segments_.reserve(128);
+            scissorStack_.reserve(8);
         }
 
         void bind(ShaderBuffers &buffers) noexcept
@@ -55,6 +57,43 @@ namespace shader_data
             cur_.regs.viewport = state.viewport;
             cur_.regs.scissor = state.scissor;
             hasViewport_ = true;
+        }
+
+        constexpr void setPipeline(VkPipeline pipeline, VkPipelineLayout layout)
+        {
+            assert(pipeline != VK_NULL_HANDLE);
+            assert(layout != VK_NULL_HANDLE);
+            flush();
+            cur_.handles.pipeline = pipeline;
+            cur_.handles.layout = layout;
+        }
+
+        constexpr void setScissor(const VkRect2D &scissor)
+        {
+            flush();
+            cur_.regs.scissor = scissor;
+        }
+
+        constexpr void pushScissor(const VkRect2D &scissor)
+        {
+            flush();
+            scissorStack_.push_back(cur_.regs.scissor);
+            cur_.regs.scissor = intersect(cur_.regs.scissor, scissor);
+        }
+
+        constexpr void popScissor()
+        {
+            if (scissorStack_.empty())
+                return;
+            flush();
+            cur_.regs.scissor = scissorStack_.back();
+            scissorStack_.pop_back();
+        }
+
+        constexpr void setViewport(const VkViewport &viewport)
+        {
+            flush();
+            cur_.regs.viewport = viewport;
         }
 
         constexpr void addInstances(std::span<const Shape> instances)
@@ -175,6 +214,7 @@ namespace shader_data
         DrawSegment cur_{};
         PushData pushBase_{};
         std::vector<DrawSegment> segments_;
+        std::vector<VkRect2D> scissorStack_;
         bool hasViewport_{false};
 
         std::uint32_t heapCursor{0};
@@ -187,10 +227,25 @@ namespace shader_data
             indirectCursor = 0;
             constantCursor = 0;
             segments_.clear();
+            scissorStack_.clear();
             currentMesh = {};
             pushBase_ = {};
             cur_ = {};
             hasViewport_ = false;
+        }
+
+        [[nodiscard]] static VkRect2D intersect(const VkRect2D &a,
+                                                const VkRect2D &b) noexcept
+        {
+            const std::int32_t x = std::max(a.offset.x, b.offset.x);
+            const std::int32_t y = std::max(a.offset.y, b.offset.y);
+            const std::int32_t r = std::min(a.offset.x + std::int32_t(a.extent.width),
+                                            b.offset.x + std::int32_t(b.extent.width));
+            const std::int32_t bt = std::min(a.offset.y + std::int32_t(a.extent.height),
+                                             b.offset.y + std::int32_t(b.extent.height));
+            return VkRect2D{.offset = {x, y},
+                            .extent = {static_cast<std::uint32_t>(std::max(r - x, 0)),
+                                       static_cast<std::uint32_t>(std::max(bt - y, 0))}};
         }
 
         constexpr void flush()

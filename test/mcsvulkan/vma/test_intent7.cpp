@@ -1784,7 +1784,13 @@ auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
     pipelineTransparentUI	OFF	            OFF	        ON	             UI
     */
     auto makePipeline = [&](const VkBool32 depthTest, const VkBool32 depthWrite,
-                            VkBool32 blendEnable) {
+                            VkBool32 blendEnable,
+                            VkBlendFactor srcColor = VK_BLEND_FACTOR_ONE,
+                            VkBlendFactor dstColor =
+                                VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                            VkBlendFactor srcAlpha = VK_BLEND_FACTOR_ONE,
+                            VkBlendFactor dstAlpha =
+                                VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA) {
         return create_graphics_pipeline{}
             .setCreateInfo(
                 {.pNext = make_pNext(structure_chain<VkPipelineRenderingCreateInfo>{
@@ -1843,13 +1849,11 @@ auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
                               {
                                   //diff: [test_dod12] start:   0  ?  MSDF  ?
                                   .blendEnable = blendEnable,
-                                  .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
-                                  .dstColorBlendFactor =
-                                      VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                                  .srcColorBlendFactor = srcColor,
+                                  .dstColorBlendFactor = dstColor,
                                   .colorBlendOp = VK_BLEND_OP_ADD,
-                                  .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
-                                  .dstAlphaBlendFactor =
-                                      VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                                  .srcAlphaBlendFactor = srcAlpha,
+                                  .dstAlphaBlendFactor = dstAlpha,
                                   .alphaBlendOp = VK_BLEND_OP_ADD,
                                   .colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
                                                     VK_COLOR_COMPONENT_G_BIT |
@@ -1884,6 +1888,14 @@ auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
     auto pipelineTransparent3D = makePipeline(VK_TRUE, VK_FALSE, VK_TRUE);
     auto pipelineOpaqueUI = makePipeline(VK_FALSE, VK_FALSE, VK_FALSE);
     auto pipelineTransparentUI = makePipeline(VK_FALSE, VK_FALSE, VK_TRUE);
+    auto pipelineAdditiveUI =
+        makePipeline(VK_FALSE, VK_FALSE, VK_TRUE, VK_BLEND_FACTOR_ONE,
+                     VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE,
+                     VK_BLEND_FACTOR_ONE);
+    auto pipelineMultiplyUI =
+        makePipeline(VK_FALSE, VK_FALSE, VK_TRUE, VK_BLEND_FACTOR_DST_COLOR,
+                     VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_DST_ALPHA,
+                     VK_BLEND_FACTOR_ZERO);
 
     // Minimal compute pipeline: compute pass scope + explicit Dispatch.
     const VkPushConstantRange computePushRange{
@@ -1924,14 +1936,16 @@ auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
 
     return make_aggregate<"mainPipelineCtx", "pipelineLayout", "pipelineOpaque3D",
                           "pipelineTransparent3D", "pipelineOpaqueUI",
-                          "pipelineTransparentUI", "swapchainAttachments",
+                          "pipelineTransparentUI", "pipelineAdditiveUI",
+                          "pipelineMultiplyUI", "swapchainAttachments",
                           "pickingAttachments", "pipelineRenderingInfo",
                           "stateOwnership", "features", "passTargetTemplate",
                           "transferScratch", "computePipelineLayout",
                           "computePipeline">(
         std::move(pipelineLayout), std::move(pipelineOpaque3D),
         std::move(pipelineTransparent3D), std::move(pipelineOpaqueUI),
-        std::move(pipelineTransparentUI), std::move(swapchainAttachments),
+        std::move(pipelineTransparentUI), std::move(pipelineAdditiveUI),
+        std::move(pipelineMultiplyUI), std::move(swapchainAttachments),
         std::move(pickingAttachments), pipelineRenderingInfo, stateOwnership,
         features, passTargetTemplate, std::move(transferScratch),
         std::move(computePipelineLayout), std::move(computePipeline));
@@ -8728,6 +8742,7 @@ namespace app = mcs::app;
 
 //
 #include "test_intent7_pass_tests.hpp"
+#include "test_intent7_ability_test.hpp"
 #include "test_intent7_pass_compiler.hpp"
 #include "test_intent7_frame_scheduler.hpp"
 #include "test_intent7_resource_state.hpp"
@@ -8799,7 +8814,8 @@ try
 
     auto mainPipelineCtx = initPipeline(hardwareCtx, descriptorCtx);
     auto &[pipelineLayout, pipelineOpaque3D, pipelineTransparent3D, pipelineOpaqueUI,
-           pipelineTransparentUI, swapchainAttachments, pickingAttachments,
+           pipelineTransparentUI, pipelineAdditiveUI, pipelineMultiplyUI,
+           swapchainAttachments, pickingAttachments,
            pipelineRenderingInfo, stateOwnership, features,
            passTargetTemplate, transferScratch, computePipelineLayout,
            computePipeline] = mainPipelineCtx;
@@ -8856,13 +8872,16 @@ try
 
     auto mainCtx =
         make_aggregate_ref<"mainCtx", "pipelineOpaque3D", "pipelineTransparent3D",
-                           "pipelineOpaqueUI", "pipelineTransparentUI", "pipelineLayout",
+                           "pipelineOpaqueUI", "pipelineTransparentUI",
+                           "pipelineAdditiveUI", "pipelineMultiplyUI",
+                           "pipelineLayout",
                            "depthResourcesBuild", "depthResource", "msaaResourcesBuild",
                            "msaaResource", "pipelineRenderingInfo", "stateOwnership",
                            "features", "passTargetTemplate", "transferScratch",
                            "computePipelineLayout", "computePipeline">(
             pipelineOpaque3D, pipelineTransparent3D, pipelineOpaqueUI,
-            pipelineTransparentUI, pipelineLayout, depthResourcesBuild, depthResource,
+            pipelineTransparentUI, pipelineAdditiveUI, pipelineMultiplyUI,
+            pipelineLayout, depthResourcesBuild, depthResource,
             msaaResourcesBuild, msaaResource, pipelineRenderingInfo, stateOwnership,
             features, passTargetTemplate, transferScratch, computePipelineLayout,
             computePipeline);
@@ -8871,8 +8890,9 @@ try
                                             "uniformBuffers", "descriptorSets">(
         drawRecorder, uniformBuffers, descriptorSets);
 
-    auto scene = std::make_unique<ui_new::pass_test_scene>(
-        *pipelineTransparentUI, *pipelineLayout, globalCtx.meshMap["quad"],
+    auto scene = std::make_unique<ui_new::ability_test_scene>(
+        *pipelineOpaqueUI, *pipelineTransparentUI, *pipelineAdditiveUI,
+        *pipelineMultiplyUI, *pipelineLayout, globalCtx.meshMap["quad"],
         swapchain.refImageExtent(), VK_SAMPLE_COUNT_4_BIT);
 
     ui_new::ScreenWidget screen{
