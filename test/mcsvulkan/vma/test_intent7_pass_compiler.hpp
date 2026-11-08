@@ -25,6 +25,20 @@
 namespace pass_data
 {
 
+inline void emitImageBarriers(FrameBuilder &frame,
+                              std::span<const VkImageMemoryBarrier2> barriers)
+{
+    if (barriers.empty())
+        return;
+    const VkDependencyInfo dependency{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .pNext = nullptr,
+        .dependencyFlags = 0,
+        .imageMemoryBarrierCount = static_cast<std::uint32_t>(barriers.size()),
+        .pImageMemoryBarriers = barriers.data()};
+    frame.barrier(dependency);
+}
+
 inline void recordPass(FrameBuilder &frame, const PassSource &source)
 {
     assert(source.desc != nullptr);
@@ -33,6 +47,7 @@ inline void recordPass(FrameBuilder &frame, const PassSource &source)
     if (source.executeSecondary)
         target.flags |= VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
 
+    emitImageBarriers(frame, source.preBarriers);
     frame.beginPass(target);
     if (source.executeSecondary)
     {
@@ -45,6 +60,7 @@ inline void recordPass(FrameBuilder &frame, const PassSource &source)
         shader_data::emit(frame, *source.buffers, source.stream, source.descriptorSet);
     }
     frame.endPass();
+    emitImageBarriers(frame, source.postBarriers);
 }
 
 inline void recordPasses(FrameBuilder &frame, std::span<const PassSource> passes)

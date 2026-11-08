@@ -94,6 +94,10 @@ using mcs::vulkan::fatal_error;
 
 constexpr uint32_t WIDTH = 1280;
 constexpr uint32_t HEIGHT = 900;
+// The UI ability scene is a 4x MSAA showcase.  Capping the sample count also
+// keeps the MRT pick attachment (128 bit/texel) inside the device-local heap
+// at 4K/fullscreen extents.
+constexpr VkSampleCountFlagBits SAMPLE_COUNT = VK_SAMPLE_COUNT_4_BIT;
 constexpr auto TITLE = "test_my_triangle";
 
 static constexpr auto MAX_FRAMES_IN_FLIGHT = 2;
@@ -1565,7 +1569,7 @@ auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
                     .depth = 1},
          .mipLevels = 1,
          .arrayLayers = 1,
-         .samples = physical_device.getMaxUsableSampleCount(),
+         .samples = SAMPLE_COUNT,
          .tiling = VK_IMAGE_TILING_OPTIMAL,
          .usage = VkImageUsageFlagBits::VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
          .sharingMode = VkSharingMode::VK_SHARING_MODE_EXCLUSIVE,
@@ -1595,7 +1599,7 @@ auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
                     .depth = 1},
          .mipLevels = 1,
          .arrayLayers = 1,
-         .samples = physical_device.getMaxUsableSampleCount(),
+         .samples = SAMPLE_COUNT,
          .tiling = VK_IMAGE_TILING_OPTIMAL,
          .usage = VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
@@ -1627,7 +1631,7 @@ auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
          .extent = {.width = WIDTH, .height = HEIGHT, .depth = 1},
          .mipLevels = 1,
          .arrayLayers = 1,
-         .samples = physical_device.getMaxUsableSampleCount(), //NOTE:  ?
+         .samples = SAMPLE_COUNT, //NOTE:  ?
          .tiling = VK_IMAGE_TILING_OPTIMAL,
          .usage =
              VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT //diff: [test_indirectdraw_no_pick]  ?pickingImage   TRANSFER_SRC_BIT
@@ -1676,6 +1680,110 @@ auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
                                          .layerCount = 1}};
         });
     auto resolveResource = resolveResourcesBuild.build(device);
+
+    // Offscreen layer resources: MSAA color + sampled resolve texture.
+    auto offscreenMsaaBuild = mcs::vulkan::memory::build_simple_resource(
+        {.imageType = VK_IMAGE_TYPE_2D,
+         .format = swapchainBuild.refImageFormat(),
+         .extent = {.width = swapchain.refImageExtent().width,
+                    .height = swapchain.refImageExtent().height,
+                    .depth = 1},
+         .mipLevels = 1,
+         .arrayLayers = 1,
+         .samples = SAMPLE_COUNT,
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
+                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED},
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        [](VkImageCreateInfo imageCreateInfo, VkImage image) noexcept
+            -> mcs::vulkan::memory::create_image::view_create_info {
+            return {.image = image,
+                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                    .format = imageCreateInfo.format,
+                    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                         .baseMipLevel = 0,
+                                         .levelCount = 1,
+                                         .baseArrayLayer = 0,
+                                         .layerCount = 1}};
+        });
+    auto offscreenMsaaResource = offscreenMsaaBuild.build(device);
+
+    auto offscreenResolveBuild = mcs::vulkan::memory::build_simple_resource(
+        {.imageType = VK_IMAGE_TYPE_2D,
+         .format = swapchainBuild.refImageFormat(),
+         .extent = {.width = swapchain.refImageExtent().width,
+                    .height = swapchain.refImageExtent().height,
+                    .depth = 1},
+         .mipLevels = 1,
+         .arrayLayers = 1,
+         .samples = VK_SAMPLE_COUNT_1_BIT,
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                  VK_IMAGE_USAGE_SAMPLED_BIT |
+                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED},
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        [](VkImageCreateInfo imageCreateInfo, VkImage image) noexcept
+            -> mcs::vulkan::memory::create_image::view_create_info {
+            return {.image = image,
+                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                    .format = imageCreateInfo.format,
+                    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                         .baseMipLevel = 0,
+                                         .levelCount = 1,
+                                         .baseArrayLayer = 0,
+                                         .layerCount = 1}};
+        });
+    auto offscreenResolveResource = offscreenResolveBuild.build(device);
+    const VkImage offscreenResolveImage = offscreenResolveResource.image();
+    const VkImageView offscreenResolveView = offscreenResolveResource.imageView();
+    std::uint32_t offscreenTextureIndex = 0;
+    {
+        auto &textureManager = *descriptorCtx.textureManager.get();
+        auto freeSlots = textureManager.view_free_indexes();
+        auto it = freeSlots.begin();
+        assert(it != freeSlots.end());
+        offscreenTextureIndex = *it;
+        textureManager.use_slot(offscreenTextureIndex,
+                                std::move(offscreenResolveResource),
+                                "offscreen_layer");
+    }
+
+    // Dedicated stencil attachment for stencil/path clipping.
+    constexpr VkFormat stencilFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    auto stencilBuild = mcs::vulkan::memory::build_simple_resource(
+        {.imageType = VK_IMAGE_TYPE_2D,
+         .format = stencilFormat,
+         .extent = {.width = swapchain.refImageExtent().width,
+                    .height = swapchain.refImageExtent().height,
+                    .depth = 1},
+         .mipLevels = 1,
+         .arrayLayers = 1,
+         .samples = SAMPLE_COUNT,
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED},
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        [](VkImageCreateInfo imageCreateInfo, VkImage image) noexcept
+            -> mcs::vulkan::memory::create_image::view_create_info {
+            return {.image = image,
+                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                    .format = imageCreateInfo.format,
+                    .subresourceRange = {
+                        .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT |
+                                      VK_IMAGE_ASPECT_STENCIL_BIT,
+                        .baseMipLevel = 0,
+                                         .levelCount = 1,
+                                         .baseArrayLayer = 0,
+                                         .layerCount = 1}};
+        });
+    auto stencilResource = stencilBuild.build(device);
+    const VkImageView stencilView = stencilResource.imageView();
+    const VkImage stencilImage = stencilResource.image();
 
     // Derive the pass target metadata from the actual attachment resources,
     // not from the pipeline create-info constants.
@@ -1766,7 +1874,7 @@ auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
     for (std::size_t i = 0; i < mainColorFormats.size(); ++i)
         pipelineRenderingInfo.colorFormats[i] = mainColorFormats[i];
     pipelineRenderingInfo.depthFormat = depthFormat_ref;
-    pipelineRenderingInfo.samples = physical_device.getMaxUsableSampleCount();
+    pipelineRenderingInfo.samples = SAMPLE_COUNT;
 
     pass_data::StateOwnershipMap stateOwnership{};
     stateOwnership.set(VK_DYNAMIC_STATE_VIEWPORT,
@@ -1822,7 +1930,7 @@ auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
                  .multisampleState =
                      {
                          .rasterizationSamples =
-                             physical_device.getMaxUsableSampleCount(),
+                             SAMPLE_COUNT,
                          .sampleShadingEnable = VK_FALSE,
                          .minSampleShading = 1.0F,
                          .sampleMask = {},
@@ -1884,6 +1992,78 @@ auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
             .build(device);
     };
     //  4 ?
+    auto makeStencilPipeline = [&](bool mask) {
+        const VkStencilOpState stencilOp{
+            .failOp = VK_STENCIL_OP_KEEP,
+            .passOp = mask ? VK_STENCIL_OP_REPLACE : VK_STENCIL_OP_KEEP,
+            .depthFailOp = VK_STENCIL_OP_KEEP,
+            .compareOp = mask ? VK_COMPARE_OP_ALWAYS : VK_COMPARE_OP_EQUAL,
+            .compareMask = 0xFFU,
+            .writeMask = static_cast<std::uint32_t>(mask ? 0xFF : 0),
+            .reference = 1U};
+        return create_graphics_pipeline{}
+            .setCreateInfo(
+                {.pNext = make_pNext(structure_chain<VkPipelineRenderingCreateInfo>{
+                     {.colorAttachmentCount = 2,
+                      .pColorAttachmentFormats = mainColorFormats.data(),
+                      .depthAttachmentFormat = stencilFormat,
+                      .stencilAttachmentFormat = stencilFormat}}),
+                 .stages = create_graphics_pipeline::makeStages(
+                     stage_info{.stage = VK_SHADER_STAGE_VERTEX_BIT,
+                                .filePath = VERT_SHADER_PATH,
+                                .pName = "main"},
+                     stage_info{.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                                .filePath = FRAG_SHADER_PATH,
+                                .pName = "main"}),
+                 .vertexInputState = {},
+                 .inputAssemblyState = {.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                                        .primitiveRestartEnable = VK_FALSE},
+                 .tessellationState = {},
+                 .viewportState = {.viewports = {VkViewport{}}, .scissors = {VkRect2D{}}},
+                 .rasterizationState = {.depthClampEnable = VK_FALSE,
+                                        .rasterizerDiscardEnable = VK_FALSE,
+                                        .polygonMode = VK_POLYGON_MODE_FILL,
+                                        .cullMode = VK_CULL_MODE_NONE,
+                                        .frontFace = VK_FRONT_FACE_CLOCKWISE,
+                                        .depthBiasEnable = VK_FALSE,
+                                        .lineWidth = 1.0F},
+                 .multisampleState =
+                     {.rasterizationSamples =
+                          SAMPLE_COUNT,
+                      .sampleShadingEnable = VK_FALSE,
+                      .minSampleShading = 1.0F,
+                      .sampleMask = {},
+                      .alphaToCoverageEnable = VK_FALSE,
+                      .alphaToOneEnable = VK_FALSE},
+                 .depthStencilState = {.depthTestEnable = VK_FALSE,
+                                       .depthWriteEnable = VK_FALSE,
+                                       .depthCompareOp = VK_COMPARE_OP_ALWAYS,
+                                       .depthBoundsTestEnable = VK_FALSE,
+                                       .stencilTestEnable = VK_TRUE,
+                                       .front = stencilOp,
+                                       .back = stencilOp,
+                                       .minDepthBounds = 0.0F,
+                                       .maxDepthBounds = 1.0F},
+                 .colorBlendState =
+                     {.logicOpEnable = VK_FALSE,
+                      .logicOp = VK_LOGIC_OP_COPY,
+                      .attachments = {{.blendEnable = VK_FALSE,
+                                       .colorWriteMask =
+                                           mask ? 0U
+                                                : (VK_COLOR_COMPONENT_R_BIT |
+                                                   VK_COLOR_COMPONENT_G_BIT |
+                                                   VK_COLOR_COMPONENT_B_BIT |
+                                                   VK_COLOR_COMPONENT_A_BIT)},
+                                      {.blendEnable = VK_FALSE,
+                                       .colorWriteMask = 0U}}},
+                 .dynamicState = {.dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT,
+                                                    VK_DYNAMIC_STATE_SCISSOR}},
+                 .layout = *pipelineLayout})
+            .build(device);
+    };
+    auto pipelineStencilMask = makeStencilPipeline(true);
+    auto pipelineStencilContent = makeStencilPipeline(false);
+
     auto pipelineOpaque3D = makePipeline(VK_TRUE, VK_TRUE, VK_FALSE);
     auto pipelineTransparent3D = makePipeline(VK_TRUE, VK_FALSE, VK_TRUE);
     auto pipelineOpaqueUI = makePipeline(VK_FALSE, VK_FALSE, VK_FALSE);
@@ -1897,58 +2077,29 @@ auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
                      VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_DST_ALPHA,
                      VK_BLEND_FACTOR_ZERO);
 
-    // Minimal compute pipeline: compute pass scope + explicit Dispatch.
-    const VkPushConstantRange computePushRange{
-        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-        .offset = 0,
-        .size = sizeof(std::uint32_t)};
-    auto computePipelineLayout =
-        create_pipeline_layout{}
-            .setCreateInfo({.pushConstantRanges = {computePushRange}})
-            .build(device);
-
-#ifdef COMP_SHADER_PATH
-    const auto computeCode = mcs::vulkan::read_file(COMP_SHADER_PATH);
-    mcs::vulkan::ShaderModule computeModule{
-        device, device.createShaderModule(
-                    {.sType = sType<VkShaderModuleCreateInfo>(),
-                     .codeSize = computeCode.size(),
-                     .pCode = std::bit_cast<const std::uint32_t *>(
-                         computeCode.data())},
-                    device.allocator())};
-
-    const VkComputePipelineCreateInfo computeInfo{
-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                  .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                  .module = *computeModule,
-                  .pName = "main"},
-        .layout = *computePipelineLayout};
-    VkPipeline rawComputePipeline = VK_NULL_HANDLE;
-    const VkResult computeResult = device.table().vkCreateComputePipelines(
-        *device, VK_NULL_HANDLE, 1, &computeInfo, nullptr, &rawComputePipeline);
-    assert(computeResult == VK_SUCCESS);
-    (void)computeResult;
-    mcs::vulkan::Pipeline computePipeline{device, rawComputePipeline};
-#else
-    mcs::vulkan::Pipeline computePipeline{};
-#endif
-
     return make_aggregate<"mainPipelineCtx", "pipelineLayout", "pipelineOpaque3D",
                           "pipelineTransparent3D", "pipelineOpaqueUI",
                           "pipelineTransparentUI", "pipelineAdditiveUI",
-                          "pipelineMultiplyUI", "swapchainAttachments",
+                          "pipelineMultiplyUI", "pipelineStencilMask",
+                          "pipelineStencilContent", "swapchainAttachments",
                           "pickingAttachments", "pipelineRenderingInfo",
                           "stateOwnership", "features", "passTargetTemplate",
-                          "transferScratch", "computePipelineLayout",
-                          "computePipeline">(
+                          "transferScratch", "offscreenMsaaBuild",
+                          "offscreenResolveBuild", "stencilBuild",
+                          "offscreenMsaaResource", "offscreenResolveView",
+                          "offscreenResolveImage", "offscreenTextureIndex",
+                          "stencilResource", "stencilView", "stencilImage">(
         std::move(pipelineLayout), std::move(pipelineOpaque3D),
         std::move(pipelineTransparent3D), std::move(pipelineOpaqueUI),
         std::move(pipelineTransparentUI), std::move(pipelineAdditiveUI),
-        std::move(pipelineMultiplyUI), std::move(swapchainAttachments),
+        std::move(pipelineMultiplyUI), std::move(pipelineStencilMask),
+        std::move(pipelineStencilContent), std::move(swapchainAttachments),
         std::move(pickingAttachments), pipelineRenderingInfo, stateOwnership,
         features, passTargetTemplate, std::move(transferScratch),
-        std::move(computePipelineLayout), std::move(computePipeline));
+        std::move(offscreenMsaaBuild), std::move(offscreenResolveBuild),
+        std::move(stencilBuild), std::move(offscreenMsaaResource),
+        offscreenResolveView, offscreenResolveImage, offscreenTextureIndex,
+        std::move(stencilResource), stencilView, stencilImage);
 }
 
 //diff: [test_dod22] start
@@ -1970,6 +2121,9 @@ struct render_context
     pass_data::PassManager *passManager{};
     // app  ?target  xtra pass  ?load/store ?
     const pass_data::PassTarget *mainPassDesc{};
+    // Live GLFW framebuffer size: the UI uses this for NDC layout even before
+    // the swapchain/attachment resources finish rebuilding on a resize.
+    VkExtent2D framebufferExtent{};
     VkDescriptorSet mainSet{};
     std::span<const Vertex> globalVertices{};
     std::span<const uint32_t> globalIndices{};
@@ -8815,10 +8969,13 @@ try
     auto mainPipelineCtx = initPipeline(hardwareCtx, descriptorCtx);
     auto &[pipelineLayout, pipelineOpaque3D, pipelineTransparent3D, pipelineOpaqueUI,
            pipelineTransparentUI, pipelineAdditiveUI, pipelineMultiplyUI,
+           pipelineStencilMask, pipelineStencilContent,
            swapchainAttachments, pickingAttachments,
            pipelineRenderingInfo, stateOwnership, features,
-           passTargetTemplate, transferScratch, computePipelineLayout,
-           computePipeline] = mainPipelineCtx;
+           passTargetTemplate, transferScratch, offscreenMsaaBuild,
+           offscreenResolveBuild, stencilBuild, offscreenMsaaResource,
+           offscreenResolveView, offscreenResolveImage, offscreenTextureIndex,
+           stencilResource, stencilView, stencilImage] = mainPipelineCtx;
     auto &[depthResourcesBuild, depthResource, msaaResourcesBuild, msaaResource] =
         swapchainAttachments;
     auto &[pickResourcesBuild, pickResource, resolveResourcesBuild, resolveResource,
@@ -8874,26 +9031,44 @@ try
         make_aggregate_ref<"mainCtx", "pipelineOpaque3D", "pipelineTransparent3D",
                            "pipelineOpaqueUI", "pipelineTransparentUI",
                            "pipelineAdditiveUI", "pipelineMultiplyUI",
+                           "pipelineStencilMask", "pipelineStencilContent",
                            "pipelineLayout",
                            "depthResourcesBuild", "depthResource", "msaaResourcesBuild",
                            "msaaResource", "pipelineRenderingInfo", "stateOwnership",
                            "features", "passTargetTemplate", "transferScratch",
-                           "computePipelineLayout", "computePipeline">(
+                           "offscreenMsaaBuild", "offscreenResolveBuild",
+                           "stencilBuild", "offscreenMsaaResource",
+                           "offscreenResolveView", "offscreenResolveImage",
+                           "offscreenTextureIndex", "stencilResource",
+                           "stencilView", "stencilImage">(
             pipelineOpaque3D, pipelineTransparent3D, pipelineOpaqueUI,
             pipelineTransparentUI, pipelineAdditiveUI, pipelineMultiplyUI,
+            pipelineStencilMask, pipelineStencilContent,
             pipelineLayout, depthResourcesBuild, depthResource,
             msaaResourcesBuild, msaaResource, pipelineRenderingInfo, stateOwnership,
-            features, passTargetTemplate, transferScratch, computePipelineLayout,
-            computePipeline);
+            features, passTargetTemplate, transferScratch, offscreenMsaaBuild,
+            offscreenResolveBuild, stencilBuild, offscreenMsaaResource,
+            offscreenResolveView, offscreenResolveImage, offscreenTextureIndex,
+            stencilResource, stencilView, stencilImage);
 
     auto mainShaderCtx = make_aggregate_ref<"mainShaderCtx", "drawRecorder",
                                             "uniformBuffers", "descriptorSets">(
         drawRecorder, uniformBuffers, descriptorSets);
 
+    // Pick up the offscreen layer texture added by initPipeline.
+    descriptorSetManager.update_texture(textureManager.view_used_indexes());
+
     auto scene = std::make_unique<ui_new::ability_test_scene>(
         *pipelineOpaqueUI, *pipelineTransparentUI, *pipelineAdditiveUI,
         *pipelineMultiplyUI, *pipelineLayout, globalCtx.meshMap["quad"],
-        swapchain.refImageExtent(), VK_SAMPLE_COUNT_4_BIT);
+        swapchain.refImageExtent(), VK_SAMPLE_COUNT_4_BIT,
+        offscreenMsaaResource.imageView(), offscreenResolveView,
+        offscreenMsaaResource.image(), offscreenResolveImage,
+        offscreenTextureIndex, *pipelineStencilMask,
+        *pipelineStencilContent, stencilView, stencilImage);
+    // Stable address: the widget owns the scene, so resize can refresh the
+    // attachment handles the scene captured at construction time.
+    ui_new::ability_test_scene *abilityScene = scene.get();
 
     ui_new::ScreenWidget screen{
         ui_new::Size{WIDTH, HEIGHT},
@@ -8902,16 +9077,20 @@ try
 
     shader_data::hover_manager hoverManager{.screen = &screen};
     // soaCtx  ?screen ?screen  ?render_object
-    auto soaCtx = make_aggregate_ref<"soaCtx", "screen">(screen);
+    auto soaCtx =
+        make_aggregate_ref<"soaCtx", "screen", "textureManager",
+                           "descriptorSetManager", "abilityScene">(
+            screen, textureManager, descriptorSetManager, abilityScene);
 
     // record_info
     auto recordCtx = make_aggregate<"recordCtx", "info", "frameBuilder">(
         record_info{}, static_cast<pass_data::FrameBuilder *>(nullptr));
     auto world =
         make_aggregate_ref<"world", "globalCtx", "mainCtx", "mainShaderCtx", "pickCtx",
-                           "recordCtx", "hoverPool", "hoverManager", "fontCtx">(
+                           "recordCtx", "hoverPool", "hoverManager", "fontCtx",
+                           "window">(
             globalCtx, mainCtx, mainShaderCtx, pickCtx, recordCtx, hoverPool(),
-            hoverManager, fontCtx);
+            hoverManager, fontCtx, window);
     using world_type = decltype(world);
 
     using data_type = decltype(soaCtx);
@@ -9412,6 +9591,7 @@ try
                 .fontSelect = fontCtx.fontSelect,
                 .passManager = &passManager,
                 .mainPassDesc = &mainDesc,
+                .framebufferExtent = world.window.getFramebufferSize(),
                 .mainSet = mainShaderCtx.descriptorSets[currentFrame],
                 .globalVertices = globalCtx.globalVertices,
                 .globalIndices = globalCtx.globalIndices};
@@ -9440,15 +9620,17 @@ try
                     .desc = &pass.desc,
                     .buffers = &pass.buffers(),
                     .stream = pass.stream(),
-                    .descriptorSet = mainShaderCtx.descriptorSets[currentFrame]});
+                    .descriptorSet = mainShaderCtx.descriptorSets[currentFrame],
+                    .preBarriers = pass.preBarriers.view(),
+                    .postBarriers = pass.postBarriers.view()});
             }
 
-            // Record CASE 2 (sources[3]) into a secondary command buffer.
-            // The primary pass only calls vkCmdExecuteCommands, so the
-            // ExecuteCommands/Inheritance path is actually exercised.
-            if (sources.size() >= 4)
+            // Record the pass before the final text overlay into a secondary
+            // command buffer. For the ability scene this is the offscreen
+            // composite pass; for the pass-test scene it is the last card.
+            if (sources.size() >= 2)
             {
-                auto &secondarySource = sources[3];
+                auto &secondarySource = sources[sources.size() - 2];
                 const auto &target = *secondarySource.desc;
 
                 secondarySource.inheritance = pass_data::InheritanceRenderingInfo{
@@ -9581,20 +9763,6 @@ try
                                     scratchCopy);
             frameBuilder.endTransferPass();
 
-            // Minimal compute pass: compute pipeline + push constants +
-            // vkCmdDispatch. No descriptors are needed by this shader.
-            frameBuilder.setPipelineLayout(*mainCtx.computePipelineLayout);
-            frameBuilder.beginComputePass();
-            frameBuilder.bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE,
-                                      *mainCtx.computePipeline);
-            const std::uint32_t computeValue = 0xFFFFFFFFU;
-            frameBuilder.pushConstants(*mainCtx.computePipelineLayout,
-                                       VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                       sizeof(computeValue), &computeValue);
-            frameBuilder.dispatch(1, 1, 1);
-            frameBuilder.endComputePass();
-            frameBuilder.setPipelineLayout(*mainCtx.pipelineLayout);
-
             // Exercise the typed transfer path. The following
             // copyImageToBuffer overwrites these bytes with the picked texel,
             // so this fill has no visible effect.
@@ -9693,12 +9861,31 @@ try
         auto &pickMouse = pickCtx.mouse;
 
         auto &screen = soaCtx.screen;
+        auto &textureManager = soaCtx.textureManager;
+        auto &descriptorSetManager = soaCtx.descriptorSetManager;
 
         surface.waitGoodFramebufferSize();
         device.waitIdle();
 
+        // Release the old extent-dependent resources before allocating the new
+        // ones.  At fullscreen (1920x1080) the 128-bit pick attachment is large
+        // enough that a new+old overlap can exceed the device-local heap.
+        const auto offscreenSlot =
+            static_cast<std::uint32_t>(mainCtx.offscreenTextureIndex);
+        if (textureManager.is_used(offscreenSlot))
+            textureManager.free_slot(offscreenSlot);
+        msaaResource = {};
+        depthResource = {};
+        pickResource = {};
+        resolveResource = {};
+        mainCtx.offscreenMsaaResource = {};
+        mainCtx.stencilResource = {};
+        swapchain.destroy();
+
         swapchain = swapchainBuild.rebuild(device, surface);
         auto newExtent = swapchain.refImageExtent();
+        std::println("[resize] new extent={}x{} images={}", newExtent.width,
+                     newExtent.height, swapchain.imagesSize());
         VkExtent3D imageExtent = {
             .width = newExtent.width, .height = newExtent.height, .depth = 1};
 
@@ -9713,6 +9900,33 @@ try
         pickResource = pickResourcesBuild.setCreateInfoExtent(imageExtent).build(device);
         resolveResource =
             resolveResourcesBuild.setCreateInfoExtent(imageExtent).build(device);
+
+        // The ability scene owns two resources that follow the framebuffer:
+        // the offscreen MSAA color + sampled resolve and the stencil attachment.
+        // They must be rebuilt with the same extent as the swapchain, otherwise
+        // the offscreen/stencil pass renderArea no longer matches the views.
+        mainCtx.offscreenMsaaResource =
+            mainCtx.offscreenMsaaBuild.setCreateInfoExtent(imageExtent).build(device);
+
+        auto newOffscreenResolve =
+            mainCtx.offscreenResolveBuild.setCreateInfoExtent(imageExtent).build(device);
+        mainCtx.offscreenResolveView = newOffscreenResolve.imageView();
+        mainCtx.offscreenResolveImage = newOffscreenResolve.image();
+
+        // Replace the sampled offscreen texture in the same descriptor slot so
+        // every pass keeps the same texture index.
+        textureManager.use_slot(offscreenSlot, std::move(newOffscreenResolve),
+                                "offscreen_layer");
+        descriptorSetManager.update_texture(textureManager.view_used_indexes());
+
+        mainCtx.stencilResource =
+            mainCtx.stencilBuild.setCreateInfoExtent(imageExtent).build(device);
+
+        soaCtx.abilityScene->updateResources(
+            mainCtx.offscreenMsaaResource.imageView(), mainCtx.offscreenResolveView,
+            mainCtx.offscreenMsaaResource.image(), mainCtx.offscreenResolveImage,
+            mainCtx.offscreenTextureIndex, mainCtx.stencilResource.imageView(),
+            mainCtx.stencilResource.image());
 
         pickMouse.valid = false;
         frameContext =
@@ -9816,6 +10030,45 @@ try
         // inputController(world, inputCtx, soaCtx); //
     };
 
+    // F11 fullscreen for this target.  The shared WSI reserves F1, and its
+    // handler toggles on both key press and release, so the test owns a
+    // single edge-triggered fullscreen switch here.
+    static constexpr auto FullscreenController = [](world_type &world,
+                                                    input_type &inputCtx,
+                                                    data_type &) {
+        using namespace mcs::vulkan::event;
+        auto &input = inputCtx.input;
+        static bool wasPressed = false;
+        static bool fullscreen = false;
+        static int windowX = 0;
+        static int windowY = 0;
+        static int windowW = static_cast<int>(WIDTH);
+        static int windowH = static_cast<int>(HEIGHT);
+
+        const bool pressed = input.isKeyPressed(Key::eF11);
+        if (pressed && !wasPressed)
+        {
+            auto *handle = world.window.data();
+            if (!fullscreen)
+            {
+                ::glfwGetWindowPos(handle, &windowX, &windowY);
+                ::glfwGetWindowSize(handle, &windowW, &windowH);
+                auto *monitor = ::glfwGetPrimaryMonitor();
+                const GLFWvidmode *mode = ::glfwGetVideoMode(monitor);
+                ::glfwSetWindowMonitor(handle, monitor, 0, 0, mode->width,
+                                       mode->height, mode->refreshRate);
+                fullscreen = true;
+            }
+            else
+            {
+                ::glfwSetWindowMonitor(handle, nullptr, windowX, windowY, windowW,
+                                       windowH, GLFW_DONT_CARE);
+                fullscreen = false;
+            }
+        }
+        wasPressed = pressed;
+    };
+
     //NOTE:  ?
     constexpr auto marking_function = ^^decltype([](auto &&...) noexcept {});
     static constexpr auto task_graph = make_task<
@@ -9836,6 +10089,7 @@ try
                              limit_frame_rate(inputCtx,
                                               60.0f); //  ?
                              InputController(world, inputCtx, soaCtx);
+                             FullscreenController(world, inputCtx, soaCtx);
 
                              //
                              //     PI  ?

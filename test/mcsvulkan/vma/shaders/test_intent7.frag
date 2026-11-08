@@ -72,6 +72,16 @@ float median(float r, float g, float b)
     return max(min(r, g), min(max(r, g), b));
 }
 
+// Color management for color-emoji bitmaps: the emoji atlas is an sRGB PNG
+// stored in an UNORM texture, so its texels are sRGB-encoded.  The swapchain
+// is B8G8R8A8_SRGB and expects linear shader output; convert once here instead
+// of letting the hardware encode the already-encoded texel again.
+vec3 srgbToLinear(vec3 c)
+{
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)),
+               step(vec3(0.04045), c));
+}
+
 float screenPxRangeTex(TexQuad inst, vec2 uv)
 {
     ivec2 texSize = textureSizeBindless(inst.textureIndex, inst.samplerIndex);
@@ -93,7 +103,9 @@ vec4 shadeGlyphTex(TexQuad inst, vec4 texel, vec2 uv)
     {
         const vec3 tint = (inst.glyph_flags & 1u) != 0u ? inst.color.rgb : vec3(1.0);
         float a = texel.a * inst.color.a * inst.opacity;
-        return vec4(texel.rgb * tint * a, a);
+        // texel.rgb is sRGB-encoded (UNORM atlas); output is linear.
+        vec3 rgb = srgbToLinear(texel.rgb);
+        return vec4(rgb * tint * a, a);
     }
 
     vec3 msd = texel.rgb;

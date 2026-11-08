@@ -37,11 +37,33 @@ struct PipelineState
 };
 
 // 一个可复用的 pass 槽位：FrameContext 只分配一次，后续帧 reset() 复用。
+struct PassBarriers
+{
+    inline static constexpr std::uint32_t CAPACITY = 4;
+
+    std::array<VkImageMemoryBarrier2, CAPACITY> items{};
+    std::uint32_t count{0};
+
+    void add(const VkImageMemoryBarrier2 &barrier) noexcept
+    {
+        assert(count < CAPACITY);
+        items[count++] = barrier;
+    }
+
+    void clear() noexcept { count = 0; }
+    [[nodiscard]] std::span<const VkImageMemoryBarrier2> view() const noexcept
+    {
+        return {items.data(), count};
+    }
+};
+
 struct Pass
 {
     PassDesc desc{};
     PipelineState base{};
     shader_data::FrameContext frame;
+    PassBarriers preBarriers{};
+    PassBarriers postBarriers{};
 
     Pass(const LogicalDevice &device, VkDeviceSize vertexCapacity,
          VkDeviceSize indexCapacity, VkDeviceSize heapCapacity,
@@ -58,7 +80,9 @@ struct Pass
     Pass &operator=(const Pass &) = delete;
 
     Pass(Pass &&other) noexcept
-        : desc{std::move(other.desc)}, base{other.base}, frame{std::move(other.frame)}
+        : desc{std::move(other.desc)}, base{other.base},
+          frame{std::move(other.frame)}, preBarriers{other.preBarriers},
+          postBarriers{other.postBarriers}
     {
         syncAddresses();
     }
@@ -70,6 +94,8 @@ struct Pass
     {
         desc = std::move(d);
         base = b;
+        preBarriers.clear();
+        postBarriers.clear();
         syncAddresses();
         frame.builder.begin({.pipeline = base.pipeline,
                              .layout = base.layout,
@@ -174,6 +200,8 @@ struct PassSource
     const shader_data::ShaderBuffers *buffers{};
     shader_data::CommandStream stream{};
     VkDescriptorSet descriptorSet{};
+    std::span<const VkImageMemoryBarrier2> preBarriers{};
+    std::span<const VkImageMemoryBarrier2> postBarriers{};
     // When true, the pass body is recorded into `secondary` and the primary
     // pass only calls vkCmdExecuteCommands.
     bool executeSecondary{false};

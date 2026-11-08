@@ -1,39 +1,23 @@
-# INTENT7_HANDOFF — 数据 + 操作 + 透明 emitter
+﻿# INTENT7_HANDOFF 鈥?鏁版嵁 + 鎿嶄綔 + 閫忔槑 emitter
 
-> 2026-11-08 重构后的交接说明。
-> 这份文档描述的是 **三轴模型** 的实现，而不是旧的“PassCompiler 把 Cmd union 翻成 vkCmd*”。
+> 2026-11-08 閲嶆瀯鍚庣殑浜ゆ帴璇存槑銆?> 杩欎唤鏂囨。鎻忚堪鐨勬槸 **涓夎酱妯″瀷** 鐨勫疄鐜帮紝鑰屼笉鏄棫鐨勨€淧assCompiler 鎶?Cmd union 缈绘垚 vkCmd*鈥濄€?
+## 1. 鐩爣
 
-## 1. 目标
+`test_intent7` 瑕侀獙璇侊細
 
-`test_intent7` 要验证：
-
-> UIWidget 的意图，经过显式的数据记录和操作展开，最终生成
-> **和手写一样显式、可调控的 Vulkan C 命令列表**，并且以
-> `[beginRendering ... endRendering]` 为 pass 边界。
-
-链路：
-
+> UIWidget 鐨勬剰鍥撅紝缁忚繃鏄惧紡鐨勬暟鎹褰曞拰鎿嶄綔灞曞紑锛屾渶缁堢敓鎴?> **鍜屾墜鍐欎竴鏍锋樉寮忋€佸彲璋冩帶鐨?Vulkan C 鍛戒护鍒楄〃**锛屽苟涓斾互
+> `[beginRendering ... endRendering]` 涓?pass 杈圭晫銆?
+閾捐矾锛?
 ```
 UIWidget
-  -> CommandBuilder / DrawSegment（UI 意图）
-  -> shader_data::emit（意图 -> 操作：bind/set/draw）
-  -> FrameBuilder（操作 -> 线性 OpStream）
-  -> VkEmitter（Op -> 显式 vkCmd*）
-  -> Vulkan C command list
+  -> CommandBuilder / DrawSegment锛圲I 鎰忓浘锛?  -> shader_data::emit锛堟剰鍥?-> 鎿嶄綔锛歜ind/set/draw锛?  -> FrameBuilder锛堟搷浣?-> 绾挎€?OpStream锛?  -> VkEmitter锛圤p -> 鏄惧紡 vkCmd*锛?  -> Vulkan C command list
 ```
 
-## 1.1 根本底层：`[pass ... pass] => [Vulkan C API list]`
+## 1.1 鏍规湰搴曞眰锛歚[pass ... pass] => [Vulkan C API list]`
 
-抽象层不是终点；每一层最终都必须变成显式、有序的 `vkCmd*` 列表。
-
-- `Opcode -> c_api_name()`：每个 Opcode 必须映射到一个官方 `vkCmd*`，没有 abstract-only op。
-- `OpStream -> c_api_list()`：按录制顺序输出 C API 列表。
-- `c_api_coverage_ok()`：检查所有 Opcode 都有 C API 名称。
-- `VkEmitter` 的 `switch` 有 `default: assert(false)`：未映射的 Opcode 不能在 debug 下静默通过。
-- 运行时日志：`[pass-c-api] opcodes=37 calls=54`，随后逐行列出 `#N vkCmd*`。
-
-当前一帧的尾部示例：
-
+鎶借薄灞備笉鏄粓鐐癸紱姣忎竴灞傛渶缁堥兘蹇呴』鍙樻垚鏄惧紡銆佹湁搴忕殑 `vkCmd*` 鍒楄〃銆?
+- `Opcode -> c_api_name()`锛氭瘡涓?Opcode 蹇呴』鏄犲皠鍒颁竴涓畼鏂?`vkCmd*`锛屾病鏈?abstract-only op銆?- `OpStream -> c_api_list()`锛氭寜褰曞埗椤哄簭杈撳嚭 C API 鍒楄〃銆?- `c_api_coverage_ok()`锛氭鏌ユ墍鏈?Opcode 閮芥湁 C API 鍚嶇О銆?- `VkEmitter` 鐨?`switch` 鏈?`default: assert(false)`锛氭湭鏄犲皠鐨?Opcode 涓嶈兘鍦?debug 涓嬮潤榛橀€氳繃銆?- 杩愯鏃舵棩蹇楋細`[pass-c-api] opcodes=37 calls=54`锛岄殢鍚庨€愯鍒楀嚭 `#N vkCmd*`銆?
+褰撳墠涓€甯х殑灏鹃儴绀轰緥锛?
 ```text
 #45 vkCmdFillBuffer
 #46 vkCmdPipelineBarrier2
@@ -43,199 +27,141 @@ UIWidget
 #50 vkCmdPipelineBarrier2
 ```
 
-这条列表就是“根本底层”的直接证据：pass 的数据/操作最终落到显式 C API。
+杩欐潯鍒楄〃灏辨槸鈥滄牴鏈簳灞傗€濈殑鐩存帴璇佹嵁锛歱ass 鐨勬暟鎹?鎿嶄綔鏈€缁堣惤鍒版樉寮?C API銆?
+### 1.2 绯荤粺灞傚櫒瀹橈紙鏈疆琛ワ級
 
-### 1.2 系统层器官（本轮补）
-
-| 器官 | 当前实现 | 状态 |
+| 鍣ㄥ畼 | 褰撳墠瀹炵幇 | 鐘舵€?|
 |---|---|---|
-| Pass domain | `PassKind { Graphics, Compute, Transfer }`；`beginComputePass/beginTransferPass` | transfer pass + compute pass 都已接入；compute 用 push constants，暂无 compute descriptor set 用例 |
-| Queue/submission | `FrameScheduler` + `QueueRole`/`QueueBinding`；acquire/submit/present | 已接入主循环；当前只有 graphics+present 单队列 |
-| Resource state | `ResourceStateTracker` + `BarrierPlanner`；显式 `VkImageMemoryBarrier2` | 已接入 pick/present 两个 transition；仍是 per-transition seed，不是全帧 registry |
+| Pass domain | `PassKind { Graphics, Compute, Transfer }`锛沗beginComputePass/beginTransferPass` | transfer pass + compute pass 閮藉凡鎺ュ叆锛沜ompute 鐢?push constants锛屾殏鏃?compute descriptor set 鐢ㄤ緥 |
+| Queue/submission | `FrameScheduler` + `QueueRole`/`QueueBinding`锛沘cquire/submit/present | 宸叉帴鍏ヤ富寰幆锛涘綋鍓嶅彧鏈?graphics+present 鍗曢槦鍒?|
+| Resource state | `ResourceStateTracker` + `BarrierPlanner`锛涙樉寮?`VkImageMemoryBarrier2` | 宸叉帴鍏?pick/present 涓や釜 transition锛涗粛鏄?per-transition seed锛屼笉鏄叏甯?registry |
 
-### 1.3 数据范围（本轮补全）
+### 1.3 鏁版嵁鑼冨洿锛堟湰杞ˉ鍏級
 
-数据分类保持有限，但每类改成完整 Vulkan 数据容器，新增命令只加 opcode/payload/emitter，不再改 `PassData`：
-
-| 分类 | 完整范围 |
+鏁版嵁鍒嗙被淇濇寔鏈夐檺锛屼絾姣忕被鏀规垚瀹屾暣 Vulkan 鏁版嵁瀹瑰櫒锛屾柊澧炲懡浠ゅ彧鍔?opcode/payload/emitter锛屼笉鍐嶆敼 `PassData`锛?
+| 鍒嗙被 | 瀹屾暣鑼冨洿 |
 |---|---|
-| Descriptor | 多 `VkDescriptorSet`、firstSet、dynamic offsets、descriptor buffer bindings/offsets、resource/sampler heap、push descriptor writes |
-| VertexInput | 多 vertex binding、offsets、sizes、strides、firstBinding |
-| DynamicState | `StateOwnershipMap` 以真实 `VkDynamicState` 为 key；`DynamicStateValue` 以 bytes 存任意状态值，不再按状态加字段 |
-| Sync | memory/buffer/image barrier 数组、dependencyFlags、event、conditional、query/timestamp、timeline semaphore、fence |
-| Inheritance | 完整 `VkCommandBufferInheritanceInfo` + rendering/conditional/heap/viewport-scissor + pNext（caller-owned） |
+| Descriptor | 澶?`VkDescriptorSet`銆乫irstSet銆乨ynamic offsets銆乨escriptor buffer bindings/offsets銆乺esource/sampler heap銆乸ush descriptor writes |
+| VertexInput | 澶?vertex binding銆乷ffsets銆乻izes銆乻trides銆乫irstBinding |
+| DynamicState | `StateOwnershipMap` 浠ョ湡瀹?`VkDynamicState` 涓?key锛沗DynamicStateValue` 浠?bytes 瀛樹换鎰忕姸鎬佸€硷紝涓嶅啀鎸夌姸鎬佸姞瀛楁 |
+| Sync | memory/buffer/image barrier 鏁扮粍銆乨ependencyFlags銆乪vent銆乧onditional銆乹uery/timestamp銆乼imeline semaphore銆乫ence |
+| Inheritance | 瀹屾暣 `VkCommandBufferInheritanceInfo` + rendering/conditional/heap/viewport-scissor + pNext锛坈aller-owned锛?|
 | Transfer | `VkBufferCopy2` / `VkImageCopy2` / `VkBufferImageCopy2` / `VkImageBlit2` / `VkImageResolve2` |
 | Feature | `VkPhysicalDeviceFeatures2` + Vulkan11/12/13/14 features + properties/limits + extension names + raw extension feature |
-| pNext | `const void* pNext`；caller-owned chain，不产生 per-pass 堆分配 |
-| Queue/Submission | queue family properties、`VkSubmitInfo2` 的 semaphore/command buffer submit info、acquire、present、command-buffer inheritance |
+| pNext | `const void* pNext`锛沜aller-owned chain锛屼笉浜х敓 per-pass 鍫嗗垎閰?|
+| Queue/Submission | queue family properties銆乣VkSubmitInfo2` 鐨?semaphore/command buffer submit info銆乤cquire銆乸resent銆乧ommand-buffer inheritance |
 | ResourceState | image/buffer state + queue family ownership |
 | Classic | `VkRenderPass` / framebuffer / clear values / subpass contents |
-| Other | clear attachments、query results、debug label、transform/raw command data |
+| Other | clear attachments銆乹uery results銆乨ebug label銆乼ransform/raw command data |
 
-`RawCommandData { name, function, arguments }` 是最后的 escape hatch：  
-vendor/future 命令可以直接走 raw data，不需要扩 `PassData`；命令映射仍是软的。
+`RawCommandData { name, function, arguments }` 鏄渶鍚庣殑 escape hatch锛? 
+vendor/future 鍛戒护鍙互鐩存帴璧?raw data锛屼笉闇€瑕佹墿 `PassData`锛涘懡浠ゆ槧灏勪粛鏄蒋鐨勩€?
+### 1.4 鐑矾寰勫垎閰嶇瓥鐣?
+- `PassData` 涓嶅惈 `std::vector` / `std::string` / `shared_ptr`锛涘彉閲忔暟鎹敤 `std::span` 鎸囧悜璋冪敤鏂瑰瓨鍌ㄣ€?- `PassData` 鍙繚鐣?core state锛歍arget / Pipeline / Descriptor / PushConstants / VertexInput / DynamicState / Draw / Sync / Inheritance + `FeatureSet*`銆俆ransfer / classic / clear / query / debug / raw / frame data 鏀惧湪鍚勮嚜 struct 鍜?OpPayload锛屼笉杩涘叆 per-pass cache銆?- `StateOwnershipMap`锛?6 椤?inline銆?- `DynamicState`锛?6 椤?脳 128B inline銆?- `PushConstants`锛?56B inline銆?- `BarrierPayload`锛? 涓?memory/buffer/image barrier inline锛屽父瑙?1 涓?barrier 闆跺爢鍒嗛厤銆?- `CopyImageToBuffer` / `CopyBuffer` / `ExecuteCommands`锛? 椤?inline锛屼笉鍐嶆瘡甯у垎閰?vector銆?- `FeatureSet`锛歚PassData` 鍙瓨鎸囬拡锛屼笉鍐嶆瘡娆?pass 鎷疯礉瀹屾暣 features/properties銆?- `OpStream`锛欶rameBuilder reserve 64锛孲econdaryBuilder reserve 16銆?- legacy `PassRecorder` / `FrameRecorder` 宸插垹闄わ紱`pass_stream.hpp` 鍙繚鐣?`pass_boundary_barrier()`銆?
+### 1.5 鏈€缁?review锛歵est_ui_ability2 杩佺Щ
 
-### 1.4 热路径分配策略
-
-- `PassData` 不含 `std::vector` / `std::string` / `shared_ptr`；变量数据用 `std::span` 指向调用方存储。
-- `PassData` 只保留 core state：Target / Pipeline / Descriptor / PushConstants / VertexInput / DynamicState / Draw / Sync / Inheritance + `FeatureSet*`。Transfer / classic / clear / query / debug / raw / frame data 放在各自 struct 和 OpPayload，不进入 per-pass cache。
-- `StateOwnershipMap`：16 项 inline。
-- `DynamicState`：16 项 × 128B inline。
-- `PushConstants`：256B inline。
-- `BarrierPayload`：8 个 memory/buffer/image barrier inline，常见 1 个 barrier 零堆分配。
-- `CopyImageToBuffer` / `CopyBuffer` / `ExecuteCommands`：4 项 inline，不再每帧分配 vector。
-- `FeatureSet`：`PassData` 只存指针，不再每次 pass 拷贝完整 features/properties。
-- `OpStream`：FrameBuilder reserve 64，SecondaryBuilder reserve 16。
-- legacy `PassRecorder` / `FrameRecorder` 已删除；`pass_stream.hpp` 只保留 `pass_boundary_barrier()`。
-
-### 1.5 最终 review：test_ui_ability2 迁移
-
-`ui_shader_device` / `ui_backend` 用到的 pass 级能力逐项核对：
-
-| 能力 | 命令 | 状态 |
+`ui_shader_device` / `ui_backend` 鐢ㄥ埌鐨?pass 绾ц兘鍔涢€愰」鏍稿锛?
+| 鑳藉姏 | 鍛戒护 | 鐘舵€?|
 |---|---|---|
 | begin/end rendering | `vkCmdBeginRendering` / `vkCmdEndRendering` | typed |
 | pipeline | `vkCmdBindPipeline` | typed |
 | descriptor set | `vkCmdBindDescriptorSets` | typed |
 | index buffer | `vkCmdBindIndexBuffer` | typed |
 | viewport / scissor | `vkCmdSetViewport` / `vkCmdSetScissor` | typed |
-| stencil reference | `vkCmdSetStencilReference` | typed（新增） |
+| stencil reference | `vkCmdSetStencilReference` | typed锛堟柊澧烇級 |
 | push constants | `vkCmdPushConstants` | typed |
 | indirect draw | `vkCmdDrawIndexedIndirect` | typed |
-| mip blit | `vkCmdBlitImage` | typed（新增） |
+| mip blit | `vkCmdBlitImage` | typed锛堟柊澧烇級 |
 | barrier | `vkCmdPipelineBarrier2` | typed |
 | multi-color / depth / resolve | `PassTarget` + `VkRenderingAttachmentInfo` | typed |
 
-vkspec 核对结果：
+vkspec 鏍稿缁撴灉锛?
+- `vkCmdSetStencilReference` / `vkCmdSetViewport` / `vkCmdSetScissor` / `vkCmdBindPipeline` / `vkCmdBindDescriptorSets` / `vkCmdBindIndexBuffer` / `vkCmdPushConstants` 鐨?Render Pass Scope 鏄?**Both**锛泇alidator 宸插厑璁?pass 澶栬皟鐢ㄣ€?- `vkCmdSetStencilReference` 鍙湁鍦?pipeline 鐨?`VK_DYNAMIC_STATE_STENCIL_REFERENCE` 鏄?dynamic 鏃舵墠鏈夋晥锛泇alidator 鐢?`StateOwnershipMap` 妫€鏌ャ€?- `vkCmdBlitImage` 鏄?Outside锛泇alidator 涓嶅湪 graphics pass 鍐呭厑璁革紝logical transfer pass 鍏佽銆?- `vkCmdExecuteCommands` 鍦?dynamic rendering 鍐呰姹?`VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT`锛泇alidator 宸叉鏌ャ€?- `c_api_coverage_ok()` 瑕嗙洊鍏ㄩ儴 Opcode锛沗VkEmitter` 鏈槧灏?opcode 浼?assert銆?
+缁撹锛歚test_ui_ability2` 鐨?pass 褰曞埗鑳藉姏鍙互杩佺Щ鍒版湰妗嗘灦锛涘皻鏈疄闄呮敼鍐?`test_ui_ability2.cpp` 婧愮爜銆?
+### 1.6 Widget 绾ц縼绉昏惤鍦?
+`test_intent7_ability_test.hpp` 鐨?`ability_test_scene` 宸叉浛浠?`pass_test_scene` 浣滀负 test_intent7 褰撳墠鍦烘櫙锛?
+- pass 0 base锛氳儗鏅?+ 18 涓?card frame + composed frame銆?- pass 1 shape/path锛?1 涓?shape/path tile銆?- pass 2 texture/effect锛? 涓?texture/effect tile + composed UI锛涜 pass 鐢?secondary command buffer 鎵ц銆?- pass 3 text overlay锛歁SDF glyph锛沗LOAD/DONT_CARE`銆?- `CommandBuilder::setPipeline` 鍒囨崲 opaque / alpha / add / multiply 鍥涚 pipeline銆?- `CommandBuilder::setScissor` 鍋?per-tile clip锛堥€?segment锛夛紱`pushScissor/popScissor` 鍋氬祵濂?clip 浜ら泦銆?- `ui_dao` 浣跨敤 7 涓?program锛歋hape / PathFill / PathStroke / Texture / Blur / ColorMatrix / Noise銆?- 鐗规€ц鐩栵細linear/radial/conic/per-corner/ring/arc銆乼riangle+AA/star/dash/rotate/skew銆乶ine-slice/masked/mipmap銆乮nner shadow/blur/sepia/noise/text銆?- 杩愯鏃ュ織锛歚[ability-test] passes=4 glyphs=427`锛涚 3 涓?effect pass 鐢?secondary command buffer 鎵ц锛坄sources[3]`锛夛紝`vkCmdExecuteCommands` 鍑虹幇鍦?dump銆?
+## 2. 涓夎酱妯″瀷
 
-- `vkCmdSetStencilReference` / `vkCmdSetViewport` / `vkCmdSetScissor` / `vkCmdBindPipeline` / `vkCmdBindDescriptorSets` / `vkCmdBindIndexBuffer` / `vkCmdPushConstants` 的 Render Pass Scope 是 **Both**；validator 已允许 pass 外调用。
-- `vkCmdSetStencilReference` 只有在 pipeline 的 `VK_DYNAMIC_STATE_STENCIL_REFERENCE` 是 dynamic 时才有效；validator 用 `StateOwnershipMap` 检查。
-- `vkCmdBlitImage` 是 Outside；validator 不在 graphics pass 内允许，logical transfer pass 允许。
-- `vkCmdExecuteCommands` 在 dynamic rendering 内要求 `VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT`；validator 已检查。
-- `c_api_coverage_ok()` 覆盖全部 Opcode；`VkEmitter` 未映射 opcode 会 assert。
+- **绾靛悜锛氭暟鎹祦**锛堝畼鏂?Pipelines 绔犵殑 block diagram锛?  `Draw -> IA -> VS -> Tess -> GS -> VertexPost -> Raster -> EarlyFrag -> FS -> LateFrag -> Blend -> Attachments`
+  璧勬簮锛歏ertex/Index/Indirect Buffer銆丏escriptor Sets/Buffers/Heaps銆丳ush Constants銆乁niform/Storage Buffer銆丼ampled/Storage Image銆?- **妯悜锛氬懡浠よ鑹?*锛堝畼鏂?Fundamentals 绔犵殑 Command Type锛?  `Control / State / Action / Synchronization / Indirection`銆?- **娣卞害锛氱敓鍛藉懆鏈?+ Scope**
+  Device / Frame / Pass / CommandBuffer / Draw / Sync / Inheritance / Feature锛?  Inside / Outside / Both锛汸rimary / Secondary锛泀ueue锛泇ideo銆?
+## 3. 鏂囦欢鑱岃矗
 
-结论：`test_ui_ability2` 的 pass 录制能力可以迁移到本框架；尚未实际改写 `test_ui_ability2.cpp` 源码。
-
-### 1.6 Widget 级迁移落地
-
-`test_intent7_ability_test.hpp` 的 `ability_test_scene` 已替代 `pass_test_scene` 作为 test_intent7 当前场景：
-
-- pass 0 base：背景 + 18 个 card frame + composed frame。
-- pass 1 shape/path：11 个 shape/path tile。
-- pass 2 texture/effect：7 个 texture/effect tile + composed UI；该 pass 由 secondary command buffer 执行。
-- pass 3 text overlay：MSDF glyph；`LOAD/DONT_CARE`。
-- `CommandBuilder::setPipeline` 切换 opaque / alpha / add / multiply 四种 pipeline。
-- `CommandBuilder::setScissor` 做 per-tile clip（逐 segment）；`pushScissor/popScissor` 做嵌套 clip 交集。
-- `ui_dao` 使用 7 个 program：Shape / PathFill / PathStroke / Texture / Blur / ColorMatrix / Noise。
-- 特性覆盖：linear/radial/conic/per-corner/ring/arc、triangle+AA/star/dash/rotate/skew、nine-slice/masked/mipmap、inner shadow/blur/sepia/noise/text。
-- 运行日志：`[ability-test] passes=4 glyphs=397`；第 3 个 effect pass 由 secondary command buffer 执行（`sources[3]`），`vkCmdExecuteCommands` 出现在 dump。
-
-## 2. 三轴模型
-
-- **纵向：数据流**（官方 Pipelines 章的 block diagram）
-  `Draw -> IA -> VS -> Tess -> GS -> VertexPost -> Raster -> EarlyFrag -> FS -> LateFrag -> Blend -> Attachments`
-  资源：Vertex/Index/Indirect Buffer、Descriptor Sets/Buffers/Heaps、Push Constants、Uniform/Storage Buffer、Sampled/Storage Image。
-- **横向：命令角色**（官方 Fundamentals 章的 Command Type）
-  `Control / State / Action / Synchronization / Indirection`。
-- **深度：生命周期 + Scope**
-  Device / Frame / Pass / CommandBuffer / Draw / Sync / Inheritance / Feature；
-  Inside / Outside / Both；Primary / Secondary；queue；video。
-
-## 3. 文件职责
-
-| 文件 | 职责 |
+| 鏂囦欢 | 鑱岃矗 |
 |---|---|
-| `test_intent7_pass_data.hpp` | **数据 schema**：`PassTarget`、`PipelineBinding`、`DescriptorBinding`、`PushConstants`、`VertexInputBinding`、`DynamicState`、`DrawArgs`、`SyncState`、`Inheritance`、`FeatureSet`、`PassData`；以及 `PassDesc = PassTarget` 兼容别名、`query_features()`。 |
-| `test_intent7_pass_opcode.hpp` | **操作层**：`Opcode`、`OpKind`、`Scope`、`Lifecycle`、`Op`、`OpStream`、`dump()`；`c_api_name()` / `c_api_list()` / `c_api_coverage_ok()` 把 `[pass...pass]` 直接映射到 `[vkCmd*]` 列表。 |
-| `test_intent7_pass_emitter.hpp` | **透明 lowering**：`VkEmitter::emit(Op)`，每个 opcode 1:1 映射到显式 `vkCmd*`。 |
-| `test_intent7_pass_validator.hpp` | **增量校验**：scope / lifecycle / basic compatibility；不做全状态树。 |
-| `test_intent7_pass_builder.hpp` | **FrameBuilder**：`beginPass/state/action/sync/endPass` -> 更新 `PassData` -> 追加 `OpStream` -> 校验 -> emit；可选用 `deferEmit` + `emitAll()` 做纯 build-then-emit。**StreamRecorder**：无校验的 secondary 状态/动作录制器；**SecondaryBuilder**：共享 `PassData`/`PassValidator` 的 secondary 录制器。 |
-| `test_intent7_pass_compiler.hpp` | `recordPasses()`：按 `PassSource[]` 顺序 `beginPass -> emit -> endPass`，并在 pass 之间插 `pass_boundary_barrier()`。 |
-| `test_intent7_frame_scheduler.hpp` | **系统层**：`QueueRole` / `QueueBinding` / `FrameScheduler`：acquire (`vkAcquireNextImageKHR`)、submit (`vkQueueSubmit`)、present (`vkQueuePresentKHR`)；queue role 建模。 |
-| `test_intent7_resource_state.hpp` | **系统层**：`ResourceStateTracker` (layout/access/stage) + `BarrierPlanner` (显式 `VkImageMemoryBarrier2` -> `FrameBuilder::barrier`)；不隐藏同步。 |
-| `test_intent7_pass_abi.hpp` | `PipelineState` / `Pass` / `PassManager` / `PassSource`：每帧 extra pass 的数据与 GPU buffer。 |
-| `test_intent7_frame_context.hpp` | `ShaderBuffers` + `CommandBuilder` + `shader_data::emit()`：UI 意图 -> 操作。 |
-| `test_intent7_pass_tests.hpp` | 可视化用例：main 背景 + 3 个 card pass + 1 个 overlay pass。 |
-| `test_intent7_ability_test.hpp` | **test_ui_ability2 的 Widget 级迁移**：7 个 program、18 个特性 tile、clip/layer/blend/mipmap/text；通过 `PassManager + FrameBuilder` 走完整 `[pass...pass]`。 |
-| `shaders/test_intent7.comp` | 最小 compute shader：push constants + 空 body，用于 `beginComputePass + BindPipeline(COMPUTE) + Dispatch`。 |
-| `test_intent7.cpp` | 主 pass target、FrameBuilder、pass sources、dump、submit。 |
+| `test_intent7_pass_data.hpp` | **鏁版嵁 schema**锛歚PassTarget`銆乣PipelineBinding`銆乣DescriptorBinding`銆乣PushConstants`銆乣VertexInputBinding`銆乣DynamicState`銆乣DrawArgs`銆乣SyncState`銆乣Inheritance`銆乣FeatureSet`銆乣PassData`锛涗互鍙?`PassDesc = PassTarget` 鍏煎鍒悕銆乣query_features()`銆?|
+| `test_intent7_pass_opcode.hpp` | **鎿嶄綔灞?*锛歚Opcode`銆乣OpKind`銆乣Scope`銆乣Lifecycle`銆乣Op`銆乣OpStream`銆乣dump()`锛沗c_api_name()` / `c_api_list()` / `c_api_coverage_ok()` 鎶?`[pass...pass]` 鐩存帴鏄犲皠鍒?`[vkCmd*]` 鍒楄〃銆?|
+| `test_intent7_pass_emitter.hpp` | **閫忔槑 lowering**锛歚VkEmitter::emit(Op)`锛屾瘡涓?opcode 1:1 鏄犲皠鍒版樉寮?`vkCmd*`銆?|
+| `test_intent7_pass_validator.hpp` | **澧為噺鏍￠獙**锛歴cope / lifecycle / basic compatibility锛涗笉鍋氬叏鐘舵€佹爲銆?|
+| `test_intent7_pass_builder.hpp` | **FrameBuilder**锛歚beginPass/state/action/sync/endPass` -> 鏇存柊 `PassData` -> 杩藉姞 `OpStream` -> 鏍￠獙 -> emit锛涘彲閫夌敤 `deferEmit` + `emitAll()` 鍋氱函 build-then-emit銆?*StreamRecorder**锛氭棤鏍￠獙鐨?secondary 鐘舵€?鍔ㄤ綔褰曞埗鍣紱**SecondaryBuilder**锛氬叡浜?`PassData`/`PassValidator` 鐨?secondary 褰曞埗鍣ㄣ€?|
+| `test_intent7_pass_compiler.hpp` | `recordPasses()`锛氭寜 `PassSource[]` 椤哄簭 `beginPass -> emit -> endPass`锛屽苟鍦?pass 涔嬮棿鎻?`pass_boundary_barrier()`銆?|
+| `test_intent7_frame_scheduler.hpp` | **绯荤粺灞?*锛歚QueueRole` / `QueueBinding` / `FrameScheduler`锛歛cquire (`vkAcquireNextImageKHR`)銆乻ubmit (`vkQueueSubmit`)銆乸resent (`vkQueuePresentKHR`)锛泀ueue role 寤烘ā銆?|
+| `test_intent7_resource_state.hpp` | **绯荤粺灞?*锛歚ResourceStateTracker` (layout/access/stage) + `BarrierPlanner` (鏄惧紡 `VkImageMemoryBarrier2` -> `FrameBuilder::barrier`)锛涗笉闅愯棌鍚屾銆?|
+| `test_intent7_pass_abi.hpp` | `PipelineState` / `Pass` / `PassManager` / `PassSource`锛氭瘡甯?extra pass 鐨勬暟鎹笌 GPU buffer銆?|
+| `test_intent7_frame_context.hpp` | `ShaderBuffers` + `CommandBuilder` + `shader_data::emit()`锛歎I 鎰忓浘 -> 鎿嶄綔銆?|
+| `test_intent7_pass_tests.hpp` | 鍙鍖栫敤渚嬶細main 鑳屾櫙 + 3 涓?card pass + 1 涓?overlay pass銆?|
+| `test_intent7_ability_test.hpp` | **test_ui_ability2 鐨?Widget 绾ц縼绉?*锛? 涓?program銆?8 涓壒鎬?tile銆乧lip/layer/blend/mipmap/text锛涢€氳繃 `PassManager + FrameBuilder` 璧板畬鏁?`[pass...pass]`銆?|
+| `shaders/test_intent7.comp` | 鏈€灏?compute shader锛歱ush constants + 绌?body锛岀敤浜?`beginComputePass + BindPipeline(COMPUTE) + Dispatch`銆?|
+| `test_intent7.cpp` | 涓?pass target銆丗rameBuilder銆乸ass sources銆乨ump銆乻ubmit銆?|
 
-## 4. 数据 schema
+## 4. 鏁版嵁 schema
 
-`PassData` 是命令缓冲区状态的记录：
-
+`PassData` 鏄懡浠ょ紦鍐插尯鐘舵€佺殑璁板綍锛?
 ```cpp
 PassData
-├─ target          PassTarget（VkRenderingInfo + color[N]/depth/stencil/resolve/load-store/clear）
-├─ pipeline        PipelineBinding（VkPipeline + VkPipelineLayout + rendering formats + state ownership）
-├─ descriptors     DescriptorBinding（layout + set）
-├─ pushConstants   PushConstants（layout/stages/offset/size/data）
-├─ vertexInput     VertexInputBinding（index buffer/offset/type）
-├─ dynamicState    DynamicState（viewport/scissor/... + valid[]）
-├─ draw            DrawArgs（kind + direct/indirect operands）
-├─ sync            SyncState（boundary barrier）
-├─ inheritance     Inheritance（secondary rendering info）
-├─ features        FeatureSet（feature gates）
-└─ passActive      bool
+鈹溾攢 target          PassTarget锛圴kRenderingInfo + color[N]/depth/stencil/resolve/load-store/clear锛?鈹溾攢 pipeline        PipelineBinding锛圴kPipeline + VkPipelineLayout + rendering formats + state ownership锛?鈹溾攢 descriptors     DescriptorBinding锛坙ayout + set锛?鈹溾攢 pushConstants   PushConstants锛坙ayout/stages/offset/size/data锛?鈹溾攢 vertexInput     VertexInputBinding锛坕ndex buffer/offset/type锛?鈹溾攢 dynamicState    DynamicState锛坴iewport/scissor/... + valid[]锛?鈹溾攢 draw            DrawArgs锛坘ind + direct/indirect operands锛?鈹溾攢 sync            SyncState锛坆oundary barrier锛?鈹溾攢 inheritance     Inheritance锛坰econdary rendering info锛?鈹溾攢 features        FeatureSet锛坒eature gates锛?鈹斺攢 passActive      bool
 ```
 
-生命周期：
-
-| 数据 | 生命周期 | 说明 |
+鐢熷懡鍛ㄦ湡锛?
+| 鏁版嵁 | 鐢熷懡鍛ㄦ湡 | 璇存槑 |
 |---|---|---|
-| `PassTarget` | pass | 只在 `beginRendering/endRendering` 之间有效 |
-| `PipelineBinding` | device / bind | pipeline 创建一次，绑定持续到改变 |
-| `DescriptorBinding` | frame / bind | set 可以是 frame 生命周期，绑定持续到改变 |
-| `PushConstants` | command buffer / draw | 设置后持续到改变 |
-| `VertexInputBinding` | device / bind | buffer 是 device/frame，binding 是 command buffer 状态 |
-| `DynamicState` | command buffer | begin 时 undefined；pipeline static 状态会覆盖；`commandBufferInheritance` 可继承 |
-| `DrawArgs` | draw | 一次 draw 命令 |
-| `SyncState` | sync op | barrier/query/event；本 demo 只用 pass boundary memory barrier |
-| `Inheritance` | secondary | secondary 录制/执行期间 |
+| `PassTarget` | pass | 鍙湪 `beginRendering/endRendering` 涔嬮棿鏈夋晥 |
+| `PipelineBinding` | device / bind | pipeline 鍒涘缓涓€娆★紝缁戝畾鎸佺画鍒版敼鍙?|
+| `DescriptorBinding` | frame / bind | set 鍙互鏄?frame 鐢熷懡鍛ㄦ湡锛岀粦瀹氭寔缁埌鏀瑰彉 |
+| `PushConstants` | command buffer / draw | 璁剧疆鍚庢寔缁埌鏀瑰彉 |
+| `VertexInputBinding` | device / bind | buffer 鏄?device/frame锛宐inding 鏄?command buffer 鐘舵€?|
+| `DynamicState` | command buffer | begin 鏃?undefined锛沺ipeline static 鐘舵€佷細瑕嗙洊锛沗commandBufferInheritance` 鍙户鎵?|
+| `DrawArgs` | draw | 涓€娆?draw 鍛戒护 |
+| `SyncState` | sync op | barrier/query/event锛涙湰 demo 鍙敤 pass boundary memory barrier |
+| `Inheritance` | secondary | secondary 褰曞埗/鎵ц鏈熼棿 |
 
 ## 5. Opcode table
 
-| Opcode | Role | Payload | 备注 |
+| Opcode | Role | Payload | 澶囨敞 |
 |---|---|---|---|
-| `BeginRendering` | Control | `PassTarget` | 在 pass 外调用 |
-| `EndRendering` | Control | - | 在 pass 内调用 |
+| `BeginRendering` | Control | `PassTarget` | 鍦?pass 澶栬皟鐢?|
+| `EndRendering` | Control | - | 鍦?pass 鍐呰皟鐢?|
 | `BindPipeline` | State | `VkPipeline` + layout | graphics bind point |
 | `BindDescriptorSet` | State | layout + set | firstSet=0 |
-| `BindDescriptorBuffer` | State | layout + `VkDescriptorBufferBindingInfoEXT` + offset | descriptor buffer 路径 |
-| `BindResourceHeap` / `BindSamplerHeap` | State | `VkBindHeapInfoEXT` | descriptor heap；通过 `vkGetDeviceProcAddr` 取函数 |
-| `PushConstants` | State | layout/stages/offset/size/data | 最大 128 bytes（demo） |
+| `BindDescriptorBuffer` | State | layout + `VkDescriptorBufferBindingInfoEXT` + offset | descriptor buffer 璺緞 |
+| `BindResourceHeap` / `BindSamplerHeap` | State | `VkBindHeapInfoEXT` | descriptor heap锛涢€氳繃 `vkGetDeviceProcAddr` 鍙栧嚱鏁?|
+| `PushConstants` | State | layout/stages/offset/size/data | 鏈€澶?128 bytes锛坉emo锛?|
 | `SetViewport` | State | `VkViewport` | first=0, count=1 |
 | `SetScissor` | State | `VkRect2D` | first=0, count=1 |
-| `SetDepthTestEnable` / `SetDepthWriteEnable` | State | `VkBool32` | 动态深度状态 |
-| `SetCullMode` / `SetFrontFace` / `SetPrimitiveTopology` / `SetStencilReference` | State | 对应枚举 | 动态固定功能状态 |
+| `SetDepthTestEnable` / `SetDepthWriteEnable` | State | `VkBool32` | 鍔ㄦ€佹繁搴︾姸鎬?|
+| `SetCullMode` / `SetFrontFace` / `SetPrimitiveTopology` / `SetStencilReference` | State | 瀵瑰簲鏋氫妇 | 鍔ㄦ€佸浐瀹氬姛鑳界姸鎬?|
 | `BindIndexBuffer` | State | buffer/offset/type | |
-| `Draw` / `DrawIndexed` / `DrawIndirect` | Action | draw operands | 直接/索引/间接 |
-| `DrawIndexedIndirect` | Action | buffer/offset/drawCount/stride | demo 主路径 |
-| `CopyImageToBuffer` | Action | image/layout/buffer/regions | pick 回读 |
-| `CopyBuffer` / `CopyBufferToImage` / `CopyImage` / `BlitImage` | Action | src/dst/regions/filter | transfer；`CopyBuffer` 在 per-frame scratch 上实际使用 |
-| `FillBuffer` / `UpdateBuffer` | Action | buffer/offset/data | transfer；`FillBuffer` 在 pick 回读前实际使用 |
+| `Draw` / `DrawIndexed` / `DrawIndirect` | Action | draw operands | 鐩存帴/绱㈠紩/闂存帴 |
+| `DrawIndexedIndirect` | Action | buffer/offset/drawCount/stride | demo 涓昏矾寰?|
+| `CopyImageToBuffer` | Action | image/layout/buffer/regions | pick 鍥炶 |
+| `CopyBuffer` / `CopyBufferToImage` / `CopyImage` / `BlitImage` | Action | src/dst/regions/filter | transfer锛沗CopyBuffer` 鍦?per-frame scratch 涓婂疄闄呬娇鐢?|
+| `FillBuffer` / `UpdateBuffer` | Action | buffer/offset/data | transfer锛沗FillBuffer` 鍦?pick 鍥炶鍓嶅疄闄呬娇鐢?|
 | `ClearColorImage` / `ClearDepthStencilImage` | Action | image/layout/clear/ranges | outside pass |
 | `Dispatch` / `DispatchIndirect` | Action | group counts / indirect buffer | compute, outside pass |
-| `ClearAttachments` | Action | attachments + rects | pass 内 clear |
-| `BeginQuery` / `EndQuery` | Sync | query pool/query/flags | occlusion/timestamp 等 |
-| `Barrier` | Sync | memory/buffer/image barrier arrays | pass 边界 + frame sync |
-| `ExecuteCommands` | Indirection | secondary command buffers | CASE 2 的 pass body 走 secondary |
+| `ClearAttachments` | Action | attachments + rects | pass 鍐?clear |
+| `BeginQuery` / `EndQuery` | Sync | query pool/query/flags | occlusion/timestamp 绛?|
+| `Barrier` | Sync | memory/buffer/image barrier arrays | pass 杈圭晫 + frame sync |
+| `ExecuteCommands` | Indirection | secondary command buffers | CASE 2 鐨?pass body 璧?secondary |
 
-新增一个命令变体时：
-
-1. 在 `Opcode`/`OpKind` 加枚举；
-2. 在 `test_intent7_pass_opcode.hpp` 加 payload 结构；
-3. 在 `dump()` 加 C 伪代码；
-4. 在 `VkEmitter::emit()` 加显式 `vkCmd*`；
-5. 在 `FrameBuilder` 加语义方法；
-6. 在 `PassValidator` 加 scope/lifecycle 检查。
-
-**不要**为每个命令加一个类；opcode + payload + emitter case 就够了。
-
-## 6. 透明 emitter 与手写质量
-
-`VkEmitter::emit(Op)` 是一个直接的 switch：
-
+鏂板涓€涓懡浠ゅ彉浣撴椂锛?
+1. 鍦?`Opcode`/`OpKind` 鍔犳灇涓撅紱
+2. 鍦?`test_intent7_pass_opcode.hpp` 鍔?payload 缁撴瀯锛?3. 鍦?`dump()` 鍔?C 浼唬鐮侊紱
+4. 鍦?`VkEmitter::emit()` 鍔犳樉寮?`vkCmd*`锛?5. 鍦?`FrameBuilder` 鍔犺涔夋柟娉曪紱
+6. 鍦?`PassValidator` 鍔?scope/lifecycle 妫€鏌ャ€?
+**涓嶈**涓烘瘡涓懡浠ゅ姞涓€涓被锛沷pcode + payload + emitter case 灏卞浜嗐€?
+## 6. 閫忔槑 emitter 涓庢墜鍐欒川閲?
+`VkEmitter::emit(Op)` 鏄竴涓洿鎺ョ殑 switch锛?
 ```cpp
 case Opcode::BindPipeline:
     vk.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p.pipeline);
@@ -245,9 +171,8 @@ case Opcode::DrawIndexedIndirect:
     break;
 ```
 
-没有隐式重排、没有隐藏 barrier、没有隐藏 pass。  
-`FrameBuilder::dump()` 输出与手写一致的 C 伪代码，例如：
-
+娌℃湁闅愬紡閲嶆帓銆佹病鏈夐殣钘?barrier銆佹病鏈夐殣钘?pass銆? 
+`FrameBuilder::dump()` 杈撳嚭涓庢墜鍐欎竴鑷寸殑 C 浼唬鐮侊紝渚嬪锛?
 ```text
 #0 // [Outside / Sync] vkCmdPipelineBarrier2
 vkCmdPipelineBarrier2(cmd, &dependency{memory=0, buffer=0, image=5}); // layout transition
@@ -268,44 +193,22 @@ vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout=..., 0, 1, 
 vkCmdPipelineBarrier2(cmd, &dependency{memory=1, buffer=0, image=0}); // pass boundary
 ```
 
-`dump()` 只在第一帧打印；如需每次都打印，可把 `static bool dumped` 改成环境变量控制。
+`dump()` 鍙湪绗竴甯ф墦鍗帮紱濡傞渶姣忔閮芥墦鍗帮紝鍙妸 `static bool dumped` 鏀规垚鐜鍙橀噺鎺у埗銆?
+## 7. 鍚屾
 
-## 7. 同步
+- 鏄惧紡鍚屾鏄?Op锛歚Barrier`锛宲ayload 鎷ユ湁 `memoryBarriers/bufferBarriers/imageBarriers` 涓変釜 vector锛沞mitter 鍦ㄨ皟鐢ㄦ椂鏋勯€犱复鏃剁殑 `VkDependencyInfo`锛屼笉鐣欎笅鎮┖鎸囬拡銆?- frame sync 宸茬粡杩涘叆 OpStream锛?  - `#0`锛? 寮?image 鐨?`UNDEFINED -> ATTACHMENT_OPTIMAL` layout transition锛坈olor/MSAA/depth/pick/resolve锛夛紱
+  - 姣忎釜 pass 涔嬮棿锛歚pass_boundary_barrier()` 鐨?memory barrier锛坰tore -> load锛夛紱
+  - pass 涔嬪悗锛歱ick resolve `COLOR_ATTACHMENT -> TRANSFER_SRC`锛?  - 鏈€鍚庯細swapchain `COLOR_ATTACHMENT -> PRESENT_SRC`銆?- `pass_boundary_barrier()` 鐨?src/dst stage 鏄?color/depth framebuffer stages锛宎ccess 鏄?attachment read/write銆?- pass 鍐?barrier 浠嶉€氳繃 `FrameBuilder::barrier()` 鍙敤锛屼絾瑕佹敞鎰忥細
+  - `vkCmdPipelineBarrier2` 鍦?`beginRendering` 鍐呴渶瑕?`dynamicRenderingLocalRead` 绛夋潯浠讹紱
+  - 鏈?demo 鐨?barrier 閮藉湪 pass 涔嬮棿锛圤utside锛夛紝鎵€浠ユ病鏈夎繖涓檺鍒躲€?
+## 8. 姣忓抚 PassManager
 
-- 显式同步是 Op：`Barrier`，payload 拥有 `memoryBarriers/bufferBarriers/imageBarriers` 三个 vector；emitter 在调用时构造临时的 `VkDependencyInfo`，不留下悬空指针。
-- frame sync 已经进入 OpStream：
-  - `#0`：5 张 image 的 `UNDEFINED -> ATTACHMENT_OPTIMAL` layout transition（color/MSAA/depth/pick/resolve）；
-  - 每个 pass 之间：`pass_boundary_barrier()` 的 memory barrier（store -> load）；
-  - pass 之后：pick resolve `COLOR_ATTACHMENT -> TRANSFER_SRC`；
-  - 最后：swapchain `COLOR_ATTACHMENT -> PRESENT_SRC`。
-- `pass_boundary_barrier()` 的 src/dst stage 是 color/depth framebuffer stages，access 是 attachment read/write。
-- pass 内 barrier 仍通过 `FrameBuilder::barrier()` 可用，但要注意：
-  - `vkCmdPipelineBarrier2` 在 `beginRendering` 内需要 `dynamicRenderingLocalRead` 等条件；
-  - 本 demo 的 barrier 都在 pass 之间（Outside），所以没有这个限制。
+`passManagers[MAX_FRAMES_IN_FLIGHT]` 涓?`drawRecorder` 甯фЫ浣嶅榻愶紝閬垮厤 CPU 鍐?pass buffer 鏃?GPU 杩樺湪璇讳笂涓€甯с€? 
+`FrameBuilder` 姣忓抚鏂板缓锛宍PassData`/`OpStream`/`Validator` 閮芥槸甯у唴涓存椂瀵硅薄銆?
+## 9. 宸茬煡缂哄彛
 
-## 8. 每帧 PassManager
-
-`passManagers[MAX_FRAMES_IN_FLIGHT]` 与 `drawRecorder` 帧槽位对齐，避免 CPU 写 pass buffer 时 GPU 还在读上一帧。  
-`FrameBuilder` 每帧新建，`PassData`/`OpStream`/`Validator` 都是帧内临时对象。
-
-## 9. 已知缺口
-
-- typed opcode 只覆盖 test_intent7 用到的命令；其余 `vkCmd*` 仍可通过 `PassRecorder::vk()` / `FrameRecorder::vk()` 或后续新增 opcode 接入。
-- `DescriptorBinding` 已有 set / descriptor buffer / resource heap / sampler heap 变体；heap 的 emitter 通过 `vkGetDeviceProcAddr` 取函数（VolkDeviceTable 版本未包含）。
-- `Inheritance` / `commandBufferInheritance` 有真实用例：CASE 2 的 pass body 录进 secondary command buffer，primary pass 用 `vkCmdExecuteCommands` 执行；`ExecuteCommandsPayload` 携带 `InheritanceRenderingInfo`，`PassValidator` 独立校验 flags/viewMask/color formats/depth/stencil/samples 与 pass target 匹配。secondary 本身现在用 `SecondaryBuilder` 录制，走同一套 `PassData`/`PassValidator`/`VkEmitter`。
-- `PipelineBinding.ownership` 现在从 `StateOwnershipMap` 填充；`PassValidator` 会检查 `vkCmdSet*` 对应的状态在 bound pipeline 中是 `Dynamic`/`Inherited`，而不是 `Static`/`Absent`。
-- `DynamicState` 已覆盖 viewport/scissor/depth test/depth write/cull/front/topology；其他状态字段可继续加 opcode。
-- `PassValidator` 已做 pipeline-target 的 color/depth/stencil format、viewMask、sample count 兼容性，descriptor layout == pipeline layout，dynamic-state ownership，secondary inheritance，以及 descriptorBuffer/descriptorHeap/dynamicRenderingLocalRead feature gate；其他 feature gate 可以继续加。
-- `FrameSync` 和 `CopyImageToBuffer` 已进入 OpStream；`vkCmdBeginCommandBuffer`/`vkCmdEndCommandBuffer`、queue submit/present 仍在 FrameBuilder 外（属于 frame/queue 层）。
-- `ClearAttachments` / `BeginQuery` / `EndQuery` 已有 typed opcode，但 demo 未实际使用；`ExecuteCommands` 已实际使用。
-- `FillBuffer` / `CopyBuffer` 已在 per-frame transfer scratch + pick 回读路径实际使用；`CopyBufferToImage` / `CopyImage` / `UpdateBuffer` / `ClearColorImage` / `ClearDepthStencilImage` / `Dispatch` / `DispatchIndirect` 已有 typed opcode，但 demo 未实际使用；它们统一走 `push_transfer`（Outside）。
-- `PassKind` 已有 Graphics/Compute/Transfer；transfer pass 已接入并产生 `[Inside / Sync]` 的 Fill/Copy/Barrier；compute pass 已接入 compute pipeline + push constants + `vkCmdDispatch`，但还没有 compute descriptor set 用例。
-- 数据 schema 已扩到多 descriptor set/dynamic offsets、vertex binding 数组、通用 `VkDynamicState`、完整 sync/inheritance/transfer2/features/properties、pNext 指针（caller-owned）、queue/submission/present、classic render pass、raw command；RT/video/acceleration-structure 仍只有 `RawCommandData`，未 typed。
-- `FrameScheduler` 已接管 acquire/submit/present，`QueueRole`/`QueueBinding` 已建模；当前只有 graphics+present 单队列，compute/transfer queue role 尚未实际使用。
-- `ResourceStateTracker`/`BarrierPlanner` 已接入 pick/present 两个 transition；当前是 per-transition seed，不是全帧 resource registry。
-- `test_intent7.cpp` 的注释在编辑过程中被编码转换损坏，已做 ASCII 清理；代码逻辑和构建不受影响。
-
-## 10. 构建 / 运行
+- typed opcode 鍙鐩?test_intent7 鐢ㄥ埌鐨勫懡浠わ紱鍏朵綑 `vkCmd*` 浠嶅彲閫氳繃 `PassRecorder::vk()` / `FrameRecorder::vk()` 鎴栧悗缁柊澧?opcode 鎺ュ叆銆?- `DescriptorBinding` 宸叉湁 set / descriptor buffer / resource heap / sampler heap 鍙樹綋锛沨eap 鐨?emitter 閫氳繃 `vkGetDeviceProcAddr` 鍙栧嚱鏁帮紙VolkDeviceTable 鐗堟湰鏈寘鍚級銆?- `Inheritance` / `commandBufferInheritance` 鏈夌湡瀹炵敤渚嬶細CASE 2 鐨?pass body 褰曡繘 secondary command buffer锛宲rimary pass 鐢?`vkCmdExecuteCommands` 鎵ц锛沗ExecuteCommandsPayload` 鎼哄甫 `InheritanceRenderingInfo`锛宍PassValidator` 鐙珛鏍￠獙 flags/viewMask/color formats/depth/stencil/samples 涓?pass target 鍖归厤銆俿econdary 鏈韩鐜板湪鐢?`SecondaryBuilder` 褰曞埗锛岃蛋鍚屼竴濂?`PassData`/`PassValidator`/`VkEmitter`銆?- `PipelineBinding.ownership` 鐜板湪浠?`StateOwnershipMap` 濉厖锛沗PassValidator` 浼氭鏌?`vkCmdSet*` 瀵瑰簲鐨勭姸鎬佸湪 bound pipeline 涓槸 `Dynamic`/`Inherited`锛岃€屼笉鏄?`Static`/`Absent`銆?- `DynamicState` 宸茶鐩?viewport/scissor/depth test/depth write/cull/front/topology锛涘叾浠栫姸鎬佸瓧娈靛彲缁х画鍔?opcode銆?- `PassValidator` 宸插仛 pipeline-target 鐨?color/depth/stencil format銆乿iewMask銆乻ample count 鍏煎鎬э紝descriptor layout == pipeline layout锛宒ynamic-state ownership锛宻econdary inheritance锛屼互鍙?descriptorBuffer/descriptorHeap/dynamicRenderingLocalRead feature gate锛涘叾浠?feature gate 鍙互缁х画鍔犮€?- `FrameSync` 鍜?`CopyImageToBuffer` 宸茶繘鍏?OpStream锛沗vkCmdBeginCommandBuffer`/`vkCmdEndCommandBuffer`銆乹ueue submit/present 浠嶅湪 FrameBuilder 澶栵紙灞炰簬 frame/queue 灞傦級銆?- `ClearAttachments` / `BeginQuery` / `EndQuery` 宸叉湁 typed opcode锛屼絾 demo 鏈疄闄呬娇鐢紱`ExecuteCommands` 宸插疄闄呬娇鐢ㄣ€?- `FillBuffer` / `CopyBuffer` 宸插湪 per-frame transfer scratch + pick 鍥炶璺緞瀹為檯浣跨敤锛沗CopyBufferToImage` / `CopyImage` / `UpdateBuffer` / `ClearColorImage` / `ClearDepthStencilImage` / `Dispatch` / `DispatchIndirect` 宸叉湁 typed opcode锛屼絾 demo 鏈疄闄呬娇鐢紱瀹冧滑缁熶竴璧?`push_transfer`锛圤utside锛夈€?- `PassKind` 宸叉湁 Graphics/Compute/Transfer锛泃ransfer pass 宸叉帴鍏ュ苟浜х敓 `[Inside / Sync]` 鐨?Fill/Copy/Barrier锛沜ompute pass 宸叉帴鍏?compute pipeline + push constants + `vkCmdDispatch`锛屼絾杩樻病鏈?compute descriptor set 鐢ㄤ緥銆?- 鏁版嵁 schema 宸叉墿鍒板 descriptor set/dynamic offsets銆乿ertex binding 鏁扮粍銆侀€氱敤 `VkDynamicState`銆佸畬鏁?sync/inheritance/transfer2/features/properties銆乸Next 鎸囬拡锛坈aller-owned锛夈€乹ueue/submission/present銆乧lassic render pass銆乺aw command锛汻T/video/acceleration-structure 浠嶅彧鏈?`RawCommandData`锛屾湭 typed銆?- `FrameScheduler` 宸叉帴绠?acquire/submit/present锛宍QueueRole`/`QueueBinding` 宸插缓妯★紱褰撳墠鍙湁 graphics+present 鍗曢槦鍒楋紝compute/transfer queue role 灏氭湭瀹為檯浣跨敤銆?- `ResourceStateTracker`/`BarrierPlanner` 宸叉帴鍏?pick/present 涓や釜 transition锛涘綋鍓嶆槸 per-transition seed锛屼笉鏄叏甯?resource registry銆?- `test_intent7.cpp` 鐨勬敞閲婂湪缂栬緫杩囩▼涓缂栫爜杞崲鎹熷潖锛屽凡鍋?ASCII 娓呯悊锛涗唬鐮侀€昏緫鍜屾瀯寤轰笉鍙楀奖鍝嶃€?
+## 10. 鏋勫缓 / 杩愯
 
 ```powershell
 cd E:\0_github_project\mcsvulkan\build
@@ -313,8 +216,7 @@ ninja mcsvulkan-vma-test_intent7
 E:\0_github_project\mcsvulkan\output\test_program\mcsvulkan\vma\test_intent7.exe
 ```
 
-预期日志：
-
+棰勬湡鏃ュ織锛?
 ```text
 [frame-scheduler] graphics_family=0 present_family=0
 [pass-test] passes=4 card_cmds=1 overlay_cmds=1
@@ -336,51 +238,76 @@ E:\0_github_project\mcsvulkan\output\test_program\mcsvulkan\vma\test_intent7.exe
   #53  vkCmdPipelineBarrier2
 ```
 
-验证层无 `VUID` 错误。  
-最终画面：`output/intent7_ability.png`（ability_test_scene），旧 pass 测试截图保留为 `output/intent7_exec.png`。
+楠岃瘉灞傛棤 `VUID` 閿欒銆? 
+鏈€缁堢敾闈細`output/intent7_ability.png`锛坅bility_test_scene锛夛紝鏃?pass 娴嬭瘯鎴浘淇濈暀涓?`output/intent7_exec.png`銆?
+## 11. 璁捐瀹¤锛?026-11-08锛?
+**瀵归綈鐨勯儴鍒?*
 
-## 11. 设计审计（2026-11-08）
+- 涓绘祦绋嬩粛鏄?`UIWidget -> DrawSegment intent -> FrameBuilder(OpStream) -> VkEmitter -> vkCmd*`銆?- 涓夎酱妯″瀷浠嶆垚绔嬶細绾靛悜鏁版嵁娴侊紙Target/Pipeline/Resources/VertexInput/DynamicState锛夈€佹í鍚?Opcode锛圕ontrol/State/Action/Sync/Indirection锛夈€佺敓鍛藉懆鏈?Scope锛坉evice/frame/pass/command-buffer/draw/sync/inheritance锛夈€?- main/extra pass 閮芥槸 `PassSource`锛屾病鏈夆€滈噸寮€ main pass鈥濈殑鐗规畩璺緞銆?- frame sync銆乸ass boundary銆乧opy銆乸resent 閮藉湪 OpStream锛沞mitter 浠嶆槸閫忔槑 1:1銆?- 楠岃瘉灞?provider銆丆ASE 2 secondary銆乮nheritance銆乻tate ownership銆乫eature gate 閮藉湪鍚屼竴鏉¤矾寰勪笂銆?
+**涓昏鍋忓樊 / 椋庨櫓**
 
-**对齐的部分**
+1. ~~secondary 鐨?`StreamRecorder` 缁曡繃浜?`PassData`/`PassValidator`~~ **宸蹭慨**锛? 
+   鐜板湪 secondary 鐢?`SecondaryBuilder` 褰曞埗锛屽叡浜?`PassData`/`PassValidator`锛屽彧绂佺敤 `BeginRendering/EndRendering`锛沺ipeline-target銆乨escriptor layout銆乨ynamic ownership 閮戒細鍦?secondary 鍐呮牎楠屻€?
+2. ~~`FeatureSet` 鏄墜宸ラ暅鍍忥紝涓嶆槸浠?`VkPhysicalDeviceFeatures2` 鏌ヨ寰楀埌~~ **閮ㄥ垎淇?*锛? 
+   `pass_data::query_features(physical_device)` 鏌ヨ鏈?app 瀹為檯鍚敤鐨?core/Vulkan12/Vulkan13/ExtendedDynamicState feature锛沝escriptorBuffer/descriptorHeap/dynamicRenderingLocalRead 浠嶆樉寮?false锛屽洜涓?app 鐨?device enable chain 娌″惎鐢ㄥ畠浠€傛煡璇⑩€滄敮鎸佲€濅笉绛変簬鈥滃惎鐢ㄢ€濓紝鎵€浠ユ病鏈夋妸鎵╁睍鏀寔鐩存帴褰撴垚鍙敤銆?
+3. ~~`PassTarget` 鐨?colorFormats/samples 鏄?app 鎻愪緵鐨勫厓鏁版嵁锛屼笉鏄粠鐪熷疄 `VkImageView` 鎺ㄥ鐨剘~ **宸蹭慨**锛? 
+   `initPipeline` 浠?`msaaResourcesBuild` / `pickResourcesBuild` / `depthResourcesBuild` 鐨?create-info 鏋勯€?`passTargetTemplate`锛沗makeMainPassDesc` 浠庡畠鎷疯礉 color/depth/samples锛屼笉鍐嶄粠 pipeline 甯搁噺鎵嬪啓銆倂alidator 鐜板湪姣旇緝 pipeline metadata vs **璧勬簮娲剧敓鐨?target metadata**銆?
+4. **legacy `PassRecorder` / `FrameRecorder` 浠嶅湪**锛屼絾宸查檷绾т负 raw fallback锛? 
+   `Pass::record` 宸插垹闄わ紱`pass_stream.hpp` 椤堕儴鏄庣‘鏍囨敞 LEGACY / RAW FALLBACK锛涗富璺緞鍙蛋 `FrameBuilder` / `SecondaryBuilder`銆傚畬鏁村垹闄ゅ彲鍚庣画鍋氥€?
+5. **`FrameBuilder` 榛樿鈥滆竟鏋勫缓杈瑰彂灏勨€?*锛屼絾宸插姞 `deferEmit` + `emitAll()`锛氬彲浠ュ厛鏋勫缓/鏍￠獙鏁翠釜 `OpStream`锛屽啀鍗曠偣鍙戝皠銆傞粯璁や粛鏄嵆鏃舵ā寮忥紝涓嶆敼鍙?demo 琛屼负銆?
+6. **`screen.makeRenderDirty(currentFrame)` 浠嶆槸 workaround**銆? 
+   灏濊瘯杩囧彧鏇存柊 pass target 鐨?resolve view銆佷笉閲嶅缓 UI锛涗絾 main pass 鐨?UI stream / camera 鏁版嵁鏈韩涔熸槸閫愬抚閲嶅缓鐨勶紝璐哥劧鍘绘帀浼氳 main pass 浣跨敤鏃?stream銆傛纭媶娉曢渶瑕佹妸鈥渕ain pass 閫愬抚褰曞埗鈥濆拰鈥渆xtra pass target 鏇存柊鈥濆垎寮€锛屽綋鍓嶄繚鐣欏己鍒堕噸寤烘洿瀹夊叏銆?
+7. **`BarrierPayload` 宸插鍒?`dependencyFlags`锛屼絾浠嶄笉澶嶅埗 `VkDependencyInfo::pNext`**锛沗PassTarget::pNext` 涔熸槸瑁告寚閽堛€? 
+   褰撳墠 demo 鐨?pNext 涓?null锛涗竴鑸墿灞曢摼闇€瑕?deep-copy 鎴栨槑纭€滃彧鍦?immediate emit 鏃舵湁鏁堚€濄€?
+8. **compute/transfer opcode**锛歚FillBuffer` + `CopyBuffer` 宸插湪 per-frame scratch 璺緞瀹為檯浣跨敤锛團ill -> barrier -> Copy锛夛紱`CopyImage`/`UpdateBuffer`/`Dispatch` 绛変粛 typed 浣?demo 鏈娇鐢紝鐪熷疄 compute pass 鐢ㄤ緥杩樻病鍋氥€?
+**缁撹**
 
-- 主流程仍是 `UIWidget -> DrawSegment intent -> FrameBuilder(OpStream) -> VkEmitter -> vkCmd*`。
-- 三轴模型仍成立：纵向数据流（Target/Pipeline/Resources/VertexInput/DynamicState）、横向 Opcode（Control/State/Action/Sync/Indirection）、生命周期/Scope（device/frame/pass/command-buffer/draw/sync/inheritance）。
-- main/extra pass 都是 `PassSource`，没有“重开 main pass”的特殊路径。
-- frame sync、pass boundary、copy、present 都在 OpStream；emitter 仍是透明 1:1。
-- 验证层/provider、CASE 2 secondary、inheritance、state ownership、feature gate 都在同一条路径上。
+鏍稿績璁捐娌℃湁鍋忕锛氭暟鎹?鎿嶄綔/emitter/涓夎酱浠嶅湪銆傚亸宸泦涓湪鈥滃畬鏁存€р€濆拰鈥滃崟涓€浜嬪疄婧愨€濓細
+feature/format 鍏冩暟鎹€乴egacy 鍙岃矾寰勩€乸Next 鐢熷懡鍛ㄦ湡銆俿econdary 鏍￠獙宸茬敱 `SecondaryBuilder` 琛ヤ笂銆?杩欎簺鍙互鍦ㄤ笉鏀逛笁杞存ā鍨嬬殑鍓嶆彁涓嬩慨鎺夛紝浼樺厛绾у缓璁細
 
-**主要偏差 / 风险**
+1. ~~`SecondaryBuilder`锛堝叡浜?PassData/Validator锛屽彧绂佺敤 Begin/End锛墌~ 宸插仛锛?2. ~~`FeatureSet::from_device`锛堢湡瀹?feature query锛墌~ 閮ㄥ垎鍋氾紙`query_features` 鏌?core锛涙墿灞?gate 闇€鍦ㄥ惎鐢ㄦ墿灞曟椂鍚屾锛夛紱
+3. ~~浠庤祫婧愬眰鎺ㄥ `PassTarget` metadata~~ 宸插仛锛坄passTargetTemplate` 鏉ヨ嚜璧勬簮 create-info锛夛紱
+4. ~~鍒犻櫎/deprecate legacy `PassRecorder`/`FrameRecorder`/`Pass::record`~~ 閮ㄥ垎鍋氾細`Pass::record` 鍒犻櫎锛宭egacy 鏍囪 raw fallback锛涘畬鏁村垹闄ゅ彲閫夛紱
+5. ~~`FrameBuilder` 鐨?build-only 妯″紡~~ 宸插姞 `deferEmit`/`emitAll`锛沚arrier pNext 鏀寔浠嶅緟鍋氥€?
+## 12. Ability matrix final (ASCII)
 
-1. ~~secondary 的 `StreamRecorder` 绕过了 `PassData`/`PassValidator`~~ **已修**：  
-   现在 secondary 由 `SecondaryBuilder` 录制，共享 `PassData`/`PassValidator`，只禁用 `BeginRendering/EndRendering`；pipeline-target、descriptor layout、dynamic ownership 都会在 secondary 内校验。
+- 21 representative tiles + wide composed UI.
+- 7 passes: base / shape-path / texture-effect / offscreen layer / stencil clip / offscreen composite (secondary) / text overlay.
+- offscreen layer: MSAA color + sampled resolve; explicit pre/post image barriers in PassSource.
+- group opacity: offscreen group flattened, composite alpha.
+- backdrop blur: offscreen texture sampled through blur.
+- stencil clip: D32_SFLOAT_S8_UINT combined depth/stencil; mask REPLACE -> content EQUAL.
+- picking: 21 card entities are written to the MRT pick attachment; hover highlights the picked card.
+- text: 430 glyphs including RTL/Chinese label.
+- blend: opaque / alpha / additive / multiply pipelines.
+- clip: per-segment scissor, nested push/pop intersection, alpha mask.
+- MSAA / resolve / 2 MRT / depth target / load-store.
+- indexed + instanced + indirect + BDA.
+- 7 DAO programs; 430 glyphs.
+- secondary: offscreen composite pass recorded into secondary command buffer.
+- C API list: opcodes=37, calls=193.
+- No VUID, no validation error, no pass-validator, no assert.
 
-2. ~~`FeatureSet` 是手工镜像，不是从 `VkPhysicalDeviceFeatures2` 查询得到~~ **部分修**：  
-   `pass_data::query_features(physical_device)` 查询本 app 实际启用的 core/Vulkan12/Vulkan13/ExtendedDynamicState feature；descriptorBuffer/descriptorHeap/dynamicRenderingLocalRead 仍显式 false，因为 app 的 device enable chain 没启用它们。查询“支持”不等于“启用”，所以没有把扩展支持直接当成可用。
+## 13. Final status addendum (2026-11-08, ASCII)
 
-3. ~~`PassTarget` 的 colorFormats/samples 是 app 提供的元数据，不是从真实 `VkImageView` 推导的~~ **已修**：  
-   `initPipeline` 从 `msaaResourcesBuild` / `pickResourcesBuild` / `depthResourcesBuild` 的 create-info 构造 `passTargetTemplate`；`makeMainPassDesc` 从它拷贝 color/depth/samples，不再从 pipeline 常量手写。validator 现在比较 pipeline metadata vs **资源派生的 target metadata**。
+The gaps named in sections 3 and 9 are closed for the runtime path:
 
-4. **legacy `PassRecorder` / `FrameRecorder` 仍在**，但已降级为 raw fallback：  
-   `Pass::record` 已删除；`pass_stream.hpp` 顶部明确标注 LEGACY / RAW FALLBACK；主路径只走 `FrameBuilder` / `SecondaryBuilder`。完整删除可后续做。
-
-5. **`FrameBuilder` 默认“边构建边发射”**，但已加 `deferEmit` + `emitAll()`：可以先构建/校验整个 `OpStream`，再单点发射。默认仍是即时模式，不改变 demo 行为。
-
-6. **`screen.makeRenderDirty(currentFrame)` 仍是 workaround**。  
-   尝试过只更新 pass target 的 resolve view、不重建 UI；但 main pass 的 UI stream / camera 数据本身也是逐帧重建的，贸然去掉会让 main pass 使用旧 stream。正确拆法需要把“main pass 逐帧录制”和“extra pass target 更新”分开，当前保留强制重建更安全。
-
-7. **`BarrierPayload` 已复制 `dependencyFlags`，但仍不复制 `VkDependencyInfo::pNext`**；`PassTarget::pNext` 也是裸指针。  
-   当前 demo 的 pNext 为 null；一般扩展链需要 deep-copy 或明确“只在 immediate emit 时有效”。
-
-8. **compute/transfer opcode**：`FillBuffer` + `CopyBuffer` 已在 per-frame scratch 路径实际使用（Fill -> barrier -> Copy）；`CopyImage`/`UpdateBuffer`/`Dispatch` 等仍 typed 但 demo 未使用，真实 compute pass 用例还没做。
-
-**结论**
-
-核心设计没有偏离：数据/操作/emitter/三轴仍在。偏差集中在“完整性”和“单一事实源”：
-feature/format 元数据、legacy 双路径、pNext 生命周期。secondary 校验已由 `SecondaryBuilder` 补上。
-这些可以在不改三轴模型的前提下修掉，优先级建议：
-
-1. ~~`SecondaryBuilder`（共享 PassData/Validator，只禁用 Begin/End）~~ 已做；
-2. ~~`FeatureSet::from_device`（真实 feature query）~~ 部分做（`query_features` 查 core；扩展 gate 需在启用扩展时同步）；
-3. ~~从资源层推导 `PassTarget` metadata~~ 已做（`passTargetTemplate` 来自资源 create-info）；
-4. ~~删除/deprecate legacy `PassRecorder`/`FrameRecorder`/`Pass::record`~~ 部分做：`Pass::record` 删除，legacy 标记 raw fallback；完整删除可选；
-5. ~~`FrameBuilder` 的 build-only 模式~~ 已加 `deferEmit`/`emitAll`；barrier pNext 支持仍待做。
+- Fixed-pixel UI: 170x126 tiles, 7x6 grid, 36 feature cases + composed panel.
+  Window growth reveals space; it never scales the widgets. Pixel -> NDC uses
+  the live framebuffer extent.
+- Runtime resize/fullscreen: offscreen MSAA color, sampled resolve and the
+  D32S8 stencil attachment are rebuilt with the swapchain. The sampled resolve
+  is replaced in the same texture slot and the descriptor set is refreshed.
+  The ability scene receives the new handles via updateResources().
+- 4x MSAA is capped explicitly (SAMPLE_COUNT) so the 128-bit pick MRT fits the
+  device-local heap at 1920x1080.
+- Old extent resources are released before allocating the new ones.
+- F11 is an edge-triggered fullscreen toggle in test_intent7.cpp.
+- Color emoji are supported and linearized from the sRGB UNORM atlas.
+- Text cases: MSDF, RTL Arabic, CJK, color emoji, UAX #14 wrapping, mixed bidi.
+- Deleted shaders/test_intent7.comp and the no-op compute pipeline; the transfer
+  pass (FillBuffer -> barrier -> CopyBuffer) remains.
+- Verified: 1280x900 -> 1582x953 -> 1920x1080 fullscreen -> back, no VUID, no
+  validation error, no pass-validator failure, no assert.
+- Updated report: INTENT7_MIGRATION_REPORT.md
+- Screenshots: output/intent7_ability.png, output/intent7_resize_1600.png
