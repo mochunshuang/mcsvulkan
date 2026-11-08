@@ -216,6 +216,14 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_intent7 test_intent7.vert test_intent7.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
+# Minimal compute shader for the compute pass scope.
+add_compile_glslc_shader(${GLSL_SHADERS_NAME}-test_intent7.comp
+    "${SHADER_DIR}/test_intent7.comp"
+    "${SHADER_OUTPUT_DIR}/test_intent7.comp.spv")
+add_dependencies(${TARGET_NAME} "${GLSL_SHADERS_NAME}-test_intent7.comp")
+target_compile_definitions(${TARGET_NAME} PRIVATE
+    COMP_SHADER_PATH="${SHADER_OUTPUT_DIR}/test_intent7.comp.spv")
+
 
 add_std_glsl_target(test_ui_ability test_ui_ability.vert test_ui_ability.frag)
 ADD_MSDF_DEF(${TARGET_NAME})

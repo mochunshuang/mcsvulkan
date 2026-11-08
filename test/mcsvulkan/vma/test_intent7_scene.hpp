@@ -2,10 +2,13 @@
 // ============================================================================
 // test_intent7_scene.hpp
 //
-// 主 pass 行 -> app 的 main pass builder（b）
-// extra pass  -> PassManager::beginPass(desc, base)；pass 拥有 FrameContext 和
-//                CommandStream。UI CommandBuilder 是 generator；endPass() 时把
-//                segments 展开成通用 Cmd 流，PassCompiler 再逐条 -> vkCmd*。
+// 最小 [pass ... pass] 场景：
+//   pass 0 : app main pass  —— 背景
+//   pass 1 : extra pass     —— accent 卡片（独立 FrameContext）
+//   pass 2 : overlay pass   —— 标题/说明文字（最后画）
+//
+// 每个 pass 的 target 都由 ctx.mainPassDesc 显式复制而来，load/store 也由
+// 场景自己决定；不再有 PassCompiler 的 Target::Main 魔法。
 // ============================================================================
 
 #include "test_intent7_pass_abi.hpp"
@@ -21,7 +24,6 @@ namespace ui_new
 
 struct test_intent7_scene final : RenderObject
 {
-    pass_data::PassManager *manager{};
     VkPipeline pipeline{};
     VkPipelineLayout layout{};
     mesh_data mesh{};
@@ -30,14 +32,17 @@ struct test_intent7_scene final : RenderObject
 
     std::vector<shader_data::TexQuad> text_{};
 
-    test_intent7_scene(pass_data::PassManager *m, VkPipeline p, VkPipelineLayout l,
-                       const mesh_data &mh, VkExtent2D e, VkSampleCountFlagBits s) noexcept
-        : manager{m}, pipeline{p}, layout{l}, mesh{mh}, extent{e}, samples{s}
+    test_intent7_scene(VkPipeline p, VkPipelineLayout l, const mesh_data &mh,
+                       VkExtent2D e, VkSampleCountFlagBits s) noexcept
+        : pipeline{p}, layout{l}, mesh{mh}, extent{e}, samples{s}
     {
     }
 
     void render(ScreenWidget *screen, Widget *, render_context &ctx) override
     {
+        auto *manager = ctx.passManager;
+        assert(manager != nullptr &&
+               "render_context must carry the current frame's PassManager");
         float W = static_cast<float>(screen->size().width);
         float H = static_cast<float>(screen->size().height);
         if (ctx.drawRecorder.hasViewport())
@@ -53,13 +58,16 @@ struct test_intent7_scene final : RenderObject
         manager->reset();
         auto &b = ctx.drawRecorder;
 
+        assert(ctx.mainPassDesc != nullptr &&
+               "the app must provide the target PassDesc before recording [pass...pass]");
+
         const glm::vec4 bg{0.055F, 0.062F, 0.080F, 1.0F};
         const glm::vec4 card{0.10F, 0.11F, 0.145F, 1.0F};
         const glm::vec4 accent{0.33F, 0.68F, 1.0F, 1.0F};
         const glm::vec4 text{0.90F, 0.93F, 0.98F, 1.0F};
         const glm::vec4 dim{0.55F, 0.60F, 0.70F, 1.0F};
 
-        // 主 pass（app 的 main pass）
+        // pass 0：背景
         b.addInstance(ui_dao::sdf_shape({24.0F, 24.0F, W - 48.0F, H - 48.0F}, view, 20.0F,
                                         bg, glm::vec4{0.0F, 0.0F, 0.0F, 0.5F}, 8.0F, 24.0F));
         b.addInstance(ui_dao::sdf_shape({60.0F, 140.0F, 420.0F, 220.0F}, view, 18.0F, card));
@@ -69,7 +77,6 @@ struct test_intent7_scene final : RenderObject
         emit_text(ctx, "MAIN PASS", view, 20.0F, 90.0F, 200.0F, text);
         emit_text(ctx, "EXTRA PASS", view, 20.0F, 560.0F, 200.0F, dim);
 
-        // extra pass：desc + base，pass 拥有 FrameContext/CommandStream
         const PushData push{
             .cameraIndex = 1,
             .renderVersion = screen->renderVersion(),
@@ -83,16 +90,52 @@ struct test_intent7_scene final : RenderObject
         const VkRect2D sc{.offset = {.x = 0, .y = 0},
                           .extent = {static_cast<std::uint32_t>(W),
                                      static_cast<std::uint32_t>(H)}};
-        auto &pass = manager->beginPass(
-            {.target = pass_data::Target::Main,
-             .colorLoad = pass_data::LoadOp::Load},
-            {.pipeline = pipeline,
-             .layout = layout,
-             .set = ctx.mainSet,
-             .viewport = vp,
-             .scissor = sc,
-             .pushData = push,
-             .mesh = mesh});
+
+        const pass_data::PipelineState base{
+            .pipeline = pipeline,
+            .layout = layout,
+            .set = ctx.mainSet,
+            .viewport = vp,
+            .scissor = sc,
+            .pushData = push,
+            .mesh = mesh,
+        };
+
+        // pass 1：extra card
+        auto cardDesc =
+            ctx.mainPassDesc->withLoad(VK_ATTACHMENT_LOAD_OP_LOAD)
+                .withStore(VK_ATTACHMENT_STORE_OP_STORE);
+        auto &extra = manager->beginPass(cardDesc, base);
+        upload_global_mesh(extra, ctx);
+        extra.frame.builder.addInstance(
+            ui_dao::sdf_shape({560.0F, 140.0F, 420.0F, 220.0F}, view, 18.0F, accent));
+        manager->endPass();
+
+        // pass 2：overlay 文字（最后画）
+        auto overlayDesc =
+            ctx.mainPassDesc->withLoad(VK_ATTACHMENT_LOAD_OP_LOAD)
+                .withStore(VK_ATTACHMENT_STORE_OP_DONT_CARE);
+        auto &overlay = manager->beginPass(overlayDesc, base);
+        upload_global_mesh(overlay, ctx);
+        if (!text_.empty())
+            overlay.frame.builder.addInstances(
+                std::span<const shader_data::TexQuad>{text_});
+        manager->endPass();
+
+        std::println("[intent7] passes={} main segs={} extra cmds={} overlay cmds={}",
+                     manager->passes().size(),
+                     b.stream().segments ? b.stream().segments->size() : 0,
+                     manager->passes().size() >= 1
+                         ? manager->passes()[0].command_count()
+                         : 0,
+                     manager->passes().size() >= 2
+                         ? manager->passes()[1].command_count()
+                         : 0);
+    }
+
+  private:
+    static void upload_global_mesh(pass_data::Pass &pass, render_context &ctx)
+    {
         if (!ctx.globalVertices.empty() && !ctx.globalIndices.empty())
         {
             pass.frame.buffers.globalVertexBuffer.write(
@@ -100,19 +143,8 @@ struct test_intent7_scene final : RenderObject
             pass.frame.buffers.globalIndexBuffer.write(
                 0, ctx.globalIndices.data(), ctx.globalIndices.size_bytes());
         }
-        pass.frame.builder.addInstance(
-            ui_dao::sdf_shape({560.0F, 140.0F, 420.0F, 220.0F}, view, 18.0F, accent));
-        manager->endPass();
-
-        if (!text_.empty())
-            b.addInstances(std::span<const shader_data::TexQuad>{text_});
-
-        std::println("[intent7] passes={} main segs={} extra cmds={}", manager->passes().size(),
-                     b.stream().segments ? b.stream().segments->size() : 0,
-                     manager->passes().empty() ? 0 : manager->passes().front().stream.size());
     }
 
-  private:
     void emit_text(render_context &ctx, const char *s, const ui_dao::view &view, float px,
                    float x, float y, const glm::vec4 &color)
     {

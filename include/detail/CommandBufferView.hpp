@@ -41,6 +41,18 @@ namespace mcs::vulkan
         }
         ~CommandBufferView() = default;
 
+        [[nodiscard]] constexpr const LogicalDevice *device() const noexcept
+        {
+            return pool_ == nullptr ? nullptr : pool_->device();
+        }
+        // Direct access to the Vulkan device dispatch table.  Pass recorders
+        // use this to expose the complete vkCmd* surface (including commands
+        // for extensions that have no hand-written wrapper here).
+        [[nodiscard]] constexpr const VolkDeviceTable &functions() const noexcept
+        {
+            return pool_->device()->table();
+        }
+
         struct begin_info
         {
             /*

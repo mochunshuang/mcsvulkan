@@ -3,30 +3,49 @@
 // ============================================================================
 // test_intent7_frame_context.hpp
 //
-// 每帧一个的上下文：只负责把「资源」和「构建器」绑在一起，**不含逻辑**。
-//   ShaderBuffers   —— 资源层
-//   CommandBuilder  —— 解析 + 构建（有状态）
-//   emit            —— 录制（无状态）
+// Per-frame context: binds resources and builders. No policy.
+//   ShaderBuffers   - resource layer
+//   CommandBuilder  - resolve + build (DrawSegment)
+//   emit            - DrawSegment -> FrameBuilder ops
 //
-// 当前 dao→shader 测试只需要 pipeline/layout/viewport/scissor + push constants；
-// 没有动态深度/拓扑/线宽/stencil、没有描述符集重绑。
+// emit takes a Recorder (FrameBuilder or SecondaryBuilder), never a raw
+// command buffer, so state/action ops stay inside one explicit pass scope.
 // ============================================================================
 
 #include "test_intent7_command_builder.hpp"
+#include "test_intent7_pass_data.hpp"
 
 #include <utility>
 
 namespace shader_data
 {
-    static constexpr void emit(CommandBufferView cmd, const ShaderBuffers &buffers,
-                               const CommandStream &stream)
+    // Emit one UI CommandStream into a Recorder.
+    // Recorder is FrameBuilder or SecondaryBuilder.
+    //
+    // 层次关系：
+    //   DrawSegment/CommandStream = UI 的“意图”（要画什么、用哪些资源）
+    //   emit(...)                = 意图 -> 操作（BindPipeline/BindResources/SetState/Draw）
+    //   FrameBuilder/OpStream    = 操作 -> 线性 Op 程序
+    //   VkEmitter                = Op -> 显式 vkCmd*
+    //
+    // 顺序 = 一个 pass 内完整的绘制状态：
+    //   bindIndexBuffer
+    //   bindPipeline (变化时)
+    //   bindDescriptorSets
+    //   setViewport / setScissor
+    //   pushConstants
+    //   drawIndexedIndirect
+    template <typename Recorder>
+    static void emit(Recorder &pass, const ShaderBuffers &buffers,
+                     const CommandStream &stream, VkDescriptorSet descriptorSet)
     {
         assert(stream.segments != nullptr);
         if (stream.segments->empty())
             return;
+        assert(descriptorSet != VK_NULL_HANDLE);
 
-        cmd.bindIndexBuffer(buffers.globalIndexBuffer.buffer.buffer(), 0,
-                            VK_INDEX_TYPE_UINT32);
+        pass.bindIndexBuffer(buffers.globalIndexBuffer.buffer.buffer(), 0,
+                             VK_INDEX_TYPE_UINT32);
 
         VkPipeline lastPipeline = VK_NULL_HANDLE;
 
@@ -34,21 +53,26 @@ namespace shader_data
         {
             if (seg.handles.pipeline != lastPipeline)
             {
-                cmd.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, seg.handles.pipeline);
+                pass.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, seg.handles.pipeline);
                 lastPipeline = seg.handles.pipeline;
             }
 
-            cmd.setViewport(0, std::span{&seg.regs.viewport, 1});
-            cmd.setScissor(0, std::span{&seg.regs.scissor, 1});
+            // 每个 segment 都重新绑定一次：pass 之间不共享“上一次 bind”的
+            // 隐式状态。这是 Vulkan 命令缓冲区里显式、可验证的做法。
+            pass.bindDescriptorSet(VK_PIPELINE_BIND_POINT_GRAPHICS, seg.handles.layout,
+                                   0, descriptorSet);
 
-            cmd.pushConstants(seg.handles.layout,
-                              VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                              0, sizeof(PushData), &seg.pushData);
+            pass.setViewport(0, std::span{&seg.regs.viewport, 1});
+            pass.setScissor(0, std::span{&seg.regs.scissor, 1});
 
-            cmd.drawIndexedIndirect(buffers.indirectDrawBuffer.buffer.buffer(),
-                                    static_cast<VkDeviceSize>(seg.draw.indirectOffset),
-                                    seg.draw.commandCount,
-                                    sizeof(VkDrawIndexedIndirectCommand));
+            pass.pushConstants(seg.handles.layout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(PushData), &seg.pushData);
+
+            pass.drawIndexedIndirect(buffers.indirectDrawBuffer.buffer.buffer(),
+                                     static_cast<VkDeviceSize>(seg.draw.indirectOffset),
+                                     seg.draw.commandCount,
+                                     sizeof(VkDrawIndexedIndirectCommand));
         }
     }
 

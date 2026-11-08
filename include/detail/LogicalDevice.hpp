@@ -25,6 +25,13 @@ namespace mcs::vulkan
         {
             return value_;
         }
+        // The device dispatch table is the complete Vulkan C entry point set.
+        // Exposing it lets command-buffer abstractions map every vkCmd* without
+        // having to add a hand-written forwarder for each extension.
+        [[nodiscard]] constexpr const VolkDeviceTable &table() const noexcept
+        {
+            return table_;
+        }
         [[nodiscard]] auto allocator() const noexcept
         {
             return physicalDevice_->allocator();
