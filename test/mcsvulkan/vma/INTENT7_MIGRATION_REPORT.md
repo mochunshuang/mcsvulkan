@@ -15,7 +15,8 @@ Default client size: 1280 x 900 (fixed-pixel design grid, 7 x 6 cells)
 Runtime stats:
 
 ```text
-[ability-test] passes=7 glyphs=897
+[ability-test] passes=7 glyphs=897 layer=rebuilt   # first frame / resize
+[ability-test] passes=5 glyphs=897 layer=cached    # steady state
 [pass-c-api] opcodes=37 calls=259
 ```
 
@@ -115,8 +116,11 @@ case, not a label without content.
 
 Infrastructure exercised by the same scene:
 
-- 7 passes: base / shape-path / texture-effect / offscreen layer / stencil clip /
-  offscreen composite (secondary command buffer) / text overlay.
+- 7 passes on a rebuild frame: base / shape-path / texture-effect / offscreen
+  layer / stencil clip / offscreen composite (secondary command buffer) / text
+  overlay.
+- retained offscreen composition layer: the offscreen + stencil passes are
+  skipped on clean frames (7 -> 5 recorded passes).
 - 2 MRT (color + `R32G32B32A32_UINT` pick), 4x MSAA, resolve, depth target.
 - `LOAD/STORE` and `LOAD/DONT_CARE` attachment states.
 - indexed + instanced + indirect + BDA.
@@ -178,6 +182,26 @@ fullscreen  1920x1080
 restore     1280x900
 ```
 
+### 4.4 Retained offscreen composition layer
+
+The offscreen group/backdrop/stencil composition is now cached:
+
+- `ability_test_scene::updateResources()` sets `layerDirty_ = true` when the
+  swapchain/offscreen/stencil resources are rebuilt.
+- On a dirty frame the scene records the 7 passes (base, shape, effect,
+  offscreen, stencil, composite, text).
+- On subsequent frames the scene skips the offscreen and stencil passes and
+  records 5 passes (base, shape, effect, composite, text). The composite pass
+  samples the retained offscreen resolve texture.
+- The layer is static content (group/backdrop/stencil tiles), so hover and text
+  changes do not invalidate it; resize/fullscreen does.
+- The composite pass now writes the tile entity to the MRT pick attachment, so
+  hovering over those tiles still selects the card.
+
+This is a real layer cache, not just a text cache. Full damage-rect partial
+redraw of the base/shape/effect layers is still a separate retained-layer step
+(see section 7).
+
 ## 5. Cleanup
 
 - Deleted `shaders/test_intent7.comp`.
@@ -190,7 +214,7 @@ restore     1280x900
 
 | File | Change |
 |---|---|
-| `test_intent7_ability_test.hpp` | Fixed-pixel 7x6 grid; 36 feature cases + composed panel; text lab (MSDF/RTL/CJK/emoji/wrap/mixed bidi); emoji texture alpha mask; cached text per extent; `updateResources()`. |
+| `test_intent7_ability_test.hpp` | Fixed-pixel 7x6 grid; 36 feature cases + composed panel; text lab (MSDF/RTL/CJK/emoji/wrap/mixed bidi); emoji texture alpha mask; cached text per extent; retained offscreen composition layer; `updateResources()`. |
 | `test_intent7.cpp` | 1280x900 default client; `SAMPLE_COUNT = 4`; store offscreen/stencil builders; rebuild them on resize; release old resources; update texture slot + descriptors; scene handle refresh; F11 fullscreen; remove compute pipeline; delete compute CMake path. |
 | `vma.cmake` | Removed `test_intent7.comp` shader target and `COMP_SHADER_PATH`. |
 | `shaders/test_intent7.frag` | Linearize the sRGB emoji bitmap atlas before writing to the sRGB swapchain. |
@@ -219,9 +243,10 @@ tile switch:
   (`VK_EXT_swapchain_colorspace`), `VkHdrMetadataEXT`
   (`VK_EXT_hdr_metadata`), 10-bit or float formats, and a display that actually
   supports HDR.
-- If the surface only offers `B8G8R8A8_SRGB` + `SRGB_NONLINEAR`, an "HDR" tile
-  would only show PQ math on an SDR output. That is not the feature; it would be
-  a demo of a transfer curve. The honest implementation is a `color_service`
+- If the swapchain candidate list only asks for `B8G8R8A8_SRGB` +
+  `SRGB_NONLINEAR` (the current `test_intent7.cpp` setup), an "HDR" tile would
+  only show PQ math on an SDR output. That is not the feature; it would be a
+  demo of a transfer curve. The honest implementation is a `color_service`
   that owns:
   - source color space (sRGB UI colors, sRGB photo textures, linear MSDF/emoji
     glyphs),
@@ -247,16 +272,13 @@ tile switch:
     "redraw a layer subtree", then composite the layer to the swapchain;
   - barriers and resolve must follow the dirty region/layer, not the whole
     framebuffer.
-- Current state: `ability_test_scene` is immediate-mode; `render()` re-emits the
-  tile instances every frame, and the main pass starts from `CLEAR`. The only
-  cache is the glyph-quad cache per framebuffer extent. A real damage/layer
-  cache is an architectural step (service owns a retained layer + damage list),
-  not a local `if` in the tile switch.
-- A useful intermediate step that fits the current code: cache the
-  offscreen/stencil composition layer and rebuild it only on resize or content
-  invalidation, while the composite pass samples it every frame. That is a
-  layer cache; full damage-rect partial redraw still needs the retained
-  controller/service layer above.
+- Current state: `ability_test_scene` is still immediate-mode for the base /
+  shape / effect / text layers; `render()` re-emits those tile instances every
+  frame. The offscreen group/backdrop/stencil composition is retained and
+  skipped on clean frames (section 4.4), and the glyph quads are cached per
+  framebuffer extent. Full damage-rect partial redraw of the base/shape/effect
+  layers is the remaining architectural step: it needs the service to own a
+  retained UI layer + damage list, not a local `if` in the tile switch.
 
 ### Fonts
 
@@ -270,9 +292,11 @@ new shader/pass feature. They are therefore not listed as a rendering gap.
 1. **HDR / wide gamut surface** is not implemented (section 7). Current output is
    SDR `B8G8R8A8_SRGB`; the sRGB/linear and emoji-linearization paths are real
    SDR color management, not HDR.
-2. **Full damage-rect partial redraw** is not implemented. The scene is still
-   immediate-mode; only the text-quad cache is retained. A layer cache for the
-   offscreen composition is the natural next step (section 7).
+2. **Full damage-rect partial redraw** is not implemented. The offscreen
+   composition layer cache is implemented (section 4.4) and the glyph quads are
+   cached, but the base/shape/effect/text layers are still re-emitted every
+   frame. Damage-rect partial redraw needs the retained controller/service UI
+   layer described in section 7.
 3. `test_ui_ability2.cpp` is still not integrated line-for-line; this is a
    Widget-level reimplementation of the same capability families.
 4. The screenshot capture path on this desktop is clipped/scaled by the display
@@ -308,6 +332,8 @@ Controls:
 - Fixed-pixel behaviour: confirmed at 1280x900, 1582x953 and 1920x1080.
 - Runtime resize/fullscreen: offscreen MSAA/resolve and stencil resources now
   follow the swapchain; fullscreen passes validation.
+- Retained offscreen composition layer: rebuild on resize/fullscreen, cached
+  (5 passes) on steady frames.
 - Text: MSDF, RTL, CJK, color emoji, wrapping and mixed bidi are rendered;
   emoji bitmaps are linearized for the sRGB swapchain.
 - Dead compute shader/pipeline removed.

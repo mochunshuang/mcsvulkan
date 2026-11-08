@@ -101,6 +101,7 @@ struct ability_test_scene final : RenderObject
         offscreenTexture_ = offscreenTexture;
         stencilView_ = stencilView;
         stencilImage_ = stencilImage;
+        layerDirty_ = true;
         // Cached glyph quads bake the pixel -> NDC transform, so they are
         // valid only for one framebuffer extent.
         textW_ = -1.0F;
@@ -303,6 +304,15 @@ struct ability_test_scene final : RenderObject
         manager->endPass();
 
         // ---- pass 3: offscreen layer ------------------------------------
+        // The offscreen group/backdrop/stencil layer is retained: it is only
+        // re-recorded when updateResources() invalidates it (resize/fullscreen).
+        // The composite pass samples it every frame.
+        const auto groupTile = tile_at(33 % kCols, 33 / kCols);
+        const auto backdropTile = tile_at(34 % kCols, 34 / kCols);
+        const auto clipTile = tile_at(35 % kCols, 35 / kCols);
+        const bool rebuildLayer = layerDirty_;
+        if (rebuildLayer)
+        {
         auto offscreenDesc = *ctx.mainPassDesc;
         offscreenDesc.colorCount = 2;
         offscreenDesc.colors[0] = pass_data::color_attachment(
@@ -322,8 +332,6 @@ struct ability_test_scene final : RenderObject
         upload_global_mesh(offscreenPass, ctx);
         auto &offscreenBuilder = offscreenPass.frame.builder;
         offscreenBuilder.setPipeline(transparent_, layout_);
-        const auto groupTile = tile_at(33 % kCols, 33 / kCols);
-        const auto backdropTile = tile_at(34 % kCols, 34 / kCols);
         offscreenBuilder.setScissor(VkRect2D{
             .offset = {static_cast<std::int32_t>(groupTile.x),
                        static_cast<std::int32_t>(groupTile.y)},
@@ -373,7 +381,6 @@ struct ability_test_scene final : RenderObject
                                  .layerCount = 1}});
 
         // ---- pass 4: stencil clipped layer ------------------------------
-        const auto clipTile = tile_at(35 % kCols, 35 / kCols);
         auto stencilDesc = offscreenDesc;
         stencilDesc.colors[0] = pass_data::color_attachment(
             offscreenMsaa_, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -443,6 +450,8 @@ struct ability_test_scene final : RenderObject
             .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
                                  .levelCount = 1,
                                  .layerCount = 1}});
+        layerDirty_ = false;
+        } // rebuildLayer
 
         // ---- pass 5: offscreen composite (secondary) ---------------------
         auto &composite = manager->beginPass(contentDesc, transparentBase);
@@ -462,7 +471,8 @@ struct ability_test_scene final : RenderObject
                        static_cast<std::uint32_t>(groupTile.h)}});
         compositeBuilder.addInstance(ui_dao::texture(
             groupTile, view, offscreenTexture_, kSamplerLinear,
-            glm::vec4(1.0F, 1.0F, 1.0F, 0.55F), compositeUv(groupTile), 8.0F));
+            glm::vec4(1.0F, 1.0F, 1.0F, 0.55F), compositeUv(groupTile), 8.0F,
+            static_cast<std::uint32_t>(34)));
         compositeBuilder.setScissor(VkRect2D{
             .offset = {static_cast<std::int32_t>(backdropTile.x),
                        static_cast<std::int32_t>(backdropTile.y)},
@@ -470,15 +480,18 @@ struct ability_test_scene final : RenderObject
                        static_cast<std::uint32_t>(backdropTile.h)}});
         compositeBuilder.addInstance(ui_dao::blur(
             backdropTile, view, offscreenTexture_, kSamplerLinear, 24.0F, 6,
-            glm::vec4(1.0F), compositeUv(backdropTile), 8.0F));
+            glm::vec4(1.0F), compositeUv(backdropTile), 8.0F,
+            static_cast<std::uint32_t>(35)));
         compositeBuilder.addInstance(ui_dao::sdf_shape(
             {backdropTile.x + 8.0F, backdropTile.y + 30.0F,
              backdropTile.w - 16.0F, backdropTile.h - 42.0F},
-            view, 8.0F, glm::vec4(1.0F, 1.0F, 1.0F, 0.10F)));
+            view, 8.0F, glm::vec4(1.0F, 1.0F, 1.0F, 0.10F), {}, 0.0F, 0.0F,
+            1.0F, static_cast<std::uint32_t>(35)));
         compositeBuilder.addInstance(ui_dao::shape_border(
             {backdropTile.x + 8.0F, backdropTile.y + 30.0F,
              backdropTile.w - 16.0F, backdropTile.h - 42.0F},
-            view, 8.0F, glm::vec4(1.0F, 1.0F, 1.0F, 0.28F), 1.0F));
+            view, 8.0F, glm::vec4(1.0F, 1.0F, 1.0F, 0.28F), 1.0F,
+            static_cast<std::uint32_t>(35)));
         compositeBuilder.setScissor(VkRect2D{
             .offset = {static_cast<std::int32_t>(clipTile.x),
                        static_cast<std::int32_t>(clipTile.y)},
@@ -486,7 +499,7 @@ struct ability_test_scene final : RenderObject
                        static_cast<std::uint32_t>(clipTile.h)}});
         compositeBuilder.addInstance(ui_dao::texture(
             clipTile, view, offscreenTexture_, kSamplerLinear, glm::vec4(1.0F),
-            compositeUv(clipTile), 8.0F));
+            compositeUv(clipTile), 8.0F, static_cast<std::uint32_t>(36)));
         compositeBuilder.setScissor(sc);
         manager->endPass();
 
@@ -502,8 +515,9 @@ struct ability_test_scene final : RenderObject
             manager->endPass();
         }
 
-        std::println("[ability-test] passes={} glyphs={}",
-                     manager->passes().size(), text_.size());
+        std::println("[ability-test] passes={} glyphs={} layer={}",
+                     manager->passes().size(), text_.size(),
+                     rebuildLayer ? "rebuilt" : "cached");
     }
 
   private:
@@ -527,6 +541,7 @@ struct ability_test_scene final : RenderObject
     std::vector<shader_data::TexQuad> text_{};
     float textW_{-1.0F};
     float textH_{-1.0F};
+    bool layerDirty_{true};
     std::uint32_t maskTex_{kTexPhoto};
     std::uint32_t maskSampler_{kSamplerLinear};
     UvTransform maskUv_{};

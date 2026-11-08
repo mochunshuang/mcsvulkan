@@ -1,4 +1,4 @@
-﻿# INTENT7_HANDOFF 鈥?鏁版嵁 + 鎿嶄綔 + 閫忔槑 emitter
+# INTENT7_HANDOFF 鈥?鏁版嵁 + 鎿嶄綔 + 閫忔槑 emitter
 
 > 2026-11-08 閲嶆瀯鍚庣殑浜ゆ帴璇存槑銆?> 杩欎唤鏂囨。鎻忚堪鐨勬槸 **涓夎酱妯″瀷** 鐨勫疄鐜帮紝鑰屼笉鏄棫鐨勨€淧assCompiler 鎶?Cmd union 缈绘垚 vkCmd*鈥濄€?
 ## 1. 鐩爣
@@ -305,6 +305,9 @@ The gaps named in sections 3 and 9 are closed for the runtime path:
 - F11 is an edge-triggered fullscreen toggle in test_intent7.cpp.
 - Color emoji are supported and linearized from the sRGB UNORM atlas.
 - Text cases: MSDF, RTL Arabic, CJK, color emoji, UAX #14 wrapping, mixed bidi.
+- Retained offscreen composition layer: rebuilt on resize/fullscreen, skipped on
+  clean frames (7 -> 5 recorded passes); the composite pass samples the retained
+  resolve texture.
 - Deleted shaders/test_intent7.comp and the no-op compute pipeline; the transfer
   pass (FillBuffer -> barrier -> CopyBuffer) remains.
 - Verified: 1280x900 -> 1582x953 -> 1920x1080 fullscreen -> back, no VUID, no
