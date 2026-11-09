@@ -216,6 +216,10 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_intent7 test_intent7.vert test_intent7.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
+# test_intent8：DrawPipelineData 绘制管线模型；绘制层与 intent7 不共享文件。
+add_std_glsl_target(test_intent8 test_intent8.vert test_intent8.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
 
 add_std_glsl_target(test_ui_ability test_ui_ability.vert test_ui_ability.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
