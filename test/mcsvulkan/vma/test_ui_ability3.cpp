@@ -998,6 +998,9 @@ constexpr auto init()
                      //diff: [test_indirectdraw_no_pick] start
                      .independentBlend = VK_TRUE, // 新增
                      //diff: [test_indirectdraw_no_pick] end
+                     // NOTE: test_intent8.frag 用 gl_PrimitiveID，SPIR-V 会声明 Geometry
+                     // capability；必须在 device 上打开 geometryShader。
+                     .geometryShader = VK_TRUE,
                      //NOTE: gcc 要求。严格的初始化顺序。 multiDrawIndirect 要在前面
                      .multiDrawIndirect = VK_TRUE, //diff: [test_indirectdraw]
                      .samplerAnisotropy = VK_TRUE,
@@ -1055,6 +1058,7 @@ constexpr auto init()
                     query.template get<VkPhysicalDeviceExtendedDynamicStateFeaturesEXT>();
                 return features2.features.samplerAnisotropy &&
                        features2.features.shaderInt64 &&
+                       features2.features.geometryShader &&
                        features2.features.multiDrawIndirect && //diff: [test_indirectdraw]
                        features2.features
                            .independentBlend && //diff: [test_indirectdraw_no_pick]
@@ -2595,7 +2599,10 @@ namespace shader_data
         {
             if (entity == ~0U)
                 return;
-            assert(entity < hover_fns.size());
+            // 没有注册任何 hover 回调时（例如 ability3 的最小矩形），
+            // picking 里回读到的 hover_fn 可能是 0；这里直接忽略，不 assert。
+            if (entity >= hover_fns.size())
+                return;
             hover_fns[entity](r, enter, inputCtx, screen);
         }
     };
@@ -9470,6 +9477,14 @@ try
     auto &[pickResourcesBuild, pickResource, resolveResourcesBuild, resolveResource,
            pickingFrames, pickMouse] = pickingAttachments;
 
+    // test_intent8.vert/frag 需要的最小数据：
+    //   4 个 Shape 实例 + 2 个 PathFill 实例 + 2 条 CommandConstant
+    constexpr VkDeviceSize shape_bytes = sizeof(shader_data::Shape) * 4u;
+    constexpr VkDeviceSize fill_bytes = sizeof(shader_data::PathFill) * 2u;
+    auto shaderBuffers = shader_data::ShaderBuffers(
+        device, sizeof(Vertex) * 4u, sizeof(std::uint32_t) * 6u, shape_bytes + fill_bytes,
+        sizeof(VkDrawIndexedIndirectCommand), sizeof(shader_data::CommandConstant) * 2u);
+
     struct record_info
     {
         uint32_t current_frame;
@@ -9493,10 +9508,10 @@ try
         make_aggregate_ref<"mainCtx", "pipelineOpaque3D", "pipelineTransparent3D",
                            "pipelineOpaqueUI", "pipelineTransparentUI", "pipelineUILayer",
                            "pipelineLayout", "depthResourcesBuild", "depthResource",
-                           "msaaResourcesBuild", "msaaResource">(
+                           "msaaResourcesBuild", "msaaResource", "shaderBuffers">(
             pipelineOpaque3D, pipelineTransparent3D, pipelineOpaqueUI,
             pipelineTransparentUI, pipelineUILayer, pipelineLayout, depthResourcesBuild,
-            depthResource, msaaResourcesBuild, msaaResource);
+            depthResource, msaaResourcesBuild, msaaResource, shaderBuffers);
 
     auto mainShaderCtx =
         make_aggregate_ref<"mainShaderCtx", "uniformBuffers", "descriptorSets">(
@@ -9925,6 +9940,204 @@ try
             const VkImage msaaImage = mainCtx.msaaResource.image();
             const VkImage pickingImage = pickCtx.pickResource.image();
             const VkImage resolveImage = pickCtx.resolveResource.image();
+
+            // ────────────────────────────────────────────────────────────
+            // 最小 test_intent8 提交：4 个 Shape 实例 + 2 个 PathFill 实例。
+            // 两种 program 用两条 CommandConstant；drawIndexed 的 instanceCount
+            // 分别取 4 / 2，体现多实例。全部裸 vkCmd*。
+            // ────────────────────────────────────────────────────────────
+            auto &sb = mainCtx.shaderBuffers;
+            auto &uniformBuffers = mainShaderCtx.uniformBuffers;
+
+            UniformBufferObject ubo{};
+            ubo.cameraInfo[0].view = glm::mat4(1.0F);
+            ubo.cameraInfo[0].proj = glm::mat4(1.0F);
+            ubo.cameraInfo[1] = ubo.cameraInfo[0];
+            std::memcpy(uniformBuffers[currentFrame].mapPtr(), &ubo, sizeof(ubo));
+
+            constexpr std::uint32_t shape_count = 4;
+            constexpr std::uint32_t fill_count = 2;
+            constexpr VkDeviceSize fill_offset = sizeof(shader_data::Shape) * shape_count;
+
+            std::array<shader_data::Shape, shape_count> shapes{};
+            const ui_dao::view view{W, H};
+            for (std::uint32_t i = 0; i < shape_count; ++i)
+            {
+                const float x = 80.0F + static_cast<float>(i) * 150.0F;
+                const float y = 90.0F + static_cast<float>(i % 2) * 130.0F;
+                shapes[i] =
+                    ui_dao::sdf_shape(ui_dao::rect_px{x, y, 120.0F, 90.0F}, view, 18.0F,
+                                      glm::vec4(0.95F, 0.45F, 0.15F, 1.0F));
+                shapes[i].hover_fn = 0xFFFFFFFFu;
+            }
+
+            const std::array<glm::vec2, 3> triangle = {
+                glm::vec2{0.5F, 0.0F}, glm::vec2{0.0F, 1.0F}, glm::vec2{1.0F, 1.0F}};
+            std::array<shader_data::PathFill, fill_count> fills{};
+            for (std::uint32_t i = 0; i < fill_count; ++i)
+            {
+                fills[i] = ui_dao::path_fill(
+                    ui_dao::rect_px{760.0F + static_cast<float>(i) * 140.0F, 420.0F,
+                                    120.0F, 120.0F},
+                    view, std::span{triangle}, glm::vec4(0.20F, 0.75F, 0.95F, 1.0F));
+            }
+
+            sb.globalVertexBuffer.write(0, quadVerts.data(), sizeof(quadVerts));
+            sb.globalIndexBuffer.write(0, quadIdx.data(), sizeof(quadIdx));
+            sb.globalHeapBuffer.write(0, shapes.data(), sizeof(shapes));
+            sb.globalHeapBuffer.write(fill_offset, fills.data(), sizeof(fills));
+            const std::array<shader_data::CommandConstant, 2> constants = {
+                shader_data::CommandConstant{.program = 0, .address_offset = 0},
+                shader_data::CommandConstant{
+                    .program = 1,
+                    .address_offset = static_cast<std::uint32_t>(fill_offset)}};
+            sb.commandConstantsBuffer.write(0, constants.data(), sizeof(constants));
+
+            PushData pc{};
+            pc.vertexAddress = sb.globalVertexBuffer.address;
+            pc.instanceAddress = sb.globalHeapBuffer.address;
+            pc.commandConstantsAddress = sb.commandConstantsBuffer.address;
+            pc.cameraIndex = 0;
+            pc.renderVersion = 0;
+
+            const bool hasStencil = mainCtx.depthResourcesBuild.hasStencilComponent();
+            const VkImageAspectFlags depthAspect =
+                hasStencil ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                           : VK_IMAGE_ASPECT_DEPTH_BIT;
+
+            my_render::transition_image_layout(
+                commandBuffer,
+                my_render::image_info{
+                    .image = image,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            .access_mask = VK_ACCESS_2_NONE,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}},
+                my_render::image_info{
+                    .image = msaaImage,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            .access_mask = VK_ACCESS_2_NONE,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}},
+                my_render::image_info{
+                    .image = pickingImage,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            .access_mask = VK_ACCESS_2_NONE,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}},
+                my_render::image_info{
+                    .image = resolveImage,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            .access_mask = VK_ACCESS_2_NONE,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}},
+                my_render::image_info{
+                    .image = depthImage,
+                    .aspect_mask = depthAspect,
+                    .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            .access_mask = VK_ACCESS_2_NONE,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                            .stage_mask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                          VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT}});
+
+            VkRenderingAttachmentInfo color0{
+                .sType = sType<VkRenderingAttachmentInfo>(),
+                .imageView = mainCtx.msaaResource.imageView(),
+                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT,
+                .resolveImageView = swapchain.imageView(imageIndex),
+                .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = {.color = {.float32 = {0.05F, 0.06F, 0.08F, 1.0F}}}};
+            VkRenderingAttachmentInfo color1{
+                .sType = sType<VkRenderingAttachmentInfo>(),
+                .imageView = pickCtx.pickResource.imageView(),
+                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+                .resolveImageView = pickCtx.resolveResource.imageView(),
+                .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = {.color = {.uint32 = {0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 0u}}}};
+            std::array attachments = {color0, color1};
+            VkRenderingAttachmentInfo depthAttachment{
+                .sType = sType<VkRenderingAttachmentInfo>(),
+                .imageView = mainCtx.depthResource.imageView(),
+                .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = {.depthStencil = {.depth = 1.0F, .stencil = 0u}}};
+
+            commandBuffer.beginRendering(
+                {.sType = sType<VkRenderingInfo>(),
+                 .renderArea = {.offset = {.x = 0, .y = 0}, .extent = extent},
+                 .layerCount = 1,
+                 .viewMask = 0,
+                 .colorAttachmentCount = static_cast<std::uint32_t>(attachments.size()),
+                 .pColorAttachments = attachments.data(),
+                 .pDepthAttachment = &depthAttachment,
+                 .pStencilAttachment = hasStencil ? &depthAttachment : nullptr});
+
+            const VkViewport viewport{0.0F, 0.0F, W, H, 0.0F, 1.0F};
+            const VkRect2D scissor{{0, 0}, extent};
+            commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                       *mainCtx.pipelineOpaqueUI);
+            commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                             *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                             nullptr);
+            commandBuffer.setViewport(0, std::span{&viewport, 1});
+            commandBuffer.setScissor(0, std::span{&scissor, 1});
+            commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                          VK_INDEX_TYPE_UINT32);
+            // Shape：4 个实例
+            pc.commandConstantsAddress = sb.commandConstantsBuffer.address;
+            commandBuffer.pushConstants(*pipelineLayout,
+                                        VK_SHADER_STAGE_VERTEX_BIT |
+                                            VK_SHADER_STAGE_FRAGMENT_BIT,
+                                        0, sizeof(PushData), &pc);
+            commandBuffer.drawIndexed(6, shape_count, 0, 0, 0);
+
+            // PathFill：2 个实例
+            pc.commandConstantsAddress =
+                sb.commandConstantsBuffer.address + sizeof(shader_data::CommandConstant);
+            commandBuffer.pushConstants(*pipelineLayout,
+                                        VK_SHADER_STAGE_VERTEX_BIT |
+                                            VK_SHADER_STAGE_FRAGMENT_BIT,
+                                        0, sizeof(PushData), &pc);
+            commandBuffer.drawIndexed(6, fill_count, 0, 0, 0);
+            commandBuffer.endRendering();
+
+            my_render::transition_image_layout(
+                commandBuffer,
+                my_render::image_info{
+                    .image = image,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                            .access_mask = VK_ACCESS_2_NONE,
+                            .stage_mask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT}});
         }),
         method<"endRendering">([](world_type &, input_type &, data_type &) {}));
 
