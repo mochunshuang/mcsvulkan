@@ -527,7 +527,7 @@ struct mesh_data
 #include "test_ui_ability3_dao.hpp"
 #include "test_ui_ability3_shader_buffers.hpp"
 
-using PushData =shader_data::PushData ;
+using PushData = shader_data::PushData;
 namespace command
 {
     struct command_context_data
@@ -3051,122 +3051,6 @@ namespace ui_new
     // clang-format on
     // NOLINTEND
 
-    /*
-    在 Flutter 中，只要父级和子级没有同时强制“唯一宽高”（即紧约束），它们确实会互相“协商”并影响对方的大小。
-
-    但是，这个“互相”必须严格遵守 Flutter 布局的第一大铁律：
-
-    约束（Constraints）向下传递，大小（Size）向上传递，位置由父级决定。
-
-    这不是“双向同时谈判”，而是严格的两步流水线。为了让你看透本质，我们分三种情况拆解：
-
-    1. 子级能改变父级大小吗？（向上影响）—— 能！
-    条件：父级没有固定宽高（即父级对子级传递的是松约束，比如 0 ≤ w ≤ ∞）。
-
-    过程：
-
-    父级说：“孩子，你想多大就多大（松约束）。”
-    子级说：“那我算出我要 200 宽。”
-    子级向上返回 size = 200。
-    父级一看：“哦，孩子是 200，我没有固定宽高，那我就把自己也设为 200 宽吧！”
-    典型例子：Container 没有设宽高，但它的孩子是一个 Container(width: 200)，那么父级会被撑成 200 宽。
-
-    2. 父级能改变子级大小吗？（向下影响）—— 能！
-    条件：父级有固定宽高或紧约束（比如父级宽 100）。
-
-    过程：
-
-    父级说：“你必须正好是 100 宽（紧约束）。”
-    子级就算想当 200，也得乖乖算出 100，向上返回 size = 100。
-    典型例子：父级是 SizedBox(width: 100)，孩子是 Container(width: 200)，最终孩子被强制变成 100（除非溢出报错）。
-
-    3. 为什么不会变成“死循环”？—— 因为你说的“不强制唯一的宽高”是关键
-    你敏锐地注意到了“如果不强制唯一的宽高”这个前提。如果父子都没有强制唯一宽高（即都是松约束），流程是这样的：
-
-    父级先出牌：父级把当前的约束（比如 0-∞）传给子级（方向：向下）。
-
-    子级算结果：子级根据自己的 child 算出自己的 size。
-
-    父级拿结果：父级读取子级的 size，据此算出自己的 size（方向：向上）。
-
-    结束！这里绝对不存在“循环回推”。
-
-    为什么不会无限循环？
-    因为约束（Constraints）和大小（Size）是两种完全不同的对象。父级在把约束给子级之前，就已经确定了自己的约束。父级不会因为子级返回了尺寸，就回过头去“修改”刚才传给子级的约束。它是先定规矩，再量尺寸。
-
-    ===============================================================================================
-    多子带来唯一的新概念：“分配剩余空间”
-    虽然汇总公式变了，但多子布局确实引入了一个单子布局里不存在的问题，那就是 flex（弹性）：
-
-    在单子（Container）里：父级给子级传什么约束，子级就按什么算，简单直接。
-
-    在多子（Row）里：父级先把总宽度拿出来，减去固定宽度孩子的尺寸，剩下的“剩余空间”怎么分？
-
-    这就引出了 RenderFlex 的“两步走”算法：
-
-    第一步（无约束测量）：先问所有非 Expanded 的孩子要多大尺寸（layout 一次）。
-    第二步（分配约束）：算出剩余空间，除以 Expanded 的 flex 权重，算出每个弹性孩子的确切新约束，再让他们重新 layout 一次（第二次测量）。
-
-
-    ===============================================================================================
-    // 只有一个孩子
-    child.layout(constraints);
-    size = child.size;  // ★ 公式：父尺寸 = 唯一孩子的尺寸（完全复制）
-
-    ----------------------------------------------------------------------
-    // 多个孩子
-    double totalWidth = 0;
-    double maxHeight = 0;
-
-    // 遍历所有孩子
-    for (child in children) {
-    child.layout(constraints, parentUsesSize: true);
-    totalWidth += child.size.width;    // 累加宽度（主轴）
-    maxHeight = max(maxHeight, child.size.height); // 取最大高度（纵轴）
-    }
-
-    // ★ 公式：父尺寸 = 子尺寸的累加和 与 最大值 的结合
-    size = Size(totalWidth, maxHeight);
-
-    ----------------------------------------------------------------------
-    // 源码位置：RenderPadding.performLayout (极度简化)
-    @override
-    void performLayout() {
-    // 1. 先扣除 margin，把缩水后的约束传给 child
-    final BoxConstraints innerConstraints = constraints.deflate(_padding); 
-    child.layout(innerConstraints, parentUsesSize: true);
-    
-    // 2. ★ 核心配合公式：最终尺寸 = 孩子的尺寸 + margin 的宽高
-    size = constraints.constrain(Size(
-        child.size.width + _padding.horizontal,   // 宽 = 孩子宽 + 左margin + 右margin
-        child.size.height + _padding.vertical,    // 高 = 孩子高 + 上margin + 下margin
-    ));
-    }
-
-    -------------------------------------------------------------------------------------
-    // 伪代码：单子父级的 performLayout
-    void performLayout() {
-    // 1. 把约束缩水后传给唯一的孩子
-    child.layout(innerConstraints);
-    
-    // 2. 算出自己的总尺寸（孩子尺寸 + 边距）
-    size = ...;
-    
-    // 3. ★ 直接计算这一个孩子的 x,y（极其简单）
-    child.parentData.offset = Offset(padding.left, padding.top);
-    }
-    -------------------------------------------------------------------------------------
-    // 伪代码：Row 父级的 performLayout（极度简化）
-    double currentX = 0;
-    for (child in children) {
-    // ★ 这才是多子布局真正的核心难点：
-    // 根据 MainAxisAlignment（居中、靠左、SpaceBetween）计算出当前孩子的起始 x
-    // 如果是 spaceBetween，还要先算出总空白间隔，再逐个累加
-    
-    child.parentData.offset = Offset(currentX, 0); // 决定 Y 轴对齐（顶部、居中、拉伸）
-    currentX += child.size.width; // 累加，指向下一个兄弟的起始位置
-    }
-    */
     struct ContainerWidget : Widget
     {
 
@@ -5193,24 +5077,7 @@ namespace ui_new
 
     // NOTE: Spacer 生成一个携带 key 的 0×0 SizedBoxWidget，同时把 (flex, tight) 交给 Flex 记账。
     // NOTE: 唯一的改动是把 FlexBuild::addChild(FlexibleBuild&) 泛化成 concept 重载，让 Spacer 也能走同一条路
-    /*
-class Spacer extends StatelessWidget {
-  const Spacer({super.key, this.flex = 1}) : assert(flex > 0);
-  final int flex;
-  Widget build(BuildContext context) => Expanded(
-    flex: flex,
-    child: const SizedBox.shrink(),   // 0×0 空盒
-  );
-}
-关键点：
-    Spacer 本身是 StatelessWidget，其 key 传给它自己；子树里是 Expanded(tight) → SizedBox.shrink()。
 
-    find.byKey('s') 命中的是 Spacer，renderObject 回溯到它子树里的 RenderConstrainedBox，即 SizedBox.shrink() 的 renderObject。
-
-    所以 Spacer 在运行时树里必须真实存在一个 Widget（不同于 Flexible），能被 find，能被 getSize 拿到尺寸。
-
-    尺寸行为 = SizedBox(0,0) 在 tight 约束下被撑成 (分配的主轴 × 0 交叉轴)。
-*/
     // =========================================================================
     // SpacerBuild —— Spacer 的等价物
     // 运行时树里生成一个真实存在的、携带 key 的 0×0 SizedBoxWidget；
@@ -5660,18 +5527,6 @@ class Spacer extends StatelessWidget {
     {
         return WrapBuild{std::move(key)};
     }
-
-    /*
-你的模型：
-    layout       → 每个 widget 的 (W, H) + Offset 全部确定
-    每帧 update  → 把 Model 矩阵上传 shader
-    render       → 画像素
-Flow 的模型：
-    layout       → 只确定 (W, H)，Offset 待定
-    paint 阶段   → 回调 delegate，现场算 Matrix4
-    render       → 画像素
-NOTE: 我不需要，我会将这些信息和renderobject 绑定，更新model矩阵更直接
-*/
 
     // =========================================================================
     // StackFit
