@@ -227,8 +227,8 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_ui_ability2 test_ui_ability2.vert test_ui_ability2.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
-# NOTE: 尝试抽象命令提交过程
-add_std_glsl_target(test_ui_ability3 test_ui_ability2.vert test_ui_ability2.frag)
+# NOTE: 尝试抽象命令提交过程 基于 test_ui_ability
+add_std_glsl_target(test_ui_ability3 test_ui_ability.vert test_ui_ability.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
 

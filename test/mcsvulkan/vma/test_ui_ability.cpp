@@ -182,20 +182,6 @@ struct my_render
         trans dst;
     };
 
-    static void transition_image_layout(const CommandBufferView &commandBuffer,
-                                        std::span<const image_info> infos) noexcept
-    {
-        commandBuffer.pipelineBarrier2(VkDependencyInfo{
-            .sType = sType<VkDependencyInfo>(),
-            .pNext = nullptr,
-            .dependencyFlags = 0,
-            .memoryBarrierCount = 0,
-            .pMemoryBarriers = nullptr,
-            .bufferMemoryBarrierCount = 0,
-            .pBufferMemoryBarriers = nullptr,
-            .imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size()),
-            .pImageMemoryBarriers = barriers.data()});
-    }
     template <std::same_as<image_info>... T>
     static void transition_image_layout(const CommandBufferView &commandBuffer,
                                         T... info) noexcept
@@ -221,7 +207,16 @@ struct my_render
                                  .levelCount = VK_REMAINING_MIP_LEVELS,
                                  .baseArrayLayer = 0,
                                  .layerCount = VK_REMAINING_ARRAY_LAYERS}}...};
-        transition_image_layout(commandBuffer, barriers);
+        commandBuffer.pipelineBarrier2(VkDependencyInfo{
+            .sType = sType<VkDependencyInfo>(),
+            .pNext = nullptr,
+            .dependencyFlags = 0,
+            .memoryBarrierCount = 0,
+            .pMemoryBarriers = nullptr,
+            .bufferMemoryBarrierCount = 0,
+            .pBufferMemoryBarriers = nullptr,
+            .imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size()),
+            .pImageMemoryBarriers = barriers.data()});
     }
 };
 
