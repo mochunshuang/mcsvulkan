@@ -227,6 +227,10 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_ui_ability2 test_ui_ability2.vert test_ui_ability2.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
+# NOTE: 尝试抽象命令提交过程
+add_std_glsl_target(test_ui_ability3 test_ui_ability2.vert test_ui_ability2.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
 
 # end
 std_glsl_env_destroy()

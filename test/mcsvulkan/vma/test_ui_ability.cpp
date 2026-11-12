@@ -182,6 +182,20 @@ struct my_render
         trans dst;
     };
 
+    static void transition_image_layout(const CommandBufferView &commandBuffer,
+                                        std::span<const image_info> infos) noexcept
+    {
+        commandBuffer.pipelineBarrier2(VkDependencyInfo{
+            .sType = sType<VkDependencyInfo>(),
+            .pNext = nullptr,
+            .dependencyFlags = 0,
+            .memoryBarrierCount = 0,
+            .pMemoryBarriers = nullptr,
+            .bufferMemoryBarrierCount = 0,
+            .pBufferMemoryBarriers = nullptr,
+            .imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size()),
+            .pImageMemoryBarriers = barriers.data()});
+    }
     template <std::same_as<image_info>... T>
     static void transition_image_layout(const CommandBufferView &commandBuffer,
                                         T... info) noexcept
@@ -207,16 +221,7 @@ struct my_render
                                  .levelCount = VK_REMAINING_MIP_LEVELS,
                                  .baseArrayLayer = 0,
                                  .layerCount = VK_REMAINING_ARRAY_LAYERS}}...};
-        commandBuffer.pipelineBarrier2(VkDependencyInfo{
-            .sType = sType<VkDependencyInfo>(),
-            .pNext = nullptr,
-            .dependencyFlags = 0,
-            .memoryBarrierCount = 0,
-            .pMemoryBarriers = nullptr,
-            .bufferMemoryBarrierCount = 0,
-            .pBufferMemoryBarriers = nullptr,
-            .imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size()),
-            .pImageMemoryBarriers = barriers.data()});
+        transition_image_layout(commandBuffer, barriers);
     }
 };
 
@@ -10583,9 +10588,8 @@ try
                 // FontType 决定着色器走距离场还是位图采样
                 using FT = mcs::vulkan::font::FontType;
                 const FT ftype = g.font_ctx->type;
-                const bool isDistance =
-                    (ftype == FT::eSDF || ftype == FT::ePSDF ||
-                     ftype == FT::eMSDF || ftype == FT::eMTSDF);
+                const bool isDistance = (ftype == FT::eSDF || ftype == FT::ePSDF ||
+                                         ftype == FT::eMSDF || ftype == FT::eMTSDF);
                 tg.fontType = isDistance ? 0u : 1u;
                 line.glyphs.push_back(tg);
                 line.width += tg.advance + static_cast<float>(g.offset_x);
@@ -12005,9 +12009,9 @@ try
                 const float y0 = static_cast<float>(msaaBox.offset.y) + 10.0F;
                 const float w = static_cast<float>(msaaBox.extent.width) - 20.0F;
                 const float h = static_cast<float>(msaaBox.extent.height) - 20.0F;
-                tri.pts.emplace_back(x0 + w * 0.5F, y0);           // 顶点
-                tri.pts.emplace_back(x0, y0 + h);                  // 左下
-                tri.pts.emplace_back(x0 + w, y0 + h);              // 右下
+                tri.pts.emplace_back(x0 + w * 0.5F, y0); // 顶点
+                tri.pts.emplace_back(x0, y0 + h);        // 左下
+                tri.pts.emplace_back(x0 + w, y0 + h);    // 右下
                 ui_path::path p;
                 p.push_back(std::move(tri));
                 return pathRegistry.add(std::move(p));
