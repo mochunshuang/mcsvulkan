@@ -11789,7 +11789,7 @@ try
 
             // ────────────────────────────────────────────────────────────────
             // [08-5..8] ② blend × ③ colorWriteMask 的 2×2 矩阵
-            //
+            // NOTE: 就shape1 效果不同
             //                mask all          mask R|G
             //   blend ON     [08-5]            [08-7]
             //   blend OFF    [08-6]            [08-8]
@@ -11863,6 +11863,7 @@ try
             }
 
             /*
+            // NOTE: 5,6,7,8差异都在管线上. blend 和 mask 决定的是颜色怎么写，不是像素在哪
             case	blend	mask	Shape1 SDF 内	        Shape1 SDF 外
             [08-5]	ON	    ALL	    (0.6, 0.3, 0.5) 紫粉	teal（看不见）
             [08-6]	OFF	    ALL	    (0.5, 0, 0) 暗红	    黑（0 直接写）
