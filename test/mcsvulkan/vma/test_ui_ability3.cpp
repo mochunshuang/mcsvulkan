@@ -1742,7 +1742,7 @@ using FontSelect = std::remove_cvref_t<decltype(std::declval<FontCtx>().fontSele
 struct ui_pipeline_ctx
 {
     // 存 Pipeline（RAII 对象）而不是裸 VkPipeline：临时对象析构会销毁管线
-    std::array<std::optional<mcs::vulkan::Pipeline>, 9> pipes{};
+    std::array<std::optional<mcs::vulkan::Pipeline>, 12> pipes{};
     // 必须在 device 销毁前显式清理：函数内 static 的析构晚于 device，
     // 否则退出时会报 N 条 "VkPipeline ... has not been destroyed"
     void reset() noexcept
@@ -2552,6 +2552,28 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
 
     uiPipelines().pipes[6] =
         makePipelineEx(blendOver, VK_TRUE, stencilEqualKeep,
+                       VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
+
+    // [08-4] 专用：blend OFF + 只写 R/G，B/A 保留 dst；用来观察 colorWriteMask。
+    auto maskRG = blendOver;
+    maskRG.blendEnable = VK_FALSE;
+    maskRG.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;
+    uiPipelines().pipes[9] = makePipelineEx(maskRG, VK_FALSE, stencilAlwaysIncr, 0);
+
+    // [08-7] 专用：blend ON + 只写 R/G（和 pipes[9] 只差 blendEnable）。
+    auto maskRGBlend = maskRG;
+    maskRGBlend.blendEnable = VK_TRUE;
+    uiPipelines().pipes[10] = makePipelineEx(maskRGBlend, VK_FALSE, stencilAlwaysIncr, 0);
+
+    // [08-3/4] 专用：stencil EQUAL + blend OFF。stencil pass 只决定“留/丢”，
+    // 不会顺带发生 blend；source 通过后是直接写红色，不是混合。
+    const auto noBlendAll = VkPipelineColorBlendAttachmentState{
+        .blendEnable = VK_FALSE,
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT};
+    uiPipelines().pipes[11] =
+        makePipelineEx(noBlendAll, VK_TRUE, stencilEqualKeep,
                        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
 
@@ -9477,13 +9499,18 @@ try
     auto &[pickResourcesBuild, pickResource, resolveResourcesBuild, resolveResource,
            pickingFrames, pickMouse] = pickingAttachments;
 
-    // test_intent8.vert/frag 需要的最小数据：
-    //   4 个 Shape 实例 + 2 个 PathFill 实例 + 2 条 CommandConstant
-    constexpr VkDeviceSize shape_bytes = sizeof(shader_data::Shape) * 4u;
-    constexpr VkDeviceSize fill_bytes = sizeof(shader_data::PathFill) * 2u;
+    // command 语料的数据区：容量是“素材”，不是工程尺寸。
+    //   heap: 64 KiB（Shape/PathFill/PathStroke/NoiseQuad 四段连续数组）
+    //   vertex/index: 1 KiB 各够 quad 副本、16-bit 索引和多套 indirect 参数
+    //   indirect/constant: 8 KiB / 4 KiB 够所有 case 的 command + CommandConstant
+    constexpr VkDeviceSize kCorpusHeapBytes = 64u * 1024u;
+    constexpr VkDeviceSize kCorpusVertexBytes = 1024u;
+    constexpr VkDeviceSize kCorpusIndexBytes = 1024u;
+    constexpr VkDeviceSize kCorpusIndirectBytes = 8u * 1024u;
+    constexpr VkDeviceSize kCorpusConstantBytes = 4u * 1024u;
     auto shaderBuffers = shader_data::ShaderBuffers(
-        device, sizeof(Vertex) * 4u, sizeof(std::uint32_t) * 6u, shape_bytes + fill_bytes,
-        sizeof(VkDrawIndexedIndirectCommand), sizeof(shader_data::CommandConstant) * 2u);
+        device, kCorpusVertexBytes, kCorpusIndexBytes, kCorpusHeapBytes,
+        kCorpusIndirectBytes, kCorpusConstantBytes);
 
     struct record_info
     {
@@ -9923,88 +9950,296 @@ try
             auto &swapchain = globalCtx.swapchain;
             auto &commandBuffers = globalCtx.commandBuffers;
 
-            // ↓↓↓ 就是它：一个 VkCommandBuffer，后面全是 vkCmd* 级别的调用 ↓↓↓
+            // ↓↓↓ 一个 VkCommandBuffer；下面全部是裸 vkCmd*，没有 CommandBuilder ↓↓↓
             const auto &[currentFrame, imageIndex] = recordCtx.info;
             const auto &commandBuffer = commandBuffers[currentFrame];
 
             auto &pipelineLayout = mainCtx.pipelineLayout;
             auto &descriptorSets = mainShaderCtx.descriptorSets;
-            auto descriptorSet = descriptorSets[currentFrame];
+            auto &uniformBuffers = mainShaderCtx.uniformBuffers;
+            const VkDescriptorSet descriptorSet = descriptorSets[currentFrame];
+            const VkDescriptorSet descriptorSetAlternate =
+                descriptorSets[(currentFrame + 1) % MAX_FRAMES_IN_FLIGHT];
 
             const VkExtent2D extent = swapchain.refImageExtent();
             const float W = static_cast<float>(extent.width);
             const float H = static_cast<float>(extent.height);
 
-            VkImage image = swapchain.image(imageIndex);
+            const VkImage image = swapchain.image(imageIndex);
             const VkImage depthImage = mainCtx.depthResource.image();
             const VkImage msaaImage = mainCtx.msaaResource.image();
             const VkImage pickingImage = pickCtx.pickResource.image();
             const VkImage resolveImage = pickCtx.resolveResource.image();
 
-            // ────────────────────────────────────────────────────────────
-            // 最小 test_intent8 提交：4 个 Shape 实例 + 2 个 PathFill 实例。
-            // 两种 program 用两条 CommandConstant；drawIndexed 的 instanceCount
-            // 分别取 4 / 2，体现多实例。全部裸 vkCmd*。
-            // ────────────────────────────────────────────────────────────
             auto &sb = mainCtx.shaderBuffers;
-            auto &uniformBuffers = mainShaderCtx.uniformBuffers;
+            const ui_dao::view view{W, H};
 
+            // ════════════════════════════════════════════════════════════════
+            // 数据协议（先看这里，再看 case）
+            //
+            //   一个 PushData 只描述“这一条 draw 从哪里取数据”：
+            //     vertexAddress          → Vertex[] 基址
+            //     instanceAddress        → 实例堆基址
+            //     commandConstantsAddress→ CommandConstant[] 基址
+            //     cameraIndex            → UBO 里的相机
+            //     renderVersion          → 拾取打包
+            //
+            //   直接 draw 时 gl_DrawIDARB == 0，所以每次 push 只指向“这一条 draw
+            //   对应的那一个 CommandConstant”；CommandConstant{program,address_offset}
+            //   里的 address_offset 是相对 instanceAddress 的字节偏移，program 决定
+            //   实例行的结构体大小。
+            //
+            //   indirect 多 draw 时 push 指向 CommandConstant[] 的首地址；第 i 条
+            //   indirect command 的 gl_DrawIDARB == i，于是 shader 用
+            //   consts[gl_DrawIDARB] 选 program/address_offset。实例行由
+            //   gl_InstanceIndex 选，所以一次 drawIndexedIndirect(count=N) 可以
+            //   同时画 N 个不同 program、不同数据的实例。
+            //
+            //   本语料把数据原地造在一个 64 KiB 的 heap 里：
+            //     Shape[] | PathFill[] | PathStroke[] | NoiseQuad[]
+            //   四段连续数组，各自按 shader 的 sizeof 步进；CommandConstant[] 和
+            //   indirect command[] 放在各自的 buffer。下面的 add_* 只做写数据，
+            //   不包装任何 vkCmd*，每个 case 的 C API 顺序仍然是手写的。
+            // ════════════════════════════════════════════════════════════════
+            // ════════════════════════════════════════════════════════════════
+            // C API 索引（给 command 命名空间当原始素材；详细解释在各 case 前）
+            //
+            //   状态类：BindPipeline / BindDescriptorSets / SetViewport / SetScissor /
+            //           BindIndexBuffer / BindVertexBuffers / SetStencilReference
+            //   数据类：PushConstants / DrawIndexed / Draw / DrawIndexedIndirect /
+            //           DrawIndirect / VkDrawIndexedIndirectCommand / CommandConstant
+            //   顺序类：state-before-pipeline / set-before-pipeline / push-per-draw
+            //   scope 类：BeginRendering / EndRendering / loadOp / renderArea /
+            //             suspend-resume
+            //   同步/搬运类：PipelineBarrier2（只放 scope 外）/ CopyImageToBuffer /
+            //                Transition（只放 scope 外）
+            //
+            // [00] BeginR → BindPipeline → BindDescriptorSets → SetViewport →
+            //      SetScissor → BindIndexBuffer → PushConstants → DrawIndexed → EndR
+            // [01] SetViewport → SetScissor → PushConstants → DrawIndexed(6,4)
+            // [02] SetViewport → SetScissor → Push → DrawIndexed(firstInstance=0) →
+            //      DrawIndexed(firstInstance=1)
+            // [03] SetViewport → SetScissor → Push(A) → DrawIndexed → Push(B) →
+            //      DrawIndexed
+            // [04] BindPipeline(A) → SetViewport → SetScissor → Push → DrawIndexed →
+            //      BindPipeline(B) → Push → DrawIndexed
+            // [05] SetViewport → SetScissor → BindDescriptorSets(A) → Push →
+            //      DrawIndexed → BindDescriptorSets(B) → DrawIndexed
+            // [06] SetScissor → SetViewport(A) → Push → DrawIndexed →
+            //      SetViewport(B) → DrawIndexed
+            // [07] SetViewport → SetScissor(A) → Push → DrawIndexed →
+            //      SetScissor(B) → DrawIndexed
+            // [08] BindIndexBuffer(0) → Push → DrawIndexed(6,firstInstance=0) →
+            //      BindIndexBuffer(24) → DrawIndexed(3,firstInstance=1)
+            // [08-1] BindPipeline(opaque3D) → SetViewport → SetScissor →
+            //        BindIndexBuffer(0) → Push → DrawIndexed(Shape0) →
+            //        DrawIndexed(Shape1, depth pass)
+            // [08-2] 同 [08-1]，第二条 firstInstance 1→2（Shape2 z=.75），depth fail
+            // [08-3] BindPipeline(pipe4) → SetViewport → SetScissor →
+            //        BindIndexBuffer(0) → Push → SetStencilReference(0) →
+            //        DrawIndexed(base, stencil setup) →
+            //        BindPipeline(opaque) → DrawIndexed(base, color) →
+            //        BindPipeline(pipe11) → SetStencilReference(1) →
+            //        DrawIndexed(source, stencil pass, blend OFF)
+            // [08-4] 同 [08-3]，pipe11 的 SetStencilReference 改成 0，stencil fail
+            // [08-5] BindPipeline(opaque) → ... → DrawIndexed(base) →
+            //        BindPipeline(transparent) → DrawIndexed(source, blend ON, mask ALL)
+            // [08-6] 同 [08-5]，第二条 pipeline 改成 opaqueUI（blend OFF, mask ALL）
+            // [08-7] 同 [08-5]，第二条 pipeline 改成 maskRGBlend（blend ON, mask R|G）
+            // [08-8] 同 [08-5]，第二条 pipeline 改成 maskRG（blend OFF, mask R|G）
+            // [09] BindIndexBuffer(UINT32,0) → DrawIndexed →
+            //      BindIndexBuffer(UINT16,72) → DrawIndexed
+            // [10] BindPipeline(transparent) → BindDescriptorSets → SetViewport →
+            //      SetScissor → BindIndexBuffer → Push → DrawIndexed → Draw
+            // [11] BindPipeline(opaque) → BindIndexBuffer → SetViewport → SetScissor →
+            //      Push → DrawIndexed(6) → DrawIndexed(3,firstIndex=1,vertexOffset=4)
+            // [12] BindPipeline(transparent) → BindDescriptorSets → SetViewport →
+            //      SetScissor → BindIndexBuffer → Push → DrawIndexedIndirect(count=1)
+            // [13] BindPipeline(transparent) → BindDescriptorSets → SetViewport →
+            //      SetScissor → BindIndexBuffer → Push(cS) →
+            //      DrawIndexedIndirect(count=2) → Push(cS) →
+            //      DrawIndexedIndirect(count=1) → Push(cF) →
+            //      DrawIndexedIndirect(count=1)
+            // [14] SetViewport → SetScissor → Push → DrawIndexed(6,3,firstInstance=1)
+            // [15] BindVertexBuffers → BindPipeline(transparent) → BindDescriptorSets →
+            //      SetViewport → SetScissor → BindIndexBuffer → Push → DrawIndexed
+            // [16] SetViewport → SetScissor → BindDescriptorSets → BindIndexBuffer →
+            //      BindPipeline(opaque) → Push → DrawIndexed
+            // [17] PB → BeginR(LOAD) → BindPipeline → BindDescriptorSets → SetViewport →
+            //      SetScissor → BindIndexBuffer → Push(A) → DrawIndexed → EndR →
+            //      PB → BeginR(LOAD) → Push(B) → DrawIndexed → EndR
+            // [18] PB → BeginR(renderArea=tile, CLEAR) → BindPipeline →
+            //      BindDescriptorSets → SetViewport → SetScissor → BindIndexBuffer →
+            //      Push → DrawIndexed → EndR
+            // [19] PB → BeginR(SUSPENDING) → BindPipeline → BindDescriptorSets →
+            //      SetViewport → SetScissor → BindIndexBuffer → Push(A) →
+            //      DrawIndexed → EndR → BeginR(RESUMING) → BindPipeline →
+            //      BindDescriptorSets → SetViewport → SetScissor → BindIndexBuffer →
+            //      Push(B) → DrawIndexed → EndR
+            // [20] Transition(resolve→TRANSFER_SRC) → CopyImageToBuffer →
+            //      Transition(resolve→COLOR) → PB → BeginR(LOAD) → BindPipeline →
+            //      BindDescriptorSets → SetViewport → SetScissor → BindIndexBuffer →
+            //      Push → DrawIndexed → EndR
+            // [21] PB → BeginR(LOAD) → BindPipeline(transparent) →
+            //      BindDescriptorSets → SetViewport → SetScissor → Push →
+            //      DrawIndirect(count=1) → EndR
+            // [22] BindPipeline(opaque3D) → BindDescriptorSets → SetViewport →
+            //      SetScissor → BindIndexBuffer → Push(A) → DrawIndexed →
+            //      Push(B) → DrawIndexed
+            // [23] BindPipeline(pipe6) → BindDescriptorSets → SetViewport →
+            //      SetScissor → BindIndexBuffer → SetStencilReference(0) → Push(A) →
+            //      DrawIndexed → SetStencilReference(1) → Push(B) → DrawIndexed
+            //
+            // 共享 A scope 的 BeginR/EndR 不在每个 case 里重复：它在 [00] 前，
+            // [23] 后；B 组每个 case 自己带 scope。这样每个 {} 就是一段可抽取的
+            // C API 片段，同时保留“状态在 begin/end 之间是否粘滞”的真实边界。
+            // ════════════════════════════════════════════════════════════════
+            constexpr std::uint32_t kShapeStride = sizeof(shader_data::Shape);
+            constexpr std::uint32_t kFillStride = sizeof(shader_data::PathFill);
+            constexpr std::uint32_t kStrokeStride = sizeof(shader_data::PathStroke);
+            constexpr std::uint32_t kNoiseStride = sizeof(shader_data::NoiseQuad);
+
+            constexpr std::uint32_t kShapeBase = 0;
+            constexpr std::uint32_t kFillBase = 64u * kShapeStride;
+            constexpr std::uint32_t kStrokeBase = kFillBase + 32u * kFillStride;
+            constexpr std::uint32_t kNoiseBase = kStrokeBase + 8u * kStrokeStride;
+
+            std::uint32_t shapeCursor = 0;
+            std::uint32_t fillCursor = 0;
+            std::uint32_t strokeCursor = 0;
+            std::uint32_t noiseCursor = 0;
+            std::uint32_t constantCursor = 0;
+            std::uint32_t indirectCursor = 0;
+
+            const auto add_shape = [&](shader_data::Shape s) -> std::uint32_t {
+                const std::uint32_t off = kShapeBase + shapeCursor * kShapeStride;
+                s.hover_fn = 0xFFFFFFFFu;
+                sb.globalHeapBuffer.write(off, &s, sizeof(s));
+                ++shapeCursor;
+                return off;
+            };
+            const auto add_fill = [&](shader_data::PathFill f) -> std::uint32_t {
+                const std::uint32_t off = kFillBase + fillCursor * kFillStride;
+                f.hover_fn = 0xFFFFFFFFu;
+                sb.globalHeapBuffer.write(off, &f, sizeof(f));
+                ++fillCursor;
+                return off;
+            };
+            const auto add_stroke = [&](shader_data::PathStroke s) -> std::uint32_t {
+                const std::uint32_t off = kStrokeBase + strokeCursor * kStrokeStride;
+                s.hover_fn = 0xFFFFFFFFu;
+                sb.globalHeapBuffer.write(off, &s, sizeof(s));
+                ++strokeCursor;
+                return off;
+            };
+            const auto add_noise = [&](shader_data::NoiseQuad n) -> std::uint32_t {
+                const std::uint32_t off = kNoiseBase + noiseCursor * kNoiseStride;
+                n.hover_fn = 0xFFFFFFFFu;
+                sb.globalHeapBuffer.write(off, &n, sizeof(n));
+                ++noiseCursor;
+                return off;
+            };
+            const auto add_const = [&](std::uint32_t program,
+                                       std::uint32_t heapOffset) -> std::uint32_t {
+                const std::uint32_t off =
+                    constantCursor * sizeof(shader_data::CommandConstant);
+                const shader_data::CommandConstant cc{.program = program,
+                                                      .address_offset = heapOffset};
+                sb.commandConstantsBuffer.write(off, &cc, sizeof(cc));
+                ++constantCursor;
+                return off;
+            };
+            const auto add_indirect_indexed =
+                [&](const VkDrawIndexedIndirectCommand &cmd) -> VkDeviceSize {
+                const VkDeviceSize off = static_cast<VkDeviceSize>(indirectCursor) *
+                                         sizeof(VkDrawIndexedIndirectCommand);
+                sb.indirectDrawBuffer.write(off, &cmd, sizeof(cmd));
+                ++indirectCursor;
+                return off;
+            };
+            const auto add_indirect =
+                [&](const VkDrawIndirectCommand &cmd) -> VkDeviceSize {
+                const VkDeviceSize off = static_cast<VkDeviceSize>(indirectCursor) *
+                                         sizeof(VkDrawIndirectCommand);
+                sb.indirectDrawBuffer.write(off, &cmd, sizeof(cmd));
+                ++indirectCursor;
+                return off;
+            };
+
+            shader_data::PushData base_pc{};
+            base_pc.vertexAddress = sb.globalVertexBuffer.address;
+            base_pc.instanceAddress = sb.globalHeapBuffer.address;
+            base_pc.commandConstantsAddress = sb.commandConstantsBuffer.address;
+            base_pc.cameraIndex = 0;
+            base_pc.renderVersion = 0;
+
+            const auto pc_at = [&](std::uint32_t constOffset,
+                                   std::uint32_t renderVersion) {
+                shader_data::PushData p = base_pc;
+                p.commandConstantsAddress =
+                    sb.commandConstantsBuffer.address + constOffset;
+                p.renderVersion = renderVersion;
+                return p;
+            };
+
+            // 顶点/索引也是原地造。四份几何：
+            //   0        ：quadVerts[0..3]
+            //   4        ：同一 quad 的副本，给 vertexOffset 用
+            //   8        ：non-indexed 的 6 顶点展开
+            const std::array<Vertex, 4> quadVerts = {
+                Vertex{{-0.5F, -0.5F, 0.0F}, {0.0F, 0.0F}},
+                Vertex{{0.5F, -0.5F, 0.0F}, {1.0F, 0.0F}},
+                Vertex{{0.5F, 0.5F, 0.0F}, {1.0F, 1.0F}},
+                Vertex{{-0.5F, 0.5F, 0.0F}, {0.0F, 1.0F}}};
+            const std::array<Vertex, 6> nonIndexedVerts = {quadVerts[0], quadVerts[1],
+                                                           quadVerts[2], quadVerts[0],
+                                                           quadVerts[2], quadVerts[3]};
+            constexpr std::uint32_t kNonIndexedVertex = 8;
+
+            const std::array<std::uint32_t, 6> quadIdx = {0, 1, 2, 0, 2, 3};
+            const std::array<std::uint32_t, 3> triIdx = {0, 1, 2};
+            const std::array<std::uint16_t, 6> idx16 = {0, 1, 2, 0, 2, 3};
+            constexpr VkDeviceSize kTriIdxOffset = sizeof(quadIdx);
+            constexpr VkDeviceSize kIndex16Offset = 3u * sizeof(quadIdx);
+
+            sb.globalVertexBuffer.write(0, quadVerts.data(), sizeof(quadVerts));
+            sb.globalVertexBuffer.write(sizeof(quadVerts), quadVerts.data(),
+                                        sizeof(quadVerts));
+            sb.globalVertexBuffer.write(2u * sizeof(quadVerts), nonIndexedVerts.data(),
+                                        sizeof(nonIndexedVerts));
+
+            /*
+            constexpr void write(std::size_t offset, const void *src,
+                                std::size_t size) noexcept
+            {
+                assert(offset + size <= capacity); // 不需要 vkFlushMappedMemoryRanges：HOST_COHERENT 保证自动可见
+                std::memcpy(static_cast<char *>(buffer.mapPtr()) + offset, src, size);
+            }
+            */
+            sb.globalIndexBuffer.write(0, quadIdx.data(),
+                                       sizeof(quadIdx)); // 偏移 0，24 字节
+            sb.globalIndexBuffer.write(kTriIdxOffset, triIdx.data(),
+                                       sizeof(triIdx)); // 偏移 24，12 字节
+            sb.globalIndexBuffer.write(kIndex16Offset, idx16.data(),
+                                       sizeof(idx16)); // 偏移 72，12 字节
+
+            // UBO 两边都写：descriptor set 切换 case 会用到另一帧的 set。
+            // cameraInfo[1] 故意带一点位移，给“partial push cameraIndex”case 看出差别。
             UniformBufferObject ubo{};
             ubo.cameraInfo[0].view = glm::mat4(1.0F);
             ubo.cameraInfo[0].proj = glm::mat4(1.0F);
             ubo.cameraInfo[1] = ubo.cameraInfo[0];
-            std::memcpy(uniformBuffers[currentFrame].mapPtr(), &ubo, sizeof(ubo));
-
-            constexpr std::uint32_t shape_count = 4;
-            constexpr std::uint32_t fill_count = 2;
-            constexpr VkDeviceSize fill_offset = sizeof(shader_data::Shape) * shape_count;
-
-            std::array<shader_data::Shape, shape_count> shapes{};
-            const ui_dao::view view{W, H};
-            for (std::uint32_t i = 0; i < shape_count; ++i)
-            {
-                const float x = 80.0F + static_cast<float>(i) * 150.0F;
-                const float y = 90.0F + static_cast<float>(i % 2) * 130.0F;
-                shapes[i] =
-                    ui_dao::sdf_shape(ui_dao::rect_px{x, y, 120.0F, 90.0F}, view, 18.0F,
-                                      glm::vec4(0.95F, 0.45F, 0.15F, 1.0F));
-                shapes[i].hover_fn = 0xFFFFFFFFu;
-            }
-
-            const std::array<glm::vec2, 3> triangle = {
-                glm::vec2{0.5F, 0.0F}, glm::vec2{0.0F, 1.0F}, glm::vec2{1.0F, 1.0F}};
-            std::array<shader_data::PathFill, fill_count> fills{};
-            for (std::uint32_t i = 0; i < fill_count; ++i)
-            {
-                fills[i] = ui_dao::path_fill(
-                    ui_dao::rect_px{760.0F + static_cast<float>(i) * 140.0F, 420.0F,
-                                    120.0F, 120.0F},
-                    view, std::span{triangle}, glm::vec4(0.20F, 0.75F, 0.95F, 1.0F));
-            }
-
-            sb.globalVertexBuffer.write(0, quadVerts.data(), sizeof(quadVerts));
-            sb.globalIndexBuffer.write(0, quadIdx.data(), sizeof(quadIdx));
-            sb.globalHeapBuffer.write(0, shapes.data(), sizeof(shapes));
-            sb.globalHeapBuffer.write(fill_offset, fills.data(), sizeof(fills));
-            const std::array<shader_data::CommandConstant, 2> constants = {
-                shader_data::CommandConstant{.program = 0, .address_offset = 0},
-                shader_data::CommandConstant{
-                    .program = 1,
-                    .address_offset = static_cast<std::uint32_t>(fill_offset)}};
-            sb.commandConstantsBuffer.write(0, constants.data(), sizeof(constants));
-
-            PushData pc{};
-            pc.vertexAddress = sb.globalVertexBuffer.address;
-            pc.instanceAddress = sb.globalHeapBuffer.address;
-            pc.commandConstantsAddress = sb.commandConstantsBuffer.address;
-            pc.cameraIndex = 0;
-            pc.renderVersion = 0;
+            ubo.cameraInfo[1].view =
+                glm::translate(glm::mat4(1.0F), glm::vec3(0.0F, 0.08F, 0.0F));
+            for (auto &ub : uniformBuffers)
+                std::memcpy(ub.mapPtr(), &ubo, sizeof(ubo));
 
             const bool hasStencil = mainCtx.depthResourcesBuild.hasStencilComponent();
             const VkImageAspectFlags depthAspect =
                 hasStencil ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
                            : VK_IMAGE_ASPECT_DEPTH_BIT;
 
+            // ── 共享 layout transition：全部从 UNDEFINED 进入 attachment layout ──
             my_render::transition_image_layout(
                 commandBuffer,
                 my_render::image_info{
@@ -10058,7 +10293,7 @@ try
                             .stage_mask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                                           VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT}});
 
-            VkRenderingAttachmentInfo color0{
+            VkRenderingAttachmentInfo color0_clear{
                 .sType = sType<VkRenderingAttachmentInfo>(),
                 .imageView = mainCtx.msaaResource.imageView(),
                 .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -10068,7 +10303,7 @@ try
                 .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
                 .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
                 .clearValue = {.color = {.float32 = {0.05F, 0.06F, 0.08F, 1.0F}}}};
-            VkRenderingAttachmentInfo color1{
+            VkRenderingAttachmentInfo color1_clear{
                 .sType = sType<VkRenderingAttachmentInfo>(),
                 .imageView = pickCtx.pickResource.imageView(),
                 .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -10078,8 +10313,7 @@ try
                 .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
                 .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
                 .clearValue = {.color = {.uint32 = {0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 0u}}}};
-            std::array attachments = {color0, color1};
-            VkRenderingAttachmentInfo depthAttachment{
+            VkRenderingAttachmentInfo depth_clear{
                 .sType = sType<VkRenderingAttachmentInfo>(),
                 .imageView = mainCtx.depthResource.imageView(),
                 .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -10087,45 +10321,2357 @@ try
                 .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
                 .clearValue = {.depthStencil = {.depth = 1.0F, .stencil = 0u}}};
 
-            commandBuffer.beginRendering(
-                {.sType = sType<VkRenderingInfo>(),
-                 .renderArea = {.offset = {.x = 0, .y = 0}, .extent = extent},
-                 .layerCount = 1,
-                 .viewMask = 0,
-                 .colorAttachmentCount = static_cast<std::uint32_t>(attachments.size()),
-                 .pColorAttachments = attachments.data(),
-                 .pDepthAttachment = &depthAttachment,
-                 .pStencilAttachment = hasStencil ? &depthAttachment : nullptr});
+            const std::array attachments_clear = {color0_clear, color1_clear};
+            VkRenderingAttachmentInfo color0_load = color0_clear;
+            color0_load.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            VkRenderingAttachmentInfo color1_load = color1_clear;
+            color1_load.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            VkRenderingAttachmentInfo depth_load = depth_clear;
+            depth_load.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            const std::array attachments_load = {color0_load, color1_load};
 
-            const VkViewport viewport{0.0F, 0.0F, W, H, 0.0F, 1.0F};
-            const VkRect2D scissor{{0, 0}, extent};
-            commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                       *mainCtx.pipelineOpaqueUI);
-            commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                             *pipelineLayout, 0, 1, &descriptorSet, 0,
-                                             nullptr);
-            commandBuffer.setViewport(0, std::span{&viewport, 1});
-            commandBuffer.setScissor(0, std::span{&scissor, 1});
-            commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
-                                          VK_INDEX_TYPE_UINT32);
-            // Shape：4 个实例
-            pc.commandConstantsAddress = sb.commandConstantsBuffer.address;
-            commandBuffer.pushConstants(*pipelineLayout,
-                                        VK_SHADER_STAGE_VERTEX_BIT |
-                                            VK_SHADER_STAGE_FRAGMENT_BIT,
-                                        0, sizeof(PushData), &pc);
-            commandBuffer.drawIndexed(6, shape_count, 0, 0, 0);
+            VkRenderingInfo info_clear{
+                .sType = sType<VkRenderingInfo>(),
+                .renderArea = {.offset = {.x = 0, .y = 0}, .extent = extent},
+                .layerCount = 1,
+                .viewMask = 0,
+                .colorAttachmentCount =
+                    static_cast<std::uint32_t>(attachments_clear.size()),
+                .pColorAttachments = attachments_clear.data(),
+                .pDepthAttachment = &depth_clear,
+                .pStencilAttachment = hasStencil ? &depth_clear : nullptr};
+            VkRenderingInfo info_load = info_clear;
+            info_load.colorAttachmentCount =
+                static_cast<std::uint32_t>(attachments_load.size());
+            info_load.pColorAttachments = attachments_load.data();
+            info_load.pDepthAttachment = &depth_load;
+            info_load.pStencilAttachment = hasStencil ? &depth_load : nullptr;
+            VkRenderingInfo info_suspend = info_load;
+            info_suspend.flags = VK_RENDERING_SUSPENDING_BIT;
+            VkRenderingInfo info_resume = info_load;
+            info_resume.flags = VK_RENDERING_RESUMING_BIT;
 
-            // PathFill：2 个实例
-            pc.commandConstantsAddress =
-                sb.commandConstantsBuffer.address + sizeof(shader_data::CommandConstant);
-            commandBuffer.pushConstants(*pipelineLayout,
-                                        VK_SHADER_STAGE_VERTEX_BIT |
-                                            VK_SHADER_STAGE_FRAGMENT_BIT,
-                                        0, sizeof(PushData), &pc);
-            commandBuffer.drawIndexed(6, fill_count, 0, 0, 0);
+            // 共享 memory barrier：只在 scope 之间建立 RAW/WAW；没有 layout 变化。
+            // 同一个 VkDependencyInfo 也会被 case [14] 在 scope 内复用。
+            VkMemoryBarrier2 scope_mb{
+                .sType = sType<VkMemoryBarrier2>(),
+                .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                .dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
+            VkDependencyInfo scope_dep{.sType = sType<VkDependencyInfo>(),
+                                       .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT,
+                                       .memoryBarrierCount = 1,
+                                       .pMemoryBarriers = &scope_mb};
+
+            constexpr std::uint32_t kCols = 6;
+            constexpr std::uint32_t kRows = 4;
+            // 语料安全区：这台机器的 GLFW client 是 1024×640，swapchain 仍是
+            // 1280×800；把所有 tile 放在左上 1024×640，保证 24 个 case 同屏可见。
+            // 不是工程布局，只是让素材在 DPI 缩放下不被裁掉。
+            const std::uint32_t gridW = std::min<std::uint32_t>(extent.width, 1024u);
+            const std::uint32_t gridH = std::min<std::uint32_t>(extent.height, 640u);
+            const std::uint32_t tw = gridW / kCols;
+            const std::uint32_t th = gridH / kRows;
+            const auto tile = [&](std::uint32_t i) -> VkRect2D {
+                return {{static_cast<std::int32_t>((i % kCols) * tw),
+                         static_cast<std::int32_t>((i / kCols) * th)},
+                        {tw, th}};
+            };
+            const auto inset = [](const VkRect2D &r, float m) -> ui_dao::rect_px {
+                return {static_cast<float>(r.offset.x) + m,
+                        static_cast<float>(r.offset.y) + m,
+                        static_cast<float>(r.extent.width) - 2.0F * m,
+                        static_cast<float>(r.extent.height) - 2.0F * m};
+            };
+            const auto half = [](const VkRect2D &r, bool right) -> ui_dao::rect_px {
+                const float m = 12.0F;
+                const float w = (static_cast<float>(r.extent.width) - 3.0F * m) * 0.5F;
+                const float x =
+                    static_cast<float>(r.offset.x) + m + (right ? w + m : 0.0F);
+                return {x, static_cast<float>(r.offset.y) + 32.0F, w,
+                        static_cast<float>(r.extent.height) - 64.0F};
+            };
+
+            // NOTE: A 组 证明 一个 [beginRendering,endRendering] 可以做下面很多事情。16个例子
+            // ════════════════════════════════════════════════════════════════
+            // A 组：cases [00]..[16], [22], [23] 共用一个 render scope。
+            //       begin 在这里，end 在 [23] 之后。
+            //       这样每个 case 的 {} 只展示“该 case 相对共享设置多出来的 C API”，
+            //       不会把 begin/end 重复 20 遍；需要独立 scope 的 case 在 B 组。
+            // ════════════════════════════════════════════════════════════════
+            commandBuffer.beginRendering(info_clear);
+            // 这里所有 Shape 的 model 都是按整张 1280×800 的 NDC 算的；
+            // 因此常规 viewport 必须保持整屏，靠 scissor 把绘制裁到 tile。
+            // 若把 viewport 也设成 tile，NDC 会被二次缩放，形状会缩成 tile 的小角落。
+            const VkViewport full_vp{0.0F, 0.0F, W, H, 0.0F, 1.0F};
+
+            // ────────────────────────────────────────────────────────────────
+            // [00] 基线：一个 scope / 一条 pipeline / 一个 set / 一条 indexed draw
+            // C API: BeginRendering(共享) → BindPipeline → BindDescriptorSets →
+            //        SetViewport → SetScissor → BindIndexBuffer →
+            //        PushConstants → DrawIndexed(6,1) → EndRendering(共享)
+            // 排列组合：所有状态都只出现一次，单实例。
+            // 分离：不需要；这是后面每个 case 的对照。
+            // NOTE: [comments/ability3-0.png]
+            // 大背景灰	quad 外（tile 内、inset 24px 外）	不执行（光栅化外）	保持 clear color (0.05, 0.06, 0.08) // #3F4550
+            // sdf外部默认 vec4 result = vec4(0.0);
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(0);
+                const VkViewport vp = full_vp;
+                auto s = ui_dao::sdf_shape(inset(area, 24.0F), view, 18.0F,
+                                           glm::vec4(0.95F, 0.45F, 0.15F, 1.0F));
+                const std::uint32_t heap = add_shape(s);
+                const std::uint32_t cst = add_const(0u, heap);
+                const shader_data::PushData pc = pc_at(cst, 0u);
+
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaqueUI);
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                                 nullptr);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+
+                // NOTE: 推送常量 + BDA 传递了 顶点基地址
+                // NOTE: 顶点通过BDA: base_pc.vertexAddress = sb.globalVertexBuffer.address;
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc), &pc);
+
+                // NOTE: 不用 BDA 而用 bindIndexBuffer
+                // NOTE: sb.globalIndexBuffer.write 上面初始化过来
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                //                               └─ VkBuffer handle ─┘           offset=0  type=UINT32
+
+                /*
+                隐变量	            值	        来源
+                gl_DrawIDARB	    0	        直接 draw
+                gl_InstanceIndex	0	        firstInstance=0, count=1
+                gl_BaseVertexARB	0	        vertexOffset=0
+                gl_VertexIndex	    [0,1,2,0,2,3]	index[firstIndex+i] + vertexOffset
+                gl_PrimitiveID =    0（三角形 1）/ 1（三角形 2） //   gl_PrimitiveID  —— vertex 阶段不可读，仅 fragment 可用
+                */
+                //constexpr void drawIndexed(uint32_t indexCount, uint32_t instanceCount,
+                //    uint32_t firstIndex, int32_t vertexOffset,
+                //    uint32_t firstInstance) const noexcept
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                //                        │  │  │  │  │
+                //                        │  │  │  │  └─ firstInstance = 0
+                //                        │  │  │  └──── vertexOffset  = 0
+                //                        │  │  └─────── firstIndex    = 0
+                //                        │  └────────── instanceCount = 1
+                //                        └───────────── indexCount    = 6
+
+                // GPU 展开（Vulkan 规范）：
+                // gl_VertexIndex   = indexBuffer[firstIndex + i] + vertexOffset
+                //                  = quadIdx[0 + i] + 0
+                //                  = [0, 1, 2, 0, 2, 3][0 + i] + 0
+
+                /*
+                // 顶点着色器：
+                //NOTE: 全局输出部分： 
+                layout(location = 0) out vec4 fragColor;//NOTE:没有flat ，自动生成插值数据
+                layout(location = 1) out vec2 fragTexCoord;
+                layout(location = 2) flat out uint program; // 硬要求：插值会让 switch 失效
+                layout(location = 3) flat out uint64_t instancePtr;// 硬要求：插值 = 垃圾地址 → 崩
+                layout(location = 4) out vec2 localPos;
+                layout(location = 5) flat out uint instanceId;
+
+                // NOTE: main 内部：
+                void main()
+                {
+                    fragColor = vec4(1.0);// NOTE: 顶点色输出的默认值（white），case 内会被实例 colors 覆盖
+                    fragTexCoord = vec2(0.0);
+                    mat4 model = mat4(1.0);
+                    vec3 pos = vec3(0.0);
+                    localPos = vec2(0.0);
+
+                    CommandConstBuffer cmdConsts = CommandConstBuffer(pc.commandConstantsAddress);
+                    CommandConstant cc = cmdConsts.consts[gl_DrawIDARB];//NOTE: 取出这个命令关联的偏移量+类型
+                    program = cc.program;
+                    instanceId = gl_InstanceIndex;// NOTE: 实例索引（0..instanceCount-1），不是 index buffer 的索引
+                    uint64_t heapBaseStart = pc.dataAddress + cc.address_offset;//NOTE: 解析出本次多实例的起始地址
+                    CameraInfo cam = ubo.cameraInfo[pc.cameraIndex];
+
+                    VertexBuffer vertBuf = VertexBuffer(pc.vertexAddress);
+                    VertexData v = vertBuf.vertices[gl_VertexIndex];// NOTE: 取出顶点数据
+
+                    switch (program)
+                    {
+                    case PROGRAM_SHAPE: {
+                        instancePtr = heapBaseStart + gl_InstanceIndex * SHAPE_SIZE;// NOTE: 本实例行绝对地址
+                        Shape inst = ShapeBuffer(instancePtr).shapes[0];
+                        model = inst.model;
+                        // NOTE: 永远等于 index[firstIndex + i]，不管 firstIndex/vertexOffset 是多少
+                        // gl_VertexIndex    = indexBuffer[firstIndex + i] + vertexOffset      ← 规范
+                        // gl_BaseVertexARB  = vertexOffset                                    ← 规范
+                        // ─────────────────────────────────────────────────────────────────
+                        // 相减：localVertexIndex = indexBuffer[firstIndex + i]                ← 与 vertexOffset 无关
+                        uint localVertexIndex = gl_VertexIndex - gl_BaseVertexARB;
+                        fragColor = inst.colors[localVertexIndex];// NOTE: 取出当前顶点的颜色。保证安全
+
+                        bool hasShadow = (inst.effects & FX_SHADOW) != 0u;
+                        vec2 expand = vec2(1.0);
+                        if (hasShadow)
+                        {
+                            vec2 cardHalf = max(inst.px_size * 0.5, vec2(1.0));
+                            float blur = max(inst.blur_px, 0.5);
+                            vec2 shadowHalf = cardHalf * max(inst.spread, 0.0);
+                            vec2 offset = inst.shadow_offset_px;
+                            vec2 margin = max(shadowHalf + blur + abs(offset) - cardHalf, vec2(0.0));
+                            margin += vec2(0.5); // AA
+                            expand = (cardHalf + margin) / cardHalf;
+                        }
+                        localPos = v.pos.xy * expand;//NOTE: 本地位置
+                        pos.xy = v.pos.xy * expand;// NOTE: 模型空间位置（待 model / view / proj 变换）
+                    }
+                    ...
+                    }
+                    mat4 mvp = cam.proj * cam.view * model;
+                    gl_Position = mvp * vec4(pos, 1.0);
+                }
+                */
+
+                /*
+                // NOTE: 片段着色器。 SDF 绘制。直接使用顶点传递过来的即可，几乎没什么好说的。SDF外部和内部的颜色都能定义
+                // ── 机制 0：Shape（SDF；fill / border / shadow 参数）────────────────
+                case PROGRAM_SHAPE: {
+                    Shape inst = ShapeBuffer(instancePtr).shapes[0];
+                    vec2 pPx = (localPos + 0.5) * inst.px_size;
+                    outColor = drawShape(inst, pPx, fragColor);
+                    outPicking = uvec4(program, inst.entity_index, packed_z, inst.hover_fn);
+                }
+                */
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [01] 多实例：同一状态，instanceCount 1→4
+            // C API: SetViewport → SetScissor → PushConstants →
+            //        DrawIndexed(6,4,0,0,0)
+            //        （pipeline/set/index 沿用 [00]；begin/end 是 A 组共享的）
+            // 位置：tile(1) 顶行第二格；代码标记 const VkRect2D area = tile(1);
+            //       和 for (i < 4) 的 2×2 排布。
+            //
+            // CPU 侧（数据怎么排）：
+            //   add_shape() 连续写 4 行，每行 248 B：
+            //     heap + 0*248 = Shape0
+            //     heap + 1*248 = Shape1
+            //     heap + 2*248 = Shape2
+            //     heap + 3*248 = Shape3
+            //   add_const(0u, heap) 只写 1 条
+            //   CommandConstant{program=0, address_offset=heap}；
+            //   pc_at(cst,1u) 把 commandConstantsAddress 指到这条常量，
+            //   renderVersion=1 只影响拾取打包，不影响几何。
+            //   注意 heap 是“首行字节偏移”，不是每实例一个常量；4 行共用同一条命令。
+            //
+            // 与 [00] 的差别：
+            //   [00] instanceCount=1 → gl_InstanceIndex 只有 0，instancePtr 永远落在 Shape0；
+            //   [01] instanceCount=4 → gl_InstanceIndex=0..3，instancePtr 按 +i*248 走完 4 行。
+            //   pipeline / descriptor set / index buffer 都没变（沿用 [00]），所以这四份
+            //   几何的差异只来自“实例行”，不是来自额外的 bind/push。
+            //
+            // NOTE: Draw 参数（只标变化）：
+            //   drawIndexed(6, 4, 0, 0, 0);
+            //                │  └ instanceCount 1→4
+            //                └ indexCount 仍是 6
+            //   firstIndex=0、vertexOffset=0、firstInstance=0 都没变。
+            //
+            // 隐变量 / 偏移：
+            //   gl_DrawIDARB = 0                 仍然只有一条 CommandConstant，不按实例变。
+            //   gl_InstanceIndex = 0,1,2,3       = firstInstance(0) + 实例序号；这是唯一
+            //                                    随实例变的量；若 firstInstance≠0 就从
+            //                                    该值起算，本 case 仍是 0。
+            //   gl_BaseVertexARB = 0             vertexOffset=0。
+            //   gl_VertexIndex = [0,1,2,0,2,3]   每个实例都一样（同一份 index buffer）。
+            //   gl_PrimitiveID = 0/1, 0/1, ...   每个实例都从 0 重新数（规范：PrimitiveId
+            //                                    reset between each instance），所以它不是
+            //                                    跨 4 个实例唯一的 id；如果要逐实例拾取，
+            //                                    拾取键还得带 entity_index/instanceId
+            //                                    （本语料没做）。
+            //
+            // 着色器端（回顾 [00] 的 main）：
+            //     cc = consts[gl_DrawIDARB];                    // 仍是 Shape 的那条常量
+            //     heapBaseStart = pc.dataAddress + cc.address_offset; // = base + heap
+            //     instancePtr = heapBaseStart + gl_InstanceIndex * SHAPE_SIZE; // + i*248
+            //     Shape inst = ShapeBuffer(instancePtr).shapes[0];
+            //   于是 model/colors/px_size 都从第 i 行取；4 个矩形的位置和颜色由
+            //   CPU 的 i%2 / i/2 以及每行 model 决定，shader 只是按实例行读。
+            //
+            // ── 合并能力（这套判据后面 case 直接复用，不再每条重写）──────────
+            // 一条 draw 能“吞掉”前面若干条 draw 的前提：
+            //   1. pipeline/layout/descriptor set 相同：fixed-function（blend/depth/
+            //      stencil/topology/rasterization）只能有一套；pipeline 是 batch key。
+            //      set 不同时，除非把数据统一到同一个 set，否则也不能合并。
+            //   2. dynamic state 相同：viewport/scissor/stencil ref/blend constants
+            //      等一条 draw 只有一份；不同就必须先统一。
+            //   3. index/vertex 输入相同：同一个 index buffer + offset + index type，
+            //      同一组 vertex buffer；Draw 和 DrawIndexed 是两条路径，不能直接合并。
+            //   4. draw 参数可表达：indexCount/firstIndex/vertexOffset 必须相同；
+            //      只有 instance 范围/数据可以变。若这些也变，走 DrawIndexedIndirect
+            //      （同一 pipeline/state，多条 VkDrawIndexedIndirectCommand）。
+            //      => 同 state、同这三个参数的相邻 drawIndexed 可以合成一条
+            //         instanced drawIndexed；不同 indexCount/firstIndex/vertexOffset
+            //         不能合成一条 drawIndexed，只能分开 draw 或走 indirect。
+            //   5. 实例数据可寻址：每个逻辑 draw 的数据必须能由
+            //      base + (firstInstance + i) * stride 找到，行连续、struct 相同。
+            //      我们的协议就是 address_offset + gl_InstanceIndex * SHAPE_SIZE。
+            //   6. CommandConstant 相同：直接 instanced draw 的 gl_DrawIDARB 恒为 0，
+            //      所有实例共用一条常量；要按 draw 换 program/address_offset，
+            //      只能走 indirect（gl_DrawID）或把 program 搬进实例数据。
+            //   7. 顺序合法：合并后的 instance 顺序必须等于原 draw 顺序。
+            //      Vulkan primitive order = submission > instance > vertex/index；
+            //      painter's order（透明/叠加）不能借合并重排；不透明可另说。
+            //   8. gl_PrimitiveID 每个 instance 从 0 重置；不能把它当跨实例唯一键。
+            //
+            // 具体到 [00]+[01]：
+            // NOTE:  [01] 内部 4 个实例**已经是合并后的形态**，不是 4 条 draw。
+            //   [00] 与 [01] 在当前语料**不能直接合并**：
+            //     - viewport/scissor 不同：tile(0) vs tile(1)，dynamic state 不统一；
+            //     - push 的 CommandConstant 不同：cst0 vs cst1，renderVersion 0 vs 1；
+            //     - 若硬合并，需要一条 draw 同时覆盖两个 tile，scissor 必须变大，
+            //       这会破坏“一格一个 case”的排版。
+            //   如果只做数据实验，理论上可以这样合并：
+            //     - viewport 用整屏，scissor 用覆盖 tile0+tile1 的大矩形；
+            //     - Shape0..Shape4 在 heap 里连续（本语料 [00] 写 1 行、[01] 写 4 行，
+            //       中间没有别的 Shape，正好连续）；
+            //     - 只保留一个 CommandConstant{program=0,address_offset=Shape0}，
+            //       以及一个 push（renderVersion 统一；若拾取要区分版本，把它搬进实例行）；
+            //     - 一条 drawIndexed(6,5,0,0,0)：instance 0 = [00]，1..4 = [01]，
+            //       每个实例的 model 已经写好各自的 tile 位置。
+            //   所以“能不能合并”不是 shader 能不能画，而是**状态 + 数据基址 + 顺序**
+            //   三件事同时成立；当前测试只排 API，暂时故意不合并。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(1);
+                const VkViewport vp = full_vp;
+                std::uint32_t heap = 0;
+                for (std::uint32_t i = 0; i < 4; ++i)
+                {
+                    const float x = static_cast<float>(area.offset.x) + 10.0F +
+                                    static_cast<float>(i % 2) * 78.0F;
+                    const float y = static_cast<float>(area.offset.y) + 18.0F +
+                                    static_cast<float>(i / 2) * 64.0F;
+                    auto s = ui_dao::sdf_shape(
+                        ui_dao::rect_px{x, y, 68.0F, 54.0F}, view, 12.0F,
+                        glm::vec4(0.95F - 0.12F * static_cast<float>(i),
+                                  0.35F + 0.12F * static_cast<float>(i), 0.20F, 1.0F));
+                    const std::uint32_t off = add_shape(s);
+                    if (i == 0)
+                        heap = off;
+                }
+                const std::uint32_t cst = add_const(0u, heap);
+                const shader_data::PushData pc = pc_at(cst, 1u);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc), &pc);
+
+                // NOTE: instanceCount = 4 这是多实例绘制。一个命令draw执行 4次。顶点着色器程序
+                commandBuffer.drawIndexed(6, 4, 0, 0, 0);
+                //                        │  │  │  │  │
+                //                        │  │  │  │  └─ firstInstance = 0
+                //                        │  │  │  └──── vertexOffset  = 0
+                //                        │  │  └─────── firstIndex    = 0
+                //                        │  └────────── instanceCount = 4
+                //                        └───────────── indexCount    = 6
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [02] 同状态，两条 draw，只改 firstInstance：0 → 1
+            // C API: SetViewport → SetScissor → PushConstants(一次) →
+            //        DrawIndexed(6,1,0,0,0) → DrawIndexed(6,1,0,0,1)
+            //        （pipeline/set/index 沿用 [00]/[01]；begin/end 是 A 组共享的）
+            // 位置：tile(2)，顶行第三格；左/右两个 Shape（half(area,false/true)）。
+            //
+            // 和 [01] 的对照：
+            //   [01] 一条 draw，instanceCount=4，gl_InstanceIndex=0..3；
+            //   [02] 两条 draw，各 instanceCount=1，gl_InstanceIndex=0 / 1。
+            //   两条 draw 的 pipeline/set/viewport/scissor/index/push 全同，
+            //   真正的差异只有 draw 的 firstInstance；这是“同一个状态、同一份
+            //   CommandConstant，靠 draw 参数切实例行”的最小例子。
+            //
+            // 数据/偏移（这里的 h0 不是 0）：
+            //   前面 [00] 1 行 + [01] 4 行已经占了 5*248；
+            //   [02] 再连续 add_shape 两行：
+            //     h0 = 5*248 = 1240（当前顺序下；前面 [00]/[01] 已写 5 行）
+            //     h1 = h0 + 248 = 1488（没有自己的 CommandConstant）
+            //   add_const(0u,h0) 只写一条 CommandConstant{program=0,address_offset=h0}；
+            //   pc_at(cst,2u) 把它指给本次 draw，renderVersion=2 只进拾取。
+            //   => cst 也不是 0；当前顺序下它是第 3 条常量（16 B）。
+            //   => 与 [01] 的 cst/pc 数值都变了（cst 8→16、heap 248→1240、
+            //      renderVersion 1→2），但结构没变，都是“本 case 自己造的数据”。
+            //
+            // 隐变量（两条 draw 各自重置）：
+            //   gl_DrawIDARB = 0            两条都是直接 draw，没有换 CommandConstant。
+            //   gl_InstanceIndex = 0 / 1    分别来自 firstInstance=0 / 1。
+            //   gl_BaseVertexARB = 0        vertexOffset=0，两条都一样。
+            //   gl_VertexIndex = [0,1,2,0,2,3]  两条都一样（同一份 index buffer）。
+            //   gl_PrimitiveID = 0/1        每条 draw 都从 0 重置，不是跨 draw 的唯一 id。
+            //
+            // 合并能力（引用 [01] 的判据）：
+            //   这两条 draw 完全满足合并条件：同 pipeline/set/viewport/scissor/index，
+            //   同 indexCount/firstIndex/vertexOffset，h0/h1 连续，且共用同一
+            //   CommandConstant。因此可以合成一条
+            //     drawIndexed(6,2,0,0,0)
+            //   gl_InstanceIndex=0/1 分别对应 h0/h1；这就是 [01] 的 2 实例版。
+            //   注意：合并后不能再按 draw 换 pc/cst；本 case 恰好不需要换。
+            //   与 [00]/[01] 合并仍不成立：viewport/scissor 是 tile(2)，cst/renderVersion
+            //   也不同；要合并先统一这些状态（详见 [01] 的 [00]+[01] 段）。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(2);
+                const VkViewport vp = full_vp;
+                // NOTE： half 分割了 area的空间。CPU分割的。两个SDF的原始空间等分相同
+                const std::uint32_t h0 =
+                    add_shape(ui_dao::sdf_shape(half(area, false), view, 16.0F,
+                                                glm::vec4(0.25F, 0.85F, 0.95F, 1.0F)));
+                const std::uint32_t h1 = add_shape(ui_dao::sdf_shape(
+                    half(area, true), view, 16.0F, glm::vec4(0.95F, 0.75F, 0.25F, 1.0F)));
+                // NOTE: h0/h1 是连续两行；h0 不是 0（当前顺序下 1240，h1=1488）。
+                //       cst 是第 3 条 CommandConstant（16 B），不是复用 [01] 的 cst；
+                //       这里只写一条常量，两条 draw 共用。
+                //       pc.instanceAddress 仍是 heapBase；真正指向 h0 的是
+                //       CommandConstant.address_offset=h0。
+                // NOTE:注意内部 ++constantCursor;。也就是add_const总是返回新的命令常量起始地址。其他add_XXX也类似，没有重复使用的
+                const std::uint32_t cst = add_const(0u, h0);
+                const shader_data::PushData pc = pc_at(cst, 2u);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                // NOTE: push 只发一次；下面两条 draw 共用 pc/cst，不换 CommandConstant。
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc), &pc);
+
+                // NOTE: 两条 draw 只有 firstInstance 变；gl_InstanceIndex 分别为 0/1，
+                //       于是 instancePtr 落到 h0/h1。pipeline/set/viewport/scissor/
+                //       index/push 全部不变。
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                //                        │  │  │  │  └─ firstInstance = 0
+                //                        │  │  │  └──── vertexOffset  = 0
+                //                        │  │  └─────── firstIndex    = 0
+                //                        │  └────────── instanceCount = 1
+                //                        └───────────── indexCount    = 6
+                //        gl_InstanceIndex=0 → instancePtr = h0 + 0*248 = h0
+                commandBuffer.drawIndexed(6, 1, 0, 0, 1);
+                //                        │  │  │  │  └─ firstInstance = 1
+                //                        │  │  │  └──── vertexOffset  = 0
+                //                        │  │  └─────── firstIndex    = 0
+                //                        │  └────────── instanceCount = 1
+                //                        └───────────── indexCount    = 6
+                //        gl_InstanceIndex=1 → instancePtr = h0 + 1*248 = h1
+
+                // NOTE: 两个draw 只有 draw的参数变化,我们的vulkan 提供了 drawIndexedIndirect 就是专门合批这样的
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [03] 同状态，两条 draw，各推一次 push constants
+            // C API: SetViewport → SetScissor →
+            //        PushConstants(pc0) → DrawIndexed(6,1,0,0,0) →
+            //        PushConstants(pc1) → DrawIndexed(6,1,0,0,0)
+            //        （pipeline/set/index 沿用 [00]..[02]；begin/end A 组共享）
+            // 位置：tile(3) 顶行第四格；half(area,false/true) 在 CPU 上把 tile 等分。
+            //
+            // NOTE: 和 [02] 的对照（最关键）：
+            //   [02] 两条 draw 只改 firstInstance，push 只发一次；
+            //   [03] 两条 draw 的 draw 参数完全相同，改的是 push 里的 CommandConstant。
+            //   => [02]：同一条命令，换实例行；[03]：同一条 draw，换命令常量。
+            //      这就是“per-draw push 是 draw 间硬边界”的最小例子。
+            //
+            // 数据/游标（[02] 已讲 add_* 每次 ++cursor，这里直接套）：
+            //   当前顺序下 [00]1 + [01]4 + [02]2 = 7 行，所以
+            //     h0 = 7*248 = 1736, h1 = h0 + 248 = 1984。
+            //   常量同理：前面 cst0/cst1/cst2 占 0/8/16，
+            //     c0 = 24, c1 = 32（c1 = c0 + 8）；两条都是新槽，不复用。
+            //   pc_at(c0,3) / pc_at(c1,3) 分别指到 c0/c1；renderVersion=3 只进拾取。
+            //
+            // CPU 的 half（[02] 已讲“等分/SDF 本地空间”，这里只补差异）：
+            //   两半都是 67×96，两个 Shape 的 px_size 相同；shader 里 localPos*px_size
+            //   的本地参数空间相同，唯一不同的是 model 平移，把等大的 SDF 放到左右。
+            //   所以两条 draw 的几何/着色器分支完全一样，只有 CommandConstant 不同。
+            //
+            // 隐变量（两条 draw 都是 0 基）：
+            //   gl_DrawIDARB = 0        两条都是直接 draw；push 变了，DrawID 仍是 0。
+            //   gl_InstanceIndex = 0    两条都 firstInstance=0，instanceCount=1。
+            //   gl_BaseVertexARB = 0    vertexOffset=0。
+            //   gl_VertexIndex = [0,1,2,0,2,3] 两条相同。
+            //   gl_PrimitiveID = 0/1    每条 draw 从 0 重置。
+            //   => 两条 instancePtr 都是 heapBaseStart + 0*248；让第二条落到 h1 的
+            //      是 cc1.address_offset=h1，不是 gl_InstanceIndex。
+            //
+            // 合并能力（引用 [01] 判据）：
+            //   两条 draw 的 pipeline/set/viewport/scissor/index/draw 参数全同，
+            //   但 PushConstants 不同，所以不能直接合成一条 instanced drawIndexed：
+            //   direct draw 的 gl_DrawIDARB 恒为 0，只有一套 push/CommandConstant。
+            //   两条路：
+            //     A. 改成 [02] 的 firstInstance 方案：只留
+            //        CommandConstant{program=0,offset=h0}，用 firstInstance=0/1
+            //        选 h0/h1，合成一条 drawIndexed(6,2,0,0,0)。
+            //        这要求 h0/h1 连续、同 program —— 本 case 满足。
+            //     B. 保持两条不同 CommandConstant：用一条
+            //        vkCmdDrawIndexedIndirect(count=2)，push 指向 CommandConstant[]
+            //        首地址；两条 VkDrawIndexedIndirectCommand 的 gl_DrawID=0/1
+            //        选 c0/c1。它是“per-draw 参数不同”时 Vulkan 提供的合批入口；
+            //        仍然是 2 条 indirect command，只是 1 条 C API。
+            //   => [03] 不能变成 1 条 drawIndexed；能变成
+            //      “1 条 drawIndexedIndirect(count=2)”或“退化后的 1 条 direct”。
+            //   与 [00]..[02] 合并仍不成立：tile(3) 的 scissor、c0/c1/renderVersion
+            //   都不同；跨 case 合并先统一这些（同 [01] 判据）。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(3);
+                const VkViewport vp = full_vp;
+                // NOTE: 同 [02] 的 half：CPU 等分 tile(3)；两半都是 67×96，
+                //       两个 Shape 的 px_size 相同，本地 SDF 空间相同，只有 model 平移不同。
+                //       add_shape 每次 ++shapeCursor；h0/h1 连续（当前 1736/1984）。
+                const std::uint32_t h0 =
+                    add_shape(ui_dao::sdf_shape(half(area, false), view, 16.0F,
+                                                glm::vec4(0.35F, 0.95F, 0.55F, 1.0F)));
+                const std::uint32_t h1 = add_shape(ui_dao::sdf_shape(
+                    half(area, true), view, 16.0F, glm::vec4(0.95F, 0.35F, 0.65F, 1.0F)));
+                // NOTE: add_const 每次 ++constantCursor，c0/c1 是两条新常量
+                //       （当前 24/32，c1=c0+8），不是复用同一条。
+                const std::uint32_t c0 = add_const(0u, h0);
+                const std::uint32_t c1 = add_const(0u, h1);
+                // NOTE: pc0/pc1 只有 commandConstantsAddress 不同（c0 vs c1）；
+                //       renderVersion 都是 3，instanceAddress/vertexAddress/cameraIndex 相同。
+                const shader_data::PushData pc0 = pc_at(c0, 3u);
+                const shader_data::PushData pc1 = pc_at(c1, 3u);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                // NOTE: push0 指向 c0；draw 参数与 [02] 相同，firstInstance=0。
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc0), &pc0);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                // NOTE: 这里换的是 push（state），不是 draw 参数；所以第二条必须重新 push。
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc1), &pc1);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                // NOTE: 两条 draw 的 draw 参数完全一样，只是 push 不同；
+                //       Vulkan 的合批入口是 vkCmdDrawIndexedIndirect(count=2)：
+                //       push 一次指向 CommandConstant[2] 首地址，gl_DrawID 选 c0/c1。
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // NOTE: 图像位于: [comments/ability3-1.png]
+            // [04] 同 scope 换 pipeline：opaqueUI → transparentUI
+            // C API: BindPipeline(opaque) → SetViewport → SetScissor → Push(pc0) →
+            //        DrawIndexed(6,1,0,0,0) → BindPipeline(transparent) →
+            //        Push(pc1) → DrawIndexed(6,1,0,0,0)
+            //        （set/index 沿用 [00]..[03]；begin/end A 组共享）
+            // 位置：tile(4) 顶行第五格；r0=(x+30,y+36,116,116)，
+            //       r1=(x+52,y+58,116,116)，两者重叠，r1 相对 r0 偏移 (22,22)。
+            //
+            // NOTE: 和 [03] 的对照：
+            //   [03] 两条 draw 的 pipeline 相同，只换 push/CommandConstant；
+            //   [04] 两条 draw 的 push 也不同，但真正的硬边界是 pipeline：
+            //       opaqueUI: blendEnable=OFF；transparentUI: blendEnable=ON。
+            //       这两条 pipeline 的 depth/stencil 都是 OFF，差别只在
+            //       colorBlendState.blendEnable；Vulkan 仍按 pipeline 状态区分，
+            //       不能跨 pipeline 合并。
+            //   => 这是“pipeline 是 batch key”的最小例子；不能靠一条 draw 或
+            //      一条 drawIndexedIndirect 跨 pipeline。
+            //
+            // 数据/偏移（当前顺序下）：
+            //   前面 [00]1+[01]4+[02]2+[03]2 = 9 行，
+            //     h0 = 9*248 = 2232, h1 = h0 + 248 = 2480。
+            //   常量前面已有 5 条（0/8/16/24/32），
+            //     c0 = 40, c1 = 48（c1 = c0 + 8）；都是新槽，不复用。
+            //   pc0/pc1 只有 commandConstantsAddress 不同；renderVersion=4 只进拾取。
+            //
+            // 重叠/painter's order：
+            //   r0 先画（opaque，橙，alpha=1），r1 后画（transparent，蓝，alpha=.55），
+            //   r1 的 model 向右下平移 (22,22)，所以重叠区是“蓝 0.55 over 橙”。
+            //   若交换两条 draw 或把透明放前面，结果会变；UI 是 painter's algorithm，
+            //   顺序不能为了合批而重排。
+            //
+            // 隐变量（两条 draw 都是 0 基）：
+            //   gl_DrawIDARB = 0   两条都是直接 draw；DrawID 不会因为 bindPipeline 变。
+            //   gl_InstanceIndex = 0  两条都 firstInstance=0，instanceCount=1。
+            //   gl_BaseVertexARB = 0；gl_VertexIndex = [0,1,2,0,2,3] 两条相同。
+            //   gl_PrimitiveID = 0/1  每条 draw 从 0 重置。
+            //   => instancePtr 都是 heapBaseStart + 0*248；第二条落到 h1 靠
+            //      cc1.address_offset=h1，不是 gl_InstanceIndex。
+            //
+            // 着色器/混合：
+            //   Shape 程序输出预乘色 vec4(rgb*a, a)；opaqueUI 直接写 attachment；
+            //   transparentUI 的 blend 是 (ONE, ONE_MINUS_SRC_ALPHA)，正好消费预乘色。
+            //   r1 的 a=0.55，所以重叠区 ≈ 0.55*蓝 + 0.45*橙；r0 的 a=1 不透明。
+            //   SDF 本地空间：r0/r1 的 px_size 都是 116x116，SDF 参数化相同，
+            //   只有 model 平移不同；不是两个不同 shader/不同 SDF。
+            //
+            // NOTE: 为什么橙色圆角外有黑角，蓝色透明圆角外没有？
+            //   drawShape() 在 SDF 外（fill/border/shadow 都没覆盖）返回 vec4(0,0,0,0)。
+            //   r0 用 opaqueUI（blendEnable=OFF）：这个 0 被直接写进 color attachment，
+            //     116×116 quad 的圆角外就是黑（alpha 被忽略/不参与混合）。
+            //   r1 用 transparentUI（blendEnable=ON）：src=(0,0,0,0) 时
+            //     dst*(ONE_MINUS_SRC_ALPHA) = dst*1，结果 = dst，
+            //     等于“不写”；所以蓝色 SDF 外保留橙色/背景，没有黑框。
+            //   两条 draw 的 program 都是 0（Shape），并不是 program id 不同；
+            //   差别在 pipeline 的 blendEnable + 实例 alpha。这是预乘 alpha 的经典坑：
+            //   “SDF 外输出 0” 在 opaque 下是黑色，在 blend 下才是“透明”。
+            //
+            // 合并能力（引用 [01] 判据）：
+            //   不能合并成一条 drawIndexed / drawIndexedIndirect：
+            //     pipeline 不同；indirect 的每条 command 仍用当前 pipeline，
+            //     gl_DrawID 只能选常量/数据，不能选 pipeline。
+            //   如果强行都用 transparentUI，r0 alpha=1 的颜色结果接近，但 SDF 边缘
+            //   的 coverage alpha <1 会走混合，和 opaqueUI 直接写 alpha 不同；
+            //   语义上不是同一个 pipeline，不能当作无损合并。
+            //   同 pipeline 时才可能像 [02] 那样用一条 drawIndexed(6,2) 合并。
+            //
+            // NOTE: 能不能不用两条 pipeline 实现同一效果？可以，而且通常更好：
+            //   1. 只用 transparentUI（预乘 alpha）：
+            //      橙色 a=1，内部结果 = src（dst*(1-1)=0），看起来仍是不透明；
+            //      蓝色 a=.55 正常 over；SDF 外 a=0，dst 不变 → 黑角自然消失。
+            //      代价：opaque 形状的 AA 边缘会和背景混合，而不是把 coverage
+            //      写进 alpha；若后面把 alpha 当遮罩，语义会不同。
+            //   2. 一条 pipeline + 动态 blend 状态（VK_EXT_extended_dynamic_state3
+            //      的 vkCmdSetColorBlendEnableEXT 等）：省掉 pipeline 对象，但仍是
+            //      两条 draw/两次状态切换，不能把 draw 合并。
+            //   3. 真正一条 draw：只用 transparentUI + 一个 CommandConstant + h0/h1
+            //      连续，firstInstance=0/1，drawIndexed(6,2,0,0,0)（[02] 的合并方式）；
+            //      橙色/蓝色的 alpha 由实例行决定。这是“无多 pipeline + 单 draw”答案。
+            //   所以本 case 的两条 pipeline 是刻意展示 pipeline 边界和黑角 artifact；
+            //   生产 UI 通常选 1 或 3，而不是为 blend enable 单独做两条 pipeline。
+            //
+            // 附加：bindPipeline(transparent) 后不用重绑 set/index：
+            //   两条 pipeline 的 layout 相同，descriptor set 兼容；viewport/scissor
+            //   由两条 pipeline 都声明为 dynamic，所以状态保持。若 pipeline 把
+            //   viewport/scissor 声明为 static，bind 会覆盖/使旧值失效，必须重设。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(4);
+                const VkViewport vp = full_vp;
+                // NOTE: r1 相对 r0 偏移 (22,22)，两个 116×116 重叠；
+                //       r0 先 opaque，r1 后 transparent，重叠区才看得到 alpha=0.55。
+                const ui_dao::rect_px r0{static_cast<float>(area.offset.x) + 30.0F,
+                                         static_cast<float>(area.offset.y) + 36.0F,
+                                         116.0F, 116.0F};
+                const ui_dao::rect_px r1{static_cast<float>(area.offset.x) + 52.0F,
+                                         static_cast<float>(area.offset.y) + 58.0F,
+                                         116.0F, 116.0F};
+                // NOTE: add_shape/add_const 都是 ++cursor；当前 h0/h1=2232/2480，
+                //       c0/c1=40/48（前面 5 条常量），不是复用前面的槽。
+                const std::uint32_t h0 = add_shape(ui_dao::sdf_shape(
+                    r0, view, 20.0F, glm::vec4(0.95F, 0.55F, 0.15F, 1.0F)));
+                const std::uint32_t h1 = add_shape(ui_dao::sdf_shape(
+                    r1, view, 20.0F, glm::vec4(0.20F, 0.55F, 0.95F, 0.55F)));
+                const std::uint32_t c0 = add_const(0u, h0);
+                const std::uint32_t c1 = add_const(0u, h1);
+                // NOTE: pc0/pc1 只差 commandConstantsAddress；renderVersion 都是 4。
+                const shader_data::PushData pc0 = pc_at(c0, 4u);
+                const shader_data::PushData pc1 = pc_at(c1, 4u);
+
+                // NOTE: 第一条用 opaqueUI（blend OFF）；这是和 [03] 之前相同的 pipeline。
+                //       这条 bind 理论上可省（[03] 末尾就是 opaque），保留让片段自包含。
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaqueUI);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc0), &pc0);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+
+                // NOTE: pipeline 是 batch key：这里换成 transparentUI（blend ON）。
+                //       后面这条不能和前面的 opaque draw 合成一条 draw/indirect。
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineTransparentUI);
+                // NOTE: set/index 不用重绑（layout 兼容、状态保持）；但 push 换了 c1。
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc1), &pc1);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                // NOTE: 两条 draw 参数相同，但 pipeline 不同；vkCmdDrawIndexedIndirect
+                //       也不能跨 pipeline（它只复用当前 pipeline）。
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [05] 同 scope 换 descriptor set：frame N → frame N+1
+            // C API: SetViewport → SetScissor → BindDescriptorSets(A) →
+            //        PushConstants(一次) → DrawIndexed(6,1,0,0,0) →
+            //        BindDescriptorSets(B) → DrawIndexed(6,1,0,0,1)
+            //        （pipeline/index 沿用 [00]..[04]；begin/end A 组共享）
+            // 位置：tile(5) 顶行第六格；左/右两个 Shape（half 等分）。
+            // NOTE: 运行当前程序可见：tile(5) 左黄、右青两块；因为两个 UBO
+            //       内容相同，set A→B 本身不改变像素，肉眼看到的是 h0/h1 两行。
+            //
+            // NOTE: 和 [02]/[03] 的对照：
+            //   [02] 只换 firstInstance；[03] 换 push/CommandConstant；
+            //   [05] 换 descriptor set（UBO 来源）。draw 参数仍只有
+            //   firstInstance=0/1，push 也仍是一次；区别只在 set 句柄。
+            //
+            // 数据/偏移（当前顺序下）：
+            //   前面 [00]1+[01]4+[02]2+[03]2+[04]2 = 11 行，
+            //     h0 = 11*248 = 2728, h1 = h0 + 248 = 2976。
+            //   常量前面已有 7 条（0..48），cst = 56；只写一条，两条 draw 共用。
+            //   pc_at(cst,5u) 的 renderVersion=5；firstInstance=0/1 仍是唯一
+            //   选择 h0/h1 的 draw 参数。
+            //
+            // descriptor set 细节：
+            //   descriptorSet = descriptorSets[currentFrame];
+            //   descriptorSetAlternate = descriptorSets[(currentFrame+1)%2];
+            //   两个句柄的 layout 相同（同一个 pipelineLayout/set0），但绑定的是
+            //   不同的 uniformBuffers[i]。本 case 把两个 UBO 都写成同一个 ubo
+            //   （cameraInfo[0] identity），所以两条 draw 的像素应完全相同；
+            //   这是“API 边界”用例，不是视觉差异用例。
+            //   如果两个 UBO 真不同（cameraInfo 平移/缩放），第二条才会换相机；
+            //   当前故意相同，便于只观察 set 的绑定顺序。
+            //
+            // 隐变量（两条 draw 都是 0 基）：
+            //   gl_DrawIDARB = 0   两条；gl_InstanceIndex = 0/1（firstInstance）；
+            //   gl_BaseVertexARB = 0；gl_VertexIndex = [0,1,2,0,2,3] 相同；
+            //   gl_PrimitiveID = 0/1 每条重置。
+            //   => instancePtr=h0/h1 仍由 firstInstance 选，set 不影响实例行；
+            //      UBO 只影响 cameraInfo，不影响 CommandConstant/instancePtr。
+            //
+            // 合并能力（引用 [01] 判据）：
+            //   两条 draw 的 pipeline/index/viewport/scissor/push/draw 参数全同，
+            //   但 descriptor set 不同 -> 不能合并成一条 draw / drawIndexedIndirect；
+            //   indirect 的每条 command 仍使用当前绑定的 set，gl_DrawID 不能选 set。
+            //   如果两个 set 内容真相同，这次 bind B 本身是冗余的；生产代码应做
+            //   set 去重，直接沿用 A。若内容不同，要么：
+            //     - 用同一个 set + bindless/SSBO 数组，把 per-instance UBO 数据
+            //       放进 buffer，shader 用 gl_InstanceIndex 索引；这样一条 draw
+            //       可覆盖两个实例；
+            //     - 或用同一个 set + dynamic offset，但 dynamic offset 是 draw state，
+            //       仍需两条 draw，不能靠它合并。
+            //   所以 [05] 的 API 排列不能合并成 1 条；能优化的是“不要 bind 冗余的 B”。
+            //
+            // 附加：bindDescriptorSets 之后，pipeline/viewport/scissor/index/push
+            //   都不变；只有 set0 绑定变了。set 的寿命到被 disturb 为止；这里
+            //   layout 兼容，不会 disturb 其他 set。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(5);
+                const VkViewport vp = full_vp;
+                // NOTE: h0/h1 连续（当前 2728/2976）；cst=56；
+                //       两个 Shape 共用同一条 CommandConstant 和同一次 push。
+                const std::uint32_t h0 =
+                    add_shape(ui_dao::sdf_shape(half(area, false), view, 16.0F,
+                                                glm::vec4(0.95F, 0.85F, 0.35F, 1.0F)));
+                const std::uint32_t h1 = add_shape(ui_dao::sdf_shape(
+                    half(area, true), view, 16.0F, glm::vec4(0.40F, 0.95F, 0.95F, 1.0F)));
+                const std::uint32_t cst = add_const(0u, h0);
+                const shader_data::PushData pc = pc_at(cst, 5u);
+
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                // NOTE: set A = 当前帧 UBO；push 一次覆盖两条 draw。
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                                 nullptr);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc), &pc);
+                // NOTE: firstInstance=0 → h0，使用 set A 的 frame N UBO。
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+
+                // NOTE: 只换 set0；pipeline/index/viewport/scissor/push 都不变。
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1,
+                                                 &descriptorSetAlternate, 0, nullptr);
+                // NOTE: firstInstance=1 → h1，使用 set B 的 frame N+1 UBO。
+                //       但两个 UBO 内容相同，所以像素应相同；这是 API 边界用例。
+                commandBuffer.drawIndexed(6, 1, 0, 0, 1);
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [06] 同 scope 换 viewport：整屏 viewport → 右移 70px 的 viewport
+            // NOTE: 图像位于: [comments/ability3-2.png]
+            // NOTE: [06] 的核心是 viewport 平移，不是换数据.两条 draw 的 draw 参数、CommandConstant、heap 行完全一样；唯一变化是 viewport
+            // NOTE: [06]/[07] 使用同一个 Rect/渐变/边框：
+            //       [06] 画两份完整的；[07] 用 scissor 只裁两个角窗。
+            //       所以 [06] 是“完整”，[07] 是“裁剪”，两者一起看。
+            //
+            // NOTE: 只有一个 add_shape，为什么画面像“两个实例”？
+            //   不是 instancing！这里发了 **两次 vkCmdDrawIndexed**，每次
+            //   instanceCount=1、firstInstance=0，所以 gl_InstanceIndex 两次都是 0；
+            //   instancePtr 两次都指向同一行 Shape。也就是说：
+            //     “画两遍同一份数据”，不是“一份数据画两个实例”。
+            //   第二次看起来移动了，是因为两次 draw 之间改了 viewport：
+            //     NDC 顶点 gl_Position 完全没变；viewport 只改 NDC→像素的映射：
+            //       x_px = viewport.x + (x_ndc + 1) * 0.5 * viewport.width
+            //     viewport A x=0  → shape 在 x20..90
+            //     viewport B x=70 → 同一 NDC 整体 +70px → x90..160
+            //   shape 宽 70、tile(6) 宽 170，所以两份都完整落在 tile 内；
+            //   这次故意不裁，方便和 [07] 的裁剪对比。
+            //   若真是多实例：[01] 那样 instanceCount>1，一次 draw 内
+            //   gl_InstanceIndex=0/1 去选不同 heap 行；这里没有那条路径。
+            //
+            // NOTE: 运行当前程序：tile(6) 是两个完整的渐变圆角矩形，
+            //       左右相邻（粉红→青蓝，带亮边框）。pipeline 是 [04] 的
+            //       transparentUI，所以 SDF 外没有 [04] 的黑角。
+            // C API: SetScissor → SetViewport(A) → Push(pc) → DrawIndexed →
+            //        SetViewport(B, x+70) → DrawIndexed
+            //        （没有 bindPipeline/bindSet/bindIndex：pipeline 沿用 [04]，
+            //          set0 沿用 [05] 的 B，index 沿用 [00]；begin/end A 共享）
+            // 位置：tile(6) 第二行第一格；完整 Rect = (x+20,y+30,70x100)，radius=18。
+            //
+            // NOTE: 和前面 case 的对照：
+            //   [02]/[05] 靠 draw 参数/descriptor set 选数据；[06] 靠 viewport 变换。
+            //   viewport A 全屏 → shape 在 x20..90；
+            //   viewport B x=70 → 同一 model 平移到 x90..160；
+            //   两拷贝都完整，scissor 仍是 tile(6) 全区域，没有裁切。
+            //   两条 draw 的 draw 参数、CommandConstant、heap 行完全一样，
+            //   唯一变化是 viewport。
+            //
+            // 数据/偏移：
+            //   前面 [00]1+[01]4+[02]2+[03]2+[04]2+[05]2 = 13 行，
+            //     heap = 13*248 = 3224；本 case 只写 1 行。
+            //   常量前面 8 条（0..56），cst = 64；pc_at(cst,6u) 的 renderVersion=6。
+            //   只 push 一次；两条 draw 共用同一条 CommandConstant 和 heap 行。
+            //
+            // 隐变量：
+            //   gl_DrawIDARB=0 两条；gl_InstanceIndex=0 两条；gl_BaseVertexARB=0；
+            //   gl_VertexIndex=[0,1,2,0,2,3] 相同；gl_PrimitiveID=0/1 每条重置。
+            //   => instancePtr 不变，都是 heap；变化只在 NDC→像素的 viewport 映射。
+            //
+            // 合并能力：
+            //   不能直接合并：一条 draw 只有一个 viewport；indirect 也不能换 viewport。
+            //   但本 case 的差别只是平移，可以把它从 viewport 搬到 model：
+            //     - 写两行 Shape，model 分别平移到 x+20 和 x+90；
+            //     - 只保留一个全屏 viewport + tile scissor；
+            //     - 一个 CommandConstant + firstInstance=0/1；
+            //     - 一条 drawIndexed(6,2,0,0,0) 就画两条。
+            //   这是 UI 合批的常见做法：能进 model/instance 的变换，不要用 viewport。
+            //   若 viewport 还带缩放/翻转/投影语义，model 不一定等价；要逐项确认。
+            //
+            // 状态继承：
+            //   [06] 没有 bindPipeline / bindDescriptorSets / bindIndexBuffer；
+            //   pipeline 沿用 [04] 的 transparentUI，set0 沿用 [05] 的 B，
+            //   index 沿用 [00]；viewport/scissor 只在这里改。
+            //   这也是“状态粘滞”的实测：只改 viewport，其他都还在。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(6);
+                // NOTE: 两个 viewport 的 width/height 都是整屏；只有 x 变 0→70，
+                //       避免把 viewport 设成 tile 导致的 NDC 二次缩放。
+                const VkViewport vp_a{0.0F, 0.0F, W, H, 0.0F, 1.0F};
+                const VkViewport vp_b{70.0F, 0.0F, W, H, 0.0F, 1.0F};
+                // NOTE: 当前 heap=3224, cst=64；只写一条 CommandConstant/一行 Shape。
+                //       只写 1 行！两次 draw 都读这同一行，不是多实例。
+                //       这个 Rect/渐变/边框和 [07] 完全一样，方便对照“完整 vs 裁剪”。
+                auto s = ui_dao::sdf_linear(
+                    ui_dao::rect_px{static_cast<float>(area.offset.x) + 20.0F,
+                                    static_cast<float>(area.offset.y) + 30.0F, 70.0F,
+                                    100.0F},
+                    view, 18.0F, glm::vec4(0.95F, 0.35F, 0.55F, 1.0F),
+                    glm::vec4(0.20F, 0.80F, 0.95F, 1.0F));
+                s.effects |= shader_data::FX_BORDER;
+                s.border_px = 4.0F;
+                s.border_color = glm::vec4(1.0F, 0.95F, 0.60F, 1.0F);
+                const std::uint32_t heap = add_shape(s);
+                const std::uint32_t cst = add_const(0u, heap);
+                const shader_data::PushData pc = pc_at(cst, 6u);
+
+                // NOTE: 这里没有 bindPipeline/bindSet/bindIndex；它们沿用 [04]/[05]/[00]。
+                // NOTE: scissor 只设一次；viewport 才是两条 draw 的差异。
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.setViewport(0, std::span{&vp_a, 1});
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc), &pc);
+                // NOTE: 同一 pc/heap/index；instanceCount=1，gl_InstanceIndex=0；
+                //       viewport A 把 shape 放到 x20..90（完整）。
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                // NOTE: 第二次还是 instanceCount=1、gl_InstanceIndex=0、同一 heap 行；
+                //       不是新实例。viewport B 的 x+70 把同一 shape 放到 x90..160；
+                //       两份都在 tile(6) 的 x0..170 内，所以都完整、不裁。
+                commandBuffer.setViewport(0, std::span{&vp_b, 1});
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                // NOTE: 两条 draw 参数一样；能合并的前提是把平移搬进 model，
+                //       见上面的“合并能力”。
+
+                // NOTE: 这里**不是** MVP 变化，也没有改 cam.view/model。
+                //       mat4 mvp = cam.proj * cam.view * model; 两条 draw 完全相同，
+                //       顶点着色器输出的 gl_Position / NDC 完全相同。
+                //       移动发生在顶点着色器之后的 **viewport transform**：
+                //         Vulkan spec §33.9 "Controlling the Viewport":
+                //           x_f = (p_x / 2) * x_d + o_x
+                //           o_x = viewport.x + p_x / 2
+                //         代入后等价于：
+                //           x_f = viewport.x + (x_d + 1) * 0.5 * p_x
+                //       （p_x = viewport.width，x_d = NDC x，x_f = framebuffer x）
+                //       所以 viewport B 的 x=70 只是把同一 NDC 结果在 framebuffer
+                //       里右移 70px；tile(6) 足够宽，两份都完整。
+                //       "V" 是 camera 的 view matrix；viewport 是另一件事，别混。
+                //       官方出处：vkspec.html#vertexpostproc-viewport
+                //       https://docs.vulkan.org/spec/latest/chapters/vertexpostproc.html#vertexpostproc-viewport
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // NOTE: 图像位于: [comments/ability3-3.png]
+            // [07] 同 scope 换 scissor：两个独立的裁剪窗口
+            // C API: SetViewport → SetScissor(A) → Push(pc) → DrawIndexed →
+            //        SetScissor(B) → DrawIndexed
+            //        （没有 bindPipeline/bindSet/bindIndex：沿用 [04]/[05]/[00]）
+            // 位置：tile(7) 第二行第二格。
+            //
+            // 数据/偏移：
+            //   前面 [00]1+[01]4+[02]2+[03]2+[04]2+[05]2+[06]1 = 14 行，
+            //     heap = 14*248 = 3472；本 case 只写 1 行。
+            //   常量前面 9 条（0..64），cst = 72；pc_at(cst,7u) 的 renderVersion=7。
+            //   只 push 一次；两条 draw 共用同一条 CommandConstant/同一行数据。
+            //
+            // NOTE: 这里的 Rect/渐变/边框和 [06] 完全一样：
+            //   Rect = (x+20, y+30, 70×100)，radius=18，横向 linear 渐变 + 4px 边框。
+            //   [06] 画两份完整的；[07] 只裁同一 Rect 的两个角窗，直接对照。
+            //
+            // shape：原始 Rect = (x+20, y+30, 70×100)，radius=18，
+            //   横向 linear 渐变 + 4px 边框；渐变给出左右颜色，边框给出原 Rect 的边。
+            //   win A = (x+15, y+25, 50, 50)  → 原 Rect 的左上角
+            //   win B = (x+45, y+85, 50, 50)  → 原 Rect 的右下角
+            //   两扇窗都同时包含“5px 背景 + 圆角边框 + 内部渐变”，所以：
+            //     - 圆角/边框告诉你窗口落在原 Rect 的哪个角；
+            //     - 窗口内侧的直边是 scissor 切出来的（与圆角边框明显不同）；
+            //     - 横向渐变让左上窗偏 c0、右下窗偏 c1，位置更直观。
+            //   一个全 tile scissor 的 draw 会显示整个 70×100 圆角矩形，
+            //   不会出现这两个分离的角窗——这才是能看出 scissor 的效果。
+            //
+            // 隐变量：
+            //   gl_DrawIDARB=0 两条；gl_InstanceIndex=0 两条；gl_BaseVertexARB=0；
+            //   gl_VertexIndex=[0,1,2,0,2,3] 相同；gl_PrimitiveID=0/1 每条重置。
+            //   => instancePtr/heap 不变；scissor 只影响片元是否通过。
+            //
+            // 合并/分离：
+            //   对“两个分离窗口”这个视觉，当前两条 draw 是必要的：
+            //   一条 draw 只有一个 scissor，无法同时产生 win A 和 win B；
+            //   vkCmdDrawIndexedIndirect 也不能换 scissor（scissor 是 state）。
+            //   若要把窗口也变成数据：把 clip rect 放进实例行，shader 里 discard/
+            //   coverage；那样一条 draw + 全 tile scissor 也能做，但这是另一个数据模型。
+            //   旧版“左右互补”之所以能合成一条 draw，是因为 sc_l ∪ sc_r = tile，
+            //   且两半不重叠；这次窗口不互补，不能那样合并。
+            //
+            // 附加：这里只改 scissor，viewport/pipeline/set/index/push 都不变；
+            //   scissor 是 dynamic state，生命周期到下一次 SetScissor/绑定 static
+            //   pipeline 为止。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(7);
+                const VkViewport vp = full_vp;
+                // NOTE: 两扇窗不重叠，分别切原 Rect 的左上角和右下角。
+                //       窗口里同时有 5px 背景 + 圆角边框 + 渐变，便于定位。
+                const VkRect2D win_a{{area.offset.x + 15, area.offset.y + 25}, {50, 50}};
+                const VkRect2D win_b{{area.offset.x + 45, area.offset.y + 85}, {50, 50}};
+                // NOTE: 原 Rect = (x+20,y+30,70×100)，radius=18；
+                //       和 [06] 的 Rect/渐变/边框完全相同；这里只改 scissor。
+                auto s = ui_dao::sdf_linear(
+                    ui_dao::rect_px{static_cast<float>(area.offset.x) + 20.0F,
+                                    static_cast<float>(area.offset.y) + 30.0F, 70.0F,
+                                    100.0F},
+                    view, 18.0F, glm::vec4(0.95F, 0.35F, 0.55F, 1.0F),
+                    glm::vec4(0.20F, 0.80F, 0.95F, 1.0F));
+                s.effects |= shader_data::FX_BORDER;
+                s.border_px = 4.0F;
+                s.border_color = glm::vec4(1.0F, 0.95F, 0.60F, 1.0F);
+                const std::uint32_t heap = add_shape(s);
+                const std::uint32_t cst = add_const(0u, heap);
+                const shader_data::PushData pc = pc_at(cst, 7u);
+
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                // NOTE: 只换 scissor；pipeline/set/index/viewport/push 都不变。
+                commandBuffer.setScissor(0, std::span{&win_a, 1});
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc), &pc);
+                // NOTE: win A：只露出原 Rect 的左上角 50×50（含圆角边框+背景）。
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                // NOTE: win B：只露出原 Rect 的右下角 50×50；两窗不重叠。
+                commandBuffer.setScissor(0, std::span{&win_b, 1});
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // NOTE: 图像位于: [comments/ability3-4.png]
+            // [08] 同 scope 换 index buffer 绑定：quad 的 6 索引 → 三角形的 3 索引
+            // NOTE: 图像 ability3-4.png 里第二个圆角四边形“未完成”不是 bug：SDF需要足够的画布像素来分配具体值,画布不够就不完整
+            // NOTE: 顶点+硬件图元决定像素范围,没有未定义. 三角形图元的顶点至少是3
+            //       offset=24 处只有 3 个索引 {0,1,2}，第二条 draw 的 indexCount=3，
+            //       所以只光栅化一个三角形；SDF 仍在完整 Shape 的局部坐标里计算，
+            //       于是你看到的是“圆角矩形的三角形切片”。
+            //       第一条 offset=0 有 6 个索引 [0,1,2,0,2,3]，所以完整。
+            // C API: SetViewport → SetScissor → BindIndexBuffer(offset=0,UINT32) →
+            //        PushConstants(一次) → DrawIndexed(6,firstInstance=0) →
+            //        BindIndexBuffer(offset=24,UINT32) → DrawIndexed(3,firstInstance=1)
+            // 位置：tile(8) 第二行第三格；左/右两个 Shape（half 等分）。
+            //
+            // NOTE: 为什么这里 SDF 外没有黑边？[08] 没有 bindPipeline，
+            //       沿用的还是 [04] 的 transparentUI（blendEnable=ON）。
+            //       同一个 Shape shader/SDF 在 SDF 外输出 vec4(0,0,0,0)：
+            //         - transparentUI: src + dst*(1-src.a) = dst → 透明，
+            //           保留背景/上一次绘制；
+            //         - opaqueUI: blend OFF，0 直接写进 attachment → 黑
+            //           （[04] 橙色圆角外的黑角就是它）。
+            //       所以“同一个 shader、同一个 SDF 算法”可以有不同效果：
+            //       shader 只算 fragColor/coverage；pipeline 的 colorBlendState
+            //       决定 fragColor 如何和 dst 合成。这里第一条完整 quad 的 SDF 外、
+            //       第二条三角形内但 SDF 外的像素，都走 transparent 路径；
+            //       第二个看起来“只有圆角的一部分”，是 indexCount=3 的几何裁剪，
+            //       不是黑边，也不是 SDF 算法变了。
+            //
+            // NOTE: src + dst*(1-src.a) 的来源（Vulkan blend equation, ADD）：
+            //   官方逐通道公式（spec §Blending / Blend Operations）：
+            // NOTE: RGB 用 srcColorBlendFactor，Alpha 用 srcAlphaBlendFactor——两套 factor 是分开的
+            // R_out = R_src * srcColorBlendFactor + R_dst * dstColorBlendFactor
+            // G_out = G_src * srcColorBlendFactor + G_dst * dstColorBlendFactor
+            // B_out = B_src * srcColorBlendFactor + B_dst * dstColorBlendFactor
+            // A_out = A_src * srcAlphaBlendFactor + A_dst * dstAlphaBlendFactor
+            //   本 pipeline 的 VkPipelineColorBlendAttachmentState：
+            //     srcColorBlendFactor = ONE              -> S_r = 1
+            //     dstColorBlendFactor = ONE_MINUS_SRC_ALPHA -> D_r = 1 - A_src
+            //     srcAlphaBlendFactor = ONE              -> S_a = 1
+            //     dstAlphaBlendFactor = ONE_MINUS_SRC_ALPHA -> D_a = 1 - A_src
+            //     colorBlendOp = alphaBlendOp = ADD
+            //   代入： C = Color（RGB 三通道打包）;A = Alpha;src = source（源，即将写入的）;dst = destination（目标，画布上已有的）;out = output（输出，混合结果）
+            //     C_out = C_src + C_dst * (1 - A_src)
+            //     A_out = A_src + A_dst * (1 - A_src)
+            //   只有 C_src 是预乘色 (rgb * a) 时，才能简写成
+            //     C_out = src + dst * (1 - src.a)
+            //   这里的 src 指“预乘后的颜色”，不是直色；
+            //   若 shader 输出直色，颜色 factor 要用 SRC_ALPHA，公式才是
+            //     C_out = src * a + dst * (1 - a)。
+            //   colorWriteMask 只决定写哪些通道，不参与上面的合成公式。
+            //
+            // 数据/偏移（当前顺序下）：
+            //   前面 [00]1+[01]4+[02]2+[03]2+[04]2+[05]2+[06]1+[07]1 = 15 行，
+            //     h0=15*248=3720, h1=3968。
+            //   常量前面 10 条（0..72），cst=80；pc_at(cst,8u) 的 renderVersion=8。
+            //   index buffer 布局：
+            //     offset 0  : [0,1,2, 0,2,3]  （6 个 UINT32，完整 quad）
+            //     offset 24 : [0,1,2]          （3 个 UINT32，三角形）
+            //   kTriIdxOffset = 24 bytes = 6 * sizeof(uint32_t)，满足 4 字节对齐。
+            //   只 push 一次；两条 draw 共用同一条 CommandConstant。
+            //
+            // 两条 draw 的差异：
+            //   first : BindIndexBuffer(0,UINT32)  + DrawIndexed(6,1,0,0,0)
+            //   second: BindIndexBuffer(24,UINT32) + DrawIndexed(3,1,0,0,1)
+            //   => offset 0→24、indexCount 6→3；firstIndex/vertexOffset 仍是 0；
+            //      firstInstance 0→1，所以第二条读 h1。
+            //   gl_VertexIndex: 第一条 [0,1,2,0,2,3]，第二条 [0,1,2]；
+            //   gl_PrimitiveID: 第一条 0/1（两个三角形），第二条只有 0。
+            //   gl_DrawIDARB=0、gl_BaseVertexARB=0 两条相同。
+            //
+            // NOTE: 如果只想验证“index buffer 绑定 offset”，第二条应该也在
+            //       offset24 放完整 6 索引并 draw(6)；当前故意放 3 索引，
+            //       让“换绑定”带来的几何差异肉眼可见，代价是第二个 Shape 只剩三角形。
+            //       这不是渲染错误，是测试数据的选择。
+            //
+            // 合并能力（引用 [01] 判据）：
+            //   不能合成一条 direct drawIndexed：一条 draw 只有一个 index buffer
+            //   绑定/offset 和 indexCount，6 与 3、0 与 24 不能同时表达。
+            //   但两条用的是同一个 VkBuffer，只是 offset 不同；所以可以 bind 一次 0，
+            //   用一条 vkCmdDrawIndexedIndirect(count=2)：
+            //     cmd0 {indexCount=6, firstIndex=0, firstInstance=0}
+            //     cmd1 {indexCount=3, firstIndex=6, firstInstance=1}  // 24B/4=6
+            //   仍然只画一个三角形（cmd1 的 indexCount=3），但 C API 合成了一条。
+            //   如果两条来自不同的 VkBuffer，indirect 也不能换 buffer，必须分开。
+            //   （若要让第二条完整：offset24 放 6 索引 + cmd1 indexCount=6，
+            //     这样才是只比较“绑定 offset”的干净用例。）
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(8);
+                const VkViewport vp = full_vp;
+                const std::uint32_t h0 =
+                    add_shape(ui_dao::sdf_shape(half(area, false), view, 16.0F,
+                                                glm::vec4(0.45F, 0.95F, 0.85F, 1.0F)));
+                const std::uint32_t h1 = add_shape(ui_dao::sdf_shape(
+                    half(area, true), view, 16.0F, glm::vec4(0.95F, 0.45F, 0.85F, 1.0F)));
+                // NOTE: 当前 h0/h1=3720/3968；cst=80；只写一条 CommandConstant。
+                const std::uint32_t cst = add_const(0u, h0);
+                const shader_data::PushData pc = pc_at(cst, 8u);
+
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                // NOTE: 这里没有 bindPipeline；pipeline 是 [04] 的 transparentUI
+                //       （blend ON），所以 SDF 外的 vec4(0) 不会写成黑。
+                // NOTE: offset=0 → 6 个索引的完整 quad [0,1,2,0,2,3]。
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc), &pc);
+                // NOTE: 6 索引 → 画完整 quad；firstInstance=0 → h0。
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                // NOTE: offset=24 → 只有 3 个索引 {0,1,2}，所以下面只能画三角形；
+                //       这不是漏画，是 indexCount=3 的自然结果。
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(),
+                                              kTriIdxOffset, VK_INDEX_TYPE_UINT32);
+                // NOTE: firstInstance=1 → h1；indexCount=3 → 只光栅化一个三角形，
+                //       SDF 仍按 h1 的完整 px_size 计算，所以看起来是“半个圆角矩形”。
+                //       三角形内、圆角外的像素 SDF=0；transparentUI 下保留 dst，
+                //       所以不是黑，而是背景/上一次绘制。若换成 opaqueUI 就会黑。
+                commandBuffer.drawIndexed(3, 1, 0, 0, 1);
+
+                // NOTE: 混合在 shader 输出之后，且不在 shader 里
+            }
+
+            // ════════════════════════════════════════════════════════════════
+            // [08-1..8] fixed-function 颜色链：同一份 Shape 数据 + 同一 fragColor
+            //
+            //   fragment shader → fragColor(src)
+            //     → ① depth test / stencil test
+            //     → ② color blend（读 dst）
+            //     → ③ colorWriteMask
+            //     → framebuffer
+            //
+            // NOTE: 为了控制单一变量，整个系列只准备一份共享数据：
+            //   Shape0 = base：teal (0.20,0.60,1.00)、inset(ref,20)、z=0.75
+            //   Shape1 = srcNear：红色 a=0.5、inset(ref,34)、z=0.25
+            //   Shape2 = srcFar ：红色 a=0.5、inset(ref,34)、z=0.75
+            //   三条 Shape 都在同一个 ref tile(9) 里；换 tile 不重新造数据，
+            //   只改 viewport 的 x/y 偏移（[06] 的平移效果），再用 scissor 裁到目标 tile。
+            //   => 所有 case 的 fragColor、几何、颜色、常量都相同；唯一的变量是
+            //      depth/stencil 的 pass/fail、blend on/off、mask 全写/RG。
+            //
+            // NOTE: ①/②/③ 到底做什么（只看固定管线，不看 shader 算法）：
+            //   ① depth/stencil test
+            //      - depth: z_f 与 depth buffer 比较（本系列 LESS）；
+            //        通过才继续，失败直接丢弃。
+            //      - stencil: ref 与 stencil buffer 比较（EQUAL）；
+            //        通过才继续，失败直接丢弃。
+            //      - 这一阶段**不混色**；通过后 fragColor 原样进入 ②/③。
+            //   ② color blend
+            //      - blendEnable=ON 才执行；读 dst，按 factor 合成：
+            //          C_out = C_src * S + C_dst * D
+            //      - blendEnable=OFF：不读 dst，C_src 直接覆盖（之后再由 ③ 过滤）。
+            //   ③ colorWriteMask
+            //      - 按位决定最终写哪些通道；没写的通道保留 dst。
+            //      - 它在 blend 之后；不是“混合”，只是写通道过滤。
+            //   顺序固定 ①→②→③；① 失败时 ②/③ 不会发生。
+            //
+            // NOTE: 本系列涉及的 pipeline 状态（只切这几个）：
+            //   pipelineOpaque3D    : depth ON/WRITE(LESS), blend OFF, mask ALL
+            //   pipes[4]            : stencil setup, blend OFF, mask 0
+            //   pipes[11]           : stencil EQUAL, blend OFF, mask ALL  ← [08-3/4]
+            //   pipelineOpaqueUI    : depth/stencil OFF, blend OFF, mask ALL
+            //   pipelineTransparentUI: blend ON, mask ALL
+            //   pipes[10]           : blend ON, mask R|G
+            //   pipes[9]            : blend OFF, mask R|G
+            //
+            // NOTE: ①→②→③ 的顺序是 fixed-function 固定的，不能重排；
+            //   ① 失败时 ②/③ 不会发生，所以不机械复制视觉重复的 2^3 组合。
+            //   每个 case 的 C API diff 在注释里单独标出。
+            //
+            // NOTE: [08-1..8] 暂时占用 tile(9..16)；原 [09]..[16] 仍在 #if0，
+            //       启用时把它们顺延/换 tile 即可，其他 case 代码不改。
+            // NOTE: setViewport 来实现偏移分开的效果,但是不改变输入,从头到尾不变
+            // ════════════════════════════════════════════════════════════════
+
+            const VkRect2D chainRef = tile(9);
+            auto chainBase = ui_dao::sdf_shape(inset(chainRef, 20.0F), view, 24.0F,
+                                               glm::vec4(0.20F, 0.60F, 1.00F, 1.0F));
+            chainBase.model[3].z = 0.75F;
+            auto chainNear = ui_dao::sdf_shape(inset(chainRef, 34.0F), view, 20.0F,
+                                               glm::vec4(1.00F, 0.00F, 0.00F, 0.50F));
+            chainNear.model[3].z = 0.25F;
+            auto chainFar = chainNear; //NOTE: chainFar 和 chainFar 就 z 不同
+            chainFar.model[3].z = 0.75F;
+
+            const std::uint32_t chainH0 = add_shape(chainBase);
+            const std::uint32_t chainH1 = add_shape(chainNear);
+            const std::uint32_t chainH2 = add_shape(chainFar);
+            const std::uint32_t chainCst = add_const(0u, chainH0);
+            const shader_data::PushData chainPc = pc_at(chainCst, 80u);
+
+            // 同一份数据从 ref tile(9) 平移到目标 tile；width/height 保持整屏。
+            const auto chain_vp = [&](const VkRect2D &area) -> VkViewport {
+                return {static_cast<float>(area.offset.x - chainRef.offset.x),
+                        static_cast<float>(area.offset.y - chainRef.offset.y),
+                        W,
+                        H,
+                        0.0F,
+                        1.0F};
+            };
+
+            // NOTE: [08-1],[08-2] 测试 z 远近; 管线: pipelineOpaque3D	    ON (LESS)	    ON	        OFF	            不透明3D物体
+            // ────────────────────────────────────────────────────────────────
+            // [08-1] ① depth PASS：base z=.75，srcNear z=.25
+            // C API: BindPipeline(opaque3D) → SetViewport(chain_vp) → SetScissor(area) →
+            //        BindIndexBuffer(0) → Push(chainPc) →
+            //        DrawIndexed(Shape0) → DrawIndexed(Shape1)
+            // 位置：tile(9)；viewport 偏移 (0,0)。
+            // 共享数据：h0=4216,h1=4464,h2=4712；cst=88,rv=80。
+            // 链：base 写 color+depth(.75)；srcNear(.25) depth 通过。
+            // NOTE: pipelineOpaque3D 的 blendEnable=OFF，source 通过 depth 后是
+            //       直接写红色 (.5,0,0)，不是 blend；所以中心暗红，不是紫。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(9);
+                const VkViewport vp = chain_vp(area);
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaque3D);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(chainPc), &chainPc);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0); // Shape0 base
+                commandBuffer.drawIndexed(6, 1, 0, 0, 1); // Shape1 near
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [08-2] ① depth FAIL：只把 source 从 Shape1 换成 Shape2（z=.75）
+            // C API diff vs [08-1]: 第二条 DrawIndexed 的 firstInstance 1→2；
+            //                       viewport/scissor 只从 tile9 换到 tile10（布局，不是实验变量）。
+            // 位置：tile(10)；viewport 偏移 (+170,0)。
+            // 链：base depth=.75；Shape2 也是 .75，LESS 失败，②/③ 不执行；只剩 teal base。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(10);
+                const VkViewport vp = chain_vp(area);
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaque3D);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(chainPc), &chainPc);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0); // Shape0 base
+                commandBuffer.drawIndexed(6, 1, 0, 0, 2); // Shape2 far
+            }
+
+            // NOTE: depth 和 stencil “一个水平”，是因为它们共用同一块 depth-stencil 内存、同属 fragment tests 阶段、都是不产生颜色的“留/丢”门禁；
+            // NOTE: ① 测试门禁 → ② 颜色合成 → ③ 写通道过滤
+            // ────────────────────────────────────────────────────────────────
+            // [08-3] ① stencil PASS：pipe4 先把 0→1，pipe11 ref=1
+            // C API: SetViewport(chain_vp) → SetScissor(area) → BindIndexBuffer(0) →
+            //        Push(chainPc) →
+            //        BindPipeline(pipe4) → SetStencilReference(0) →
+            //        DrawIndexed(Shape0, 只写 stencil) →
+            //        BindPipeline(opaqueUI) → DrawIndexed(Shape0, 写 color) →
+            //        BindPipeline(pipe11) → SetStencilReference(1) →
+            //        DrawIndexed(Shape1)
+            // 位置：tile(11)；viewport 偏移 (+340,0)。
+            //
+            // NOTE: 先把 stencil 的三个值分开（后面 [08-4] 只改②）：
+            //   ① stencil buffer 值：depth-stencil image 每像素 8 bit；
+            //      GPU 在 draw 执行时按 passOp/failOp/depthFailOp 逐片元改。
+            //   ② reference：per-draw 的 dynamic state；
+            //      CPU 用 vkCmdSetStencilReference 在 draw 前设，后续 draw 沿用。
+            //   ③ compareMask / writeMask / compareOp / passOp…：
+            //      pipeline 创建时写死，draw 期间不变。
+            //
+            //   每个片元：
+            //     ref_m     = reference     & compareMask
+            //     stencil_m = stencil_buffer& compareMask
+            //     pass      = compare(stencil_m, ref_m)       // 本 case EQUAL
+            //     if (!pass)          stencil = op(failOp,      stencil) & writeMask
+            //     else if (!depthPass) stencil = op(depthFailOp, stencil) & writeMask
+            //     else                stencil = op(passOp,      stencil) & writeMask
+            //   stencilTestEnable=FALSE 时整段跳过；
+            //   writeMask=0 时测试照做，但 stencil buffer 不更新。
+            //
+            // NOTE: 本 case 三条 draw 用的 pipeline：
+            //   pipes[4]        : stencil ON, compare=ALWAYS, passOp=INCREMENT,
+            //                     writeMask=0xFF, colorWriteMask=0
+            //   pipelineOpaqueUI: stencil OFF, depth OFF, blend OFF, color ALL
+            //   pipes[11]       : stencil ON, compare=EQUAL, passOp=KEEP,
+            //                     writeMask=0x00, blend OFF, color ALL
+            //
+            // 初始：tile(11) 的 stencil 全 0（A scope 的 stencil clear=0）。
+            // Draw 1（pipes[4]，Shape0，ref=0）：
+            //   compare=ALWAYS 通过；passOp=INCREMENT → stencil 0→1；
+            //   colorWriteMask=0 → 不写 color。结果：stencil=1，color 仍是 clear。
+            // Draw 2（opaqueUI，Shape0）：
+            //   stencil OFF → stencil buffer 完全不动，仍是 1；
+            //   写 teal 到 color。
+            // Draw 3（pipes[11]，Shape1，ref=1）：
+            //   stencil_m=1&0xFF=1，ref_m=1&0xFF=1 → EQUAL 通过；
+            //   passOp=KEEP、writeMask=0 → stencil 仍为 1；
+            //   blendEnable=OFF → 不读 dst；
+            //   colorWriteMask=ALL → 直接写 Shape1 的预乘红色
+            //   (.5,0,0,.5)。结果：暗红直接覆盖 teal，不是混合。
+            //
+            // NOTE: stencil PASS 本身**不是混合**！混合只由 ② blendEnable 决定；
+            //       pipes[11] 的 blendEnable=OFF，所以 PASS 后是直接覆盖。
+            //       （之前用 pipe6 会 blendOver，那是 stencil + blend 两件事混在一起，
+            //         已改成 pipes[11] 隔离 ①。）
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(11);
+                const VkViewport vp = chain_vp(area);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(chainPc), &chainPc);
+
+                // NOTE: “draw 不一定生成像素”
+                // pipeline	            stencil	                            colorWriteMask	    blend
+                // pipes[4]	            ALWAYS + INCREMENT，writeMask=0xFF	0（不写 color）	    OFF
+                // pipelineOpaqueUI	    OFF（不碰 stencil）	                ALL	                OFF
+                // pipes[11]	        EQUAL + KEEP，writeMask=0	        ALL	                OFF
+
+                /*
+                Draw 1：pipes[4]，Shape0（base），ref=0
+                光栅化：base 大矩形 ∩ scissor(tile11) → 每个片元
+                对每个片元：
+                    stencil_buffer[px] = 0        （初始 clear 值）
+                    ref                = 0        （setStencilReference(0)）
+                    compareMask        = 0xFF
+                    compareOp          = ALWAYS   → (0 & 0xFF) ALWAYS (0 & 0xFF) → pass
+                    passOp             = INCREMENT_AND_CLAMP, writeMask = 0xFF
+                                    → stencil_buffer[px] = 0 + 1 = 1
+                    colorWriteMask     = 0        → 不写 color（clear 值保留）
+                结果：base 覆盖的每个像素 stencil=1，color 仍是 clear。
+                注意：base 之外没有片元（scissor 内但几何外），谈不上 pass/fail。
+                */
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *(*uiPipelines().pipes[4]));
+                commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+
+                /*
+                Draw 2：pipelineOpaqueUI，Shape0（base）
+                光栅化：base 大矩形 ∩ scissor → 每个片元
+                对每个片元：
+                    stencilTestEnable = VK_FALSE  → 没有 stencil test，也就没有 pass/fail
+                                                → stencil_buffer 不读、不写、保持 1
+                    blendEnable       = OFF       → 不读 dst
+                    colorWriteMask    = ALL       → 直接写 teal
+                结果：base 覆盖的每个像素 color=teal，stencil 仍为 1。
+                NOTE: 关键：这条 draw 没有“成功/失败”概念，因为 stencilTest=OFF。它只写颜色
+                */
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaqueUI);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0); // base teal
+
+                /*
+                Draw 3：pipes[11]，Shape1（srcNear），ref=1
+                光栅化：srcNear 小矩形 ∩ scissor → 每个片元
+                前提：srcNear ⊂ base（inset 34 > inset 20），
+                        所以这些片元所在像素在 Draw 1 里都被写成 stencil=1。
+                对每个片元：
+                    stencil_buffer[px] = 1
+                    ref                = 1        （setStencilReference(1)）
+                    compareMask        = 0xFF
+                    compareOp          = EQUAL    → (1 & 0xFF) EQUAL (1 & 0xFF) → pass
+                    passOp             = KEEP, writeMask = 0x00
+                                    → stencil_buffer[px] 仍为 1
+                    blendEnable        = OFF      → 不读 dst
+                    colorWriteMask     = ALL      → 直接写 red (1,0,0,0.5)
+                结果：srcNear 覆盖的每个像素 color=red（直接覆盖 teal），stencil 仍为 1。
+                失败条件（本 case 不触发）：若某个片元所在像素 stencil≠1，
+                    EQUAL 失败 → 该片元被丢弃，不写 color、不改 stencil。
+                NOTE: 关键：这条 draw 的 pass/fail 取决于“片元所在像素的 stencil 值”。
+                */
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *(*uiPipelines().pipes[11]));
+                commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK, 1);
+                commandBuffer.drawIndexed(6, 1, 0, 0,
+                                          1); // Shape1, stencil pass, blend OFF
+
+                // NOTE: 视觉：teal 框 + 红中心——和 [08-1] 完全一样。
+                /*
+                NOTE: 为什么 [08-1] 和 [08-3] 视觉一样
+                因为它们都是“base 先画 teal，srcNear 后画 red 覆盖”，只是中间的“门禁”不同：
+                            [08-1]	                [08-3]
+                门禁	    depth test（LESS）	    stencil test（EQUAL）
+                门禁数据	depth buffer 的 0.75	stencil buffer 的 1
+                门禁通过后	写 red	                写 red
+                门禁失败时	丢弃	                丢弃
+
+                NOTE: depth test 和 stencil test 都是“门禁”：通过就放行片元去写颜色，失败就丢弃。
+                */
+
+                /*
+                NOTE: 为什么 [08-3] 要 3 次 draw，而 [08-1] 只要 2 次
+                因为代码故意把“stencil setup”和“color write”拆开，让每一步职责单一：
+                pipes[4]：colorWriteMask=0 → 只写 stencil，不写 color
+                pipelineOpaqueUI：stencilTest=OFF → 只写 color，不碰 stencil
+                pipes[11]：blendEnable=OFF + mask=ALL → 只做 stencil 测试 + 直接写 color，不混合
+
+                如果把 pipes[4] 的 colorWriteMask 改成 ALL，它就能同时写 stencil 和 teal，[08-3] 可以压缩成 2 次 draw（和 [08-1] 对称）。
+                但那样就把“stencil 写”和“color 写”混在一次 draw 里，不容易单独观察 ① 阶段。这是测试代码的设计选择，不是 Vulkan 的硬性要求。
+                */
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [08-4] ① stencil FAIL：//NOTE: 只把 pipe11 的 ref 1→0,让 EQUAL 失败,然后丢弃片元
+            // C API diff vs [08-3]: SetStencilReference(1)→(0)；数据/viewport 完全不变
+            //                      （viewport 只从 tile11 换到 tile12）。
+            // 位置：tile(12)；viewport 偏移 (-510,+160)。
+            //
+            // 三条 draw 和 [08-3] 完全一样：
+            //   Draw1 pipe4: stencil 0→1，不写 color；
+            //   Draw2 opaqueUI: 写 teal，不碰 stencil；
+            //   Draw3 pipe11: stencil_m=1，ref_m=0 → EQUAL 失败。
+            // 失败分支：
+            //   failOp=KEEP、writeMask=0 → stencil 仍为 1（不被改）；
+            //   片元被丢弃 → ② blend / ③ colorWriteMask 根本不执行；
+            //   framebuffer 只有 Draw2 的 teal。
+            //
+            // NOTE: 这不是“blend 失败”，是片元在 ① 就被丢弃了；
+            //       即使 pipes[11] 的 blendEnable 改成 ON，也不会发生混合。
+            //       ① 通过后才轮到 ②/③，这是固定顺序。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(12);
+                const VkViewport vp = chain_vp(area);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(chainPc), &chainPc);
+
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *(*uiPipelines().pipes[4]));
+                commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaqueUI);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+
+                /*
+                Draw 3：pipes[11]，Shape1（srcNear），ref=0   ← 与 [08-3] 唯一差别
+                对每个片元：
+                    stencil_buffer[px] = 1        （Draw 1 写的，Draw 2 没碰）
+                    ref                = 0
+                    compareOp          = EQUAL    → (1 & 0xFF) EQUAL (0 & 0xFF) → 1==0 → fail
+                    failOp             = KEEP, writeMask = 0x00
+                                    → stencil_buffer[px] 仍为 1
+                    片元被丢弃 → blend / colorWriteMask 不执行
+                结果：srcNear 区域保留 Draw 2 写的 teal，没有红色。
+                */
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *(*uiPipelines().pipes[11]));
+                commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+                commandBuffer.drawIndexed(6, 1, 0, 0,
+                                          1); // Shape1, stencil fail, blend OFF
+
+                /*
+                NOTE: 可以同时打开 深度和模板测试: fragment shader → scissor → stencil test → depth test → blend → colorWriteMask
+                注意：stencil test 先于 depth test。这个顺序决定了 VkStencilOpState 为什么有三个 op：
+                    .failOp        // stencil test 失败
+                    .passOp        // stencil test 通过，且 depth test 也通过
+                    .depthFailOp   // stencil test 通过，但 depth test 失败
+                */
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [08-5..8] ② blend × ③ colorWriteMask 的 2×2 矩阵
+            //
+            //                mask all          mask R|G
+            //   blend ON     [08-5]            [08-7]
+            //   blend OFF    [08-6]            [08-8]
+            //
+            //   四格用同一份 base/source、同一 viewport 尺寸、同一 fragColor：
+            //     base   = (0.20,0.60,1.00,1.0)  // teal
+            //     source = red a=0.5
+            //   只切 pipeline 的 blendEnable / colorWriteMask；tile 只变 viewport 偏移。
+            //   5↔6、7↔8 只差 blend；5↔7、6↔8 只差 mask。
+            // ────────────────────────────────────────────────────────────────
+
+            // NOTE: 8-5;8-6 测试混合;全部 mask ALL
+            // ────────────────────────────────────────────────────────────────
+            // [08-5] ② blend ON + ③ mask ALL
+            // NOTE: 视觉：
+            //   Shape1 中心 = 预乘红(0.5,0,0) + teal*0.5 = (0.6,0.3,0.5) 紫粉；
+            //   Shape1 的 SDF 外 = src=(0,0,0,0) 走 blend → dst*1 = teal，不黑；
+            //   Shape0 的 SDF 外 = Draw 1 用 opaqueUI，blend OFF，0 直接写 → 仍然黑。
+            //   => “红色变粉”对；“没有圆角外的黑色”只对 Shape1 成立，Shape0 圆角外仍黑。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(13);
+                const VkViewport vp = chain_vp(area);
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaqueUI);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(chainPc), &chainPc);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0); // Shape0 base
+
+                // NOTE: pipelineTransparentUI 混合让圆角不黑
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineTransparentUI);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 1); // Shape1, blend ON, mask all
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [08-6] ② blend OFF + ③ mask ALL
+            // NOTE: 视觉：
+            //   Shape1 红色直接覆盖 teal（不混合）→ 暗红；
+            //   Shape1 的 SDF 外 = vec4(0) 直接写 → 也黑；
+            //   Shape0 的 SDF 外 = 同样黑。
+            //   => 和 [08-1] 视觉一样（blend OFF 直接贴 + 黑角），
+            //      但 [08-1] 用 pipelineOpaque3D（depth ON），这里用 pipelineOpaqueUI（depth OFF）；
+            //      因为 Shape1 ⊂ Shape0，depth test 不改变结果，所以视觉才一样。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(14);
+                const VkViewport vp = chain_vp(area);
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaqueUI);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(chainPc), &chainPc);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0); // Shape0 base
+
+                // NOTE: 都是 pipelineOpaqueUI .都有黑圆角外部
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaqueUI);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 1); // Shape1, blend OFF, mask all
+            }
+
+            /*
+            case	blend	mask	Shape1 SDF 内	        Shape1 SDF 外
+            [08-5]	ON	    ALL	    (0.6, 0.3, 0.5) 紫粉	teal（看不见）
+            [08-6]	OFF	    ALL	    (0.5, 0, 0) 暗红	    黑（0 直接写）
+            [08-7]	ON	    R|G	    (0.6, 0.3, 1.0) 偏蓝紫	teal（看不见）
+            [08-8]	OFF	    R|G	    (0.5, 0, 1.0) 偏蓝	    纯蓝（R/G=0，B 保留）
+            */
+            // ────────────────────────────────────────────────────────────────
+            // [08-7] ② blend ON + ③ mask R|G
+            // C API diff vs [08-5]: 只把 transparentUI 换成 maskRGBlend（pipes[10]，
+            //                       blend ON + colorWriteMask=R|G）；数据/viewport 不变。
+            // 位置：tile(15)；viewport 偏移 (0,+160)。
+            // 链：先 blend 得 (.6,.3,.5)，再 mask R|G：
+            //       R/G 写成 blend 结果，B/A 保留 base → (.6,.3,1.0)。
+            //     对比 [08-5] 的 (.6,.3,.5)，B 没被写；对比 [08-6] 的暗红，
+            //     mask 后 B 保留 base。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(15);
+                const VkViewport vp = chain_vp(area);
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaqueUI);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(chainPc), &chainPc);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0); // Shape0 base
+
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *(*uiPipelines().pipes[10]));
+                commandBuffer.drawIndexed(6, 1, 0, 0, 1); // Shape1, blend ON, mask RG
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [08-8] ② blend OFF + ③ mask R|G
+            // C API diff vs [08-7]: 只把 maskRGBlend 换成 maskRG（pipes[9]，
+            //                       blend OFF + mask R|G）；数据/viewport 不变。
+            // 位置：tile(16)；viewport 偏移 (+170,+160)。
+            // 链：blend OFF 时 source (.5,0,0)；mask R|G：
+            //       R/G 写成 .5/0，B/A 保留 base → (.5,0,1.0)。
+            //     对比 [08-7] 的 (.6,.3,1.0)，R/G 不同；对比 [08-6] 的暗红，
+            //     B 保留 base。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(16);
+                const VkViewport vp = chain_vp(area);
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaqueUI);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(chainPc), &chainPc);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0); // Shape0 base
+
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *(*uiPipelines().pipes[9]));
+                commandBuffer.drawIndexed(6, 1, 0, 0, 1); // Shape1, blend OFF, mask RG
+            }
+#if 0
+            // ────────────────────────────────────────────────────────────────
+            // [09] 同 scope 换 index type：UINT32 → UINT16
+            // C API: BindIndexBuffer(UINT32,0) → DrawIndexed → BindIndexBuffer(UINT16,72) →
+            //        DrawIndexed
+            // 排列组合：indexType 变一次；两条 draw 的索引宽度不同。
+            // 分离：必要。indexType 是 vkCmdBindIndexBuffer 的一部分，不能按实例变。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(9);
+                const VkViewport vp = full_vp;
+                const std::uint32_t h0 =
+                    add_shape(ui_dao::sdf_shape(half(area, false), view, 16.0F,
+                                                glm::vec4(0.75F, 0.55F, 0.95F, 1.0F)));
+                const std::uint32_t h1 = add_shape(ui_dao::sdf_shape(
+                    half(area, true), view, 16.0F, glm::vec4(0.35F, 0.95F, 0.45F, 1.0F)));
+                const std::uint32_t cst = add_const(0u, h0);
+                const shader_data::PushData pc = pc_at(cst, 9u);
+
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc), &pc);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(),
+                                              kIndex16Offset, VK_INDEX_TYPE_UINT16);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 1);
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [10] indexed → non-indexed
+            // C API: BindPipeline(transparent) → BindDescriptorSets → SetViewport →
+            //        SetScissor → BindIndexBuffer → PushConstants →
+            //        DrawIndexed(6,firstInstance=0) → Draw(6,firstVertex=8,firstInstance=1)
+            // 排列组合：indexed 路径变 non-indexed；index buffer 仍绑着但不被 Draw 使用。
+            // 分离：必要。两条 draw 的几何提交路径不同；这是两种不同的 C API。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(10);
+                const VkViewport vp = full_vp;
+                const std::array<glm::vec2, 3> tri = {
+                    glm::vec2{0.5F, 0.0F}, glm::vec2{0.0F, 1.0F}, glm::vec2{1.0F, 1.0F}};
+                const std::uint32_t f0 =
+                    add_fill(ui_dao::path_fill(half(area, false), view, std::span{tri},
+                                               glm::vec4(0.20F, 0.75F, 0.95F, 1.0F)));
+                const std::uint32_t f1 =
+                    add_fill(ui_dao::path_fill(half(area, true), view, std::span{tri},
+                                               glm::vec4(0.95F, 0.55F, 0.20F, 1.0F)));
+                const std::uint32_t cst = add_const(1u, f0);
+                const shader_data::PushData pc = pc_at(cst, 10u);
+
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineTransparentUI);
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                                 nullptr);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc), &pc);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                commandBuffer.draw(6, 1, kNonIndexedVertex, 1);
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [11] 同一绑定，只改 draw 参数：indexCount 6→3，firstIndex 0→1，
+            //      vertexOffset 0→4，firstInstance 0→1
+            // C API: BindPipeline(opaque) → BindIndexBuffer → SetViewport → SetScissor →
+            //        PushConstants(一次) → DrawIndexed(6,firstInstance=0) →
+            //        DrawIndexed(3,firstIndex=1,vertexOffset=4,firstInstance=1)
+            // 排列组合：状态完全不变，只有 draw 参数变；第二条是三角形，
+            //           并走顶点数组的 4..7 副本。
+            // 分离：必要。indexCount/firstIndex/vertexOffset 不能按 instance 变；
+            //       两条 draw 必须分开，且不能用一条 instanced draw 合并。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(11);
+                const VkViewport vp = full_vp;
+                const std::uint32_t h0 =
+                    add_shape(ui_dao::sdf_shape(half(area, false), view, 16.0F,
+                                                glm::vec4(0.95F, 0.95F, 0.35F, 1.0F)));
+                const std::uint32_t h1 = add_shape(ui_dao::sdf_shape(
+                    half(area, true), view, 16.0F, glm::vec4(0.35F, 0.75F, 0.95F, 1.0F)));
+                const std::uint32_t cst = add_const(0u, h0);
+                const shader_data::PushData pc = pc_at(cst, 11u);
+
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaqueUI);
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc), &pc);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                commandBuffer.drawIndexed(3, 1, 1, 4, 1);
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [12] indexed indirect，单条 command，PathStroke program
+            // C API: BindPipeline(transparent) → BindDescriptorSets → SetViewport →
+            //        SetScissor → BindIndexBuffer → PushConstants(program=2) →
+            //        DrawIndexedIndirect(count=1)
+            // 排列组合：draw 参数从 C++ 搬到 VkDrawIndexedIndirectCommand；
+            //           program=2，实例行是 PathStroke。
+            // 分离：C API 层不需要为“参数不同”再发 draw；indirect command 是 data。
+            //       这是与 [11] 的直接对照：同一变化点，一个在 CPU/命令流，一个在 buffer。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(12);
+                const VkViewport vp = full_vp;
+                const std::array<glm::vec2, 5> zig = {
+                    glm::vec2{0.10F, 0.20F}, glm::vec2{0.50F, 0.82F},
+                    glm::vec2{0.82F, 0.20F}, glm::vec2{0.22F, 0.62F},
+                    glm::vec2{0.90F, 0.72F}};
+                const std::uint32_t heap = add_stroke(
+                    ui_dao::path_stroke(inset(area, 24.0F), view, std::span{zig}, 12.0F,
+                                        glm::vec4(0.95F, 0.35F, 0.75F, 1.0F),
+                                        glm::vec4(0.20F, 0.95F, 0.95F, 1.0F)));
+                const std::uint32_t cst = add_const(2u, heap);
+                const VkDrawIndexedIndirectCommand cmd{.indexCount = 6,
+                                                       .instanceCount = 1,
+                                                       .firstIndex = 0,
+                                                       .vertexOffset = 0,
+                                                       .firstInstance = 0};
+                const VkDeviceSize ind = add_indirect_indexed(cmd);
+                const shader_data::PushData pc = pc_at(cst, 12u);
+
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineTransparentUI);
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                                 nullptr);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc), &pc);
+                commandBuffer.drawIndexedIndirect(sb.indirectDrawBuffer.buffer.buffer(),
+                                                  ind, 1,
+                                                  sizeof(VkDrawIndexedIndirectCommand));
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [13] indirect + 两个不同 program：count=2 目标形态，加 count=1 可见回退
+            // C API: BindPipeline(transparent) → BindDescriptorSets → SetViewport →
+            //        SetScissor → BindIndexBuffer →
+            //        Push(cS) → DrawIndexedIndirect(count=2, stride=20) →
+            //        Push(cS) → DrawIndexedIndirect(count=1) →
+            //        Push(cF) → DrawIndexedIndirect(count=1)
+            // 排列组合：同一份 VkDrawIndexedIndirectCommand[]/CommandConstant[]，
+            //           先按 intent8 的目标形态发一条 count=2（gl_DrawID 选 program），
+            //           再按“同一条 indirect command + 两次不同 push”发两条 count=1。
+            // 数据协议：count=2 时 shader 用 gl_DrawIDARB 选 CommandConstant[i]；
+            //           count=1 时 push 直接指向对应的 CommandConstant[i]。
+            // 实测：本机 count=2 的画面只有第一条 command；所以保守形态改用
+            //       “同一条 indirect command + 两次不同 push”把 Shape/PathFill
+            //       都画出来。两条路径共用同一份数据，正好给出“理想 c_api_list”
+            //       和“保守 c_api_list”两种素材；command 层可以按驱动能力选择。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(13);
+                const VkViewport vp = full_vp;
+                const std::uint32_t hS =
+                    add_shape(ui_dao::sdf_shape(half(area, false), view, 16.0F,
+                                                glm::vec4(0.85F, 0.65F, 0.20F, 1.0F)));
+                const std::array<glm::vec2, 3> tri = {
+                    glm::vec2{0.5F, 0.0F}, glm::vec2{0.0F, 1.0F}, glm::vec2{1.0F, 1.0F}};
+                const std::uint32_t hF =
+                    add_fill(ui_dao::path_fill(half(area, true), view, std::span{tri},
+                                               glm::vec4(0.20F, 0.65F, 0.95F, 1.0F)));
+                const std::uint32_t cS = add_const(0u, hS);
+                const std::uint32_t cF = add_const(1u, hF);
+                const VkDrawIndexedIndirectCommand cmd0{.indexCount = 6,
+                                                        .instanceCount = 1,
+                                                        .firstIndex = 0,
+                                                        .vertexOffset = 0,
+                                                        .firstInstance = 0};
+                const VkDrawIndexedIndirectCommand cmd1{.indexCount = 6,
+                                                        .instanceCount = 1,
+                                                        .firstIndex = 0,
+                                                        .vertexOffset = 0,
+                                                        .firstInstance = 0};
+                const VkDeviceSize ind = add_indirect_indexed(cmd0);
+                add_indirect_indexed(cmd1);
+                const shader_data::PushData pcS = pc_at(cS, 13u);
+                const shader_data::PushData pcF = pc_at(cF, 13u);
+
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineTransparentUI);
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                                 nullptr);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+
+                // 目标形态：一条 C API 承载两条 command，gl_DrawID 选 program。
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pcS), &pcS);
+                commandBuffer.drawIndexedIndirect(sb.indirectDrawBuffer.buffer.buffer(),
+                                                  ind, 2,
+                                                  sizeof(VkDrawIndexedIndirectCommand));
+
+                // 保守形态：每条 command 各发一条 count=1，两个 program 都可见。
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pcS), &pcS);
+                commandBuffer.drawIndexedIndirect(sb.indirectDrawBuffer.buffer.buffer(),
+                                                  ind, 1,
+                                                  sizeof(VkDrawIndexedIndirectCommand));
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pcF), &pcF);
+                commandBuffer.drawIndexedIndirect(sb.indirectDrawBuffer.buffer.buffer(),
+                                                  ind, 1,
+                                                  sizeof(VkDrawIndexedIndirectCommand));
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [14] 实例范围：firstInstance=1, instanceCount=3
+            // C API: SetViewport → SetScissor → PushConstants(一次) →
+            //        DrawIndexed(6,3,0,0,1)
+            // 排列组合：一条 draw，实例范围 [1,3]；和 [01]（instanceCount=4,
+            //           firstInstance=0）、[02]（两条 draw, firstInstance=0/1）不同。
+            // 分离：不需要。firstInstance 是实例数组的起始行，instanceCount 是
+            //       覆盖的连续行数；一条 draw 就能画“从第 1 行起的 3 个实例”。
+            //
+            // NOTE: 这里故意不放 vkCmdPipelineBarrier2。未启用
+            //       dynamicRenderingLocalRead / shaderTileImage* 时，
+            //       VUID-vkCmdPipelineBarrier2-None-09553 禁止在 render scope 内
+            //       调用 vkCmdPipelineBarrier2；所以本语料的 barrier 全部放在
+            //       scope 之间（见 [17] / [20] / [21]）。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(14);
+                const VkViewport vp = full_vp;
+                std::uint32_t heap = 0;
+                for (std::uint32_t i = 0; i < 4; ++i)
+                {
+                    auto s = ui_dao::sdf_shape(
+                        ui_dao::rect_px{static_cast<float>(area.offset.x) + 10.0F +
+                                            static_cast<float>(i) * 40.0F,
+                                        static_cast<float>(area.offset.y) + 30.0F, 36.0F,
+                                        100.0F},
+                        view, 10.0F,
+                        glm::vec4(0.15F + 0.20F * static_cast<float>(i), 0.45F,
+                                  0.95F - 0.18F * static_cast<float>(i), 1.0F));
+                    const std::uint32_t off = add_shape(s);
+                    if (i == 0)
+                        heap = off;
+                }
+                const std::uint32_t cst = add_const(0u, heap);
+                const shader_data::PushData pc = pc_at(cst, 14u);
+
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc), &pc);
+                commandBuffer.drawIndexed(6, 3, 0, 0, 1);
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [15] 正交 state：BindVertexBuffers + Noise program
+            // C API: BindVertexBuffers → BindPipeline(transparent) →
+            //        BindDescriptorSets → SetViewport → SetScissor →
+            //        BindIndexBuffer → PushConstants → DrawIndexed
+            // 排列组合：多了一条 vertex buffer 绑定；本 pipeline 没有 vertex input，
+            //           所以这个绑定合法但不参与 shader；NoiseQuad 是 program 6。
+            // 分离：不需要为 vertex buffer 再发 draw；它只是状态流里的一条命令。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(15);
+                const VkViewport vp = full_vp;
+                const std::uint32_t heap = add_noise(ui_dao::noise(
+                    inset(area, 26.0F), view, glm::vec4(0.15F, 0.20F, 0.35F, 1.0F),
+                    glm::vec4(0.95F, 0.55F, 0.20F, 1.0F), 6.0F, 0.37F, 3, 14.0F));
+                const std::uint32_t cst = add_const(6u, heap);
+                const shader_data::PushData pc = pc_at(cst, 15u);
+                const VkBuffer vertexBuffer = sb.globalVertexBuffer.buffer.buffer();
+                const VkDeviceSize vertexOffset = 0;
+
+                commandBuffer.bindVertexBuffers(0, 1, vertexBuffer, vertexOffset);
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineTransparentUI);
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                                 nullptr);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc), &pc);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [16] 顺序变体：先写 dynamic state / descriptor / index，再 bind pipeline
+            // C API: SetViewport → SetScissor → BindDescriptorSets → BindIndexBuffer →
+            //        BindPipeline(opaque) → PushConstants → DrawIndexed
+            // 排列组合：与 [00] 的 API 种类相同，但顺序反过来。
+            // 分离：不需要额外的 draw；这个 case 证明 dynamic state 和 descriptor set
+            //       在 bind pipeline 之后仍然有效（layout 兼容、pipeline 声明了 dynamic）。
+            //       它是 command 层“去重/重排”必须保住的生命周期用例。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(16);
+                const VkViewport vp = full_vp;
+                const VkRect2D sc = area;
+                const std::uint32_t heap =
+                    add_shape(ui_dao::sdf_shape(inset(area, 24.0F), view, 18.0F,
+                                                glm::vec4(0.55F, 0.95F, 0.55F, 1.0F)));
+                const std::uint32_t cst = add_const(0u, heap);
+                const shader_data::PushData pc = pc_at(cst, 16u);
+
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&sc, 1});
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                                 nullptr);
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaqueUI);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc), &pc);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [22] depth-test pipeline：opaque3D，两个重叠 Shape，z=0.25 / 0.75
+            // C API: BindPipeline(opaque3D) → BindDescriptorSets → SetViewport →
+            //        SetScissor → BindIndexBuffer → Push(A) → DrawIndexed →
+            //        Push(B) → DrawIndexed
+            // 排列组合：pipeline 的 depthTest/depthWrite 打开；两条 draw 的数据
+            //           只有 model 的 z/xy 平移不同。
+            // 分离：必要。深度测试是 fixed-function state，pipeline 是 batch key；
+            //       第二条在重叠区域被 LESS 丢弃，不能和第一条合并。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(22);
+                const VkViewport vp = full_vp;
+                auto s0 = ui_dao::sdf_shape(inset(area, 34.0F), view, 20.0F,
+                                            glm::vec4(0.95F, 0.25F, 0.25F, 1.0F));
+                s0.model[3].z = 0.25F;
+                auto s1 = ui_dao::sdf_shape(inset(area, 34.0F), view, 20.0F,
+                                            glm::vec4(0.25F, 0.45F, 0.95F, 1.0F));
+                s1.model[3].z = 0.75F;
+                s1.model[3].x += 0.04F;
+                s1.model[3].y += 0.04F;
+                const std::uint32_t h0 = add_shape(s0);
+                const std::uint32_t h1 = add_shape(s1);
+                const std::uint32_t c0 = add_const(0u, h0);
+                const std::uint32_t c1 = add_const(0u, h1);
+                const shader_data::PushData pc0 = pc_at(c0, 22u);
+                const shader_data::PushData pc1 = pc_at(c1, 22u);
+
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaque3D);
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                                 nullptr);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc0), &pc0);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc1), &pc1);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [23] 动态 stencil reference：pipe6（stencilTest=ON, compare=EQUAL）
+            // C API: BindPipeline(pipe6) → BindDescriptorSets → SetViewport →
+            //        SetScissor → BindIndexBuffer → SetStencilReference(0) →
+            //        Push(A) → DrawIndexed → SetStencilReference(1) →
+            //        Push(B) → DrawIndexed
+            // 排列组合：stencil reference 在两条 draw 之间变 0→1；模板缓冲初始 clear 0。
+            // 分离：必要。stencil ref 是 dynamic state，不能按 instance 变；
+            //       第二条 compare 1==0 失败，被模板测试丢弃（右侧留空）。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(23);
+                const VkViewport vp = full_vp;
+                const std::uint32_t h0 =
+                    add_shape(ui_dao::sdf_shape(half(area, false), view, 16.0F,
+                                                glm::vec4(0.95F, 0.75F, 0.25F, 1.0F)));
+                const std::uint32_t h1 = add_shape(ui_dao::sdf_shape(
+                    half(area, true), view, 16.0F, glm::vec4(0.25F, 0.85F, 0.95F, 1.0F)));
+                const std::uint32_t c0 = add_const(0u, h0);
+                const std::uint32_t c1 = add_const(0u, h1);
+                const shader_data::PushData pc0 = pc_at(c0, 23u);
+                const shader_data::PushData pc1 = pc_at(c1, 23u);
+
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *(*uiPipelines().pipes[6]));
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                                 nullptr);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc0), &pc0);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK, 1);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc1), &pc1);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+            }
+#endif
+            // A 组结束：这是第一个 endRendering，但绝不是唯一一个。
             commandBuffer.endRendering();
 
+#if 0
+            // ════════════════════════════════════════════════════════════════
+            // B 组：scope 边界 / 多次 endRendering / suspend-resume / copy
+            //   每个 case 自己带 begin/end；scope 之间没有隐式顺序，所以先发
+            //   memory barrier（case [20] 的 copy 用 image barrier 承担同一职责）。
+            //   NOTE: 这些 barrier 必须放在 scope 外。未启用
+            //   dynamicRenderingLocalRead / shaderTileImage* 时，
+            //   VUID-vkCmdPipelineBarrier2-None-09553 禁止在 render scope 内调用
+            //   vkCmdPipelineBarrier2；scope 内只允许 draw/state/query 等。
+            // ════════════════════════════════════════════════════════════════
+
+            // ────────────────────────────────────────────────────────────────
+            // [17] 两次 begin/end，同一个 target：multiple endRendering
+            // C API: PipelineBarrier2 → BeginRendering(LOAD) → BindPipeline →
+            //        BindDescriptorSets → SetViewport → SetScissor → BindIndexBuffer →
+            //        Push(A) → DrawIndexed → EndRendering → PipelineBarrier2 →
+            //        BeginRendering(LOAD) → Push(B) → DrawIndexed → EndRendering
+            // 排列组合：两个 scope；第二次 begin 不再重绑 pipeline/set/index/viewport/
+            //           scissor，证明 beginRendering 不是状态重置。
+            // 分离：必要。两个 render pass instance 之间没有隐式顺序，必须显式 barrier；
+            //       这是用户要求的“多个 endRendering”用例。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(17);
+                const VkViewport vp = full_vp;
+                const std::uint32_t h0 = add_shape(ui_dao::sdf_shape(
+                    half(area, false), view, 16.0F, glm::vec4(0.95F, 0.45F, 0.15F, 1.0F)));
+                const std::uint32_t h1 = add_shape(ui_dao::sdf_shape(
+                    half(area, true), view, 16.0F, glm::vec4(0.20F, 0.75F, 0.95F, 1.0F)));
+                const std::uint32_t c0 = add_const(0u, h0);
+                const std::uint32_t c1 = add_const(0u, h1);
+                const shader_data::PushData pc0 = pc_at(c0, 17u);
+                const shader_data::PushData pc1 = pc_at(c1, 17u);
+
+                commandBuffer.pipelineBarrier2(scope_dep);
+                commandBuffer.beginRendering(info_load);
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaqueUI);
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &descriptorSet,
+                                                 0, nullptr);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc0), &pc0);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                commandBuffer.endRendering();
+
+                commandBuffer.pipelineBarrier2(scope_dep);
+                commandBuffer.beginRendering(info_load);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc1), &pc1);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                commandBuffer.endRendering();
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [18] scope 的 renderArea 变体：只对 tile 做 CLEAR，再画
+            // C API: PipelineBarrier2 → BeginRendering(renderArea=tile, loadOp=CLEAR) →
+            //        BindPipeline → BindDescriptorSets → SetViewport → SetScissor →
+            //        BindIndexBuffer → PushConstants → DrawIndexed → EndRendering
+            // 排列组合：VkRenderingInfo.renderArea 从全屏变成 tile；clear 只作用于
+            //           这个 scope 的 renderArea，不是 scissor。
+            // 分离：这是 scope 级变体，不是 draw 间分离；它决定 load/store 的作用域。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(18);
+                const VkViewport vp = full_vp;
+                const std::uint32_t heap = add_shape(ui_dao::sdf_shape(
+                    inset(area, 24.0F), view, 18.0F,
+                    glm::vec4(0.65F, 0.45F, 0.95F, 1.0F)));
+                const std::uint32_t cst = add_const(0u, heap);
+                const shader_data::PushData pc = pc_at(cst, 18u);
+                VkRenderingInfo info_area = info_clear;
+                info_area.renderArea = area;
+
+                commandBuffer.pipelineBarrier2(scope_dep);
+                commandBuffer.beginRendering(info_area);
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaqueUI);
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &descriptorSet,
+                                                 0, nullptr);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc), &pc);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                commandBuffer.endRendering();
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [19] suspend → resume：同一个 scope 被拆成两次 begin/end
+            // C API: PipelineBarrier2 → BeginRendering(SUSPENDING) → BindPipeline →
+            //        BindDescriptorSets → SetViewport → SetScissor → BindIndexBuffer →
+            //        Push(A) → DrawIndexed → EndRendering → BeginRendering(RESUMING) →
+            //        BindPipeline → BindDescriptorSets → SetViewport → SetScissor →
+            //        BindIndexBuffer → Push(B) → DrawIndexed → EndRendering
+            // 排列组合：第一次 begin 带 SUSPENDING，第二次带 RESUMING；两个
+            //           VkRenderingInfo 除 flags 外必须一致。
+            // 分离：必要。suspend 与 resume 之间不能插入任何 action/sync 命令，
+            //       也不能有别的 scope；这是动态渲染的高级拓扑。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(19);
+                const VkViewport vp = full_vp;
+                const std::uint32_t h0 = add_shape(ui_dao::sdf_shape(
+                    half(area, false), view, 16.0F, glm::vec4(0.95F, 0.85F, 0.55F, 1.0F)));
+                const std::uint32_t h1 = add_shape(ui_dao::sdf_shape(
+                    half(area, true), view, 16.0F, glm::vec4(0.35F, 0.85F, 0.45F, 1.0F)));
+                const std::uint32_t c0 = add_const(0u, h0);
+                const std::uint32_t c1 = add_const(0u, h1);
+                const shader_data::PushData pc0 = pc_at(c0, 19u);
+                const shader_data::PushData pc1 = pc_at(c1, 19u);
+
+                commandBuffer.pipelineBarrier2(scope_dep);
+                commandBuffer.beginRendering(info_suspend);
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaqueUI);
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &descriptorSet,
+                                                 0, nullptr);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc0), &pc0);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                commandBuffer.endRendering();
+
+                // 这里不能有 barrier / copy / 任何别的命令，只能 begin(RESUMING)。
+                commandBuffer.beginRendering(info_resume);
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaqueUI);
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &descriptorSet,
+                                                 0, nullptr);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc1), &pc1);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                commandBuffer.endRendering();
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [20] scope 外 copy：COLOR_ATTACHMENT → TRANSFER_SRC → copy → 回来
+            // C API: Transition(resolve, COLOR→TRANSFER_SRC) →
+            //        CopyImageToBuffer(1×1) →
+            //        Transition(resolve, TRANSFER_SRC→COLOR) → PipelineBarrier2 →
+            //        BeginRendering(LOAD) → BindPipeline → BindDescriptorSets →
+            //        SetViewport → SetScissor → BindIndexBuffer → PushConstants →
+            //        DrawIndexed → EndRendering
+            // 排列组合：copy 是 render scope 外的工作；两条 layout transition 夹住它。
+            // 分离：必要。copy / layout transition 都只能 Outside render scope；
+            //       这是 picking/readback 的典型边界。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(20);
+                const VkViewport vp = full_vp;
+                const std::uint32_t heap = add_shape(ui_dao::sdf_shape(
+                    inset(area, 24.0F), view, 18.0F,
+                    glm::vec4(0.55F, 0.95F, 0.95F, 1.0F)));
+                const std::uint32_t cst = add_const(0u, heap);
+                const shader_data::PushData pc = pc_at(cst, 20u);
+
+                my_render::transition_image_layout(
+                    commandBuffer,
+                    my_render::image_info{
+                        .image = resolveImage,
+                        .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                .stage_mask =
+                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                        .dst = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
+                                .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
+
+                const VkBufferImageCopy region{
+                    .bufferOffset = 0,
+                    .bufferRowLength = 0,
+                    .bufferImageHeight = 0,
+                    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                    .imageOffset =
+                        {area.offset.x +
+                             static_cast<std::int32_t>(area.extent.width / 2),
+                         area.offset.y +
+                             static_cast<std::int32_t>(area.extent.height / 2),
+                         0},
+                    .imageExtent = {1, 1, 1}};
+                commandBuffer.copyImageToBuffer(
+                    resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    pickCtx.frames[currentFrame].buffer(), std::span{&region, 1});
+
+                my_render::transition_image_layout(
+                    commandBuffer,
+                    my_render::image_info{
+                        .image = resolveImage,
+                        .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                        .src = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
+                                .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT},
+                        .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                .stage_mask =
+                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
+
+                commandBuffer.pipelineBarrier2(scope_dep);
+                commandBuffer.beginRendering(info_load);
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineOpaqueUI);
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &descriptorSet,
+                                                 0, nullptr);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                              VK_INDEX_TYPE_UINT32);
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc), &pc);
+                commandBuffer.drawIndexed(6, 1, 0, 0, 0);
+                commandBuffer.endRendering();
+            }
+
+            // ────────────────────────────────────────────────────────────────
+            // [21] 非索引 indirect：vkCmdDrawIndirect，PathFill program
+            // C API: PipelineBarrier2 → BeginRendering(LOAD) →
+            //        BindPipeline(transparent) → BindDescriptorSets → SetViewport →
+            //        SetScissor → PushConstants → DrawIndirect(count=1) → EndRendering
+            // 排列组合：非索引 indirect；没有 BindIndexBuffer 参与这条 draw；
+            //           firstVertex=8 指向 non-indexed 顶点数组。
+            // 分离：C API 层不需要为“非索引”再发 BindIndexBuffer；它和 [12] 的
+            //       indexed indirect 是两条不同的提交路径。
+            // ────────────────────────────────────────────────────────────────
+            {
+                const VkRect2D area = tile(21);
+                const VkViewport vp = full_vp;
+                const std::array<glm::vec2, 3> tri = {
+                    glm::vec2{0.5F, 0.0F}, glm::vec2{0.0F, 1.0F},
+                    glm::vec2{1.0F, 1.0F}};
+                const std::uint32_t heap = add_fill(ui_dao::path_fill(
+                    inset(area, 26.0F), view, std::span{tri},
+                    glm::vec4(0.35F, 0.95F, 0.45F, 1.0F)));
+                const std::uint32_t cst = add_const(1u, heap);
+                const VkDrawIndirectCommand cmd{
+                    .vertexCount = 6,
+                    .instanceCount = 1,
+                    .firstVertex = kNonIndexedVertex,
+                    .firstInstance = 0};
+                const VkDeviceSize ind = add_indirect(cmd);
+                const shader_data::PushData pc = pc_at(cst, 21u);
+
+                commandBuffer.pipelineBarrier2(scope_dep);
+                commandBuffer.beginRendering(info_load);
+                commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                           *mainCtx.pipelineTransparentUI);
+                commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                 *pipelineLayout, 0, 1, &descriptorSet,
+                                                 0, nullptr);
+                commandBuffer.setViewport(0, std::span{&vp, 1});
+                commandBuffer.setScissor(0, std::span{&area, 1});
+                commandBuffer.pushConstants(*pipelineLayout,
+                                            VK_SHADER_STAGE_VERTEX_BIT |
+                                                VK_SHADER_STAGE_FRAGMENT_BIT,
+                                            0, sizeof(pc), &pc);
+                commandBuffer.functions().vkCmdDrawIndirect(
+                    *commandBuffer, sb.indirectDrawBuffer.buffer.buffer(), ind, 1,
+                    sizeof(VkDrawIndirectCommand));
+                commandBuffer.endRendering();
+            }
+#endif
+            // 最后：swapchain image 从 COLOR_ATTACHMENT_OPTIMAL → PRESENT_SRC。
             my_render::transition_image_layout(
                 commandBuffer,
                 my_render::image_info{
