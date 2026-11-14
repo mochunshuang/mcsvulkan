@@ -10108,7 +10108,10 @@ try
             std::uint32_t strokeCursor = 0;
             std::uint32_t noiseCursor = 0;
             std::uint32_t constantCursor = 0;
-            std::uint32_t indirectCursor = 0;
+            // 注意：VkDrawIndexedIndirectCommand(20B) 和 VkDrawIndirectCommand(16B)
+            // 共用一个 buffer，不能用“第几条”乘各自 sizeof；必须用字节 cursor，
+            // 否则 [21] 会写到 [13] 的 cmd1 中间，造成数据被覆盖/闪烁。
+            VkDeviceSize indirectByteCursor = 0;
 
             const auto add_shape = [&](shader_data::Shape s) -> std::uint32_t {
                 const std::uint32_t off = kShapeBase + shapeCursor * kShapeStride;
@@ -10150,18 +10153,16 @@ try
             };
             const auto add_indirect_indexed =
                 [&](const VkDrawIndexedIndirectCommand &cmd) -> VkDeviceSize {
-                const VkDeviceSize off = static_cast<VkDeviceSize>(indirectCursor) *
-                                         sizeof(VkDrawIndexedIndirectCommand);
+                const VkDeviceSize off = indirectByteCursor;
                 sb.indirectDrawBuffer.write(off, &cmd, sizeof(cmd));
-                ++indirectCursor;
+                indirectByteCursor += sizeof(cmd);
                 return off;
             };
             const auto add_indirect =
                 [&](const VkDrawIndirectCommand &cmd) -> VkDeviceSize {
-                const VkDeviceSize off = static_cast<VkDeviceSize>(indirectCursor) *
-                                         sizeof(VkDrawIndirectCommand);
+                const VkDeviceSize off = indirectByteCursor;
                 sb.indirectDrawBuffer.write(off, &cmd, sizeof(cmd));
-                ++indirectCursor;
+                indirectByteCursor += sizeof(cmd);
                 return off;
             };
 
@@ -12656,18 +12657,57 @@ try
 
             // ────────────────────────────────────────────────────────────────
             // [17] 两次 begin/end，同一个 target：multiple endRendering
-            // C API: PipelineBarrier2 → BeginRendering(LOAD) → BindPipeline →
-            //        BindDescriptorSets → SetViewport → SetScissor → BindIndexBuffer →
-            //        Push(A) → DrawIndexed → EndRendering → PipelineBarrier2 →
-            //        BeginRendering(LOAD) → Push(B) → DrawIndexed → EndRendering
-            // 排列组合：两个 scope；第二次 begin 不再重绑 pipeline/set/index/viewport/
-            //           scissor，证明 beginRendering 不是状态重置。
-            // 分离：必要。两个 render pass instance 之间没有隐式顺序，必须显式 barrier；
-            //       这是用户要求的“多个 endRendering”用例。
+            // C API: PB → BeginRendering(LOAD) → BindPipeline → BindDescriptorSets →
+            //        SetViewport → SetScissor → BindIndexBuffer → Push(A) →
+            //        DrawIndexed → EndRendering →
+            //        PB → BeginRendering(LOAD) → Push(B) → DrawIndexed → EndRendering
+            //
+            // NOTE: 这是 B 组第一个 case，也是全语料第一次出现“同一个 target 上
+            //       开两个 render pass instance”。A 组是 1 个 scope 包 20+ 个 case；
+            //       [17] 是 2 个 scope，每个 scope 各画一条 draw。
+            //
+            // NOTE: 和 A 组的对照：
+            //   A 组      : 1 个 scope，附件 CLEAR，scope 内 draw 之间无 barrier；
+            //   [17]      : 2 个 scope，附件 LOAD，两个 scope 之间必须显式 barrier。
+            //
+            // NOTE: 三个独有观察点（A 组都测不到）：
+            //
+            //   ① 多 scope 到同一 target 合法，前提是第二次用 LOAD：
+            //      第一个 scope 用 info_load（loadOp=LOAD，不是 CLEAR）；
+            //      如果第二次也用 CLEAR，第一次画的 h0 会被清掉。
+            //      LOAD 让第二个 scope 继承前一个 scope 的附件内容。
+            //
+            //   ② scope 之间必须显式 barrier：
+            //      endRendering 之后，第一个 scope 的 color/depth 写入对第二个
+            //      scope 没有隐式可见性。第二个 scope 用 LOAD 要读之前的颜色，
+            //      这是 RAW 依赖，必须靠 pipelineBarrier2 建立。
+            //      两个 scope 之间没有隐式顺序，这是和 A 组“scope 内 draw 无
+            //      barrier”的本质区别。
+            //
+            //   ③ beginRendering/endRendering 不重置 command buffer 绑定状态：
+            //      第二次 begin 后没有 bindPipeline / bindDescriptorSets /
+            //      setViewport / setScissor / bindIndexBuffer，直接 draw。
+            //      第一次 scope 里绑的 pipeline / set / viewport / scissor /
+            //      index buffer 全部保留。
+            //      证明 begin/end 只切换 render pass instance，不是状态重置。
+            //
+            // NOTE: 但 pushConstants 要重新 push：
+            //      push constants 也跨 scope 保留，但这里值变了（从 pc0 换成
+            //      pc1），所以要重 push。如果第二次还用 pc0，就不需要重 push。
+            //      准确表述：pipeline/set/viewport/scissor/index 跨 scope 保留，
+            //      不需要重绑；push constants 也保留，但值变了所以要重 push。
+            //
+            // NOTE: 和 [06]/[16] 的三方向对照（同一主题的三个方向）：
+            //   [06] 同一个 scope 内，状态粘滞：不重绑，旧状态仍有效；
+            //   [16] 同一个 scope 内，状态可重排：先设后绑，只要兼容就有效；
+            //   [17] 跨 scope，状态粘滞：end/begin 不重置绑定。
+            //   三者合起来：pipeline 绑定、dynamic state、descriptor set、
+            //   index buffer 的生命周期都不受 begin/end 影响。
             // ────────────────────────────────────────────────────────────────
             {
-                const VkRect2D area = tile(17);
+                const VkRect2D area = tile(25);
                 const VkViewport vp = full_vp;
+                // 左橙右青，两个 Shape 分别给 scope1、scope2 用
                 const std::uint32_t h0 =
                     add_shape(ui_dao::sdf_shape(half(area, false), view, 16.0F,
                                                 glm::vec4(0.95F, 0.45F, 0.15F, 1.0F)));
@@ -12678,8 +12718,12 @@ try
                 const shader_data::PushData pc0 = pc_at(c0, 17u);
                 const shader_data::PushData pc1 = pc_at(c1, 17u);
 
+                // ── Scope 1：完整绑定 + 画 h0 ───────────────────────────────
+                // barrier 必须在 scope 外：A 组 endRendering 之后还没有任何
+                // 对 color/depth 的读，所以这里 barrier 是“scope1 的写入 →
+                // scope2 的 LOAD 读”的 RAW 依赖。
                 commandBuffer.pipelineBarrier2(scope_dep);
-                commandBuffer.beginRendering(info_load);
+                commandBuffer.beginRendering(info_load); // loadOp=LOAD，保留 clear 值
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                            *mainCtx.pipelineOpaqueUI);
                 commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -12696,7 +12740,23 @@ try
                 commandBuffer.drawIndexed(6, 1, 0, 0, 0);
                 commandBuffer.endRendering();
 
+                // ── Scope 1 → Scope 2 的边界 ─────────────────────────────────
+                // 两个 render pass instance 之间没有隐式顺序：
+                // scope1 的 color/depth 写入必须靠 barrier 才可见。
+                // barrier 只能放 scope 外（VUID-vkCmdPipelineBarrier2-None-09553
+                // 禁止在 render scope 内调用）。
                 commandBuffer.pipelineBarrier2(scope_dep);
+
+                // ── Scope 2：不重绑，只换 push，再画 h1 ─────────────────────
+                // 第二次 beginRendering 后，以下状态全部保留：
+                //   pipeline = pipelineOpaqueUI
+                //   descriptor set = descriptorSet
+                //   viewport = vp
+                //   scissor = area
+                //   index buffer = globalIndexBuffer, offset 0
+                // 所以这里没有 bindPipeline / bindDescriptorSets / setViewport /
+                // setScissor / bindIndexBuffer。
+                // pushConstants 也保留，但值从 pc0 换成 pc1，所以要重 push。
                 commandBuffer.beginRendering(info_load);
                 commandBuffer.pushConstants(*pipelineLayout,
                                             VK_SHADER_STAGE_VERTEX_BIT |
@@ -12705,34 +12765,70 @@ try
                 commandBuffer.drawIndexed(6, 1, 0, 0, 0);
                 commandBuffer.endRendering();
             }
-#if 0
+
             // ────────────────────────────────────────────────────────────────
             // [18] scope 的 renderArea 变体：只对 tile 做 CLEAR，再画
-            // C API: PipelineBarrier2 → BeginRendering(renderArea=tile, loadOp=CLEAR) →
+            // C API: PB → BeginRendering(renderArea=tile, loadOp=CLEAR) →
             //        BindPipeline → BindDescriptorSets → SetViewport → SetScissor →
             //        BindIndexBuffer → PushConstants → DrawIndexed → EndRendering
-            // 排列组合：VkRenderingInfo.renderArea 从全屏变成 tile；clear 只作用于
-            //           这个 scope 的 renderArea，不是 scissor。
-            // 分离：这是 scope 级变体，不是 draw 间分离；它决定 load/store 的作用域。
+            //
+            // NOTE: 本 case 的独有点只有一个：renderArea 从全屏缩到 tile(26)，
+            //       而且 loadOp 是 CLEAR。它带出三个前面没测过的观察点：
+            //
+            //   ① renderArea 是 scope 级，不是 draw 级：
+            //      renderArea 是 VkRenderingInfo 的字段，在 beginRendering 时
+            //      确定，整个 scope 内不变。它不是 draw 参数，也不是 dynamic
+            //      state，不能按 draw 改。
+            //
+            //   ② renderArea 同时决定三件事：
+            //      - loadOp=CLEAR 的作用域：只清 renderArea 内，renderArea 外
+            //        保留之前的内容；
+            //      - storeOp=STORE 的作用域：只把 renderArea 内写回附件；
+            //      - 片元裁剪：renderArea 外的片元被丢弃（和 scissor 叠加）。
+            //      所以本 case 的视觉是：tile(26) 被清 + 紫色 Shape；
+            //      tile(26) 外保留 [17] 画的两个 Shape（CLEAR 没碰它们）。
+            //
+            //   ③ renderArea 和 scissor 的区别：
+            //      - renderArea 是 scope 级（VkRenderingInfo），不能按 draw 变；
+            //        scissor 是 draw 级（dynamic state），可以按 draw 变；
+            //      - renderArea 影响 CLEAR/STORE 的作用域；scissor 不影响；
+            //      - 两者都裁剪片元，范围取交集。
+            //      本 case 的 renderArea 和 scissor 都是 tile(26)，所以裁剪
+            //      范围相同；但 renderArea 额外决定了 CLEAR 的作用域，这是
+            //      scissor 做不到的。
+            //
+            // NOTE: 和 [17] 的对照：
+            //   [17] 2 个 scope，全屏 renderArea，LOAD → 证明多 scope 到同一
+            //        target 合法 + 状态跨 scope 保留；
+            //   [18] 1 个 scope，tile renderArea，CLEAR → 证明 renderArea 可以
+            //        小于全屏，CLEAR 只作用于它，renderArea 外保留之前的内容。
+            //   两者合起来覆盖 VkRenderingInfo 的两个关键字段：loadOp 和 renderArea。
+            //
+            // NOTE: 这里只有一个 scope，所以不需要 scope 间 barrier；但
+            //       beginRendering 之前仍要 pipelineBarrier2，因为 [17] 的
+            //       写入对 [18] 的 CLEAR/READ 需要可见性。
             // ────────────────────────────────────────────────────────────────
             {
-                const VkRect2D area = tile(18);
+                const VkRect2D area = tile(26);
                 const VkViewport vp = full_vp;
-                const std::uint32_t heap = add_shape(ui_dao::sdf_shape(
-                    inset(area, 24.0F), view, 18.0F,
-                    glm::vec4(0.65F, 0.45F, 0.95F, 1.0F)));
+                const std::uint32_t heap =
+                    add_shape(ui_dao::sdf_shape(inset(area, 24.0F), view, 18.0F,
+                                                glm::vec4(0.65F, 0.45F, 0.95F, 1.0F)));
                 const std::uint32_t cst = add_const(0u, heap);
                 const shader_data::PushData pc = pc_at(cst, 18u);
                 VkRenderingInfo info_area = info_clear;
                 info_area.renderArea = area;
 
+                // NOTE: 必须。即使两次 beginRendering 之间附件布局和最终状态完全不变，pipelineBarrier2 依然是必需的
+                // pipelineBarrier2 在这里是数据可见性的保证，而非布局状态的同步。规范将独立的 render pass 视为完全独立的执行单元，它们之间的数据依赖必须由你通过显式 barrier 来连接。
                 commandBuffer.pipelineBarrier2(scope_dep);
-                commandBuffer.beginRendering(info_area);
+                commandBuffer.beginRendering(
+                    info_area); //NOTE: 更新 VkRenderingInfo 需要跨 scope
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                            *mainCtx.pipelineOpaqueUI);
                 commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                                 *pipelineLayout, 0, 1, &descriptorSet,
-                                                 0, nullptr);
+                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                                 nullptr);
                 commandBuffer.setViewport(0, std::span{&vp, 1});
                 commandBuffer.setScissor(0, std::span{&area, 1});
                 commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
@@ -12746,22 +12842,54 @@ try
             }
 
             // ────────────────────────────────────────────────────────────────
-            // [19] suspend → resume：同一个 scope 被拆成两次 begin/end
-            // C API: PipelineBarrier2 → BeginRendering(SUSPENDING) → BindPipeline →
-            //        BindDescriptorSets → SetViewport → SetScissor → BindIndexBuffer →
-            //        Push(A) → DrawIndexed → EndRendering → BeginRendering(RESUMING) →
-            //        BindPipeline → BindDescriptorSets → SetViewport → SetScissor →
-            //        BindIndexBuffer → Push(B) → DrawIndexed → EndRendering
-            // 排列组合：第一次 begin 带 SUSPENDING，第二次带 RESUMING；两个
-            //           VkRenderingInfo 除 flags 外必须一致。
-            // 分离：必要。suspend 与 resume 之间不能插入任何 action/sync 命令，
-            //       也不能有别的 scope；这是动态渲染的高级拓扑。
+            // [19] suspend → resume：//NOTE: 同一个 scope 被拆成两次 begin/end
+            // C API: PB → BeginRendering(SUSPENDING) → BindPipeline → BindDescriptorSets →
+            //        SetViewport → SetScissor → BindIndexBuffer → Push(A) →
+            //        DrawIndexed → EndRendering →
+            //        BeginRendering(RESUMING) → BindPipeline → BindDescriptorSets →
+            //        SetViewport → SetScissor → BindIndexBuffer → Push(B) →
+            //        DrawIndexed → EndRendering
+            //
+            // NOTE: 这不是 [17] 那种“两个独立 scope”。[17] 是两个 render pass
+            //       instance，靠 barrier 建立可见性；[19] 是**同一个 render pass
+            //       instance 被拆成两段**，中间禁止插入任何命令，状态的延续由
+            //       规范本身保证，不靠 command buffer 绑定状态粘滞。
+            //
+            // NOTE: Vulkan 规范的三条硬约束（缺一不可）：
+            //
+            //   ① 两个 VkRenderingInfo 除 flags 外必须完全相同：
+            //      suspend 用 info_suspend（含 VK_RENDERING_SUSPENDING_BIT），
+            //      resume 用 info_resume（含 VK_RENDERING_RESUMING_BIT）；
+            //      其余字段（renderArea / layerCount / viewMask / 附件 / loadOp /
+            //      storeOp / clearValue）必须逐项一致。
+            //
+            //   ② suspend 和 resume 之间禁止插入任何命令：
+            //      不能有 pipelineBarrier2、不能有 copy、不能有另一个
+            //      beginRendering。注释“这里不能有 barrier / copy / 任何别的命令”
+            //      就是这个意思。这和 [17]“scope 之间必须 barrier”正好相反。
+            //
+            //   ③ load/store 只在端点执行：
+            //      SUSPENDING 的实例不执行 storeOp（附件内容不写回）；
+            //      RESUMING 的实例不执行 loadOp（不重新加载）；
+            //      但 suspend 结束时附件内容保持定义，供 resume 访问。
+            //      所以视觉上两段绘制是连续叠加的，没有中间写回/重载。
+            //
+            // NOTE: 和 [17] 的对照：
+            //   [17]: 两个独立 scope，必须 barrier，第二次用 LOAD 继承内容；
+            //   [19]: 同一个 scope 的 suspend/resume，禁止 barrier，
+            //         内容延续由规范保证，不靠 LOAD。
+            //
+            // NOTE: 状态重绑：resume 后仍然重绑了 pipeline/set/viewport/scissor/
+            //       index。这不是“必须重绑”（规范不要求 resume 后重置状态），
+            //       而是为了让这段代码自包含、方便单独抽取；如果省略，状态
+            //       也会延续。但 pushConstants 从 pc0 换成 pc1，值变了，必须重 push。
             // ────────────────────────────────────────────────────────────────
             {
-                const VkRect2D area = tile(19);
+                const VkRect2D area = tile(27);
                 const VkViewport vp = full_vp;
-                const std::uint32_t h0 = add_shape(ui_dao::sdf_shape(
-                    half(area, false), view, 16.0F, glm::vec4(0.95F, 0.85F, 0.55F, 1.0F)));
+                const std::uint32_t h0 =
+                    add_shape(ui_dao::sdf_shape(half(area, false), view, 16.0F,
+                                                glm::vec4(0.95F, 0.85F, 0.55F, 1.0F)));
                 const std::uint32_t h1 = add_shape(ui_dao::sdf_shape(
                     half(area, true), view, 16.0F, glm::vec4(0.35F, 0.85F, 0.45F, 1.0F)));
                 const std::uint32_t c0 = add_const(0u, h0);
@@ -12770,12 +12898,12 @@ try
                 const shader_data::PushData pc1 = pc_at(c1, 19u);
 
                 commandBuffer.pipelineBarrier2(scope_dep);
-                commandBuffer.beginRendering(info_suspend);
+                commandBuffer.beginRendering(info_suspend); // flags = SUSPENDING
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                            *mainCtx.pipelineOpaqueUI);
                 commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                                 *pipelineLayout, 0, 1, &descriptorSet,
-                                                 0, nullptr);
+                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                                 nullptr);
                 commandBuffer.setViewport(0, std::span{&vp, 1});
                 commandBuffer.setScissor(0, std::span{&area, 1});
                 commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
@@ -12785,15 +12913,20 @@ try
                                                 VK_SHADER_STAGE_FRAGMENT_BIT,
                                             0, sizeof(pc0), &pc0);
                 commandBuffer.drawIndexed(6, 1, 0, 0, 0);
-                commandBuffer.endRendering();
+                commandBuffer.endRendering(); // 这里不会执行 storeOp
 
-                // 这里不能有 barrier / copy / 任何别的命令，只能 begin(RESUMING)。
-                commandBuffer.beginRendering(info_resume);
+                // ⚠️ 这里不能有 barrier / copy / 任何别的命令，只能 begin(RESUMING)。
+                // 规范：suspend 和 resume 之间禁止 action/sync 命令，也禁止其他
+                // render pass 实例。加 barrier 反而违规。
+                commandBuffer.beginRendering(info_resume); // flags = RESUMING
+                // 这里不执行 loadOp；内容延续自 suspend 之前。
+                // 重绑不是规范要求，是为了自包含；pushConstants 值变了必须重 push。
+
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                            *mainCtx.pipelineOpaqueUI);
                 commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                                 *pipelineLayout, 0, 1, &descriptorSet,
-                                                 0, nullptr);
+                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                                 nullptr);
                 commandBuffer.setViewport(0, std::span{&vp, 1});
                 commandBuffer.setScissor(0, std::span{&area, 1});
                 commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
@@ -12803,7 +12936,10 @@ try
                                                 VK_SHADER_STAGE_FRAGMENT_BIT,
                                             0, sizeof(pc1), &pc1);
                 commandBuffer.drawIndexed(6, 1, 0, 0, 0);
-                commandBuffer.endRendering();
+                commandBuffer.endRendering(); // 这里才执行 storeOp
+
+                // [19] 的注释核心是一条反转规则：[17] 说“scope 之间必须 barrier”，[19] 必须说“suspend 和 resume 之间禁止任何命令，包括 barrier”；
+                // 状态的延续由 Vulkan 规范保证（pRenderingInfo 一致 + 内容保持定义），不靠 command buffer 绑定粘滞，也不靠 LOAD
             }
 
             // ────────────────────────────────────────────────────────────────
@@ -12814,19 +12950,67 @@ try
             //        BeginRendering(LOAD) → BindPipeline → BindDescriptorSets →
             //        SetViewport → SetScissor → BindIndexBuffer → PushConstants →
             //        DrawIndexed → EndRendering
-            // 排列组合：copy 是 render scope 外的工作；两条 layout transition 夹住它。
-            // 分离：必要。copy / layout transition 都只能 Outside render scope；
-            //       这是 picking/readback 的典型边界。
+            //
+            // NOTE: 前面 [17]/[18]/[19] 讨论的都是 scope 内部或 scope 边界；
+            //       [20] 第一次处理“scope 外的工作”：copy 和 layout transition。
+            //
+            // NOTE: Vulkan 规范的两条硬约束（决定了这个 case 的顺序）：
+            //   ① vkCmdCopyImageToBuffer 不能在 render pass instance 内执行；
+            //      只能在 beginRendering 之前或 endRendering 之后。
+            //   ② layout transition 也不能在 render pass instance 内执行
+            //      （除非启用 dynamicRenderingLocalRead / shaderTileImage*）。
+            //   所以本 case 的顺序必须是：
+            //     transition → copy → transition → barrier → beginRendering → draw
+            //   不能把 copy 塞进 beginRendering 里。
+            //
+            // NOTE: 为什么读 resolveImage，不是 pickingImage：
+            //   A 组共享 scope 里，picking 附件是 MSAA 多采样（pickResource），
+            //   resolve 目标才是 1×1 单采样（resolveResource）。
+            //   vkCmdCopyImageToBuffer 要求单采样图像，不能直接 copy 多采样；
+            //   所以先 resolve 到 resolveImage，再从 resolveImage copy。
+            //   这是 picking/readback 的典型路径：多采样附件 → resolve →
+            //   单采样 → copy 到 buffer。
+            //
+            // NOTE: copy 的尺寸是 1×1，不是整个 tile：
+            //   imageExtent = {1, 1, 1}，只读 tile(28) 中心一个像素。
+            //   这个 case 的目的是验证“scope 外 copy 合法”，不是真做 picking
+            //   回读；1×1 足够小，不会覆盖太多数据。
+            //   buffer 是 pickCtx.frames[currentFrame]，大小
+            //   sizeof(picking_result)=16 字节，1×1 RGBA32_UINT 正好 16 字节。
+            //
+            // NOTE: 这个 copy 的结果没有被任何代码消费：
+            //   没有 CPU 回读，也没有 shader 读；它只是把数据写进 buffer，
+            //   演示 API 形态。所以 [20] 是“scope 外 copy 的合法性演示”，
+            //   不是“picking 回读演示”。
+            //
+            // NOTE: 两次 transition 夹 copy 是标准模式：
+            //   COLOR_ATTACHMENT_OPTIMAL → TRANSFER_SRC_OPTIMAL（为了 copy 读）
+            //   copy
+            //   TRANSFER_SRC_OPTIMAL → COLOR_ATTACHMENT_OPTIMAL（回来继续当附件）
+            //   如果后面还要用 resolveImage 当 attachment，必须转回来；
+            //   否则 layout 不匹配。
+            //
+            // NOTE: 和 [17]/[18]/[19] 的对照：
+            //   [17]: 两个独立 scope，scope 间必须 barrier；
+            //   [18]: scope 的 renderArea 缩小 + CLEAR；
+            //   [19]: 同一个 scope 的 suspend/resume，中间禁止任何命令；
+            //   [20]: scope 外 copy + 双 transition，copy 和 transition 都不能
+            //         在 scope 内。
+            //   四个 case 合起来覆盖了 render scope 的四种边界：
+            //   多 scope / scope 作用域 / scope 拆分段 / scope 外工作。
             // ────────────────────────────────────────────────────────────────
             {
-                const VkRect2D area = tile(20);
+                const VkRect2D area = tile(28);
                 const VkViewport vp = full_vp;
-                const std::uint32_t heap = add_shape(ui_dao::sdf_shape(
-                    inset(area, 24.0F), view, 18.0F,
-                    glm::vec4(0.55F, 0.95F, 0.95F, 1.0F)));
+                const std::uint32_t heap =
+                    add_shape(ui_dao::sdf_shape(inset(area, 24.0F), view, 18.0F,
+                                                glm::vec4(0.55F, 0.95F, 0.95F, 1.0F)));
                 const std::uint32_t cst = add_const(0u, heap);
                 const shader_data::PushData pc = pc_at(cst, 20u);
 
+                // ── Scope 外：transition → copy → transition ─────────────────
+                // 第一次 transition：COLOR_ATTACHMENT → TRANSFER_SRC，为了 copy 能读。
+                // 必须在 beginRendering 之前，因为 layout transition 不能在 scope 内。
                 my_render::transition_image_layout(
                     commandBuffer,
                     my_render::image_info{
@@ -12840,22 +13024,28 @@ try
                                 .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
                                 .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
 
+                // copy 1×1 像素：tile(28) 中心。
+                // 读的是 resolveImage（1×1 sample），不是 pickingImage（MSAA）；
+                // vkCmdCopyImageToBuffer 要求单采样图像。
+                // copy 结果写进 pickCtx.frames[currentFrame]，但本 case 没有消费它。
                 const VkBufferImageCopy region{
                     .bufferOffset = 0,
                     .bufferRowLength = 0,
                     .bufferImageHeight = 0,
                     .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                    .imageOffset =
-                        {area.offset.x +
-                             static_cast<std::int32_t>(area.extent.width / 2),
-                         area.offset.y +
-                             static_cast<std::int32_t>(area.extent.height / 2),
-                         0},
+                    .imageOffset = {area.offset.x +
+                                        static_cast<std::int32_t>(area.extent.width / 2),
+                                    area.offset.y +
+                                        static_cast<std::int32_t>(area.extent.height / 2),
+                                    0},
                     .imageExtent = {1, 1, 1}};
                 commandBuffer.copyImageToBuffer(
                     resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     pickCtx.frames[currentFrame].buffer(), std::span{&region, 1});
 
+                // 第二次 transition：TRANSFER_SRC → COLOR_ATTACHMENT，回来继续当附件。
+                // 如果后面还要用 resolveImage 当 attachment，必须转回来；
+                // 否则 layout 不匹配。
                 my_render::transition_image_layout(
                     commandBuffer,
                     my_render::image_info{
@@ -12869,13 +13059,17 @@ try
                                 .stage_mask =
                                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
 
+                // ── 回到 scope：barrier + beginRendering ─────────────────────
+                // copy 完成后、beginRendering 前，需要显式 barrier 建立可见性：
+                // 前面的 copy / transition 结果对后续 scope 内的读取/写入可见。
                 commandBuffer.pipelineBarrier2(scope_dep);
+                // 用 LOAD 不是 CLEAR：保留之前 scope 画的内容。
                 commandBuffer.beginRendering(info_load);
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                            *mainCtx.pipelineOpaqueUI);
                 commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                                 *pipelineLayout, 0, 1, &descriptorSet,
-                                                 0, nullptr);
+                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                                 nullptr);
                 commandBuffer.setViewport(0, std::span{&vp, 1});
                 commandBuffer.setScissor(0, std::span{&area, 1});
                 commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
@@ -12886,34 +13080,81 @@ try
                                             0, sizeof(pc), &pc);
                 commandBuffer.drawIndexed(6, 1, 0, 0, 0);
                 commandBuffer.endRendering();
+
+                //[20] 的注释核心是：copy 和 layout transition 都不能在 render scope 内，必须在 beginRendering 之前或 endRendering 之后；
+                // 因此 [20] 用“transition → copy → transition → barrier → beginRendering”的顺序，读的是 resolveImage（1×1 sample）
+                // 而不是 pickingImage（MSAA），copy 1×1 只是为了演示 API 形态。
+                // 它和 [17]/[18]/[19] 一起覆盖了 render scope 的四种边界：多 scope / scope 作用域 / scope 拆分段 / scope 外工作
             }
 
             // ────────────────────────────────────────────────────────────────
             // [21] 非索引 indirect：vkCmdDrawIndirect，PathFill program
-            // C API: PipelineBarrier2 → BeginRendering(LOAD) →
-            //        BindPipeline(transparent) → BindDescriptorSets → SetViewport →
-            //        SetScissor → PushConstants → DrawIndirect(count=1) → EndRendering
-            // 排列组合：非索引 indirect；没有 BindIndexBuffer 参与这条 draw；
-            //           firstVertex=8 指向 non-indexed 顶点数组。
-            // 分离：C API 层不需要为“非索引”再发 BindIndexBuffer；它和 [12] 的
-            //       indexed indirect 是两条不同的提交路径。
+            // C API: PB → BeginRendering(LOAD) → BindPipeline(transparent) →
+            //        BindDescriptorSets → SetViewport → SetScissor → PushConstants →
+            //        DrawIndirect(count=1) → EndRendering
+            //
+            // NOTE: 本 case 的独有点有三个，其余（scope/pipeline/set/viewport/
+            //       scissor/push）都是前面重复的，不再展开。
+            //
+            // ① 唯一一次 vkCmdDrawIndirect（非索引 indirect）：
+            //    前面 [12]/[13] 是 vkCmdDrawIndexedIndirect（索引 indirect），
+            //    参数结构体 VkDrawIndexedIndirectCommand 是 20 B；
+            //    本 case 的 VkDrawIndirectCommand 是 16 B，少一个 firstIndex。
+            //    三者对照：
+            //      vkCmdDrawIndexed        : 立即参数，读 index buffer      [00]~[16]
+            //      vkCmdDraw               : 立即参数，不读 index buffer    [10]
+            //      vkCmdDrawIndexedIndirect: buffer 参数，读 index buffer   [12]/[13]
+            //      vkCmdDrawIndirect       : buffer 参数，不读 index buffer [21]
+            //
+            // ② 没有 BindIndexBuffer 参与这条 draw：
+            //    VkDrawIndirectCommand 只有 vertexCount/instanceCount/
+            //    firstVertex/firstInstance，没有 firstIndex；
+            //    shader 按 gl_VertexIndex = firstVertex + ordinal 取顶点，
+            //    index buffer 完全不参与。
+            //    和 [10] 的 draw(6,1,8,1) 一一对应：
+            //      vertexCount=6, instanceCount=1, firstVertex=8, firstInstance=0
+            //    区别只是参数放在哪：立即参数 vs buffer 里的结构体。
+            //
+            // ③ indirect buffer 必须用字节 cursor 分配，不能按“第几条 × sizeof”：
+            //    VkDrawIndexedIndirectCommand = 20 B，VkDrawIndirectCommand = 16 B；
+            //    如果按“第几条 × 各自 sizeof”：
+            //      [12] 0..19，[13] 20..59，[21] 会写到 2*16=32，
+            //      落在 [13] cmd1 的 40..59 中间，覆盖 [13] 的数据 → 闪烁。
+            //    新代码用字节 cursor：
+            //      [12]=0..19，[13]=20..59，[21]=60..75，互不重叠。
+            //    这条是踩坑记录，保留注释防止回归。
+            //
+            // NOTE: 和 [12]/[13] 的对照：
+            //   [12]/[13] 是 indexed indirect，参数结构体带 firstIndex，读 index；
+            //   [21] 是 non-indexed indirect，参数结构体不带 firstIndex，不读 index。
+            //   两者不能混在一条 indirect 里：命令族不同，结构体大小不同。
+            //
+            // NOTE: 画面：PathFill 三角形（program=1），carrier 是 6 个 non-indexed
+            //       顶点 vertices[8..13]，fragment shader 把 path 外的片元丢掉。
+            //       和 [10] 的 non-indexed 路径是同一份数据，只是提交方式从
+            //       vkCmdDraw 变成 vkCmdDrawIndirect。
             // ────────────────────────────────────────────────────────────────
             {
-                const VkRect2D area = tile(21);
+                const VkRect2D area = tile(29);
                 const VkViewport vp = full_vp;
                 const std::array<glm::vec2, 3> tri = {
-                    glm::vec2{0.5F, 0.0F}, glm::vec2{0.0F, 1.0F},
-                    glm::vec2{1.0F, 1.0F}};
-                const std::uint32_t heap = add_fill(ui_dao::path_fill(
-                    inset(area, 26.0F), view, std::span{tri},
-                    glm::vec4(0.35F, 0.95F, 0.45F, 1.0F)));
+                    glm::vec2{0.5F, 0.0F}, glm::vec2{0.0F, 1.0F}, glm::vec2{1.0F, 1.0F}};
+                const std::uint32_t heap =
+                    add_fill(ui_dao::path_fill(inset(area, 26.0F), view, std::span{tri},
+                                               glm::vec4(0.35F, 0.95F, 0.45F, 1.0F)));
                 const std::uint32_t cst = add_const(1u, heap);
-                const VkDrawIndirectCommand cmd{
-                    .vertexCount = 6,
-                    .instanceCount = 1,
-                    .firstVertex = kNonIndexedVertex,
-                    .firstInstance = 0};
+
+                // 和 [10] 的 draw(6,1,8,1) 一一对应，只是参数放在 buffer 里。
+                // 注意：VkDrawIndirectCommand 是 16 B，没有 firstIndex；
+                //       VkDrawIndexedIndirectCommand 是 20 B，多一个 firstIndex。
+                const VkDrawIndirectCommand cmd{.vertexCount = 6,
+                                                .instanceCount = 1,
+                                                .firstVertex = kNonIndexedVertex, // 8
+                                                .firstInstance = 0};
+                // 字节 cursor 分配：[12]=0..19，[13]=20..59，[21]=60..75。
+                // 不能用“第几条 × 各自 sizeof”，否则 [21] 会覆盖 [13] 的数据。
                 const VkDeviceSize ind = add_indirect(cmd);
+
                 const shader_data::PushData pc = pc_at(cst, 21u);
 
                 commandBuffer.pipelineBarrier2(scope_dep);
@@ -12921,20 +13162,24 @@ try
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                            *mainCtx.pipelineTransparentUI);
                 commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                                 *pipelineLayout, 0, 1, &descriptorSet,
-                                                 0, nullptr);
+                                                 *pipelineLayout, 0, 1, &descriptorSet, 0,
+                                                 nullptr);
                 commandBuffer.setViewport(0, std::span{&vp, 1});
                 commandBuffer.setScissor(0, std::span{&area, 1});
+                // 注意：这里没有 bindIndexBuffer。non-indexed indirect 不读 index buffer；
+                // 之前 bind 的 index buffer 仍然有效，但对这条 draw 是 dead state。
                 commandBuffer.pushConstants(*pipelineLayout,
                                             VK_SHADER_STAGE_VERTEX_BIT |
                                                 VK_SHADER_STAGE_FRAGMENT_BIT,
                                             0, sizeof(pc), &pc);
-                commandBuffer.functions().vkCmdDrawIndirect(
-                    *commandBuffer, sb.indirectDrawBuffer.buffer.buffer(), ind, 1,
-                    sizeof(VkDrawIndirectCommand));
+                // vkCmdDrawIndirect(buffer, offset, drawCount=1, stride=16)
+                // GPU 从 ind 读一条 VkDrawIndirectCommand，按其中 4 个字段执行一次
+                // non-indexed draw；CPU 没有逐个传 vertexCount/firstVertex/...
+                commandBuffer.drawIndirect(sb.indirectDrawBuffer.buffer.buffer(), ind, 1,
+                                           sizeof(VkDrawIndirectCommand));
                 commandBuffer.endRendering();
             }
-#endif
+
             // 最后：swapchain image 从 COLOR_ATTACHMENT_OPTIMAL → PRESENT_SRC。
             my_render::transition_image_layout(
                 commandBuffer,

@@ -775,5 +775,13 @@ namespace mcs::vulkan
             MCS_ASSERT(table_.vkCmdSetLineWidth != nullptr);
             table_.vkCmdSetLineWidth(commandBuffer, lineWidth);
         }
+
+        constexpr void cmdDrawIndirect(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                                       VkDeviceSize offset, uint32_t drawCount,
+                                       uint32_t stride) const noexcept
+        {
+            MCS_ASSERT(table_.vkCmdDrawIndirect != nullptr);
+            table_.vkCmdDrawIndirect(commandBuffer, buffer, offset, drawCount, stride);
+        }
     };
 }; // namespace mcs::vulkan
