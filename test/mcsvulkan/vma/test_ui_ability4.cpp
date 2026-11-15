@@ -747,7 +747,6 @@ namespace command
     struct command_recorder
     {
         shader_data::ShaderBuffers shaderBuffers;
-        std::vector<command_pass> pass;
 
         constexpr auto operator()(const CommandBufferView &commandBuffer,
                                   command_context_data &context_data) noexcept
