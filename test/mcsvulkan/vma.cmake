@@ -231,6 +231,11 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_ui_ability3 test_intent8.vert test_intent8.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
+# ability4：ability3 的副本；只改 command recorder / indirect 路径，不改 shader。
+add_std_glsl_target(test_ui_ability4 test_intent8.vert test_intent8.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
+
 
 # end
 std_glsl_env_destroy()

@@ -530,13 +530,80 @@ struct mesh_data
 using PushData = shader_data::PushData;
 namespace command
 {
+    using PushData = shader_data::PushData;
+
     struct command_context_data
     {
         // 录制过程需要的API,关联的全部类型+数据
     };
 
-    struct per_draw_key
+    // 比较两个 VkViewport 是否相等
+    constexpr bool viewportEqual(const VkViewport &a, const VkViewport &b) noexcept
     {
+        return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height &&
+               a.minDepth == b.minDepth && a.maxDepth == b.maxDepth;
+    }
+
+    // 比较两个 VkRect2D 是否相等
+    constexpr bool rect2DEqual(const VkRect2D &a, const VkRect2D &b) noexcept
+    {
+        return a.offset.x == b.offset.x && a.offset.y == b.offset.y &&
+               a.extent.width == b.extent.width && a.extent.height == b.extent.height;
+    }
+
+    struct draw_state
+    {
+        VkPipeline pipeline{};
+        VkDescriptorSet descriptorSet{};
+        VkDescriptorSetLayout descriptorSetLayout{};
+        VkViewport viewport{};
+        VkRect2D scissor{};
+        PushData pushData{};
+        std::optional<std::uint32_t> stencilRef;
+        constexpr bool valid() const noexcept
+        {
+            return pipeline != nullptr && descriptorSet != nullptr &&
+                   descriptorSetLayout != nullptr && (viewport.width > 0) &&
+                   pushData.valid();
+        }
+        constexpr bool operator==(const draw_state &o) const noexcept
+        {
+            return pipeline == o.pipeline && descriptorSet == o.descriptorSet &&
+                   descriptorSetLayout == o.descriptorSetLayout &&
+                   viewportEqual(viewport, o.viewport) &&
+                   rect2DEqual(scissor, o.scissor) && pushData == o.pushData &&
+                   stencilRef == o.stencilRef;
+        }
+    };
+
+    enum class stream_state : std::uint8_t
+    {
+        open,
+        close,
+    };
+    struct draw_indexed_indirect
+    {
+        struct intance_key
+        {
+            shader_data::CommandConstant command_constant;
+            VkDrawIndexedIndirectCommand command; //NOTE: 隐变量用的
+        };
+        intance_key cur_intances;
+        draw_state cur_draw_state;
+        stream_state status;
+
+        // buffer_resource_with_address globalHeapBuffer{};
+        // buffer_resource indirectDrawBuffer{};
+        // buffer_resource_with_address commandConstantsBuffer{};
+        // Shape
+        void addInsteance() {}
+    };
+
+    enum class scope_state : std::uint8_t
+    {
+        PipelineBarrier2,
+        BeginRendering, //NOTE: BeginRendering 之前不保证都能写一个PipelineBarrier2.参考 [19]
+        EndRendering,
     };
 
     // 在 beginRendering 之前或 endRendering 之后记录.避免块内同步。块内需要额外扩展
@@ -677,21 +744,9 @@ namespace command
         rendering_info::rendering_info_submit __beginRendering_;
     };
 
-    struct command_pass
-    {
-        transition_image transitions;
-        rendering_scope_build renderingBuild;
-
-        constexpr auto operator()(const CommandBufferView &commandBuffer,
-                                  command_context_data &context_data) noexcept
-        {
-            transitions.apply(commandBuffer);
-            renderingBuild.apply(commandBuffer, context_data);
-        }
-    };
-
     struct command_recorder
     {
+        shader_data::ShaderBuffers shaderBuffers;
         std::vector<command_pass> pass;
 
         constexpr auto operator()(const CommandBufferView &commandBuffer,
