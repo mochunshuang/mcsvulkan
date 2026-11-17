@@ -315,4 +315,39 @@ namespace shader_data
     static_assert(static_cast<std::uint32_t>(Program::ColorMatrix) == 5);
     static_assert(static_cast<std::uint32_t>(Program::Noise) == 6);
 
+    /*
+  static_assert(sizeof(Shape) == SHAPE_SIZE);
+    static_assert(sizeof(PathFill) == PATH_FILL_SIZE);
+    static_assert(sizeof(PathStroke) == PATH_STROKE_SIZE);
+    static_assert(sizeof(TexQuad) == TEX_QUAD_SIZE);
+    static_assert(sizeof(BlurQuad) == BLUR_QUAD_SIZE);
+    static_assert(sizeof(ColorMatrix) == COLOR_MATRIX_SIZE);
+    static_assert(sizeof(NoiseQuad) == NOISE_QUAD_SIZE);
+*/
+    template <class T>
+    [[nodiscard]] consteval Program program_of() noexcept
+    {
+        if constexpr (std::is_same_v<Shape, T>)
+            return Program::Shape;
+        else if constexpr (std::is_same_v<PathFill, T>)
+            return Program::PathFill;
+        else if constexpr (std::is_same_v<PathStroke, T>)
+            return Program::PathStroke;
+        else if constexpr (std::is_same_v<TexQuad, T>)
+            return Program::Texture;
+        else if constexpr (std::is_same_v<BlurQuad, T>)
+            return Program::Blur;
+        else if constexpr (std::is_same_v<ColorMatrix, T>)
+            return Program::ColorMatrix;
+        else if constexpr (std::is_same_v<NoiseQuad, T>)
+            return Program::Noise;
+        else
+            static_assert(false, "program_of error: none type");
+    }
+    template <class T>
+    [[nodiscard]] consteval std::uint32_t program_value() noexcept
+    {
+        return static_cast<std::uint32_t>(program_of<T>());
+    }
+
 } // namespace shader_data

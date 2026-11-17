@@ -84,6 +84,7 @@ using mcs::vulkan::meta::make_aggregate_ref;
 using mcs::vulkan::meta::make_aggregate;
 using mcs::vulkan::meta::field;
 using mcs::vulkan::meta::method;
+using mcs::vulkan::meta::static_string;
 
 using mcs::vulkan::ecs::gen_soa_aggregate;
 using mcs::vulkan::ecs::gen_soa_struct;
@@ -527,6 +528,106 @@ struct mesh_data
 #include "test_ui_ability3_dao.hpp"
 #include "test_ui_ability3_shader_buffers.hpp"
 
+struct record_info
+{
+    uint32_t current_frame{};
+    uint32_t image_index{};
+};
+
+struct pick_mouse
+{
+    glm::ivec2 pos{0, 0};
+    bool valid = false;
+};
+
+// ─────────────────────────────────────────────────────────────────────────
+// 全局具名资源表：名字 -> 对象指针；同类型多个的，一个类型一张 map<名字, T*>。
+//
+//   * 存对象指针，不是句柄值：拿到的就是能调用成员的那个对象；
+//   * 全局：函数内 static + namespace 里的 resources()，任何函数都能取
+//     （和 uiPipelines()/uiTextures()/hoverPool() 同款），不再受 main 限制；
+//   * 不拥有资源：不析构、不 free、不转移所有权；
+//   * 地址在 init 后不变：recreateSwapChain 换的是对象里的值，不是对象地址。
+//
+//   分三层，和“init 后对象不变 / per-frame 槽位 / recreateSwapChain 必须重建”
+//   对齐；第二层逐项标注依赖 swapchain 的哪个属性。
+// ─────────────────────────────────────────────────────────────────────────
+namespace named_resource
+{
+    template <class T>
+    using resource_map = std::flat_map<static_string, T *>;
+
+    // Vulkan 侧：资源（Buffer/Image/...）+ 对象（Device/Queue/Swapchain/...）。
+    //   spec 的“资源”是窄义（Resource Creation / Resource Descriptors 两章：
+    //   Buffer、Image、ImageView、BufferView、Sampler、DescriptorSet*）。
+    //   Device/Queue/Swapchain/Pipeline/CommandBuffer/同步对象属于 Object Model，
+    //   严格说不叫资源；但 recreateSwapChain 和 draw 都要用，放同一张表。
+    struct resource_table
+    {
+        // ══ 一、init 后对象不变：recreateSwapChain 完全不动 ══
+        // Vulkan 对象
+        LogicalDevice *device{};
+        surface_impl<Window> *surface{};
+        Queue *queue{};
+        CommandPool *commandPool{};
+        CommandBuffers *commandBuffers{}; // per-frame：reset + record
+        mcs::vulkan::PipelineLayout *pipelineLayout{};
+        // 资源描述符
+        DescriptorSetLayout *descriptorSetLayout{};
+        DescriptorPool *descriptorPool{};
+        DescriptorSets *descriptorSets{}; // per-frame：只 update
+        // 资源（Buffer）
+        std::array<mcs::vulkan::memory::auto_map_buffer, MAX_FRAMES_IN_FLIGHT>
+            *uniformBuffers{}; // per-frame：CPU 写
+        std::array<mcs::vulkan::memory::auto_map_buffer, MAX_FRAMES_IN_FLIGHT>
+            *pickingFrames{}; // per-frame：GPU copy 进、CPU 读
+        shader_data::ShaderBuffers *shaderBuffers{};
+
+        // ══ 二、recreateSwapChain 必须处理（括注 = 依赖的 swapchain 属性）══
+        mcs::vulkan::Swapchain *swapchain{};              // extent + format + imageCount
+        mcs::vulkan::memory::resource *depthResource{};   // extent
+        mcs::vulkan::memory::resource *msaaResource{};    // extent + format
+        mcs::vulkan::memory::resource *pickResource{};    // 不依赖（WIDTH*HEIGHT 常量）
+        mcs::vulkan::memory::resource *resolveResource{}; // 同上
+        resource_map<mcs::vulkan::Pipeline> pipelines;    // format
+        frame_context<MAX_FRAMES_IN_FLIGHT> *frameContext{}; // imageCount
+    };
+
+    // 宿主侧：不是资源，也不在 Vulkan 里创建 —— 每帧状态、窗口、建造配置。
+    struct frame_state
+    {
+        Window *window{};
+        record_info *frameInfo{};
+        pick_mouse *pickMouse{};
+        mcs::vulkan::memory::create_resources *depthResourcesBuild{};
+        mcs::vulkan::memory::create_resources *msaaResourcesBuild{};
+        mcs::vulkan::memory::create_resources *pickResourcesBuild{};
+        mcs::vulkan::memory::create_resources *resolveResourcesBuild{};
+    };
+
+    // 全局唯一实例
+    constexpr resource_table &resources() noexcept
+    {
+        static resource_table value{};
+        return value;
+    }
+    constexpr frame_state &frameState() noexcept
+    {
+        static frame_state value{};
+        return value;
+    }
+
+    // 名字 -> 对象指针（找不到返回 nullptr）
+    template <class T>
+    [[nodiscard]] constexpr T *find(resource_map<T> &map, std::string_view name)
+    {
+        for (auto &&[key, value] : map)
+            if (key.view() == name)
+                return value;
+        return nullptr;
+    }
+}; // namespace named_resource
+
 using PushData = shader_data::PushData;
 namespace command
 {
@@ -554,8 +655,9 @@ namespace command
     struct draw_state
     {
         VkPipeline pipeline{};
+        VkPipelineLayout pipelineLayout{};
         VkDescriptorSet descriptorSet{};
-        VkDescriptorSetLayout descriptorSetLayout{};
+
         VkViewport viewport{};
         VkRect2D scissor{};
         PushData pushData{};
@@ -563,13 +665,13 @@ namespace command
         constexpr bool valid() const noexcept
         {
             return pipeline != nullptr && descriptorSet != nullptr &&
-                   descriptorSetLayout != nullptr && (viewport.width > 0) &&
+                   pipelineLayout != nullptr && (viewport.width > 0) &&
                    pushData.valid();
         }
         constexpr bool operator==(const draw_state &o) const noexcept
         {
-            return pipeline == o.pipeline && descriptorSet == o.descriptorSet &&
-                   descriptorSetLayout == o.descriptorSetLayout &&
+            return pipeline == o.pipeline && pipelineLayout == o.pipelineLayout &&
+                   descriptorSet == o.descriptorSet &&
                    viewportEqual(viewport, o.viewport) &&
                    rect2DEqual(scissor, o.scissor) && pushData == o.pushData &&
                    stencilRef == o.stencilRef;
@@ -578,25 +680,9 @@ namespace command
 
     enum class stream_state : std::uint8_t
     {
-        open,
         close,
-    };
-    struct draw_indexed_indirect
-    {
-        struct intance_key
-        {
-            shader_data::CommandConstant command_constant;
-            VkDrawIndexedIndirectCommand command; //NOTE: 隐变量用的
-        };
-        intance_key cur_intances;
-        draw_state cur_draw_state;
-        stream_state status;
-
-        // buffer_resource_with_address globalHeapBuffer{};
-        // buffer_resource indirectDrawBuffer{};
-        // buffer_resource_with_address commandConstantsBuffer{};
-        // Shape
-        void addInsteance() {}
+        open,
+        pending
     };
 
     enum class scope_state : std::uint8_t
@@ -744,14 +830,312 @@ namespace command
         rendering_info::rendering_info_submit __beginRendering_;
     };
 
-    struct command_recorder
+    class ByteBuffer
     {
-        shader_data::ShaderBuffers shaderBuffers;
-
-        constexpr auto operator()(const CommandBufferView &commandBuffer,
-                                  command_context_data &context_data) noexcept
+      public:
+        ByteBuffer() = default;
+        explicit ByteBuffer(std::size_t cap)
+            : data_(cap ? std::make_unique_for_overwrite<uint8_t[]>(cap) : nullptr),
+              capacity_(cap)
         {
         }
+
+        // 写入任意 trivially copyable 的 T
+        template <class T>
+        constexpr void write(const T &v)
+        {
+            static_assert(std::is_trivially_copyable_v<T>,
+                          "ByteBuffer 只接受 trivially copyable 的类型");
+            write_bytes(&v, sizeof(T));
+        }
+
+        // 写入 T 的数组
+        template <class T>
+        constexpr void write_array(const T *p, std::size_t n)
+        {
+            static_assert(std::is_trivially_copyable_v<T>);
+            write_bytes(p, n * sizeof(T));
+        }
+
+        // 原始字节写入（内部统一走这里）
+        constexpr void write_bytes(const void *src, std::size_t n)
+        {
+            reserve(size_ + n);
+            std::memcpy(data_.get() + size_, src, n);
+            size_ += n;
+        }
+
+        // 按偏移读出 T
+        template <class T>
+        constexpr T read(std::size_t off) const
+        {
+            static_assert(std::is_trivially_copyable_v<T>);
+            if (off + sizeof(T) > size_)
+                throw std::out_of_range("ByteBuffer::read out of range");
+            T v;
+            std::memcpy(&v, data_.get() + off, sizeof(T));
+            return v;
+        }
+
+        constexpr uint8_t *data() noexcept
+        {
+            return data_.get();
+        }
+        constexpr const uint8_t *data() const noexcept
+        {
+            return data_.get();
+        }
+        constexpr std::size_t size() const noexcept
+        {
+            return size_;
+        }
+        constexpr std::size_t capacity() const noexcept
+        {
+            return capacity_;
+        }
+        constexpr void clear() noexcept
+        {
+            size_ = 0;
+        }
+
+      private:
+        // 自动扩容：容量不足时按 2 倍增长，只搬运 size_ 个有效字节
+        void reserve(std::size_t need)
+        {
+            if (need <= capacity_)
+                return;
+
+            const std::size_t max = std::numeric_limits<std::size_t>::max();
+            std::size_t newcap = capacity_ ? capacity_ : 64;
+            while (newcap < need)
+            {
+                if (newcap > max / 2)
+                {
+                    newcap = need;
+                    break;
+                } // 防溢出
+                newcap *= 2;
+            }
+
+            // 注意：make_unique_for_overwrite 不初始化内存
+            auto nd = std::make_unique_for_overwrite<uint8_t[]>(newcap);
+            if (size_)
+                std::memcpy(nd.get(), data_.get(), size_);
+            data_ = std::move(nd);
+            capacity_ = newcap;
+        }
+
+        std::unique_ptr<uint8_t[]> data_;
+        std::size_t size_ = 0;
+        std::size_t capacity_ = 0;
+    };
+
+    struct command_recorder
+    {
+        named_resource::resource_table *resources{};
+        std::vector<shader_data::CommandConstant> constants;
+        std::vector<VkDrawIndexedIndirectCommand> commands;
+        ByteBuffer heapBuffer;
+
+        struct draw_data_range
+        {
+            struct span_info
+            {
+                std::uint32_t offset;
+                std::uint32_t size;
+            };
+            span_info data_span;
+            constexpr std::uint32_t draw_count()
+            {
+                return data_span.size;
+            }
+            constexpr bool empty() const noexcept
+            {
+                return data_span.size == 0;
+            }
+            constexpr bool valid() const noexcept
+            {
+                return not empty();
+            }
+            template <class T>
+            constexpr static auto to_span(std::span<T> v, span_info si) noexcept
+            {
+                return v.subspan(si.offset, si.size);
+            }
+            constexpr auto to_span(std::vector<shader_data::CommandConstant> &v) noexcept
+            {
+                return to_span(std::span{v}, data_span);
+            }
+            constexpr auto to_span(std::vector<VkDrawIndexedIndirectCommand> &v) noexcept
+            {
+                return to_span(std::span{v}, data_span);
+            }
+        };
+        struct draw_item
+        {
+            draw_data_range data_ranges;
+            draw_state draw_state;
+        };
+        std::vector<draw_item> draws;
+        draw_data_range pendingData;
+        draw_state draw_state;
+
+        constexpr bool canSubmit() const noexcept
+        {
+            return draw_state.valid() && pendingData.valid();
+        }
+        void submitPending()
+        {
+            assert(canSubmit());
+            draws.emplace_back(pendingData, draw_state);
+            pendingData = {};
+        }
+        constexpr void setViewport(VkViewport viewport) noexcept
+        {
+            if (viewportEqual(draw_state.viewport, viewport)) //  skip
+                return;
+            if (canSubmit()) //  submit by change state
+                submitPending();
+            draw_state.viewport = viewport; //new state
+        }
+        constexpr void setScissor(VkRect2D scissor) noexcept {}
+        constexpr void setPushData(PushData pushData) noexcept {}
+        constexpr void setStencilRef(std::optional<std::uint32_t> stencilRef) noexcept {}
+        constexpr void setPipeline(VkPipeline pipeline) noexcept {}
+        constexpr void setDescriptorSet(VkDescriptorSet descriptorSet) noexcept {}
+        constexpr void setPipelineLayout(
+            VkPipelineLayout pipelineLayout) noexcept
+        {
+        }
+        void solveDrawItem(std::size_t index)
+        {
+            if (canSubmit()) //  submit pending
+                submitPending();
+
+            const auto size = draws.size();
+            if (size == 0)
+                return;
+
+            const CommandBufferView commandBuffer = (*resources->commandBuffers)[index];
+
+            auto &globalHeapBuffer = resources->shaderBuffers->globalHeapBuffer;
+            auto &commandConstantsBuffer =
+                resources->shaderBuffers->commandConstantsBuffer;
+            auto &indirectDrawBuffer = resources->shaderBuffers->indirectDrawBuffer;
+            const auto heapBufferSubmitSize = heapBuffer.size();
+            const auto constantSubmitSize =
+                constants.size() * sizeof(shader_data::CommandConstant);
+            const auto commandSubmitSize =
+                commands.size() * sizeof(VkDrawIndexedIndirectCommand);
+
+            // 保证内存足够
+            {
+                if (globalHeapBuffer.capacity < heapBufferSubmitSize)
+                {
+                    auto newCapacity = std::bit_ceil(heapBufferSubmitSize);
+                    globalHeapBuffer = shader_data::ShaderBuffers::newHeapBuffer(
+                        *globalHeapBuffer.buffer.device(), newCapacity);
+                }
+                if (commandConstantsBuffer.capacity < constantSubmitSize)
+                {
+                    auto newCapacity = std::bit_ceil(constantSubmitSize);
+                    commandConstantsBuffer =
+                        shader_data::ShaderBuffers::newConstantBuffer(
+                            *commandConstantsBuffer.buffer.device(), newCapacity);
+                }
+                if (indirectDrawBuffer.capacity < commandSubmitSize)
+                {
+                    auto newCapacity = std::bit_ceil(commandSubmitSize);
+                    indirectDrawBuffer = shader_data::ShaderBuffers::newIndirectBuffer(
+                        *indirectDrawBuffer.buffer.device(), newCapacity);
+                }
+            }
+            globalHeapBuffer.write(0, heapBuffer.data(), heapBufferSubmitSize);
+            commandConstantsBuffer.write(0, constants.data(), constantSubmitSize);
+            indirectDrawBuffer.write(0, commands.data(), commandSubmitSize);
+
+            auto pre = draws[0].draw_state;
+
+            commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pre.pipeline);
+            commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                             pre.pipelineLayout, 0, 1, &pre.descriptorSet,
+                                             0, nullptr);
+            commandBuffer.setViewport(0, std::span<const VkViewport>{&pre.viewport, 1});
+            commandBuffer.setScissor(0, std::span<const VkRect2D>{&pre.scissor, 1});
+
+            // NOTE: 实践中,使用不到好像. 需要实例实例索引
+            commandBuffer.bindIndexBuffer(
+                resources->shaderBuffers->globalIndexBuffer.buffer.buffer(), 0,
+                VK_INDEX_TYPE_UINT32);
+            commandBuffer.pushConstants(pre.pipelineLayout,
+                                        VK_SHADER_STAGE_VERTEX_BIT |
+                                            VK_SHADER_STAGE_FRAGMENT_BIT,
+                                        0, sizeof(PushData), &pre.pushData);
+            auto offset = 0;
+            auto count = draws[0].data_ranges.draw_count();
+            commandBuffer.drawIndexedIndirect(indirectDrawBuffer.buffer.buffer(), offset,
+                                              count,
+                                              sizeof(VkDrawIndexedIndirectCommand));
+            offset += count * sizeof(VkDrawIndexedIndirectCommand);
+
+            for (size_t i = 1; i < size; ++i)
+            {
+                auto &[data_ranges, cur] = draws[i];
+
+                if (cur.pipeline != pre.pipeline)
+                    commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                               cur.pipeline);
+
+                if (cur.pipelineLayout != pre.pipelineLayout ||
+                    cur.descriptorSet != pre.descriptorSet)
+                    commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                     cur.pipelineLayout, 0, 1,
+                                                     &cur.descriptorSet, 0, nullptr);
+                if (not viewportEqual(cur.viewport, pre.viewport))
+                    commandBuffer.setViewport(
+                        0, std::span<const VkViewport>{&cur.viewport, 1});
+
+                if (not rect2DEqual(cur.scissor, pre.scissor))
+                      commandBuffer.setScissor(0, std::span<const VkRect2D>{&cur.scissor, 1});
+
+                if (cur.pipelineLayout != pre.pipelineLayout ||cur.pushData != pre.pushData)
+                     commandBuffer.pushConstants(cur.pipelineLayout,
+                                        VK_SHADER_STAGE_VERTEX_BIT |
+                                            VK_SHADER_STAGE_FRAGMENT_BIT,
+                                        0, sizeof(PushData), &cur.pushData);
+                count = data_ranges.draw_count();
+                commandBuffer.drawIndexedIndirect(indirectDrawBuffer.buffer.buffer(),
+                                                  offset, count,
+                                                  sizeof(VkDrawIndexedIndirectCommand));
+                offset += count * sizeof(VkDrawIndexedIndirectCommand);
+                pre = cur;
+            }
+        }
+
+        template <class T>
+        constexpr void addInsteance(T &&data)
+        {
+            constexpr auto program_value = shader_data::program_value<T>();
+            constexpr auto cmd = VkDrawIndexedIndirectCommand{.indexCount = 6,
+                                                              .instanceCount = 0,
+                                                              .firstIndex = 0,
+                                                              .vertexOffset = 0,
+                                                              .firstInstance = 0};
+
+            if (pendingData.empty())
+            {
+                // new realy memory
+            }
+            if (pendingData.valid())
+            {
+                auto &back_constant = pendingData.to_span(constants).back();
+                auto &back_command = pendingData.to_span(commands).back();
+            }
+            else
+            {
+            }
+        }
+        void clear() noexcept {}
     };
 
 }; // namespace command
@@ -999,8 +1383,6 @@ auto generateGradientTexture(const LogicalDevice &device, const CommandPool &poo
 }
 // NOLINTEND
 //diff: [test_indirectdraw2] end
-
-using mcs::vulkan::meta::static_string;
 
 // 删除了 UI 命名空间及其所有依赖（Container/Row/Column/Expanded/Text Trait, UIBuilder, FlatLayoutTree 等）
 
@@ -2123,6 +2505,7 @@ constexpr auto run_text_pipeline(auto &fontSelect, const auto *rawText,
                                           std::move(test_shape_result),
                                           std::move(break_result));
 }
+
 constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
 {
     auto &physical_device = *hardwareCtx.physicalDevice.get();
@@ -2280,11 +2663,6 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
             BUFFER_SIZE);
     }
-    struct pick_mouse
-    {
-        glm::ivec2 pos{0, 0};
-        bool valid = false;
-    };
     pick_mouse pickMouse;
     auto pickingAttachments =
         make_aggregate<"pickingAttachments", "pickResourcesBuild", "pickResource",
@@ -9566,12 +9944,6 @@ try
         device, kCorpusVertexBytes, kCorpusIndexBytes, kCorpusHeapBytes,
         kCorpusIndirectBytes, kCorpusConstantBytes);
 
-    struct record_info
-    {
-        uint32_t current_frame;
-        uint32_t image_index;
-    };
-
     auto pickCtx =
         make_aggregate_ref<"pickCtx", "pickResourcesBuild", "pickResource",
                            "resolveResourcesBuild", "resolveResource", "frames", "mouse">(
@@ -9989,28 +10361,92 @@ try
     constexpr uint32_t kGeomFan = 2u;          // 填充扇形批处理（顶点在 buffer 高位区）
     constexpr uint32_t kFanVertexBase = 2048u; // 与 VS 里 kFanBase 一致
 
+    // ──────────────────────────────────────────────────────────────────────
+    // 填全局资源表：名字 -> 对象指针（表本身在 main 外部，见 named_resource）
+    //
+    //   一、init 后不变：只写这一次；
+    //   二、recreateSwapChain 要重新取的项：现在记下初始对象，之后按第二层
+    //       的依赖（extent/format/imageCount）决定要不要换。
+    // ──────────────────────────────────────────────────────────────────────
+    {
+        auto &r = named_resource::resources();
+        auto &fs = named_resource::frameState();
+
+        // 一、init 后不变
+        r.device = &device;
+        r.surface = &surface;
+        r.queue = &GRAPHICS_AND_PRESENT;
+        r.commandPool = &commandPool;
+        r.commandBuffers = &commandBuffers;
+        r.pipelineLayout = &pipelineLayout;
+        r.descriptorSetLayout = &descriptorSetLayout;
+        r.descriptorPool = &descriptorPool;
+        r.descriptorSets = &descriptorSets;
+        r.uniformBuffers = &uniformBuffers;
+        r.pickingFrames = &pickingFrames;
+        r.shaderBuffers = &shaderBuffers;
+
+        // 宿主侧：每帧状态 / 窗口 / 建造配置
+        fs.window = &window;
+        fs.frameInfo = &recordCtx.info;
+        fs.pickMouse = &pickMouse;
+        fs.depthResourcesBuild = &depthResourcesBuild;
+        fs.msaaResourcesBuild = &msaaResourcesBuild;
+        fs.pickResourcesBuild = &pickResourcesBuild;
+        fs.resolveResourcesBuild = &resolveResourcesBuild;
+
+        // 二、recreateSwapChain 必须处理
+        r.swapchain = &swapchain;
+        r.depthResource = &depthResource;
+        r.msaaResource = &msaaResource;
+        r.pickResource = &pickResource;
+        r.resolveResource = &resolveResource;
+        r.pipelines = {{static_string{"pipelineOpaque3D"}, &pipelineOpaque3D},
+                       {static_string{"pipelineTransparent3D"}, &pipelineTransparent3D},
+                       {static_string{"pipelineOpaqueUI"}, &pipelineOpaqueUI},
+                       {static_string{"pipelineTransparentUI"}, &pipelineTransparentUI},
+                       {static_string{"pipelineUILayer"}, &pipelineUILayer}};
+        r.frameContext = &frameContext;
+    }
+
     static constexpr auto mainPipeline = make_aggregate<"mainPipeline">(
         // NOTE: 布局转换 / 开始渲染 / 管线状态 / 结束渲染 都并进 draw 了
         method<"transitionImageLayout">([](world_type &, input_type &, data_type &) {}),
         method<"beginRendering">([](world_type &, input_type &, data_type &) {}),
         method<"setPipelineState">([](world_type &, input_type &, data_type &) {}),
-        method<"draw">([](world_type &world, input_type &inputCtx, data_type &soaCtx) {
-            auto &globalCtx = world.globalCtx;
-            auto &mainCtx = world.mainCtx;
-            auto &mainShaderCtx = world.mainShaderCtx;
-            auto &recordCtx = world.recordCtx;
-            auto &pickCtx = world.pickCtx;
+        method<"draw">([](world_type &, input_type &, data_type &) {
+            // 资源从 resources() 取，宿主状态（每帧序号/UI 场景）从 frameState() 取
+            auto &r = named_resource::resources();
+            auto &fs = named_resource::frameState();
 
-            auto &swapchain = globalCtx.swapchain;
-            auto &commandBuffers = globalCtx.commandBuffers;
+            auto &swapchain = *r.swapchain;
+            auto &commandBuffers = *r.commandBuffers;
+            auto &pipelineLayout = *r.pipelineLayout;
+            auto &descriptorSets = *r.descriptorSets;
+            auto &uniformBuffers = *r.uniformBuffers;
+            auto &pickingFrames = *r.pickingFrames;
+            auto &depthResource = *r.depthResource;
+            auto &msaaResource = *r.msaaResource;
+            auto &pickResource = *r.pickResource;
+            auto &resolveResource = *r.resolveResource;
+            auto &sb = *r.shaderBuffers;
+            auto &depthResourcesBuild = *fs.depthResourcesBuild;
+
+            auto pipeline = [&](static_string name) -> mcs::vulkan::Pipeline & {
+                return *named_resource::find(r.pipelines, name.view());
+            };
+            auto &pipelineOpaque3D = pipeline(static_string{"pipelineOpaque3D"});
+            auto &pipelineTransparent3D =
+                pipeline(static_string{"pipelineTransparent3D"});
+            auto &pipelineOpaqueUI = pipeline(static_string{"pipelineOpaqueUI"});
+            auto &pipelineTransparentUI =
+                pipeline(static_string{"pipelineTransparentUI"});
+            auto &pipelineUILayer = pipeline(static_string{"pipelineUILayer"});
 
             // ↓↓↓ 一个 VkCommandBuffer；下面全部是裸 vkCmd*，没有 CommandBuilder ↓↓↓
-            const auto &[currentFrame, imageIndex] = recordCtx.info;
+            const auto &[currentFrame, imageIndex] = *fs.frameInfo;
             const auto &commandBuffer = commandBuffers[currentFrame];
 
-            auto &pipelineLayout = mainCtx.pipelineLayout;
-            auto &descriptorSets = mainShaderCtx.descriptorSets;
-            auto &uniformBuffers = mainShaderCtx.uniformBuffers;
             const VkDescriptorSet descriptorSet = descriptorSets[currentFrame];
             const VkDescriptorSet descriptorSetAlternate =
                 descriptorSets[(currentFrame + 1) % MAX_FRAMES_IN_FLIGHT];
@@ -10020,12 +10456,11 @@ try
             const float H = static_cast<float>(extent.height);
 
             const VkImage image = swapchain.image(imageIndex);
-            const VkImage depthImage = mainCtx.depthResource.image();
-            const VkImage msaaImage = mainCtx.msaaResource.image();
-            const VkImage pickingImage = pickCtx.pickResource.image();
-            const VkImage resolveImage = pickCtx.resolveResource.image();
+            const VkImage depthImage = depthResource.image();
+            const VkImage msaaImage = msaaResource.image();
+            const VkImage pickingImage = pickResource.image();
+            const VkImage resolveImage = resolveResource.image();
 
-            auto &sb = mainCtx.shaderBuffers;
             const ui_dao::view view{W, H};
 
             // ════════════════════════════════════════════════════════════════
@@ -10309,7 +10744,7 @@ try
             for (auto &ub : uniformBuffers)
                 std::memcpy(ub.mapPtr(), &ubo, sizeof(ubo));
 
-            const bool hasStencil = mainCtx.depthResourcesBuild.hasStencilComponent();
+            const bool hasStencil = depthResourcesBuild.hasStencilComponent();
             const VkImageAspectFlags depthAspect =
                 hasStencil ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
                            : VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -10370,7 +10805,7 @@ try
 
             VkRenderingAttachmentInfo color0_clear{
                 .sType = sType<VkRenderingAttachmentInfo>(),
-                .imageView = mainCtx.msaaResource.imageView(),
+                .imageView = msaaResource.imageView(),
                 .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 .resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT,
                 .resolveImageView = swapchain.imageView(imageIndex),
@@ -10380,17 +10815,17 @@ try
                 .clearValue = {.color = {.float32 = {0.05F, 0.06F, 0.08F, 1.0F}}}};
             VkRenderingAttachmentInfo color1_clear{
                 .sType = sType<VkRenderingAttachmentInfo>(),
-                .imageView = pickCtx.pickResource.imageView(),
+                .imageView = pickResource.imageView(),
                 .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 .resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
-                .resolveImageView = pickCtx.resolveResource.imageView(),
+                .resolveImageView = resolveResource.imageView(),
                 .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
                 .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
                 .clearValue = {.color = {.uint32 = {0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 0u}}}};
             VkRenderingAttachmentInfo depth_clear{
                 .sType = sType<VkRenderingAttachmentInfo>(),
-                .imageView = mainCtx.depthResource.imageView(),
+                .imageView = depthResource.imageView(),
                 .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                 .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
                 .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
@@ -10457,9 +10892,21 @@ try
             const std::uint32_t tw = gridW / kCols;
             const std::uint32_t th = gridH / kRows;
             const auto tile = [&](std::uint32_t i) -> VkRect2D {
-                return {{static_cast<std::int32_t>((i % kCols) * tw),
-                         static_cast<std::int32_t>((i / kCols) * th)},
-                        {tw, th}};
+                VkRect2D r{{static_cast<std::int32_t>((i % kCols) * tw),
+                            static_cast<std::int32_t>((i / kCols) * th)},
+                           {tw, th}};
+                // 窗口缩小后 tile 可能越界：renderArea 必须 ≤ 附件尺寸（VUID-06080）
+                const auto fit = [](std::uint32_t offset, std::uint32_t len,
+                                    std::uint32_t limit) {
+                    if (offset >= limit)
+                        return 0u;
+                    return std::min(len, limit - offset);
+                };
+                r.extent.width = fit(static_cast<std::uint32_t>(r.offset.x),
+                                     r.extent.width, extent.width);
+                r.extent.height = fit(static_cast<std::uint32_t>(r.offset.y),
+                                      r.extent.height, extent.height);
+                return r;
             };
             const auto inset = [](const VkRect2D &r, float m) -> ui_dao::rect_px {
                 return {static_cast<float>(r.offset.x) + m,
@@ -10510,7 +10957,7 @@ try
                 const shader_data::PushData pc = pc_at(cst, 0u);
 
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaqueUI);
+                                           *pipelineOpaqueUI);
                 commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                                  *pipelineLayout, 0, 1, &descriptorSet, 0,
                                                  nullptr);
@@ -11059,7 +11506,7 @@ try
                 // NOTE: 第一条用 opaqueUI（blend OFF）；这是和 [03] 之前相同的 pipeline。
                 //       这条 bind 理论上可省（[03] 末尾就是 opaque），保留让片段自包含。
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaqueUI);
+                                           *pipelineOpaqueUI);
                 commandBuffer.setViewport(0, std::span{&vp, 1});
                 commandBuffer.setScissor(0, std::span{&area, 1});
                 commandBuffer.pushConstants(*pipelineLayout,
@@ -11071,7 +11518,7 @@ try
                 // NOTE: pipeline 是 batch key：这里换成 transparentUI（blend ON）。
                 //       后面这条不能和前面的 opaque draw 合成一条 draw/indirect。
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineTransparentUI);
+                                           *pipelineTransparentUI);
                 // NOTE: set/index 不用重绑（layout 兼容、状态保持）；但 push 换了 c1。
                 commandBuffer.pushConstants(*pipelineLayout,
                                             VK_SHADER_STAGE_VERTEX_BIT |
@@ -11600,7 +12047,7 @@ try
                 const VkRect2D area = tile(9);
                 const VkViewport vp = chain_vp(area);
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaque3D);
+                                           *pipelineOpaque3D);
                 commandBuffer.setViewport(0, std::span{&vp, 1});
                 commandBuffer.setScissor(0, std::span{&area, 1});
                 commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
@@ -11624,7 +12071,7 @@ try
                 const VkRect2D area = tile(10);
                 const VkViewport vp = chain_vp(area);
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaque3D);
+                                           *pipelineOpaque3D);
                 commandBuffer.setViewport(0, std::span{&vp, 1});
                 commandBuffer.setScissor(0, std::span{&area, 1});
                 commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
@@ -11743,7 +12190,7 @@ try
                 NOTE: 关键：这条 draw 没有“成功/失败”概念，因为 stencilTest=OFF。它只写颜色
                 */
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaqueUI);
+                                           *pipelineOpaqueUI);
                 commandBuffer.drawIndexed(6, 1, 0, 0, 0); // base teal
 
                 /*
@@ -11833,7 +12280,7 @@ try
                 commandBuffer.drawIndexed(6, 1, 0, 0, 0);
 
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaqueUI);
+                                           *pipelineOpaqueUI);
                 commandBuffer.drawIndexed(6, 1, 0, 0, 0);
 
                 /*
@@ -11889,7 +12336,7 @@ try
                 const VkRect2D area = tile(13);
                 const VkViewport vp = chain_vp(area);
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaqueUI);
+                                           *pipelineOpaqueUI);
                 commandBuffer.setViewport(0, std::span{&vp, 1});
                 commandBuffer.setScissor(0, std::span{&area, 1});
                 commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
@@ -11902,7 +12349,7 @@ try
 
                 // NOTE: pipelineTransparentUI 混合让圆角不黑
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineTransparentUI);
+                                           *pipelineTransparentUI);
                 commandBuffer.drawIndexed(6, 1, 0, 0, 1); // Shape1, blend ON, mask all
             }
 
@@ -11920,7 +12367,7 @@ try
                 const VkRect2D area = tile(14);
                 const VkViewport vp = chain_vp(area);
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaqueUI);
+                                           *pipelineOpaqueUI);
                 commandBuffer.setViewport(0, std::span{&vp, 1});
                 commandBuffer.setScissor(0, std::span{&area, 1});
                 commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
@@ -11933,7 +12380,7 @@ try
 
                 // NOTE: 都是 pipelineOpaqueUI .都有黑圆角外部
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaqueUI);
+                                           *pipelineOpaqueUI);
                 commandBuffer.drawIndexed(6, 1, 0, 0, 1); // Shape1, blend OFF, mask all
             }
 
@@ -11959,7 +12406,7 @@ try
                 const VkRect2D area = tile(15);
                 const VkViewport vp = chain_vp(area);
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaqueUI);
+                                           *pipelineOpaqueUI);
                 commandBuffer.setViewport(0, std::span{&vp, 1});
                 commandBuffer.setScissor(0, std::span{&area, 1});
                 commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
@@ -11989,7 +12436,7 @@ try
                 const VkRect2D area = tile(16);
                 const VkViewport vp = chain_vp(area);
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaqueUI);
+                                           *pipelineOpaqueUI);
                 commandBuffer.setViewport(0, std::span{&vp, 1});
                 commandBuffer.setScissor(0, std::span{&area, 1});
                 commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
@@ -12125,7 +12572,7 @@ try
                 //   PathFill 的 shader 用 gl_InstanceIndex 选实例，所以 0→f0，1→f1。
 
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineTransparentUI);
+                                           *pipelineTransparentUI);
                 commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                                  *pipelineLayout, 0, 1, &descriptorSet, 0,
                                                  nullptr);
@@ -12197,7 +12644,7 @@ try
                 const shader_data::PushData pc = pc_at(cst, 11u);
 
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaqueUI);
+                                           *pipelineOpaqueUI);
                 commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
                                               VK_INDEX_TYPE_UINT32);
                 commandBuffer.setViewport(0, std::span{&vp, 1});
@@ -12303,7 +12750,7 @@ try
                 const shader_data::PushData pc = pc_at(cst, 12u);
 
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineTransparentUI);
+                                           *pipelineTransparentUI);
                 commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                                  *pipelineLayout, 0, 1, &descriptorSet, 0,
                                                  nullptr);
@@ -12417,7 +12864,7 @@ try
                 const shader_data::PushData pcS = pc_at(cS, 13u);
 
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineTransparentUI);
+                                           *pipelineTransparentUI);
                 commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                                  *pipelineLayout, 0, 1, &descriptorSet, 0,
                                                  nullptr);
@@ -12607,7 +13054,7 @@ try
 
                 commandBuffer.bindVertexBuffers(0, 1, vertexBuffer, vertexOffset);
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineTransparentUI);
+                                           *pipelineTransparentUI);
                 commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                                  *pipelineLayout, 0, 1, &descriptorSet, 0,
                                                  nullptr);
@@ -12685,7 +13132,7 @@ try
                 commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
                                               VK_INDEX_TYPE_UINT32);
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaqueUI);
+                                           *pipelineOpaqueUI);
                 commandBuffer.pushConstants(*pipelineLayout,
                                             VK_SHADER_STAGE_VERTEX_BIT |
                                                 VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -12779,7 +13226,7 @@ try
                 commandBuffer.pipelineBarrier2(scope_dep);
                 commandBuffer.beginRendering(info_load); // loadOp=LOAD，保留 clear 值
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaqueUI);
+                                           *pipelineOpaqueUI);
                 commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                                  *pipelineLayout, 0, 1, &descriptorSet, 0,
                                                  nullptr);
@@ -12879,7 +13326,7 @@ try
                 commandBuffer.beginRendering(
                     info_area); //NOTE: 更新 VkRenderingInfo 需要跨 scope
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaqueUI);
+                                           *pipelineOpaqueUI);
                 commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                                  *pipelineLayout, 0, 1, &descriptorSet, 0,
                                                  nullptr);
@@ -12954,7 +13401,7 @@ try
                 commandBuffer.pipelineBarrier2(scope_dep);
                 commandBuffer.beginRendering(info_suspend); // flags = SUSPENDING
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaqueUI);
+                                           *pipelineOpaqueUI);
                 commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                                  *pipelineLayout, 0, 1, &descriptorSet, 0,
                                                  nullptr);
@@ -12977,7 +13424,7 @@ try
                 // 重绑不是规范要求，是为了自包含；pushConstants 值变了必须重 push。
 
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaqueUI);
+                                           *pipelineOpaqueUI);
                 commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                                  *pipelineLayout, 0, 1, &descriptorSet, 0,
                                                  nullptr);
@@ -13029,7 +13476,7 @@ try
             //   imageExtent = {1, 1, 1}，只读 tile(28) 中心一个像素。
             //   这个 case 的目的是验证“scope 外 copy 合法”，不是真做 picking
             //   回读；1×1 足够小，不会覆盖太多数据。
-            //   buffer 是 pickCtx.frames[currentFrame]，大小
+            //   buffer 是 pickingFrames[currentFrame]，大小
             //   sizeof(picking_result)=16 字节，1×1 RGBA32_UINT 正好 16 字节。
             //
             // NOTE: 这个 copy 的结果没有被任何代码消费：
@@ -13081,7 +13528,7 @@ try
                 // copy 1×1 像素：tile(28) 中心。
                 // 读的是 resolveImage（1×1 sample），不是 pickingImage（MSAA）；
                 // vkCmdCopyImageToBuffer 要求单采样图像。
-                // copy 结果写进 pickCtx.frames[currentFrame]，但本 case 没有消费它。
+                // copy 结果写进 pickingFrames[currentFrame]，但本 case 没有消费它。
                 const VkBufferImageCopy region{
                     .bufferOffset = 0,
                     .bufferRowLength = 0,
@@ -13095,7 +13542,7 @@ try
                     .imageExtent = {1, 1, 1}};
                 commandBuffer.copyImageToBuffer(
                     resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    pickCtx.frames[currentFrame].buffer(), std::span{&region, 1});
+                    pickingFrames[currentFrame].buffer(), std::span{&region, 1});
 
                 // 第二次 transition：TRANSFER_SRC → COLOR_ATTACHMENT，回来继续当附件。
                 // 如果后面还要用 resolveImage 当 attachment，必须转回来；
@@ -13120,7 +13567,7 @@ try
                 // 用 LOAD 不是 CLEAR：保留之前 scope 画的内容。
                 commandBuffer.beginRendering(info_load);
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineOpaqueUI);
+                                           *pipelineOpaqueUI);
                 commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                                  *pipelineLayout, 0, 1, &descriptorSet, 0,
                                                  nullptr);
@@ -13214,7 +13661,7 @@ try
                 commandBuffer.pipelineBarrier2(scope_dep);
                 commandBuffer.beginRendering(info_load);
                 commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                           *mainCtx.pipelineTransparentUI);
+                                           *pipelineTransparentUI);
                 commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
                                                  *pipelineLayout, 0, 1, &descriptorSet, 0,
                                                  nullptr);
