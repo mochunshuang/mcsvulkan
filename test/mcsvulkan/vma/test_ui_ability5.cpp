@@ -1193,7 +1193,7 @@ namespace command
                 // NOTE: 需要增加命令.多实例只需要增加命令数据,无法合批. 才需要新 draw. state又不变
                 constants.emplace_back(init_cc);
                 commands.emplace_back(initcmd);
-                pendingData.size++; //drawIndexedIndirect 命令参数的 count ++
+                pendingData.data_span.size++; //drawIndexedIndirect 命令参数的 count ++
             }
         }
         void clear() noexcept
@@ -10532,9 +10532,6 @@ try
             const VkImage resolveImage = resolveResource.image();
 
             const ui_dao::view view{W, H};
-
-
-            
         }),
         method<"endRendering">([](world_type &, input_type &, data_type &) {}));
 
