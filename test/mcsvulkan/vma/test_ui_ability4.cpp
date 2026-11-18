@@ -665,8 +665,7 @@ namespace command
         constexpr bool valid() const noexcept
         {
             return pipeline != nullptr && descriptorSet != nullptr &&
-                   pipelineLayout != nullptr && (viewport.width > 0) &&
-                   pushData.valid();
+                   pipelineLayout != nullptr && (viewport.width > 0) && pushData.valid();
         }
         constexpr bool operator==(const draw_state &o) const noexcept
         {
@@ -936,6 +935,7 @@ namespace command
         std::vector<shader_data::CommandConstant> constants;
         std::vector<VkDrawIndexedIndirectCommand> commands;
         ByteBuffer heapBuffer;
+        size_t heap_offset{};
 
         struct draw_data_range
         {
@@ -990,27 +990,63 @@ namespace command
             draws.emplace_back(pendingData, draw_state);
             pendingData = {};
         }
+        void trySubmit()
+        {
+            if (canSubmit()) //  submit by change state
+                submitPending();
+        }
         constexpr void setViewport(VkViewport viewport) noexcept
         {
             if (viewportEqual(draw_state.viewport, viewport)) //  skip
                 return;
-            if (canSubmit()) //  submit by change state
-                submitPending();
+            trySubmit();
             draw_state.viewport = viewport; //new state
         }
-        constexpr void setScissor(VkRect2D scissor) noexcept {}
-        constexpr void setPushData(PushData pushData) noexcept {}
-        constexpr void setStencilRef(std::optional<std::uint32_t> stencilRef) noexcept {}
-        constexpr void setPipeline(VkPipeline pipeline) noexcept {}
-        constexpr void setDescriptorSet(VkDescriptorSet descriptorSet) noexcept {}
-        constexpr void setPipelineLayout(
-            VkPipelineLayout pipelineLayout) noexcept
+        constexpr void setScissor(VkRect2D scissor) noexcept
         {
+            if (rect2DEqual(draw_state.scissor, scissor))
+                return;
+            trySubmit();
+            draw_state.scissor = scissor;
+        }
+        constexpr void setPushData(PushData pushData) noexcept
+        {
+            if (draw_state.pushData == pushData)
+                return;
+            trySubmit();
+            draw_state.pushData = pushData;
+        }
+        constexpr void setStencilRef(std::optional<std::uint32_t> stencilRef) noexcept
+        {
+            if (draw_state.stencilRef == stencilRef)
+                return;
+            trySubmit();
+            draw_state.stencilRef = stencilRef;
+        }
+        constexpr void setPipeline(VkPipeline pipeline) noexcept
+        {
+            if (draw_state.pipeline == pipeline)
+                return;
+            trySubmit();
+            draw_state.pipeline = pipeline;
+        }
+        constexpr void setDescriptorSet(VkDescriptorSet descriptorSet) noexcept
+        {
+            if (draw_state.descriptorSet == descriptorSet)
+                return;
+            trySubmit();
+            draw_state.descriptorSet = descriptorSet;
+        }
+        constexpr void setPipelineLayout(VkPipelineLayout pipelineLayout) noexcept
+        {
+            if (draw_state.pipelineLayout == pipelineLayout)
+                return;
+            trySubmit();
+            draw_state.pipelineLayout = pipelineLayout;
         }
         void solveDrawItem(std::size_t index)
         {
-            if (canSubmit()) //  submit pending
-                submitPending();
+            trySubmit();
 
             const auto size = draws.size();
             if (size == 0)
@@ -1096,13 +1132,15 @@ namespace command
                         0, std::span<const VkViewport>{&cur.viewport, 1});
 
                 if (not rect2DEqual(cur.scissor, pre.scissor))
-                      commandBuffer.setScissor(0, std::span<const VkRect2D>{&cur.scissor, 1});
+                    commandBuffer.setScissor(0,
+                                             std::span<const VkRect2D>{&cur.scissor, 1});
 
-                if (cur.pipelineLayout != pre.pipelineLayout ||cur.pushData != pre.pushData)
-                     commandBuffer.pushConstants(cur.pipelineLayout,
-                                        VK_SHADER_STAGE_VERTEX_BIT |
-                                            VK_SHADER_STAGE_FRAGMENT_BIT,
-                                        0, sizeof(PushData), &cur.pushData);
+                if (cur.pipelineLayout != pre.pipelineLayout ||
+                    cur.pushData != pre.pushData)
+                    commandBuffer.pushConstants(cur.pipelineLayout,
+                                                VK_SHADER_STAGE_VERTEX_BIT |
+                                                    VK_SHADER_STAGE_FRAGMENT_BIT,
+                                                0, sizeof(PushData), &cur.pushData);
                 count = data_ranges.draw_count();
                 commandBuffer.drawIndexedIndirect(indirectDrawBuffer.buffer.buffer(),
                                                   offset, count,
@@ -1112,30 +1150,62 @@ namespace command
             }
         }
 
+        // NOTE: [13] 确定了,state 不变 随便合批. 不同的 T 增加命令缓冲区即可. 不需要新增 drawIndexedIndirect
         template <class T>
-        constexpr void addInsteance(T &&data)
+        constexpr void addInsteance(T data)
         {
             constexpr auto program_value = shader_data::program_value<T>();
-            constexpr auto cmd = VkDrawIndexedIndirectCommand{.indexCount = 6,
-                                                              .instanceCount = 0,
-                                                              .firstIndex = 0,
-                                                              .vertexOffset = 0,
-                                                              .firstInstance = 0};
-
+            constexpr auto initcmd = VkDrawIndexedIndirectCommand{.indexCount = 6,
+                                                                  .instanceCount = 1,
+                                                                  .firstIndex = 0,
+                                                                  .vertexOffset = 0,
+                                                                  .firstInstance = 0};
+            heapBuffer.write(data);
+            //CommandConstBuffer cmdConsts = CommandConstBuffer(pc.commandConstantsAddress);
+            // CommandConstant cc = cmdConsts.consts[gl_DrawIDARB];
+            //uint64_t heapBaseStart = pc.dataAddress + cc.address_offset;//dataAddress就是heapBuffer的起始地址
+            // instancePtr = heapBaseStart + gl_InstanceIndex * SHAPE_SIZE;
+            const auto init_cc = shader_data::CommandConstant{
+                .program = program_value, .address_offset = heap_offset};
+            heap_offset += sizeof(T);
             if (pendingData.empty())
             {
                 // new realy memory
+                constants.emplace_back(init_cc);
+                commands.emplace_back(initcmd);
+                pendingData =
+                    draw_data_range{.data_span = {.offset = static_cast<std::uint32_t>(
+                                                      constants.size() - 1),
+                                                  .size = 1}};
+                return;
             }
-            if (pendingData.valid())
+
+            assert(pendingData.valid());
+            if (auto &back_constant = pendingData.to_span(constants).back();
+                program_value == back_constant.program)
             {
-                auto &back_constant = pendingData.to_span(constants).back();
+                // NOTE: 同一类型,在多实例绘制支持下,不需要增加命令
                 auto &back_command = pendingData.to_span(commands).back();
+                back_command.instanceCount++; // 注意 gl_InstanceIndex = [0,instanceCount)
             }
             else
             {
+                // NOTE: 需要增加命令.多实例只需要增加命令数据,无法合批. 才需要新 draw. state又不变
+                constants.emplace_back(init_cc);
+                commands.emplace_back(initcmd);
+                pendingData.size++; //drawIndexedIndirect 命令参数的 count ++
             }
         }
-        void clear() noexcept {}
+        void clear() noexcept
+        {
+            draws.clear();
+            constants.clear();
+            commands.clear();
+            heapBuffer.clear();
+            heap_offset = 0;
+            pendingData = {};
+            draw_state = {};
+        }
     };
 
 }; // namespace command
