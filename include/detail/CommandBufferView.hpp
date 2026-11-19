@@ -400,6 +400,10 @@ namespace mcs::vulkan
         {
             pool_->device()->cmdSetPrimitiveTopology(value_, primitiveTopology);
         }
+        constexpr void setLineWidth(float lineWidth) const noexcept
+        {
+            pool_->device()->cmdSetLineWidth(value_, lineWidth);
+        }
         constexpr void drawIndirect(VkBuffer buffer, VkDeviceSize offset,
                                     uint32_t drawCount, uint32_t stride) const noexcept
         {
