@@ -1,5 +1,6 @@
 #include <any>
 #include <array>
+#include <bit>
 #include <cassert>
 #include <concepts>
 #include <cstddef>
@@ -23,6 +24,7 @@
 #include <typeindex>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <memory_resource> // pmr 内存资源
@@ -581,7 +583,7 @@ namespace named_resource
             *uniformBuffers{}; // per-frame：CPU 写
         std::array<mcs::vulkan::memory::auto_map_buffer, MAX_FRAMES_IN_FLIGHT>
             *pickingFrames{}; // per-frame：GPU copy 进、CPU 读
-        shader_data::ShaderBuffers *shaderBuffers{};
+        std::array<shader_data::ShaderBuffers, MAX_FRAMES_IN_FLIGHT> *shaderBuffers{};
 
         // ══ 二、recreateSwapChain 必须处理（括注 = 依赖的 swapchain 属性）══
         mcs::vulkan::Swapchain *swapchain{};              // extent + format + imageCount
@@ -652,6 +654,10 @@ namespace command
                a.extent.width == b.extent.width && a.extent.height == b.extent.height;
     }
 
+    // PushData 里只有 cameraIndex 是 per-draw；
+    // renderVersion 是帧级 picking 版本（和 hover 回读有关），不参与合批。
+    // vertexAddress / instanceAddress / commandConstantsAddress 由 recorder
+    // 在 solve 时按当前 frame 的 buffer 自动算。
     struct draw_state
     {
         VkPipeline pipeline{};
@@ -660,19 +666,19 @@ namespace command
 
         VkViewport viewport{};
         VkRect2D scissor{};
-        PushData pushData{};
+        std::uint32_t cameraIndex{};
         std::optional<std::uint32_t> stencilRef;
         constexpr bool valid() const noexcept
         {
             return pipeline != nullptr && descriptorSet != nullptr &&
-                   pipelineLayout != nullptr && (viewport.width > 0) && pushData.valid();
+                   pipelineLayout != nullptr && (viewport.width > 0);
         }
         constexpr bool operator==(const draw_state &o) const noexcept
         {
             return pipeline == o.pipeline && pipelineLayout == o.pipelineLayout &&
                    descriptorSet == o.descriptorSet &&
                    viewportEqual(viewport, o.viewport) &&
-                   rect2DEqual(scissor, o.scissor) && pushData == o.pushData &&
+                   rect2DEqual(scissor, o.scissor) && cameraIndex == o.cameraIndex &&
                    stencilRef == o.stencilRef;
         }
     };
@@ -935,7 +941,6 @@ namespace command
         std::vector<shader_data::CommandConstant> constants;
         std::vector<VkDrawIndexedIndirectCommand> commands;
         ByteBuffer heapBuffer;
-        size_t heap_offset{};
 
         struct draw_data_range
         {
@@ -945,7 +950,7 @@ namespace command
                 std::uint32_t size;
             };
             span_info data_span;
-            constexpr std::uint32_t draw_count()
+            constexpr std::uint32_t draw_count() const noexcept
             {
                 return data_span.size;
             }
@@ -976,6 +981,7 @@ namespace command
             draw_data_range data_ranges;
             draw_state draw_state;
         };
+
         std::vector<draw_item> draws;
         draw_data_range pendingData;
         draw_state draw_state;
@@ -1009,12 +1015,12 @@ namespace command
             trySubmit();
             draw_state.scissor = scissor;
         }
-        constexpr void setPushData(PushData pushData) noexcept
+        constexpr void setCameraIndex(std::uint32_t cameraIndex) noexcept
         {
-            if (draw_state.pushData == pushData)
+            if (draw_state.cameraIndex == cameraIndex)
                 return;
             trySubmit();
-            draw_state.pushData = pushData;
+            draw_state.cameraIndex = cameraIndex;
         }
         constexpr void setStencilRef(std::optional<std::uint32_t> stencilRef) noexcept
         {
@@ -1044,53 +1050,69 @@ namespace command
             trySubmit();
             draw_state.pipelineLayout = pipelineLayout;
         }
-        void solveDrawItem(std::size_t index)
+        // renderVersion 只是 picking 回读的过滤标签，不属于 draw 录制状态；
+        // 在发射时统一盖章，不参与 draw_state / 合批。
+        void solveDrawItem(std::size_t index, std::uint32_t renderVersion)
         {
+            assert(resources != nullptr);
+            assert(index < MAX_FRAMES_IN_FLIGHT);
+
             trySubmit();
 
             const auto size = draws.size();
             if (size == 0)
                 return;
 
+            // 每个 frame-in-flight 一套 ShaderBuffers：第 N 帧用自己的 buffer，
+            // 上一帧仍在飞行时，不会被这一帧的扩容/写入覆盖。
+            auto &sb = (*resources->shaderBuffers)[index];
+            assert(sb.globalVertexBuffer.address != 0);
+            assert(sb.globalHeapBuffer.address != 0);
+            assert(sb.commandConstantsBuffer.address != 0);
             const CommandBufferView commandBuffer = (*resources->commandBuffers)[index];
 
-            auto &globalHeapBuffer = resources->shaderBuffers->globalHeapBuffer;
-            auto &commandConstantsBuffer =
-                resources->shaderBuffers->commandConstantsBuffer;
-            auto &indirectDrawBuffer = resources->shaderBuffers->indirectDrawBuffer;
             const auto heapBufferSubmitSize = heapBuffer.size();
             const auto constantSubmitSize =
                 constants.size() * sizeof(shader_data::CommandConstant);
             const auto commandSubmitSize =
                 commands.size() * sizeof(VkDrawIndexedIndirectCommand);
 
-            // 保证内存足够
-            {
-                if (globalHeapBuffer.capacity < heapBufferSubmitSize)
-                {
-                    auto newCapacity = std::bit_ceil(heapBufferSubmitSize);
-                    globalHeapBuffer = shader_data::ShaderBuffers::newHeapBuffer(
-                        *globalHeapBuffer.buffer.device(), newCapacity);
-                }
-                if (commandConstantsBuffer.capacity < constantSubmitSize)
-                {
-                    auto newCapacity = std::bit_ceil(constantSubmitSize);
-                    commandConstantsBuffer =
-                        shader_data::ShaderBuffers::newConstantBuffer(
-                            *commandConstantsBuffer.buffer.device(), newCapacity);
-                }
-                if (indirectDrawBuffer.capacity < commandSubmitSize)
-                {
-                    auto newCapacity = std::bit_ceil(commandSubmitSize);
-                    indirectDrawBuffer = shader_data::ShaderBuffers::newIndirectBuffer(
-                        *indirectDrawBuffer.buffer.device(), newCapacity);
-                }
-            }
-            globalHeapBuffer.write(0, heapBuffer.data(), heapBufferSubmitSize);
-            commandConstantsBuffer.write(0, constants.data(), constantSubmitSize);
-            indirectDrawBuffer.write(0, commands.data(), commandSubmitSize);
+            // 保留原来的自动扩容；扩容只动当前 frame 的 buffer。
+            if (sb.globalHeapBuffer.capacity < heapBufferSubmitSize)
+                sb.globalHeapBuffer = shader_data::ShaderBuffers::newHeapBuffer(
+                    *sb.globalHeapBuffer.buffer.device(),
+                    std::bit_ceil(heapBufferSubmitSize));
+            if (sb.commandConstantsBuffer.capacity < constantSubmitSize)
+                sb.commandConstantsBuffer = shader_data::ShaderBuffers::newConstantBuffer(
+                    *sb.commandConstantsBuffer.buffer.device(),
+                    std::bit_ceil(constantSubmitSize));
+            if (sb.indirectDrawBuffer.capacity < commandSubmitSize)
+                sb.indirectDrawBuffer = shader_data::ShaderBuffers::newIndirectBuffer(
+                    *sb.indirectDrawBuffer.buffer.device(),
+                    std::bit_ceil(commandSubmitSize));
 
-            auto pre = draws[0].draw_state;
+            sb.globalHeapBuffer.write(0, heapBuffer.data(), heapBufferSubmitSize);
+            sb.commandConstantsBuffer.write(0, constants.data(), constantSubmitSize);
+            sb.indirectDrawBuffer.write(0, commands.data(), commandSubmitSize);
+
+            // 关键：gl_DrawIDARB 在每次 drawIndexedIndirect 内从 0 开始。
+            // 每个 draw_item 的 push 必须指向它自己的 CommandConstant 区间，
+            // 同时把绝对地址重新解析到当前 frame 的 buffer 槽。
+            const auto resolvePush = [&](const draw_item &item) {
+                PushData push{};
+                push.vertexAddress = sb.globalVertexBuffer.address;
+                push.instanceAddress = sb.globalHeapBuffer.address;
+                push.commandConstantsAddress = sb.commandConstantsBuffer.address +
+                                               item.data_ranges.data_span.offset *
+                                                   sizeof(shader_data::CommandConstant);
+                push.cameraIndex = item.draw_state.cameraIndex;
+                push.renderVersion = renderVersion;
+                return push;
+            };
+
+            auto &first = draws[0];
+            auto pre = first.draw_state;
+            auto prePush = resolvePush(first);
 
             commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pre.pipeline);
             commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1098,25 +1120,25 @@ namespace command
                                              0, nullptr);
             commandBuffer.setViewport(0, std::span<const VkViewport>{&pre.viewport, 1});
             commandBuffer.setScissor(0, std::span<const VkRect2D>{&pre.scissor, 1});
-
-            // NOTE: 实践中,使用不到好像. 需要实例实例索引
-            commandBuffer.bindIndexBuffer(
-                resources->shaderBuffers->globalIndexBuffer.buffer.buffer(), 0,
-                VK_INDEX_TYPE_UINT32);
+            commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+                                          VK_INDEX_TYPE_UINT32);
             commandBuffer.pushConstants(pre.pipelineLayout,
                                         VK_SHADER_STAGE_VERTEX_BIT |
                                             VK_SHADER_STAGE_FRAGMENT_BIT,
-                                        0, sizeof(PushData), &pre.pushData);
-            auto offset = 0;
-            auto count = draws[0].data_ranges.draw_count();
-            commandBuffer.drawIndexedIndirect(indirectDrawBuffer.buffer.buffer(), offset,
-                                              count,
-                                              sizeof(VkDrawIndexedIndirectCommand));
-            offset += count * sizeof(VkDrawIndexedIndirectCommand);
+                                        0, sizeof(PushData), &prePush);
 
-            for (size_t i = 1; i < size; ++i)
+            auto offset =
+                first.data_ranges.data_span.offset * sizeof(VkDrawIndexedIndirectCommand);
+            auto count = first.data_ranges.draw_count();
+            commandBuffer.drawIndexedIndirect(sb.indirectDrawBuffer.buffer.buffer(),
+                                              offset, count,
+                                              sizeof(VkDrawIndexedIndirectCommand));
+
+            for (std::size_t i = 1; i < size; ++i)
             {
-                auto &[data_ranges, cur] = draws[i];
+                auto &item = draws[i];
+                auto &cur = item.draw_state;
+                auto curPush = resolvePush(item);
 
                 if (cur.pipeline != pre.pipeline)
                     commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1135,18 +1157,20 @@ namespace command
                     commandBuffer.setScissor(0,
                                              std::span<const VkRect2D>{&cur.scissor, 1});
 
-                if (cur.pipelineLayout != pre.pipelineLayout ||
-                    cur.pushData != pre.pushData)
+                if (cur.pipelineLayout != pre.pipelineLayout || curPush != prePush)
                     commandBuffer.pushConstants(cur.pipelineLayout,
                                                 VK_SHADER_STAGE_VERTEX_BIT |
                                                     VK_SHADER_STAGE_FRAGMENT_BIT,
-                                                0, sizeof(PushData), &cur.pushData);
-                count = data_ranges.draw_count();
-                commandBuffer.drawIndexedIndirect(indirectDrawBuffer.buffer.buffer(),
+                                                0, sizeof(PushData), &curPush);
+
+                offset = item.data_ranges.data_span.offset *
+                         sizeof(VkDrawIndexedIndirectCommand);
+                count = item.data_ranges.draw_count();
+                commandBuffer.drawIndexedIndirect(sb.indirectDrawBuffer.buffer.buffer(),
                                                   offset, count,
                                                   sizeof(VkDrawIndexedIndirectCommand));
-                offset += count * sizeof(VkDrawIndexedIndirectCommand);
                 pre = cur;
+                prePush = curPush;
             }
         }
 
@@ -1154,20 +1178,18 @@ namespace command
         template <class T>
         constexpr void addInsteance(T data)
         {
+            assert(draw_state.valid());
             constexpr auto program_value = shader_data::program_value<T>();
             constexpr auto initcmd = VkDrawIndexedIndirectCommand{.indexCount = 6,
                                                                   .instanceCount = 1,
                                                                   .firstIndex = 0,
                                                                   .vertexOffset = 0,
                                                                   .firstInstance = 0};
+            const auto address_offset = static_cast<std::uint32_t>(heapBuffer.size());
             heapBuffer.write(data);
-            //CommandConstBuffer cmdConsts = CommandConstBuffer(pc.commandConstantsAddress);
-            // CommandConstant cc = cmdConsts.consts[gl_DrawIDARB];
-            //uint64_t heapBaseStart = pc.dataAddress + cc.address_offset;//dataAddress就是heapBuffer的起始地址
-            // instancePtr = heapBaseStart + gl_InstanceIndex * SHAPE_SIZE;
+            // CommandConstant.address_offset 相对 pc.dataAddress（本帧的实例堆起点）。
             const auto init_cc = shader_data::CommandConstant{
-                .program = program_value, .address_offset = heap_offset};
-            heap_offset += sizeof(T);
+                .program = program_value, .address_offset = address_offset};
             if (pendingData.empty())
             {
                 // new realy memory
@@ -1202,11 +1224,17 @@ namespace command
             constants.clear();
             commands.clear();
             heapBuffer.clear();
-            heap_offset = 0;
             pendingData = {};
             draw_state = {};
         }
     };
+
+    // 单线程录制：一个 recorder 顺序录每帧；GPU 侧按 frame 槽隔离。
+    inline command_recorder &globalRecorder() noexcept
+    {
+        static command_recorder value{};
+        return value;
+    }
 
 }; // namespace command
 //
@@ -10001,18 +10029,34 @@ try
     auto &[pickResourcesBuild, pickResource, resolveResourcesBuild, resolveResource,
            pickingFrames, pickMouse] = pickingAttachments;
 
-    // command 语料的数据区：容量是“素材”，不是工程尺寸。
-    //   heap: 64 KiB（Shape/PathFill/PathStroke/NoiseQuad 四段连续数组）
-    //   vertex/index: 1 KiB 各够 quad 副本、16-bit 索引和多套 indirect 参数
-    //   indirect/constant: 8 KiB / 4 KiB 够所有 case 的 command + CommandConstant
-    constexpr VkDeviceSize kCorpusHeapBytes = 64u * 1024u;
+    // 每个 frame-in-flight 一套 ShaderBuffers：
+    // 第 N 帧用自己的 buffer，上一帧仍可安全读自己的那套；每套仍保留自动扩容。
+    constexpr VkDeviceSize kFrameHeapBytes = 64u * 1024u;
+    constexpr VkDeviceSize kFrameIndirectBytes = 8u * 1024u;
+    constexpr VkDeviceSize kFrameConstantBytes = 4u * 1024u;
     constexpr VkDeviceSize kCorpusVertexBytes = 1024u;
     constexpr VkDeviceSize kCorpusIndexBytes = 1024u;
-    constexpr VkDeviceSize kCorpusIndirectBytes = 8u * 1024u;
-    constexpr VkDeviceSize kCorpusConstantBytes = 4u * 1024u;
-    auto shaderBuffers = shader_data::ShaderBuffers(
-        device, kCorpusVertexBytes, kCorpusIndexBytes, kCorpusHeapBytes,
-        kCorpusIndirectBytes, kCorpusConstantBytes);
+    // 每个 frame-in-flight 一套 ShaderBuffers；扩容只影响自己的那一套。
+    std::array<shader_data::ShaderBuffers, MAX_FRAMES_IN_FLIGHT> shaderBuffers;
+    for (auto &sb : shaderBuffers)
+        sb = shader_data::ShaderBuffers(device, kCorpusVertexBytes, kCorpusIndexBytes,
+                                        kFrameHeapBytes, kFrameIndirectBytes,
+                                        kFrameConstantBytes);
+
+    // 所有 recorder 程序共用的 quad carrier：4 个唯一顶点 + 6 个索引。
+    {
+        const std::array<Vertex, 4> quadVerts = {
+            Vertex{{-0.5F, -0.5F, 0.0F}, {0.0F, 0.0F}},
+            Vertex{{0.5F, -0.5F, 0.0F}, {1.0F, 0.0F}},
+            Vertex{{0.5F, 0.5F, 0.0F}, {1.0F, 1.0F}},
+            Vertex{{-0.5F, 0.5F, 0.0F}, {0.0F, 1.0F}}};
+        const std::array<std::uint32_t, 6> quadIdx = {0, 1, 2, 0, 2, 3};
+        for (auto &sb : shaderBuffers)
+        {
+            sb.globalVertexBuffer.write(0, quadVerts.data(), sizeof(quadVerts));
+            sb.globalIndexBuffer.write(0, quadIdx.data(), sizeof(quadIdx));
+        }
+    }
 
     auto pickCtx =
         make_aggregate_ref<"pickCtx", "pickResourcesBuild", "pickResource",
@@ -10484,7 +10528,7 @@ try
         method<"transitionImageLayout">([](world_type &, input_type &, data_type &) {}),
         method<"beginRendering">([](world_type &, input_type &, data_type &) {}),
         method<"setPipelineState">([](world_type &, input_type &, data_type &) {}),
-        method<"draw">([](world_type &, input_type &, data_type &) {
+        method<"draw">([](world_type &, input_type &, data_type &soaCtx) {
             // 资源从 resources() 取，宿主状态（每帧序号/UI 场景）从 frameState() 取
             auto &r = named_resource::resources();
             auto &fs = named_resource::frameState();
@@ -10499,27 +10543,16 @@ try
             auto &msaaResource = *r.msaaResource;
             auto &pickResource = *r.pickResource;
             auto &resolveResource = *r.resolveResource;
-            auto &sb = *r.shaderBuffers;
             auto &depthResourcesBuild = *fs.depthResourcesBuild;
 
-            auto pipeline = [&](static_string name) -> mcs::vulkan::Pipeline & {
-                return *named_resource::find(r.pipelines, name.view());
-            };
-            auto &pipelineOpaque3D = pipeline(static_string{"pipelineOpaque3D"});
-            auto &pipelineTransparent3D =
-                pipeline(static_string{"pipelineTransparent3D"});
-            auto &pipelineOpaqueUI = pipeline(static_string{"pipelineOpaqueUI"});
-            auto &pipelineTransparentUI =
-                pipeline(static_string{"pipelineTransparentUI"});
-            auto &pipelineUILayer = pipeline(static_string{"pipelineUILayer"});
+            auto &pipelineTransparentUI = *named_resource::find(
+                r.pipelines, static_string{"pipelineTransparentUI"}.view());
 
-            // ↓↓↓ 一个 VkCommandBuffer；下面全部是裸 vkCmd*，没有 CommandBuilder ↓↓↓
+            // 一个 VkCommandBuffer；绘制录入交给 command_recorder。
             const auto &[currentFrame, imageIndex] = *fs.frameInfo;
             const auto &commandBuffer = commandBuffers[currentFrame];
 
             const VkDescriptorSet descriptorSet = descriptorSets[currentFrame];
-            const VkDescriptorSet descriptorSetAlternate =
-                descriptorSets[(currentFrame + 1) % MAX_FRAMES_IN_FLIGHT];
 
             const VkExtent2D extent = swapchain.refImageExtent();
             const float W = static_cast<float>(extent.width);
@@ -10532,6 +10565,225 @@ try
             const VkImage resolveImage = resolveResource.image();
 
             const ui_dao::view view{W, H};
+
+            auto &recorder = command::globalRecorder();
+            recorder.resources = &r;
+            recorder.clear();
+
+            // 每个 frame-in-flight 一份 UBO；当前 fence 已经等过，写当前槽安全。
+            UniformBufferObject ubo{};
+            ubo.cameraInfo[0].view = glm::mat4(1.0F);
+            ubo.cameraInfo[0].proj = glm::mat4(1.0F);
+            ubo.cameraInfo[1] = ubo.cameraInfo[0];
+            std::memcpy(uniformBuffers[currentFrame].mapPtr(), &ubo, sizeof(ubo));
+
+            const bool hasStencil = depthResourcesBuild.hasStencilComponent();
+            const VkImageAspectFlags depthAspect =
+                hasStencil ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                           : VK_IMAGE_ASPECT_DEPTH_BIT;
+
+            const auto to_color = [](VkImage img) {
+                return my_render::image_info{
+                    .image = img,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            .access_mask = VK_ACCESS_2_NONE,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}};
+            };
+            const my_render::image_info depth_transition{
+                .image = depthImage,
+                .aspect_mask = depthAspect,
+                .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                        .access_mask = VK_ACCESS_2_NONE,
+                        .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                .dst = {.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT}};
+            my_render::transition_image_layout(
+                commandBuffer, to_color(image), to_color(msaaImage),
+                to_color(pickingImage), to_color(resolveImage), depth_transition);
+
+            VkRenderingAttachmentInfo color0_clear{
+                .sType = sType<VkRenderingAttachmentInfo>(),
+                .imageView = msaaResource.imageView(),
+                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT,
+                .resolveImageView = swapchain.imageView(imageIndex),
+                .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = {.color = {.float32 = {0.05F, 0.06F, 0.08F, 1.0F}}}};
+            VkRenderingAttachmentInfo color1_clear{
+                .sType = sType<VkRenderingAttachmentInfo>(),
+                .imageView = pickResource.imageView(),
+                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+                .resolveImageView = resolveResource.imageView(),
+                .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = {.color = {.uint32 = {0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 0u}}}};
+            VkRenderingAttachmentInfo depth_clear{
+                .sType = sType<VkRenderingAttachmentInfo>(),
+                .imageView = depthResource.imageView(),
+                .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = {.depthStencil = {.depth = 1.0F, .stencil = 0u}}};
+
+            const std::array attachments_clear = {color0_clear, color1_clear};
+            VkRenderingInfo info_clear{
+                .sType = sType<VkRenderingInfo>(),
+                .renderArea = {.offset = {.x = 0, .y = 0}, .extent = extent},
+                .layerCount = 1,
+                .viewMask = 0,
+                .colorAttachmentCount =
+                    static_cast<std::uint32_t>(attachments_clear.size()),
+                .pColorAttachments = attachments_clear.data(),
+                .pDepthAttachment = &depth_clear,
+                .pStencilAttachment = hasStencil ? &depth_clear : nullptr};
+
+            commandBuffer.beginRendering(info_clear);
+
+            const VkViewport full_vp{0.0F, 0.0F, W, H, 0.0F, 1.0F};
+            const VkRect2D full_scissor{{0, 0}, extent};
+
+            // ── command_recorder 场景 ──────────────────────────────────
+            recorder.setPipeline(*pipelineTransparentUI);
+            recorder.setPipelineLayout(*pipelineLayout);
+            recorder.setDescriptorSet(descriptorSet);
+            recorder.setViewport(full_vp);
+            recorder.setScissor(full_scissor);
+
+            // renderVersion 是 picking/UI 的语义输入，不是 buffer 地址；
+            // 取当前屏幕版本，避免硬编码 0 后 picking 被 wait 阶段丢弃。
+            const auto renderVersion =
+                static_cast<std::uint32_t>(soaCtx.screen.renderVersion());
+            recorder.setCameraIndex(0);
+
+            const float margin = 36.0F;
+            const float gap = 24.0F;
+            const float panelW = std::max((W - 2.0F * margin - gap) * 0.5F, 1.0F);
+            const float panelH = std::max(H - 2.0F * margin, 1.0F);
+            const ui_dao::rect_px left_panel{margin, margin, panelW, panelH};
+            const ui_dao::rect_px right_panel{margin + panelW + gap, margin, panelW,
+                                              panelH};
+            const auto inset = [](ui_dao::rect_px rect, float m) {
+                rect.x += m;
+                rect.y += m;
+                rect.w = std::max(rect.w - 2.0F * m, 1.0F);
+                rect.h = std::max(rect.h - 2.0F * m, 1.0F);
+                return rect;
+            };
+
+            const glm::vec4 left_bg{0.08F, 0.10F, 0.14F, 1.0F};
+            const glm::vec4 left_card{0.16F, 0.20F, 0.28F, 1.0F};
+            const glm::vec4 left_accent{0.20F, 0.85F, 0.95F, 1.0F};
+            const glm::vec4 right_bg{0.13F, 0.09F, 0.15F, 1.0F};
+            const glm::vec4 right_card{0.23F, 0.16F, 0.27F, 1.0F};
+            const glm::vec4 right_accent{0.95F, 0.50F, 0.75F, 1.0F};
+
+            // 第一段 state：左侧面板。Shape ×3 走一条 indirect command 的 3 个实例，
+            // PathStroke 另起一条 command；一次 drawIndexedIndirect 即可。
+            const auto left_card_rect = inset(left_panel, 20.0F);
+            recorder.addInsteance(ui_dao::sdf_shape(left_panel, view, 18.0F, left_bg, {},
+                                                    0.0F, 0.0F, 1.0F, 1));
+            recorder.addInsteance(ui_dao::sdf_shape(left_card_rect, view, 14.0F,
+                                                    left_card, {}, 0.0F, 0.0F, 1.0F, 2));
+            recorder.addInsteance(
+                ui_dao::shape_border(left_card_rect, view, 14.0F, left_accent, 3.0F, 3));
+            const std::array<glm::vec2, 5> zig = {
+                glm::vec2{0.10F, 0.20F}, glm::vec2{0.50F, 0.82F}, glm::vec2{0.82F, 0.20F},
+                glm::vec2{0.22F, 0.62F}, glm::vec2{0.90F, 0.72F}};
+            recorder.addInsteance(
+                ui_dao::path_stroke(inset(left_panel, 48.0F), view, std::span{zig}, 10.0F,
+                                    glm::vec4(0.95F, 0.35F, 0.75F, 1.0F),
+                                    glm::vec4(0.20F, 0.95F, 0.95F, 1.0F), 1, 4));
+
+            // 换 push（cameraIndex 变化）会提交左侧 draw_item；右侧是新 state。
+            // 两个 UBO 相机都是单位矩阵，画面不受影响，但 push 变化足以切 batch。
+            recorder.setCameraIndex(1);
+
+            const auto right_card_rect = inset(right_panel, 20.0F);
+            recorder.addInsteance(ui_dao::sdf_shape(right_panel, view, 18.0F, right_bg,
+                                                    {}, 0.0F, 0.0F, 1.0F, 5));
+            recorder.addInsteance(ui_dao::sdf_shape(right_card_rect, view, 14.0F,
+                                                    right_card, {}, 0.0F, 0.0F, 1.0F, 6));
+            recorder.addInsteance(ui_dao::shape_border(right_card_rect, view, 14.0F,
+                                                       right_accent, 3.0F, 7));
+            const std::array<glm::vec2, 3> tri = {glm::vec2{0.50F, 0.10F},
+                                                  glm::vec2{0.10F, 0.90F},
+                                                  glm::vec2{0.90F, 0.90F}};
+            recorder.addInsteance(
+                ui_dao::path_fill(inset(right_panel, 48.0F), view, std::span{tri},
+                                  glm::vec4(0.20F, 0.65F, 0.95F, 1.0F),
+                                  glm::vec4(0.95F, 0.85F, 0.25F, 1.0F), 8));
+
+            recorder.solveDrawItem(currentFrame, renderVersion);
+
+            commandBuffer.endRendering();
+
+            // picking 回读：resolve 是单采样图；只 copy 光标所在的那个像素，
+            // 和 test_dod.cpp 的 copyImageToBuffer 同目的，不是固定测试点。
+            auto &pickMouse = *fs.pickMouse;
+            my_render::transition_image_layout(
+                commandBuffer,
+                my_render::image_info{
+                    .image = resolveImage,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
+
+            const std::int32_t px = std::clamp(
+                pickMouse.pos.x, 0, static_cast<std::int32_t>(extent.width) - 1);
+            const std::int32_t py = std::clamp(
+                pickMouse.pos.y, 0, static_cast<std::int32_t>(extent.height) - 1);
+            const VkBufferImageCopy region{
+                .bufferOffset = 0,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                .imageOffset = {px, py, 0},
+                .imageExtent = {1, 1, 1}};
+            commandBuffer.copyImageToBuffer(
+                resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                pickingFrames[currentFrame].buffer(), std::span{&region, 1});
+
+            my_render::transition_image_layout(
+                commandBuffer,
+                my_render::image_info{
+                    .image = resolveImage,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
+
+            my_render::transition_image_layout(
+                commandBuffer,
+                my_render::image_info{
+                    .image = image,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                            .access_mask = VK_ACCESS_2_NONE,
+                            .stage_mask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT}});
         }),
         method<"endRendering">([](world_type &, input_type &, data_type &) {}));
 
