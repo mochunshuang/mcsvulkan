@@ -1052,7 +1052,8 @@ namespace command
         }
         // renderVersion 只是 picking 回读的过滤标签，不属于 draw 录制状态；
         // 在发射时统一盖章，不参与 draw_state / 合批。
-        void solveDrawItem(std::size_t index, std::uint32_t renderVersion)
+        void solveDrawItem(const CommandBufferView &commandBuffer, std::size_t index,
+                           std::uint32_t renderVersion)
         {
             assert(resources != nullptr);
             assert(index < MAX_FRAMES_IN_FLIGHT);
@@ -1069,7 +1070,6 @@ namespace command
             assert(sb.globalVertexBuffer.address != 0);
             assert(sb.globalHeapBuffer.address != 0);
             assert(sb.commandConstantsBuffer.address != 0);
-            const CommandBufferView commandBuffer = (*resources->commandBuffers)[index];
 
             const auto heapBufferSubmitSize = heapBuffer.size();
             const auto constantSubmitSize =
@@ -10724,8 +10724,7 @@ try
                                   glm::vec4(0.20F, 0.65F, 0.95F, 1.0F),
                                   glm::vec4(0.95F, 0.85F, 0.25F, 1.0F), 8));
 
-            recorder.solveDrawItem(currentFrame, renderVersion);
-
+            recorder.solveDrawItem(commandBuffer, currentFrame, renderVersion);
             commandBuffer.endRendering();
 
             // picking 回读：resolve 是单采样图；只 copy 光标所在的那个像素，
