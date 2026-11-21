@@ -776,6 +776,24 @@ namespace command
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     };
 
+    constexpr bool blend_equation_equal(const VkColorBlendEquationEXT &a,
+                                        const VkColorBlendEquationEXT &b) noexcept
+    {
+        return a.srcColorBlendFactor == b.srcColorBlendFactor &&
+               a.dstColorBlendFactor == b.dstColorBlendFactor &&
+               a.colorBlendOp == b.colorBlendOp &&
+               a.srcAlphaBlendFactor == b.srcAlphaBlendFactor &&
+               a.dstAlphaBlendFactor == b.dstAlphaBlendFactor &&
+               a.alphaBlendOp == b.alphaBlendOp;
+    }
+    constexpr bool stencil_op_equal(const VkStencilOpState &a,
+                                    const VkStencilOpState &b) noexcept
+    {
+        return a.failOp == b.failOp && a.passOp == b.passOp &&
+               a.depthFailOp == b.depthFailOp && a.compareOp == b.compareOp &&
+               a.compareMask == b.compareMask && a.writeMask == b.writeMask;
+    }
+
     struct draw_state
     {
         VkPipeline pipeline{};
@@ -786,6 +804,40 @@ namespace command
         VkRect2D scissor{};
         std::uint32_t cameraIndex{};
         std::optional<std::uint32_t> stencilRef;
+
+        // ── ext_dynamic_state2/3：blend / A2C / stencil（sticky）───────────
+        bool dynamic_ui = false; // 该 pipeline 是否声明了这些动态状态
+        std::array<VkBool32, 2> color_blend_enable{VK_TRUE, VK_FALSE};
+        std::array<VkColorBlendEquationEXT, 2> color_blend_equation{
+            VkColorBlendEquationEXT{VK_BLEND_FACTOR_ONE,
+                                    VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                                    VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE,
+                                    VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                                    VK_BLEND_OP_ADD},
+            VkColorBlendEquationEXT{VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO,
+                                    VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ZERO,
+                                    VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD}};
+        std::array<VkColorComponentFlags, 2> color_write_mask{
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT};
+        VkBool32 alpha_to_coverage = VK_FALSE;
+        VkBool32 stencil_test_enable = VK_FALSE;
+        VkStencilOpState stencil_op{};
+
+        constexpr bool dynamic_equal(const draw_state &o) const noexcept
+        {
+            return color_blend_enable == o.color_blend_enable &&
+                   blend_equation_equal(color_blend_equation[0],
+                                        o.color_blend_equation[0]) &&
+                   blend_equation_equal(color_blend_equation[1],
+                                        o.color_blend_equation[1]) &&
+                   color_write_mask == o.color_write_mask &&
+                   alpha_to_coverage == o.alpha_to_coverage &&
+                   stencil_test_enable == o.stencil_test_enable &&
+                   stencil_op_equal(stencil_op, o.stencil_op);
+        }
         constexpr bool valid() const noexcept
         {
             return pipeline != nullptr && descriptorSet != nullptr &&
@@ -797,7 +849,8 @@ namespace command
                    descriptorSet == o.descriptorSet &&
                    viewportEqual(viewport, o.viewport) &&
                    rect2DEqual(scissor, o.scissor) && cameraIndex == o.cameraIndex &&
-                   stencilRef == o.stencilRef;
+                   stencilRef == o.stencilRef && dynamic_ui == o.dynamic_ui &&
+                   (!dynamic_ui || dynamic_equal(o));
         }
     };
 
@@ -1032,6 +1085,27 @@ namespace command
         std::size_t capacity_ = 0;
     };
 
+    // 一个 scope 在 GPU 上的落地地址。只能由 record_builder::resolveStorage 产出；
+    // command_recorder::record 必须拿到它才能录 vkCmd* —— 用类型把“先定地址、后录命令”
+    // 固化成调用约束，避免先录命令、后扩容导致的地址失效。
+    struct scope_binding
+    {
+        VkDeviceAddress vertex{};
+        VkDeviceAddress heap{};
+        VkDeviceAddress constants{};
+        VkBuffer index_buffer{};
+        VkBuffer indirect_buffer{};
+        VkDeviceSize indirect_offset{};
+
+        // 仅用于断言 / 回溯
+        std::uint32_t heap_base{};
+        std::uint32_t heap_bytes{};
+        std::uint32_t constants_base{};
+        std::uint32_t constants_bytes{};
+        std::uint32_t indirect_base{};
+        std::uint32_t indirect_bytes{};
+    };
+
     struct command_recorder
     {
         named_resource::resource_table *resources{};
@@ -1137,6 +1211,51 @@ namespace command
             trySubmit();
             draw_state.stencilRef = stencilRef;
         }
+        // ── ext_dynamic_state2/3：不新建管线，直接改状态 ──────────────────
+        constexpr void setDynamicUI(bool enabled) noexcept
+        {
+            if (draw_state.dynamic_ui == enabled)
+                return;
+            trySubmit();
+            draw_state.dynamic_ui = enabled;
+        }
+        constexpr void setBlendState(std::array<VkBool32, 2> enable,
+                                     std::array<VkColorBlendEquationEXT, 2> equation,
+                                     std::array<VkColorComponentFlags, 2> mask) noexcept
+        {
+            if (draw_state.color_blend_enable == enable &&
+                draw_state.color_write_mask == mask &&
+                blend_equation_equal(draw_state.color_blend_equation[0],
+                                     equation[0]) &&
+                blend_equation_equal(draw_state.color_blend_equation[1],
+                                     equation[1]))
+                return;
+            trySubmit();
+            draw_state.color_blend_enable = enable;
+            draw_state.color_blend_equation = equation;
+            draw_state.color_write_mask = mask;
+        }
+        constexpr void setAlphaToCoverage(VkBool32 enabled) noexcept
+        {
+            if (draw_state.alpha_to_coverage == enabled)
+                return;
+            trySubmit();
+            draw_state.alpha_to_coverage = enabled;
+        }
+        constexpr void setStencilTest(VkBool32 enabled) noexcept
+        {
+            if (draw_state.stencil_test_enable == enabled)
+                return;
+            trySubmit();
+            draw_state.stencil_test_enable = enabled;
+        }
+        constexpr void setStencilOp(VkStencilOpState op) noexcept
+        {
+            if (stencil_op_equal(draw_state.stencil_op, op))
+                return;
+            trySubmit();
+            draw_state.stencil_op = op;
+        }
         constexpr void setPipeline(VkPipeline pipeline) noexcept
         {
             if (draw_state.pipeline == pipeline)
@@ -1188,12 +1307,12 @@ namespace command
 
         // renderVersion 只是 picking 回读的过滤标签，不属于 draw 录制状态；
         // 在发射时统一盖章，不参与 draw_state / 合批。
-        void solveDrawItem(const CommandBufferView &commandBuffer, std::size_t index,
-                           std::uint32_t renderVersion, bool closed)
+        // ── 阶段 2：只录 vkCmd*，地址全部来自 scope_binding ────────────────
+        //   binding 由 record_builder::resolveStorage 产出；数据在阶段 1
+        //   已全部写进 GPU buffer，这里不再扩容、不再写 heap。
+        void record(const CommandBufferView &commandBuffer, const scope_binding &binding,
+                    std::uint32_t renderVersion, bool closed)
         {
-            assert(resources != nullptr);
-            assert(index < MAX_FRAMES_IN_FLIGHT);
-
             trySubmit();
 
             const auto size = draws.size();
@@ -1205,51 +1324,55 @@ namespace command
                 return;
             }
 
+            assert(binding.vertex != 0);
+            assert(binding.heap != 0);
+            assert(binding.constants != 0);
+            assert(binding.index_buffer != VK_NULL_HANDLE);
+            assert(binding.indirect_buffer != VK_NULL_HANDLE);
+
             emit_begin_rendering(commandBuffer);
 
-            // 每个 frame-in-flight 一套 ShaderBuffers：第 N 帧用自己的 buffer，
-            // 上一帧仍在飞行时，不会被这一帧的扩容/写入覆盖。
-            auto &sb = (*resources->shaderBuffers)[index];
-            assert(sb.globalVertexBuffer.address != 0);
-            assert(sb.globalHeapBuffer.address != 0);
-            assert(sb.commandConstantsBuffer.address != 0);
-
-            const auto heap_size = heap_end - heap_begin;
-            const auto constantSubmitSize =
-                constants.size() * sizeof(shader_data::CommandConstant);
-            const auto commandSubmitSize =
-                commands.size() * sizeof(VkDrawIndexedIndirectCommand);
-
-            // 保留原来的自动扩容；扩容只动当前 frame 的 buffer。
-            if (sb.globalHeapBuffer.capacity < heap_size)
-                sb.globalHeapBuffer = shader_data::ShaderBuffers::newHeapBuffer(
-                    *sb.globalHeapBuffer.buffer.device(), std::bit_ceil(heap_size));
-            if (sb.commandConstantsBuffer.capacity < constantSubmitSize)
-                sb.commandConstantsBuffer = shader_data::ShaderBuffers::newConstantBuffer(
-                    *sb.commandConstantsBuffer.buffer.device(),
-                    std::bit_ceil(constantSubmitSize));
-            if (sb.indirectDrawBuffer.capacity < commandSubmitSize)
-                sb.indirectDrawBuffer = shader_data::ShaderBuffers::newIndirectBuffer(
-                    *sb.indirectDrawBuffer.buffer.device(),
-                    std::bit_ceil(commandSubmitSize));
-
-            sb.globalHeapBuffer.write(0, heap->data() + heap_begin, heap_size);
-            sb.commandConstantsBuffer.write(0, constants.data(), constantSubmitSize);
-            sb.indirectDrawBuffer.write(0, commands.data(), commandSubmitSize);
+            // 数据已由 record_builder::resolveStorage 在阶段 1 写好；
+            // 这里只录命令。绝不再重建 buffer —— 重建会让先录的地址失效。
 
             // 关键：gl_DrawIDARB 在每次 drawIndexedIndirect 内从 0 开始。
             // 每个 draw_item 的 push 必须指向它自己的 CommandConstant 区间，
             // 同时把绝对地址重新解析到当前 frame 的 buffer 槽。
             const auto resolvePush = [&](const draw_item &item) {
                 PushData push{};
-                push.vertexAddress = sb.globalVertexBuffer.address;
-                push.instanceAddress = sb.globalHeapBuffer.address;
-                push.commandConstantsAddress = sb.commandConstantsBuffer.address +
-                                               item.data_ranges.data_span.offset *
-                                                   sizeof(shader_data::CommandConstant);
+                push.vertexAddress = binding.vertex;
+                push.instanceAddress = binding.heap;
+                push.commandConstantsAddress =
+                    binding.constants + item.data_ranges.data_span.offset *
+                                            sizeof(shader_data::CommandConstant);
                 push.cameraIndex = item.draw_state.cameraIndex;
                 push.renderVersion = renderVersion;
                 return push;
+            };
+
+            // ext_dynamic_state2/3：blend / A2C / stencil 一律走动态状态
+            const auto emit_dynamic = [&](const command::draw_state &s) {
+                const auto &vk = commandBuffer.functions();
+                vk.vkCmdSetColorBlendEnableEXT(
+                    *commandBuffer, 0, 2, s.color_blend_enable.data());
+                vk.vkCmdSetColorBlendEquationEXT(
+                    *commandBuffer, 0, 2, s.color_blend_equation.data());
+                vk.vkCmdSetColorWriteMaskEXT(
+                    *commandBuffer, 0, 2, s.color_write_mask.data());
+                vk.vkCmdSetAlphaToCoverageEnableEXT(*commandBuffer,
+                                                    s.alpha_to_coverage);
+                vk.vkCmdSetStencilTestEnable(*commandBuffer,
+                                             s.stencil_test_enable);
+                vk.vkCmdSetStencilOp(
+                    *commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK,
+                    s.stencil_op.failOp, s.stencil_op.passOp,
+                    s.stencil_op.depthFailOp, s.stencil_op.compareOp);
+                vk.vkCmdSetStencilCompareMask(
+                    *commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK,
+                    s.stencil_op.compareMask);
+                vk.vkCmdSetStencilWriteMask(
+                    *commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK,
+                    s.stencil_op.writeMask);
             };
 
             auto &first = draws[0];
@@ -1262,19 +1385,21 @@ namespace command
                                              0, nullptr);
             commandBuffer.setViewport(0, std::span<const VkViewport>{&pre.viewport, 1});
             commandBuffer.setScissor(0, std::span<const VkRect2D>{&pre.scissor, 1});
-            commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
+            commandBuffer.bindIndexBuffer(binding.index_buffer, 0,
                                           recorder_config::index_type);
             if (pre.stencilRef)
                 commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK,
                                                   *pre.stencilRef);
             commandBuffer.pushConstants(pre.pipelineLayout, recorder_config::push_stages,
                                         0, sizeof(PushData), &prePush);
+            if (pre.dynamic_ui)
+                emit_dynamic(pre);
 
-            auto offset =
-                first.data_ranges.data_span.offset * sizeof(VkDrawIndexedIndirectCommand);
+            auto offset = binding.indirect_offset +
+                          first.data_ranges.data_span.offset *
+                              sizeof(VkDrawIndexedIndirectCommand);
             auto count = first.data_ranges.draw_count();
-            commandBuffer.drawIndexedIndirect(sb.indirectDrawBuffer.buffer.buffer(),
-                                              offset, count,
+            commandBuffer.drawIndexedIndirect(binding.indirect_buffer, offset, count,
                                               sizeof(VkDrawIndexedIndirectCommand));
 
             for (std::size_t i = 1; i < size; ++i)
@@ -1309,11 +1434,15 @@ namespace command
                                                 recorder_config::push_stages, 0,
                                                 sizeof(PushData), &curPush);
 
-                offset = item.data_ranges.data_span.offset *
-                         sizeof(VkDrawIndexedIndirectCommand);
+                if (cur.dynamic_ui &&
+                    (cur.pipeline != pre.pipeline || !cur.dynamic_equal(pre)))
+                    emit_dynamic(cur);
+
+                offset = binding.indirect_offset +
+                         item.data_ranges.data_span.offset *
+                             sizeof(VkDrawIndexedIndirectCommand);
                 count = item.data_ranges.draw_count();
-                commandBuffer.drawIndexedIndirect(sb.indirectDrawBuffer.buffer.buffer(),
-                                                  offset, count,
+                commandBuffer.drawIndexedIndirect(binding.indirect_buffer, offset, count,
                                                   sizeof(VkDrawIndexedIndirectCommand));
                 pre = cur;
                 prePush = curPush;
@@ -1381,6 +1510,21 @@ namespace command
             }
             pendingData = {};
             draw_state = {};
+        }
+
+        // ── 阶段 1：把本段的 heap / constants / indirect 写进 GPU buffer ──
+        //   b 的 base 由 record_builder 统一分配，保证各 scope 的区间不重叠。
+        void writeStorage(shader_data::ShaderBuffers &sb, const scope_binding &b) const
+        {
+            if (b.heap_bytes != 0)
+                sb.globalHeapBuffer.write(b.heap_base, heap->data() + heap_begin,
+                                          b.heap_bytes);
+            if (b.constants_bytes != 0)
+                sb.commandConstantsBuffer.write(b.constants_base, constants.data(),
+                                                b.constants_bytes);
+            if (b.indirect_bytes != 0)
+                sb.indirectDrawBuffer.write(b.indirect_base, commands.data(),
+                                            b.indirect_bytes);
         }
     };
 
@@ -1632,6 +1776,7 @@ namespace command
         std::uint32_t inter = no_scope;
         bool opened = false; // beginRendering 已录
         bool closed = false; // endRendering 已录（显式或自动）
+        scope_binding binding{}; // 阶段 1 产出的 GPU 落地地址
     };
 
     struct record_builder
@@ -1729,6 +1874,29 @@ namespace command
         {
             active_inter().setStencilRef(std::forward<A>(a)...);
         }
+        // ext_dynamic_state2/3 代理
+        void setDynamicUI(bool enabled)
+        {
+            active_inter().setDynamicUI(enabled);
+        }
+        void setBlendState(std::array<VkBool32, 2> enable,
+                           std::array<VkColorBlendEquationEXT, 2> equation,
+                           std::array<VkColorComponentFlags, 2> mask)
+        {
+            active_inter().setBlendState(enable, equation, mask);
+        }
+        void setAlphaToCoverage(VkBool32 enabled)
+        {
+            active_inter().setAlphaToCoverage(enabled);
+        }
+        void setStencilTest(VkBool32 enabled)
+        {
+            active_inter().setStencilTest(enabled);
+        }
+        void setStencilOp(VkStencilOpState op)
+        {
+            active_inter().setStencilOp(op);
+        }
         template <class T>
         void addInsteance(T data)
         {
@@ -1762,17 +1930,128 @@ namespace command
             return outers[scopes[scope_index].outer];
         }
 
+        // ── 阶段 1：定地址 + 推数据（不录任何 vkCmd*）────────────────────
+        //   1. 统计所有 scope 的 heap / constants / indirect 总量
+        //   2. 每个 scope 分配互不重叠、16 B 对齐的区间
+        //   3. 一次性扩容；此后 realloc 不会再发生
+        //   4. 全部写入 GPU buffer
+        //   5. 产出 scope_binding，阶段 2 只读它
+        static constexpr std::uint32_t kScopeGpuAlign = 16;
+        static constexpr std::uint32_t alignScopeBase(std::uint32_t value) noexcept
+        {
+            return (value + kScopeGpuAlign - 1) / kScopeGpuAlign * kScopeGpuAlign;
+        }
+
+        void resolveStorage(std::size_t frame)
+        {
+            assert(resources != nullptr);
+            auto &sb = (*resources->shaderBuffers)[frame];
+
+            std::uint32_t heap_total = 0;
+            std::uint32_t constants_total = 0;
+            std::uint32_t indirect_total = 0;
+
+            for (auto &scope : scopes)
+            {
+                if (scope.inter == no_scope)
+                    continue;
+                const auto &recorder = inters[scope.inter];
+                auto &b = scope.binding;
+
+                b.heap_base = heap_total;
+                b.heap_bytes = recorder.heap_end - recorder.heap_begin;
+                heap_total = alignScopeBase(heap_total + b.heap_bytes);
+
+                b.constants_base = constants_total;
+                b.constants_bytes = static_cast<std::uint32_t>(
+                    recorder.constants.size() * sizeof(shader_data::CommandConstant));
+                constants_total = alignScopeBase(constants_total + b.constants_bytes);
+
+                b.indirect_base = indirect_total;
+                b.indirect_bytes = static_cast<std::uint32_t>(
+                    recorder.commands.size() * sizeof(VkDrawIndexedIndirectCommand));
+                indirect_total = alignScopeBase(indirect_total + b.indirect_bytes);
+            }
+
+            if (std::getenv("MCS_DUMP_SCOPES") != nullptr)
+            {
+                static bool dumped = false;
+                if (!dumped)
+                {
+                    dumped = true;
+                    std::println("[scope-bind] scopes={} heap={} constants={} "
+                                 "indirect={}",
+                                 scopes.size(), heap_total, constants_total,
+                                 indirect_total);
+                    for (const auto &scope : scopes)
+                        if (scope.inter != no_scope)
+                            std::println("[scope-bind] inter={} heap[{},{}) "
+                                         "const[{},{}) indirect[{},{})",
+                                         scope.inter, scope.binding.heap_base,
+                                         scope.binding.heap_base +
+                                             scope.binding.heap_bytes,
+                                         scope.binding.constants_base,
+                                         scope.binding.constants_base +
+                                             scope.binding.constants_bytes,
+                                         scope.binding.indirect_base,
+                                         scope.binding.indirect_base +
+                                             scope.binding.indirect_bytes);
+                }
+            }
+
+            const auto heap_need = heap_total == 0 ? 1u : heap_total;
+            if (sb.globalHeapBuffer.capacity < heap_need)
+                sb.globalHeapBuffer = shader_data::ShaderBuffers::newHeapBuffer(
+                    *sb.globalHeapBuffer.buffer.device(), std::bit_ceil(heap_need));
+
+            const auto constants_need = constants_total == 0 ? 1u : constants_total;
+            if (sb.commandConstantsBuffer.capacity < constants_need)
+                sb.commandConstantsBuffer = shader_data::ShaderBuffers::newConstantBuffer(
+                    *sb.commandConstantsBuffer.buffer.device(),
+                    std::bit_ceil(constants_need));
+
+            const auto indirect_need = indirect_total == 0 ? 1u : indirect_total;
+            if (sb.indirectDrawBuffer.capacity < indirect_need)
+                sb.indirectDrawBuffer = shader_data::ShaderBuffers::newIndirectBuffer(
+                    *sb.indirectDrawBuffer.buffer.device(), std::bit_ceil(indirect_need));
+
+            assert(sb.globalHeapBuffer.capacity >= heap_total);
+            assert(sb.commandConstantsBuffer.capacity >= constants_total);
+            assert(sb.indirectDrawBuffer.capacity >= indirect_total);
+
+            // 地址从此固定：阶段 2 不再扩容、不再写 heap。
+            for (auto &scope : scopes)
+            {
+                if (scope.inter == no_scope)
+                    continue;
+                auto &recorder = inters[scope.inter];
+                auto &b = scope.binding;
+
+                recorder.writeStorage(sb, b);
+                b.vertex = sb.globalVertexBuffer.address;
+                b.heap = sb.globalHeapBuffer.address + b.heap_base;
+                b.constants = sb.commandConstantsBuffer.address + b.constants_base;
+                b.index_buffer = sb.globalIndexBuffer.buffer.buffer();
+                b.indirect_buffer = sb.indirectDrawBuffer.buffer.buffer();
+                b.indirect_offset = b.indirect_base;
+            }
+        }
+
         void replay(const CommandBufferView &commandBuffer, std::size_t frame,
                     std::uint32_t renderVersion)
         {
             end_rendering(); // 尾段未闭合时自动闭合
+
+            resolveStorage(frame); // 阶段 1：地址稳定 + 数据就位
+
+            // 阶段 2：只按顺序录 vkCmd*；binding 已经在阶段 1 定死。
             for (const auto &scope : scopes)
             {
                 if (scope.outer != no_scope)
                     outers[scope.outer].flush(commandBuffer);
                 if (scope.inter != no_scope)
-                    inters[scope.inter].solveDrawItem(commandBuffer, frame, renderVersion,
-                                                      scope.closed);
+                    inters[scope.inter].record(commandBuffer, scope.binding, renderVersion,
+                                               scope.closed);
             }
         }
 
@@ -2078,9 +2357,15 @@ constexpr auto init()
         VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
         VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME}; // NOLINTEND
     requiredDeviceExtension.emplace_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+    requiredDeviceExtension.emplace_back(
+        VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
+    requiredDeviceExtension.emplace_back(
+        VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
     structure_chain<VkPhysicalDeviceFeatures2, VkPhysicalDeviceVulkan13Features,
                     VkPhysicalDeviceVulkan12Features, VkPhysicalDeviceVulkan11Features,
-                    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT>
+                    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT,
+                    VkPhysicalDeviceExtendedDynamicState2FeaturesEXT,
+                    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT>
         enablefeatureChain = {
             {.features =
                  {
@@ -2120,7 +2405,20 @@ constexpr auto init()
             {
                 .shaderDrawParameters = VK_TRUE //diff: [test_indirectdraw]
             },
-            {.extendedDynamicState = VK_TRUE}};
+            {.extendedDynamicState = VK_TRUE},
+            {.extendedDynamicState2 = VK_TRUE},
+            {}};
+
+    // ext3 的字段太多，按需在链上就地打开（不用逐个写进聚合初始化）。
+    {
+        auto &ext3 = enablefeatureChain
+                         .template get<VkPhysicalDeviceExtendedDynamicState3FeaturesEXT>();
+        ext3.extendedDynamicState3ColorBlendEnable = VK_TRUE;
+        ext3.extendedDynamicState3ColorBlendEquation = VK_TRUE;
+        ext3.extendedDynamicState3ColorWriteMask = VK_TRUE;
+        ext3.extendedDynamicState3AlphaToCoverageEnable = VK_TRUE;
+        ext3.extendedDynamicState3SampleMask = VK_TRUE;
+    }
 
     auto [id [[maybe_unused]], physical_device [[maybe_unused]]] =
         create_physical_device_selector{}
@@ -2138,7 +2436,10 @@ constexpr auto init()
                 auto query = structure_chain<
                     VkPhysicalDeviceFeatures2, VkPhysicalDeviceVulkan13Features,
                     VkPhysicalDeviceVulkan12Features, VkPhysicalDeviceVulkan11Features,
-                    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT>{{}, {}, {}, {}, {}};
+                    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT,
+                    VkPhysicalDeviceExtendedDynamicState2FeaturesEXT,
+                    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT>{
+                    {}, {}, {}, {}, {}, {}, {}};
                 physicalDevice.getFeatures2(&query.head());
                 auto &features2 = query.template get<VkPhysicalDeviceFeatures2>();
                 auto &query_vulkan13_features =
@@ -2149,6 +2450,10 @@ constexpr auto init()
                     query.template get<VkPhysicalDeviceVulkan11Features>();
                 auto &query_extended_dynamic_state_features =
                     query.template get<VkPhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+                auto &query_ext2 =
+                    query.template get<VkPhysicalDeviceExtendedDynamicState2FeaturesEXT>();
+                auto &query_ext3 =
+                    query.template get<VkPhysicalDeviceExtendedDynamicState3FeaturesEXT>();
                 return features2.features.samplerAnisotropy &&
                        features2.features.shaderInt64 &&
                        features2.features.geometryShader &&
@@ -2167,7 +2472,13 @@ constexpr auto init()
                            .shaderSampledImageArrayNonUniformIndexing &&
                        query_vulkan11_features
                            .shaderDrawParameters && //diff: [test_indirectdraw]
-                       query_extended_dynamic_state_features.extendedDynamicState;
+                       query_extended_dynamic_state_features.extendedDynamicState &&
+                       query_ext2.extendedDynamicState2 &&
+                       query_ext3.extendedDynamicState3ColorBlendEnable &&
+                       query_ext3.extendedDynamicState3ColorBlendEquation &&
+                       query_ext3.extendedDynamicState3ColorWriteMask &&
+                       query_ext3.extendedDynamicState3AlphaToCoverageEnable &&
+                       query_ext3.extendedDynamicState3SampleMask;
             })
             .select(*instance.get())[0];
     auto physical = std::make_unique<PhysicalDevice>(std::move(physical_device));
@@ -3449,9 +3760,16 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
                                       {
                                           VK_DYNAMIC_STATE_VIEWPORT,
                                           VK_DYNAMIC_STATE_SCISSOR,
-                                          //NOTE: 多管线替代下面的动态状态了
-                                          //   VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
-                                          //   VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+                                          // ext 动态状态：blend / A2C / stencil
+                                          VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+                                          VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+                                          VK_DYNAMIC_STATE_STENCIL_OP,
+                                          VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+                                          VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                                          VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT,
+                                          VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
+                                          VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT,
+                                          VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT,
                                       }},
                  .layout = *pipelineLayout})
             .build(device);
@@ -11169,6 +11487,60 @@ try
                                  to_color(pickingImage), to_color(resolveImage),
                                  depth_transition);
 
+            // ── 离屏层：capture 主 framebuffer 的区域，再模糊 ──────────────
+            //   layerCapture：从 swapchain blit 出来的“真实 UI 内容”
+            //   layerBlur   ：对 layerCapture 做高斯模糊
+            auto &layerCapture = uiLayers().layers[currentFrame][0];
+            auto &layerBlur = uiLayers().layers[currentFrame][1];
+            auto &layerPipeline = *named_resource::find(
+                r.pipelines, static_string{"pipelineUILayer"}.view());
+
+            const ui_dao::view layerView{
+                static_cast<float>(ui_layer_ctx::kExtent.width),
+                static_cast<float>(ui_layer_ctx::kExtent.height)};
+
+            const auto layer_begin = [&](VkImageView view) {
+                command::rendering_info info;
+                info.renderArea = {.offset = {.x = 0, .y = 0},
+                                   .extent = ui_layer_ctx::kExtent};
+                info.layerCount = 1;
+                info.viewMask = 0;
+                info.colorAttachments.emplace_back(
+                    command::rendering_info::rendering_attachment{
+                        .imageView = view,
+                        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                        .clearValue = {.color = {
+                                           .float32 = {0.0F, 0.0F, 0.0F, 1.0F}}}});
+                frame.begin_rendering(std::move(info));
+                frame.setPipeline(*layerPipeline);
+                frame.setPipelineLayout(*pipelineLayout);
+                frame.setDescriptorSet(descriptorSet);
+                frame.setViewport(
+                    VkViewport{.x = 0.0F,
+                               .y = 0.0F,
+                               .width = static_cast<float>(ui_layer_ctx::kExtent.width),
+                               .height = static_cast<float>(ui_layer_ctx::kExtent.height),
+                               .minDepth = 0.0F,
+                               .maxDepth = 1.0F});
+                frame.setScissor(VkRect2D{{0, 0}, ui_layer_ctx::kExtent});
+                frame.setCameraIndex(1);
+            };
+
+            const auto layer_to_sampled = [&](VkImage img) {
+                frame.add_transition(my_render::image_info{
+                    .image = img,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                            .stage_mask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT}});
+            };
+
             VkRenderingAttachmentInfo color0_clear{
                 .sType = sType<VkRenderingAttachmentInfo>(),
                 .imageView = msaaResource.imageView(),
@@ -11239,6 +11611,8 @@ try
             const auto renderVersion =
                 static_cast<std::uint32_t>(soaCtx.screen.renderVersion());
             frame.setCameraIndex(0);
+            // 主 UI 管线声明了 ext2/3 动态状态：blend / A2C / stencil 全部动态设置
+            frame.setDynamicUI(true);
 
             const float margin = 36.0F;
             const float gap = 24.0F;
@@ -11297,6 +11671,210 @@ try
                 ui_dao::path_fill(inset(right_panel, 48.0F), view, std::span{tri},
                                   glm::vec4(0.20F, 0.65F, 0.95F, 1.0F),
                                   glm::vec4(0.95F, 0.85F, 0.25F, 1.0F), 8));
+
+            // ── 动态状态演示：stencil 裁剪 + A2C + 动态混合（不新建管线）──
+            {
+                std::array<glm::vec2, 10> star{};
+                for (int i = 0; i < 10; ++i)
+                {
+                    const float a = -1.5707963F + static_cast<float>(i) * 0.62831853F;
+                    const float r = (i & 1) == 0 ? 0.46F : 0.20F;
+                    star[static_cast<std::size_t>(i)] = {
+                        0.5F + r * glm::cos(a), 0.5F + r * glm::sin(a)};
+                }
+                const ui_dao::rect_px clipRect{left_panel.x + 120.0F,
+                                               left_panel.y + 330.0F, 260.0F, 260.0F};
+                constexpr VkColorComponentFlags rgba =
+                    VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                    VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+                const VkColorBlendEquationEXT over{
+                    VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                    VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE,
+                    VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD};
+                const VkColorBlendEquationEXT add{
+                    VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD,
+                    VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD};
+                const VkColorBlendEquationEXT none{
+                    VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
+                    VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD};
+
+                // 1) mask：不写颜色，A2C 把解析覆盖率写进 stencil（INCR）
+                frame.setBlendState({VK_FALSE, VK_FALSE}, {none, none}, {0, 0});
+                frame.setAlphaToCoverage(VK_TRUE);
+                frame.setStencilTest(VK_TRUE);
+                frame.setStencilOp(VkStencilOpState{
+                    .failOp = VK_STENCIL_OP_KEEP,
+                    .passOp = VK_STENCIL_OP_INCREMENT_AND_CLAMP,
+                    .depthFailOp = VK_STENCIL_OP_KEEP,
+                    .compareOp = VK_COMPARE_OP_ALWAYS,
+                    .compareMask = 0xFF,
+                    .writeMask = 0xFF,
+                    .reference = 0});
+                frame.setStencilRef(0);
+                frame.addInsteance(ui_dao::path_fill(clipRect, view, std::span{star},
+                                                     glm::vec4(1.0F), {}, 0, 1.0F));
+
+                // 2) content：stencil EQUAL 1 才写，over 混合
+                frame.setBlendState({VK_TRUE, VK_FALSE}, {over, none}, {rgba, rgba});
+                frame.setAlphaToCoverage(VK_FALSE);
+                frame.setStencilOp(VkStencilOpState{
+                    .failOp = VK_STENCIL_OP_KEEP,
+                    .passOp = VK_STENCIL_OP_KEEP,
+                    .depthFailOp = VK_STENCIL_OP_KEEP,
+                    .compareOp = VK_COMPARE_OP_EQUAL,
+                    .compareMask = 0xFF,
+                    .writeMask = 0x00,
+                    .reference = 0});
+                frame.setStencilRef(1);
+                frame.addInsteance(ui_dao::sdf_linear(
+                    clipRect, view, 0.0F, glm::vec4(1.0F, 0.55F, 0.2F, 1.0F),
+                    glm::vec4(0.2F, 0.8F, 1.0F, 1.0F), true));
+
+                // 3) glow：add 混合，不测 stencil
+                frame.setStencilTest(VK_FALSE);
+                frame.setBlendState({VK_TRUE, VK_FALSE}, {add, none}, {rgba, rgba});
+                frame.addInsteance(ui_dao::sdf_radial(
+                    {clipRect.x - 70.0F, clipRect.y - 70.0F, clipRect.w + 140.0F,
+                     clipRect.h + 140.0F},
+                    view, 0.0F, glm::vec4(1.0F, 0.85F, 0.25F, 0.45F),
+                    glm::vec4(0.0F)));
+
+                // 4) 恢复默认，后续圆点/抓屏按 over 走
+                frame.setBlendState({VK_TRUE, VK_FALSE}, {over, none}, {rgba, rgba});
+                frame.setStencilTest(VK_FALSE);
+                frame.setAlphaToCoverage(VK_FALSE);
+            }
+
+            // 玻璃区域背后的真实场景内容：一排彩色圆点（部分伸出卡片外，
+            // 便于对比“卡片外清晰 / 卡片内模糊”）。
+            for (int i = 0; i < 5; ++i)
+            {
+                const float t = static_cast<float>(i);
+                frame.addInsteance(ui_dao::sdf_shape(
+                    {right_panel.x + 40.0F + t * 95.0F, right_panel.y + 190.0F, 70.0F,
+                     70.0F},
+                    view, 35.0F,
+                    glm::vec4(0.95F, 0.45F + t * 0.08F, 0.25F + t * 0.12F, 1.0F)));
+            }
+
+            // ── 抓主 framebuffer → 模糊 → 玻璃合成 ────────────────────────
+            //   1) 主通道刚 resolve 到 swapchain（1x），先转 TRANSFER_SRC
+            //   2) blit 玻璃区域 → layerCapture（真实 UI 内容）
+            //   3) layerCapture →(高斯模糊)→ layerBlur
+            //   4) swapchain 转回 COLOR_ATTACHMENT，LOAD 后画玻璃
+            if (W >= 320.0F && H >= 192.0F)
+            {
+                const float gx = std::clamp(right_panel.x + 120.0F, 0.0F,
+                                            W - static_cast<float>(ui_layer_ctx::kExtent.width));
+                const float gy = std::clamp(right_panel.y + 140.0F, 0.0F,
+                                            H - static_cast<float>(ui_layer_ctx::kExtent.height));
+                const ui_dao::rect_px glassArea{
+                    gx, gy, static_cast<float>(ui_layer_ctx::kExtent.width),
+                    static_cast<float>(ui_layer_ctx::kExtent.height)};
+
+                frame.add_transition(my_render::image_info{
+                    .image = image,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
+
+                frame.add_transition(my_render::image_info{
+                    .image = layerCapture.image,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            .access_mask = VK_ACCESS_2_NONE,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
+
+                const VkImageBlit blit{
+                    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                    .srcOffsets = {
+                        {static_cast<std::int32_t>(glassArea.x),
+                         static_cast<std::int32_t>(glassArea.y), 0},
+                        {static_cast<std::int32_t>(glassArea.x + glassArea.w),
+                         static_cast<std::int32_t>(glassArea.y + glassArea.h), 1}},
+                    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                    .dstOffsets = {
+                        {0, 0, 0},
+                        {static_cast<std::int32_t>(ui_layer_ctx::kExtent.width),
+                         static_cast<std::int32_t>(ui_layer_ctx::kExtent.height), 1}}};
+                frame.add_blit_image(
+                    image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, layerCapture.image,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, std::span{&blit, 1},
+                    VK_FILTER_NEAREST);
+
+                frame.add_transition(my_render::image_info{
+                    .image = layerCapture.image,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                            .stage_mask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT}});
+
+                // 模糊：layerCapture → layerBlur
+                frame.add_transition(my_render::image_info{
+                    .image = layerBlur.image,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            .access_mask = VK_ACCESS_2_NONE,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
+                layer_begin(layerBlur.view);
+                frame.addInsteance(ui_dao::blur(
+                    {0.0F, 0.0F, static_cast<float>(ui_layer_ctx::kExtent.width),
+                     static_cast<float>(ui_layer_ctx::kExtent.height)},
+                    layerView, layerCapture.texture, layerCapture.sampler, 10.0F, 6));
+                layer_to_sampled(layerBlur.image);
+
+                // swapchain 回到 COLOR_ATTACHMENT，LOAD 后画玻璃
+                frame.add_transition(my_render::image_info{
+                    .image = image,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
+
+                command::rendering_info glass_info;
+                glass_info.renderArea = {.offset = {.x = 0, .y = 0}, .extent = extent};
+                glass_info.layerCount = 1;
+                glass_info.viewMask = 0;
+                glass_info.colorAttachments.emplace_back(
+                    command::rendering_info::rendering_attachment{
+                        .imageView = swapchain.imageView(imageIndex),
+                        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+                        .storeOp = VK_ATTACHMENT_STORE_OP_STORE});
+                frame.begin_rendering(std::move(glass_info));
+                frame.setPipeline(*layerPipeline);
+                frame.setPipelineLayout(*pipelineLayout);
+                frame.setDescriptorSet(descriptorSet);
+                frame.setViewport(full_vp);
+                frame.setScissor(full_scissor);
+                frame.setCameraIndex(1);
+                frame.addInsteance(ui_dao::texture(
+                    glassArea, view, layerBlur.texture, layerBlur.sampler,
+                    glm::vec4(1.0F, 1.0F, 1.0F, 1.0F), {}, 18.0F, 20));
+                frame.addInsteance(ui_dao::shape_border(
+                    glassArea, view, 18.0F, glm::vec4(1.0F, 1.0F, 1.0F, 0.55F), 2.0F,
+                    21));
+            }
 
             // 外部 API 调用会自动闭合当前 pass
             auto &pickMouse = *fs.pickMouse;
