@@ -5,6 +5,8 @@
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <deque>
 #include <format>
 #include <functional>
 #include <exception>
@@ -232,6 +234,113 @@ struct my_render
     {
         std::array<VkImageMemoryBarrier2, sizeof...(T)> barriers{to_barrier(info)...};
         transition_image_layout(commandBuffer, barriers);
+    }
+
+    // VkDependencyInfo 的数据头：完整表达 flags + 三类 barrier 数组
+    struct barrier2_header
+    {
+        VkDependencyFlags flags;
+        std::uint32_t memory_count;
+        std::uint32_t buffer_count;
+        std::uint32_t image_count;
+    };
+
+    static constexpr std::uint32_t align_up(std::uint32_t value,
+                                            std::uint32_t alignment) noexcept
+    {
+        return (value + alignment - 1) / alignment * alignment;
+    }
+
+    // 解析函数版本：数据 = [header][memory][buffer][image] → vkCmdPipelineBarrier2
+    static void parse_transition(std::span<const std::byte> data,
+                                 const CommandBufferView &commandBuffer)
+    {
+        const auto *base = data.data();
+        const auto *head = reinterpret_cast<const barrier2_header *>(base);
+        std::uint32_t offset = static_cast<std::uint32_t>(sizeof(barrier2_header));
+
+        offset = align_up(offset, alignof(VkMemoryBarrier2));
+        const auto *memory = reinterpret_cast<const VkMemoryBarrier2 *>(base + offset);
+        offset +=
+            head->memory_count * static_cast<std::uint32_t>(sizeof(VkMemoryBarrier2));
+
+        offset = align_up(offset, alignof(VkBufferMemoryBarrier2));
+        const auto *buffer =
+            reinterpret_cast<const VkBufferMemoryBarrier2 *>(base + offset);
+        offset += head->buffer_count *
+                  static_cast<std::uint32_t>(sizeof(VkBufferMemoryBarrier2));
+
+        offset = align_up(offset, alignof(VkImageMemoryBarrier2));
+        const auto *image =
+            reinterpret_cast<const VkImageMemoryBarrier2 *>(base + offset);
+
+        VkDependencyInfo info{};
+        info.sType = sType<VkDependencyInfo>();
+        info.dependencyFlags = head->flags;
+        info.memoryBarrierCount = head->memory_count;
+        info.pMemoryBarriers = memory;
+        info.bufferMemoryBarrierCount = head->buffer_count;
+        info.pBufferMemoryBarriers = buffer;
+        info.imageMemoryBarrierCount = head->image_count;
+        info.pImageMemoryBarriers = image;
+        commandBuffer.pipelineBarrier2(info);
+    }
+
+    // copyImageToBuffer 的数据头
+    struct copy_image_to_buffer_info
+    {
+        VkImage src;
+        VkImageLayout layout;
+        VkBuffer dst;
+    };
+
+    // 解析函数版本：数据 = [info][count][VkBufferImageCopy × count] → 发射。
+    static void parse_copy_image_to_buffer(std::span<const std::byte> data,
+                                           const CommandBufferView &commandBuffer)
+    {
+        const auto *info =
+            reinterpret_cast<const copy_image_to_buffer_info *>(data.data());
+        const auto *count = reinterpret_cast<const std::uint32_t *>(
+            data.data() + sizeof(copy_image_to_buffer_info));
+        constexpr auto align = static_cast<std::uint32_t>(alignof(VkBufferImageCopy));
+        const auto header = static_cast<std::uint32_t>(sizeof(copy_image_to_buffer_info) +
+                                                       sizeof(std::uint32_t));
+        const auto offset = (header + align - 1) / align * align;
+        const auto *regions =
+            reinterpret_cast<const VkBufferImageCopy *>(data.data() + offset);
+
+        commandBuffer.copyImageToBuffer(
+            info->src, info->layout, info->dst,
+            std::span<const VkBufferImageCopy>{regions, *count});
+    }
+
+    // blitImage 的数据头（pass 外：layer/主图之间的拷贝+缩放+格式转换）
+    struct blit_image_header
+    {
+        VkImage src;
+        VkImageLayout src_layout;
+        VkImage dst;
+        VkImageLayout dst_layout;
+        VkFilter filter;
+    };
+
+    // 解析函数版本：数据 = [header][count][VkImageBlit × count] → 发射。
+    static void parse_blit_image(std::span<const std::byte> data,
+                                 const CommandBufferView &commandBuffer)
+    {
+        const auto *head = reinterpret_cast<const blit_image_header *>(data.data());
+        const auto *count = reinterpret_cast<const std::uint32_t *>(
+            data.data() + sizeof(blit_image_header));
+        constexpr auto align = static_cast<std::uint32_t>(alignof(VkImageBlit));
+        const auto header = static_cast<std::uint32_t>(sizeof(blit_image_header) +
+                                                       sizeof(std::uint32_t));
+        const auto offset = (header + align - 1) / align * align;
+        const auto *regions = reinterpret_cast<const VkImageBlit *>(data.data() + offset);
+
+        commandBuffer.blitImage(head->src, head->src_layout, head->dst,
+                                head->dst_layout,
+                                std::span<const VkImageBlit>{regions, *count},
+                                head->filter);
     }
 };
 
@@ -658,6 +767,15 @@ namespace command
     // renderVersion 是帧级 picking 版本（和 hover 回读有关），不参与合批。
     // vertexAddress / instanceAddress / commandConstantsAddress 由 recorder
     // 在 solve 时按当前 frame 的 buffer 自动算。
+    // 创建期与录制期共用的常量：从句柄创建到 draw 只写一份。
+    struct recorder_config
+    {
+        static constexpr VkIndexType index_type = VK_INDEX_TYPE_UINT32;
+        static constexpr std::uint32_t index_count = 6;
+        static constexpr VkShaderStageFlags push_stages =
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    };
+
     struct draw_state
     {
         VkPipeline pipeline{};
@@ -814,27 +932,6 @@ namespace command
         std::optional<rendering_attachment> stencilAttachment;
     }; // NOLINTEND
 
-    struct rendering_scope_build
-    {
-        rendering_scope_build() = default;
-
-        void setbeginRendering(rendering_info info)
-        {
-            beginRendering_ = std::move(info);
-            __beginRendering_.apply(beginRendering_);
-        }
-        constexpr auto apply(const CommandBufferView &commandBuffer,
-                             command_context_data &context_data) const noexcept
-        {
-            commandBuffer.beginRendering(__beginRendering_(beginRendering_));
-            commandBuffer.endRendering();
-        }
-
-      private:
-        rendering_info beginRendering_;
-        rendering_info::rendering_info_submit __beginRendering_;
-    };
-
     class ByteBuffer
     {
       public:
@@ -940,7 +1037,18 @@ namespace command
         named_resource::resource_table *resources{};
         std::vector<shader_data::CommandConstant> constants;
         std::vector<VkDrawIndexedIndirectCommand> commands;
-        ByteBuffer heapBuffer;
+
+        // 共享堆：由 record_builder 提供；本段只占 [heap_begin, heap_end)。
+        ByteBuffer *heap = nullptr;
+        std::uint32_t heap_begin = 0;
+        std::uint32_t heap_end = 0;
+
+        constexpr void attach(ByteBuffer &shared) noexcept
+        {
+            heap = &shared;
+            heap_begin = static_cast<std::uint32_t>(shared.size());
+            heap_end = heap_begin;
+        }
 
         struct draw_data_range
         {
@@ -1050,10 +1158,38 @@ namespace command
             trySubmit();
             draw_state.pipelineLayout = pipelineLayout;
         }
+
+        // ── [beginRendering, endRendering] 段先录后放 ──────────────────────
+        // 直接持有完整 rendering_info（pNext 链、任意颜色附件数都在里面），
+        // 回放时由 rendering_info_submit 拼 VkRenderingInfo。
+        std::optional<rendering_info> begin_info;
+
+        void begin_rendering(rendering_info info)
+        {
+            begin_info = std::move(info);
+            heap_end = static_cast<std::uint32_t>(heap->size());
+        }
+
+        // 段闭合：钉住本段的 heap 切片；endRendering 由 scope 的 closed 决定。
+        void close()
+        {
+            if (heap)
+                heap_end = static_cast<std::uint32_t>(heap->size());
+        }
+
+        void emit_begin_rendering(const CommandBufferView &commandBuffer) const
+        {
+            if (!begin_info)
+                return;
+            rendering_info::rendering_info_submit submit;
+            submit.apply(*begin_info);
+            commandBuffer.beginRendering(submit(*begin_info));
+        }
+
         // renderVersion 只是 picking 回读的过滤标签，不属于 draw 录制状态；
         // 在发射时统一盖章，不参与 draw_state / 合批。
         void solveDrawItem(const CommandBufferView &commandBuffer, std::size_t index,
-                           std::uint32_t renderVersion)
+                           std::uint32_t renderVersion, bool closed)
         {
             assert(resources != nullptr);
             assert(index < MAX_FRAMES_IN_FLIGHT);
@@ -1062,7 +1198,14 @@ namespace command
 
             const auto size = draws.size();
             if (size == 0)
+            {
+                emit_begin_rendering(commandBuffer);
+                if (closed)
+                    commandBuffer.endRendering();
                 return;
+            }
+
+            emit_begin_rendering(commandBuffer);
 
             // 每个 frame-in-flight 一套 ShaderBuffers：第 N 帧用自己的 buffer，
             // 上一帧仍在飞行时，不会被这一帧的扩容/写入覆盖。
@@ -1071,17 +1214,16 @@ namespace command
             assert(sb.globalHeapBuffer.address != 0);
             assert(sb.commandConstantsBuffer.address != 0);
 
-            const auto heapBufferSubmitSize = heapBuffer.size();
+            const auto heap_size = heap_end - heap_begin;
             const auto constantSubmitSize =
                 constants.size() * sizeof(shader_data::CommandConstant);
             const auto commandSubmitSize =
                 commands.size() * sizeof(VkDrawIndexedIndirectCommand);
 
             // 保留原来的自动扩容；扩容只动当前 frame 的 buffer。
-            if (sb.globalHeapBuffer.capacity < heapBufferSubmitSize)
+            if (sb.globalHeapBuffer.capacity < heap_size)
                 sb.globalHeapBuffer = shader_data::ShaderBuffers::newHeapBuffer(
-                    *sb.globalHeapBuffer.buffer.device(),
-                    std::bit_ceil(heapBufferSubmitSize));
+                    *sb.globalHeapBuffer.buffer.device(), std::bit_ceil(heap_size));
             if (sb.commandConstantsBuffer.capacity < constantSubmitSize)
                 sb.commandConstantsBuffer = shader_data::ShaderBuffers::newConstantBuffer(
                     *sb.commandConstantsBuffer.buffer.device(),
@@ -1091,7 +1233,7 @@ namespace command
                     *sb.indirectDrawBuffer.buffer.device(),
                     std::bit_ceil(commandSubmitSize));
 
-            sb.globalHeapBuffer.write(0, heapBuffer.data(), heapBufferSubmitSize);
+            sb.globalHeapBuffer.write(0, heap->data() + heap_begin, heap_size);
             sb.commandConstantsBuffer.write(0, constants.data(), constantSubmitSize);
             sb.indirectDrawBuffer.write(0, commands.data(), commandSubmitSize);
 
@@ -1121,10 +1263,11 @@ namespace command
             commandBuffer.setViewport(0, std::span<const VkViewport>{&pre.viewport, 1});
             commandBuffer.setScissor(0, std::span<const VkRect2D>{&pre.scissor, 1});
             commandBuffer.bindIndexBuffer(sb.globalIndexBuffer.buffer.buffer(), 0,
-                                          VK_INDEX_TYPE_UINT32);
-            commandBuffer.pushConstants(pre.pipelineLayout,
-                                        VK_SHADER_STAGE_VERTEX_BIT |
-                                            VK_SHADER_STAGE_FRAGMENT_BIT,
+                                          recorder_config::index_type);
+            if (pre.stencilRef)
+                commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK,
+                                                  *pre.stencilRef);
+            commandBuffer.pushConstants(pre.pipelineLayout, recorder_config::push_stages,
                                         0, sizeof(PushData), &prePush);
 
             auto offset =
@@ -1157,11 +1300,14 @@ namespace command
                     commandBuffer.setScissor(0,
                                              std::span<const VkRect2D>{&cur.scissor, 1});
 
+                if (cur.stencilRef != pre.stencilRef && cur.stencilRef)
+                    commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK,
+                                                      *cur.stencilRef);
+
                 if (cur.pipelineLayout != pre.pipelineLayout || curPush != prePush)
                     commandBuffer.pushConstants(cur.pipelineLayout,
-                                                VK_SHADER_STAGE_VERTEX_BIT |
-                                                    VK_SHADER_STAGE_FRAGMENT_BIT,
-                                                0, sizeof(PushData), &curPush);
+                                                recorder_config::push_stages, 0,
+                                                sizeof(PushData), &curPush);
 
                 offset = item.data_ranges.data_span.offset *
                          sizeof(VkDrawIndexedIndirectCommand);
@@ -1172,6 +1318,9 @@ namespace command
                 pre = cur;
                 prePush = curPush;
             }
+
+            if (closed)
+                commandBuffer.endRendering();
         }
 
         // NOTE: [13] 确定了,state 不变 随便合批. 不同的 T 增加命令缓冲区即可. 不需要新增 drawIndexedIndirect
@@ -1180,13 +1329,15 @@ namespace command
         {
             assert(draw_state.valid());
             constexpr auto program_value = shader_data::program_value<T>();
-            constexpr auto initcmd = VkDrawIndexedIndirectCommand{.indexCount = 6,
-                                                                  .instanceCount = 1,
-                                                                  .firstIndex = 0,
-                                                                  .vertexOffset = 0,
-                                                                  .firstInstance = 0};
-            const auto address_offset = static_cast<std::uint32_t>(heapBuffer.size());
-            heapBuffer.write(data);
+            constexpr auto initcmd =
+                VkDrawIndexedIndirectCommand{.indexCount = recorder_config::index_count,
+                                             .instanceCount = 1,
+                                             .firstIndex = 0,
+                                             .vertexOffset = 0,
+                                             .firstInstance = 0};
+            const auto address_offset =
+                static_cast<std::uint32_t>(heap->size() - heap_begin);
+            heap->write(data);
             // CommandConstant.address_offset 相对 pc.dataAddress（本帧的实例堆起点）。
             const auto init_cc = shader_data::CommandConstant{
                 .program = program_value, .address_offset = address_offset};
@@ -1223,7 +1374,11 @@ namespace command
             draws.clear();
             constants.clear();
             commands.clear();
-            heapBuffer.clear();
+            if (heap)
+            {
+                heap_begin = static_cast<std::uint32_t>(heap->size());
+                heap_end = heap_begin;
+            }
             pendingData = {};
             draw_state = {};
         }
@@ -1235,6 +1390,410 @@ namespace command
         static command_recorder value{};
         return value;
     }
+
+    // ── 外部段：与 command_recorder 同级的“记录 → 回放”对象 ──────────────
+    enum class outer_opcode : std::uint16_t
+    {
+        transition,
+        copy_image_to_buffer,
+        blit_image,
+        Count
+    };
+
+    using parse_fn = void (*)(std::span<const std::byte> data,
+                              const CommandBufferView &commandBuffer);
+
+    struct outer_op
+    {
+        outer_opcode type; // 数据 → 类型（回溯）
+        parse_fn parse;    // 数据 → Vulkan 调用（回放）
+    };
+
+    // API → 解析函数：由 tag 自动决定，调用方不手填。
+    struct transition_cmd_tag
+    {
+    };
+    struct copy_image_cmd_tag
+    {
+    };
+    struct blit_cmd_tag
+    {
+    };
+
+    template <class Tag>
+    struct outer_codec;
+
+    template <>
+    struct outer_codec<transition_cmd_tag>
+    {
+        static constexpr outer_opcode type = outer_opcode::transition;
+        static constexpr parse_fn parse = my_render::parse_transition;
+    };
+
+    template <>
+    struct outer_codec<copy_image_cmd_tag>
+    {
+        static constexpr outer_opcode type = outer_opcode::copy_image_to_buffer;
+        static constexpr parse_fn parse = my_render::parse_copy_image_to_buffer;
+    };
+
+    template <>
+    struct outer_codec<blit_cmd_tag>
+    {
+        static constexpr outer_opcode type = outer_opcode::blit_image;
+        static constexpr parse_fn parse = my_render::parse_blit_image;
+    };
+
+    template <class Tag>
+    inline constexpr outer_op op_v{outer_codec<Tag>::type, outer_codec<Tag>::parse};
+
+    struct command_recorder_outer
+    {
+        struct item
+        {
+            outer_op op;
+            std::uint32_t offset;
+            std::uint32_t size;
+        };
+
+        ByteBuffer *bytes = nullptr; // record_builder 的共享堆
+        std::vector<item> items;
+
+        void attach(ByteBuffer &shared) noexcept
+        {
+            bytes = &shared;
+        }
+
+        // 和 addInsteance 一样直接：录一个 barrier 段
+        template <class... T>
+            requires(std::same_as<T, my_render::image_info> && ...)
+        void add_transition(T... infos)
+        {
+            const std::array barriers{my_render::to_barrier(infos)...};
+            push_barrier2(0, {}, {}, barriers);
+        }
+
+        // 完整 vkCmdPipelineBarrier2：flags + memory/buffer/image 三类 barrier
+        void add_pipeline_barrier2(const VkDependencyInfo &info)
+        {
+            assert(info.pNext == nullptr);
+            push_barrier2(info.dependencyFlags,
+                          {info.pMemoryBarriers, info.memoryBarrierCount},
+                          {info.pBufferMemoryBarriers, info.bufferMemoryBarrierCount},
+                          {info.pImageMemoryBarriers, info.imageMemoryBarrierCount});
+        }
+
+        void add_copy_image_to_buffer(VkImage src, VkImageLayout layout, VkBuffer dst,
+                                      std::span<const VkBufferImageCopy> regions)
+        {
+            push<copy_image_cmd_tag>(
+                my_render::copy_image_to_buffer_info{src, layout, dst}, regions);
+        }
+
+        // pass 外：layer/主图之间的 blit（拷贝 + 缩放 + 格式转换）
+        void add_blit_image(VkImage src, VkImageLayout src_layout, VkImage dst,
+                            VkImageLayout dst_layout,
+                            std::span<const VkImageBlit> regions, VkFilter filter)
+        {
+            push<blit_cmd_tag>(
+                my_render::blit_image_header{src, src_layout, dst, dst_layout, filter},
+                regions);
+        }
+
+        // 手工组合：把还没发射的按顺序发射，cursor 前进；items 保留用于回溯。
+        void flush(const CommandBufferView &commandBuffer)
+        {
+            for (; cursor_ < items.size(); ++cursor_)
+            {
+                const auto &it = items[cursor_];
+                it.op.parse(
+                    std::span<const std::byte>{
+                        reinterpret_cast<const std::byte *>(bytes->data()) + it.offset,
+                        it.size},
+                    commandBuffer);
+            }
+        }
+
+        [[nodiscard]] static constexpr std::string_view name(outer_opcode type) noexcept
+        {
+            switch (type)
+            {
+            case outer_opcode::transition:
+                return "transition";
+            case outer_opcode::copy_image_to_buffer:
+                return "copy_image_to_buffer";
+            case outer_opcode::blit_image:
+                return "blit_image";
+            case outer_opcode::Count:
+                break;
+            }
+            return "?";
+        }
+
+        void clear() noexcept
+        {
+            items.clear();
+            cursor_ = 0;
+        }
+
+        // 外部回溯：目录 + 原始数据（按 item.op.type 自行解释）
+        [[nodiscard]] std::span<const item> entries() const noexcept
+        {
+            return items;
+        }
+        [[nodiscard]] std::span<const std::byte> payload(const item &it) const noexcept
+        {
+            return {reinterpret_cast<const std::byte *>(bytes->data()) + it.offset,
+                    it.size};
+        }
+
+      private:
+        void push_barrier2(VkDependencyFlags flags,
+                           std::span<const VkMemoryBarrier2> memory,
+                           std::span<const VkBufferMemoryBarrier2> buffer,
+                           std::span<const VkImageMemoryBarrier2> image)
+        {
+            constexpr auto op = op_v<transition_cmd_tag>;
+            const auto offset = align_to(16);
+            write_value(my_render::barrier2_header{
+                flags, static_cast<std::uint32_t>(memory.size()),
+                static_cast<std::uint32_t>(buffer.size()),
+                static_cast<std::uint32_t>(image.size())});
+            align_to(alignof(VkMemoryBarrier2));
+            if (!memory.empty())
+                write_bytes(memory.data(), memory.size_bytes());
+            align_to(alignof(VkBufferMemoryBarrier2));
+            if (!buffer.empty())
+                write_bytes(buffer.data(), buffer.size_bytes());
+            align_to(alignof(VkImageMemoryBarrier2));
+            if (!image.empty())
+                write_bytes(image.data(), image.size_bytes());
+            items.push_back(
+                {op, offset, static_cast<std::uint32_t>(bytes->size() - offset)});
+        }
+
+        template <class Tag, class T>
+        void push(std::span<const T> values)
+        {
+            static_assert(std::is_trivially_copyable_v<T>);
+            constexpr auto op = op_v<Tag>;
+            const auto offset = align_to(16);
+            write_value(static_cast<std::uint32_t>(values.size()));
+            align_to(alignof(T));
+            if (!values.empty())
+                write_bytes(values.data(), values.size() * sizeof(T));
+            items.push_back(
+                {op, offset, static_cast<std::uint32_t>(bytes->size() - offset)});
+        }
+
+        template <class Tag, class Header, class T>
+        void push(const Header &header, std::span<const T> values)
+        {
+            static_assert(std::is_trivially_copyable_v<Header>);
+            constexpr auto op = op_v<Tag>;
+            const auto offset = align_to(16);
+            write_value(header);
+            write_value(static_cast<std::uint32_t>(values.size()));
+            align_to(alignof(T));
+            if (!values.empty())
+                write_bytes(values.data(), values.size() * sizeof(T));
+            items.push_back(
+                {op, offset, static_cast<std::uint32_t>(bytes->size() - offset)});
+        }
+
+        std::uint32_t align_to(std::size_t alignment)
+        {
+            static constexpr std::byte zero{0};
+            while (bytes->size() % alignment != 0)
+                bytes->write_bytes(&zero, 1);
+            return static_cast<std::uint32_t>(bytes->size());
+        }
+        void write_bytes(const void *src, std::size_t count)
+        {
+            if (count != 0)
+                bytes->write_bytes(src, count);
+        }
+        template <class T>
+        void write_value(const T &value)
+        {
+            static_assert(std::is_trivially_copyable_v<T>);
+            write_bytes(&value, sizeof(T));
+        }
+
+        std::size_t cursor_ = 0;
+    };
+
+    // ── 帧级：[beginRendering, endRendering] 及 outer 记录 ──────────────────
+    inline constexpr std::uint32_t no_scope = 0xFFFFFFFFu;
+
+    struct scope_info
+    {
+        std::uint32_t outer = no_scope;
+        std::uint32_t inter = no_scope;
+        bool opened = false; // beginRendering 已录
+        bool closed = false; // endRendering 已录（显式或自动）
+    };
+
+    struct record_builder
+    {
+        ByteBuffer heap;
+        named_resource::resource_table *resources{};
+        std::deque<command_recorder_outer> outers;
+        std::deque<command_recorder> inters;
+        std::vector<scope_info> scopes; // 顺序即 C API 走向
+
+        // ── 外部代理：自动闭合当前 pass，落到当前/新建的 outer 段 ──
+        template <class... T>
+            requires(std::same_as<T, my_render::image_info> && ...)
+        void add_transition(T... infos)
+        {
+            outer_segment().add_transition(infos...);
+        }
+
+        void add_copy_image_to_buffer(VkImage src, VkImageLayout layout, VkBuffer dst,
+                                      std::span<const VkBufferImageCopy> regions)
+        {
+            outer_segment().add_copy_image_to_buffer(src, layout, dst, regions);
+        }
+
+        void add_blit_image(VkImage src, VkImageLayout src_layout, VkImage dst,
+                            VkImageLayout dst_layout,
+                            std::span<const VkImageBlit> regions, VkFilter filter)
+        {
+            outer_segment().add_blit_image(src, src_layout, dst, dst_layout, regions,
+                                           filter);
+        }
+
+        void add_pipeline_barrier2(const VkDependencyInfo &info)
+        {
+            outer_segment().add_pipeline_barrier2(info);
+        }
+
+        // ── 内部代理：builder 持有并代理“激活未关闭”的 command_recorder ──
+        void begin_rendering(rendering_info info)
+        {
+            end_rendering();
+            if (scopes.empty() || scopes.back().inter != no_scope)
+                scopes.push_back({});
+            auto &scope = scopes.back();
+            assert(scope.inter == no_scope && !scope.opened);
+
+            scope.inter = static_cast<std::uint32_t>(inters.size());
+            inters.emplace_back();
+            auto &recorder = inters.back();
+            recorder.attach(heap);
+            recorder.clear();
+            recorder.resources = resources;
+            recorder.begin_rendering(std::move(info));
+            scope.opened = true;
+        }
+
+        [[nodiscard]] command_recorder &active_inter()
+        {
+            assert(pending());
+            return inters[scopes.back().inter];
+        }
+
+        template <class... A>
+        void setPipeline(A &&...a)
+        {
+            active_inter().setPipeline(std::forward<A>(a)...);
+        }
+        template <class... A>
+        void setPipelineLayout(A &&...a)
+        {
+            active_inter().setPipelineLayout(std::forward<A>(a)...);
+        }
+        template <class... A>
+        void setDescriptorSet(A &&...a)
+        {
+            active_inter().setDescriptorSet(std::forward<A>(a)...);
+        }
+        template <class... A>
+        void setViewport(A &&...a)
+        {
+            active_inter().setViewport(std::forward<A>(a)...);
+        }
+        template <class... A>
+        void setScissor(A &&...a)
+        {
+            active_inter().setScissor(std::forward<A>(a)...);
+        }
+        template <class... A>
+        void setCameraIndex(A &&...a)
+        {
+            active_inter().setCameraIndex(std::forward<A>(a)...);
+        }
+        template <class... A>
+        void setStencilRef(A &&...a)
+        {
+            active_inter().setStencilRef(std::forward<A>(a)...);
+        }
+        template <class T>
+        void addInsteance(T data)
+        {
+            active_inter().addInsteance(std::move(data));
+        }
+
+        // 幂等：没有开着的段就什么也不做。
+        void end_rendering()
+        {
+            if (!pending())
+                return;
+            auto &scope = scopes.back();
+            inters[scope.inter].close();
+            scope.closed = true;
+        }
+
+        [[nodiscard]] bool pending() const noexcept
+        {
+            return !scopes.empty() && scopes.back().opened && !scopes.back().closed;
+        }
+
+        // 外部回溯（无回调）：段表 + 某段的 outer 记录
+        [[nodiscard]] std::span<const scope_info> scopes_view() const noexcept
+        {
+            return scopes;
+        }
+        [[nodiscard]] const command_recorder_outer &outer_of(
+            std::uint32_t scope_index) const
+        {
+            assert(scope_index < scopes.size() && scopes[scope_index].outer != no_scope);
+            return outers[scopes[scope_index].outer];
+        }
+
+        void replay(const CommandBufferView &commandBuffer, std::size_t frame,
+                    std::uint32_t renderVersion)
+        {
+            end_rendering(); // 尾段未闭合时自动闭合
+            for (const auto &scope : scopes)
+            {
+                if (scope.outer != no_scope)
+                    outers[scope.outer].flush(commandBuffer);
+                if (scope.inter != no_scope)
+                    inters[scope.inter].solveDrawItem(commandBuffer, frame, renderVersion,
+                                                      scope.closed);
+            }
+        }
+
+      private:
+        command_recorder_outer &outer_segment()
+        {
+            end_rendering(); // outer API 自动闭合当前 pass
+
+            if (scopes.empty() || scopes.back().inter != no_scope)
+                scopes.push_back({});
+
+            auto &scope = scopes.back();
+            if (scope.outer == no_scope)
+            {
+                scope.outer = static_cast<std::uint32_t>(outers.size());
+                outers.emplace_back();
+                outers.back().attach(heap);
+            }
+            return outers[scope.outer];
+        }
+    };
 
 }; // namespace command
 //
@@ -2564,7 +3123,8 @@ constexpr std::array<Vertex, 4> quadVerts = {
     Vertex{{0.5f, 0.5f, 0.0f}, {1.0f, 1.0f}},   // 右下
     Vertex{{-0.5f, 0.5f, 0.0f}, {0.0f, 1.0f}}   // 左下
 };
-constexpr auto quadIdx = std::array<uint32_t, 6>{0, 1, 2, 0, 2, 3};
+constexpr auto quadIdx =
+    std::array<uint32_t, command::recorder_config::index_count>{0, 1, 2, 0, 2, 3};
 constexpr auto initMeshManager()
 {
     mesh_manager m;
@@ -2775,8 +3335,8 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
             .setCreateInfo(
                 {.setLayouts = {*descriptorSetLayout},
                  // diff: [test_dod8] 推送常量传说地址更快，没有绑定的开销？
-                 .pushConstantRanges = {{.stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
-                                                       VK_SHADER_STAGE_FRAGMENT_BIT,
+                 .pushConstantRanges = {{.stageFlags =
+                                             command::recorder_config::push_stages,
                                          .offset = 0,
                                          .size = sizeof(PushData)}}})
             .build(device);
@@ -10050,7 +10610,8 @@ try
             Vertex{{0.5F, -0.5F, 0.0F}, {1.0F, 0.0F}},
             Vertex{{0.5F, 0.5F, 0.0F}, {1.0F, 1.0F}},
             Vertex{{-0.5F, 0.5F, 0.0F}, {0.0F, 1.0F}}};
-        const std::array<std::uint32_t, 6> quadIdx = {0, 1, 2, 0, 2, 3};
+        const std::array<std::uint32_t, command::recorder_config::index_count> quadIdx = {
+            0, 1, 2, 0, 2, 3};
         for (auto &sb : shaderBuffers)
         {
             sb.globalVertexBuffer.write(0, quadVerts.data(), sizeof(quadVerts));
@@ -10566,9 +11127,9 @@ try
 
             const ui_dao::view view{W, H};
 
-            auto &recorder = command::globalRecorder();
-            recorder.resources = &r;
-            recorder.clear();
+            // 帧级：record_builder 代理一切；段由 begin/end 自动开闭。
+            command::record_builder frame;
+            frame.resources = &r;
 
             // 每个 frame-in-flight 一份 UBO；当前 fence 已经等过，写当前槽安全。
             UniformBufferObject ubo{};
@@ -10604,9 +11165,9 @@ try
                         .access_mask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                         .stage_mask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                                       VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT}};
-            my_render::transition_image_layout(
-                commandBuffer, to_color(image), to_color(msaaImage),
-                to_color(pickingImage), to_color(resolveImage), depth_transition);
+            frame.add_transition(to_color(image), to_color(msaaImage),
+                                 to_color(pickingImage), to_color(resolveImage),
+                                 depth_transition);
 
             VkRenderingAttachmentInfo color0_clear{
                 .sType = sType<VkRenderingAttachmentInfo>(),
@@ -10636,35 +11197,48 @@ try
                 .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
                 .clearValue = {.depthStencil = {.depth = 1.0F, .stencil = 0u}}};
 
-            const std::array attachments_clear = {color0_clear, color1_clear};
-            VkRenderingInfo info_clear{
-                .sType = sType<VkRenderingInfo>(),
-                .renderArea = {.offset = {.x = 0, .y = 0}, .extent = extent},
-                .layerCount = 1,
-                .viewMask = 0,
-                .colorAttachmentCount =
-                    static_cast<std::uint32_t>(attachments_clear.size()),
-                .pColorAttachments = attachments_clear.data(),
-                .pDepthAttachment = &depth_clear,
-                .pStencilAttachment = hasStencil ? &depth_clear : nullptr};
+            // VkRenderingAttachmentInfo → rendering_attachment（完整字段）
+            const auto to_attach = [](const VkRenderingAttachmentInfo &a) {
+                command::rendering_info::rendering_attachment r{};
+                r.imageView = a.imageView;
+                r.imageLayout = a.imageLayout;
+                r.resolveMode = a.resolveMode;
+                r.resolveImageView = a.resolveImageView;
+                r.resolveImageLayout = a.resolveImageLayout;
+                r.loadOp = a.loadOp;
+                r.storeOp = a.storeOp;
+                r.clearValue = a.clearValue;
+                return r;
+            };
 
-            commandBuffer.beginRendering(info_clear);
+            command::rendering_info info_clear;
+            info_clear.renderArea = {.offset = {.x = 0, .y = 0}, .extent = extent};
+            info_clear.layerCount = 1;
+            info_clear.viewMask = 0;
+            info_clear.colorAttachments.emplace_back(to_attach(color0_clear));
+            info_clear.colorAttachments.emplace_back(to_attach(color1_clear));
+            info_clear.depthAttachment = to_attach(depth_clear);
+            if (hasStencil)
+                info_clear.stencilAttachment = to_attach(depth_clear);
+
+            // 内部段：builder 代理激活的 command_recorder
+            frame.begin_rendering(std::move(info_clear));
 
             const VkViewport full_vp{0.0F, 0.0F, W, H, 0.0F, 1.0F};
             const VkRect2D full_scissor{{0, 0}, extent};
 
             // ── command_recorder 场景 ──────────────────────────────────
-            recorder.setPipeline(*pipelineTransparentUI);
-            recorder.setPipelineLayout(*pipelineLayout);
-            recorder.setDescriptorSet(descriptorSet);
-            recorder.setViewport(full_vp);
-            recorder.setScissor(full_scissor);
+            frame.setPipeline(*pipelineTransparentUI);
+            frame.setPipelineLayout(*pipelineLayout);
+            frame.setDescriptorSet(descriptorSet);
+            frame.setViewport(full_vp);
+            frame.setScissor(full_scissor);
 
             // renderVersion 是 picking/UI 的语义输入，不是 buffer 地址；
             // 取当前屏幕版本，避免硬编码 0 后 picking 被 wait 阶段丢弃。
             const auto renderVersion =
                 static_cast<std::uint32_t>(soaCtx.screen.renderVersion());
-            recorder.setCameraIndex(0);
+            frame.setCameraIndex(0);
 
             const float margin = 36.0F;
             const float gap = 24.0F;
@@ -10691,57 +11265,50 @@ try
             // 第一段 state：左侧面板。Shape ×3 走一条 indirect command 的 3 个实例，
             // PathStroke 另起一条 command；一次 drawIndexedIndirect 即可。
             const auto left_card_rect = inset(left_panel, 20.0F);
-            recorder.addInsteance(ui_dao::sdf_shape(left_panel, view, 18.0F, left_bg, {},
+            frame.addInsteance(ui_dao::sdf_shape(left_panel, view, 18.0F, left_bg, {},
                                                     0.0F, 0.0F, 1.0F, 1));
-            recorder.addInsteance(ui_dao::sdf_shape(left_card_rect, view, 14.0F,
+            frame.addInsteance(ui_dao::sdf_shape(left_card_rect, view, 14.0F,
                                                     left_card, {}, 0.0F, 0.0F, 1.0F, 2));
-            recorder.addInsteance(
+            frame.addInsteance(
                 ui_dao::shape_border(left_card_rect, view, 14.0F, left_accent, 3.0F, 3));
             const std::array<glm::vec2, 5> zig = {
                 glm::vec2{0.10F, 0.20F}, glm::vec2{0.50F, 0.82F}, glm::vec2{0.82F, 0.20F},
                 glm::vec2{0.22F, 0.62F}, glm::vec2{0.90F, 0.72F}};
-            recorder.addInsteance(
+            frame.addInsteance(
                 ui_dao::path_stroke(inset(left_panel, 48.0F), view, std::span{zig}, 10.0F,
                                     glm::vec4(0.95F, 0.35F, 0.75F, 1.0F),
                                     glm::vec4(0.20F, 0.95F, 0.95F, 1.0F), 1, 4));
 
             // 换 push（cameraIndex 变化）会提交左侧 draw_item；右侧是新 state。
             // 两个 UBO 相机都是单位矩阵，画面不受影响，但 push 变化足以切 batch。
-            recorder.setCameraIndex(1);
+            frame.setCameraIndex(1);
 
             const auto right_card_rect = inset(right_panel, 20.0F);
-            recorder.addInsteance(ui_dao::sdf_shape(right_panel, view, 18.0F, right_bg,
+            frame.addInsteance(ui_dao::sdf_shape(right_panel, view, 18.0F, right_bg,
                                                     {}, 0.0F, 0.0F, 1.0F, 5));
-            recorder.addInsteance(ui_dao::sdf_shape(right_card_rect, view, 14.0F,
+            frame.addInsteance(ui_dao::sdf_shape(right_card_rect, view, 14.0F,
                                                     right_card, {}, 0.0F, 0.0F, 1.0F, 6));
-            recorder.addInsteance(ui_dao::shape_border(right_card_rect, view, 14.0F,
+            frame.addInsteance(ui_dao::shape_border(right_card_rect, view, 14.0F,
                                                        right_accent, 3.0F, 7));
             const std::array<glm::vec2, 3> tri = {glm::vec2{0.50F, 0.10F},
                                                   glm::vec2{0.10F, 0.90F},
                                                   glm::vec2{0.90F, 0.90F}};
-            recorder.addInsteance(
+            frame.addInsteance(
                 ui_dao::path_fill(inset(right_panel, 48.0F), view, std::span{tri},
                                   glm::vec4(0.20F, 0.65F, 0.95F, 1.0F),
                                   glm::vec4(0.95F, 0.85F, 0.25F, 1.0F), 8));
 
-            recorder.solveDrawItem(commandBuffer, currentFrame, renderVersion);
-            commandBuffer.endRendering();
-
-            // picking 回读：resolve 是单采样图；只 copy 光标所在的那个像素，
-            // 和 test_dod.cpp 的 copyImageToBuffer 同目的，不是固定测试点。
+            // 外部 API 调用会自动闭合当前 pass
             auto &pickMouse = *fs.pickMouse;
-            my_render::transition_image_layout(
-                commandBuffer,
-                my_render::image_info{
-                    .image = resolveImage,
-                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                            .stage_mask =
-                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
-                    .dst = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
-                            .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
+            frame.add_transition(my_render::image_info{
+                .image = resolveImage,
+                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                .dst = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
 
             const std::int32_t px = std::clamp(
                 pickMouse.pos.x, 0, static_cast<std::int32_t>(extent.width) - 1);
@@ -10754,35 +11321,75 @@ try
                 .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                 .imageOffset = {px, py, 0},
                 .imageExtent = {1, 1, 1}};
-            commandBuffer.copyImageToBuffer(
+            frame.add_copy_image_to_buffer(
                 resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 pickingFrames[currentFrame].buffer(), std::span{&region, 1});
 
-            my_render::transition_image_layout(
-                commandBuffer,
-                my_render::image_info{
-                    .image = resolveImage,
-                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .src = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
-                            .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT},
-                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                            .stage_mask =
-                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
+            frame.add_transition(my_render::image_info{
+                .image = resolveImage,
+                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .src = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT},
+                .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
 
-            my_render::transition_image_layout(
-                commandBuffer,
-                my_render::image_info{
-                    .image = image,
-                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                            .stage_mask =
-                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
-                    .dst = {.layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                            .access_mask = VK_ACCESS_2_NONE,
-                            .stage_mask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT}});
+            frame.add_transition(my_render::image_info{
+                .image = image,
+                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                .dst = {.layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                        .access_mask = VK_ACCESS_2_NONE,
+                        .stage_mask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT}});
+
+            // 段顺序：[outer0, inter0] [outer1]
+            frame.replay(commandBuffer, currentFrame, renderVersion);
+
+            // 回溯：段结构 + 外部命令（首次且设置 MCS_DUMP_SCOPES 时打印）
+            static bool dumped = false;
+            if (!dumped && std::getenv("MCS_DUMP_SCOPES") != nullptr)
+            {
+                dumped = true;
+                for (std::uint32_t s = 0; s < frame.scopes_view().size(); ++s)
+                {
+                    const auto &scope = frame.scopes_view()[s];
+                    std::println("scope[{}] outer={} inter={} opened={} closed={}", s,
+                                 scope.outer, scope.inter, scope.opened, scope.closed);
+                    if (scope.outer == command::no_scope)
+                        continue;
+                    for (const auto &it : frame.outer_of(s).entries())
+                    {
+                        const auto bytes = frame.outer_of(s).payload(it);
+                        // 每个 opcode 的布局不同，按类型取 count
+                        std::uint32_t count = 0;
+                        switch (it.op.type)
+                        {
+                        case command::outer_opcode::transition:
+                            count = reinterpret_cast<const my_render::barrier2_header *>(
+                                        bytes.data())
+                                        ->image_count;
+                            break;
+                        case command::outer_opcode::copy_image_to_buffer:
+                            count = *reinterpret_cast<const std::uint32_t *>(
+                                bytes.data() +
+                                sizeof(my_render::copy_image_to_buffer_info));
+                            break;
+                        case command::outer_opcode::blit_image:
+                            count = *reinterpret_cast<const std::uint32_t *>(
+                                bytes.data() + sizeof(my_render::blit_image_header));
+                            break;
+                        case command::outer_opcode::Count:
+                            break;
+                        }
+                        std::println("  {} payload={}B count={}",
+                                     command::command_recorder_outer::name(it.op.type),
+                                     it.size, count);
+                    }
+                }
+            }
         }),
         method<"endRendering">([](world_type &, input_type &, data_type &) {}));
 
