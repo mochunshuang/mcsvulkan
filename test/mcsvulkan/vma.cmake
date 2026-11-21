@@ -241,5 +241,8 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_ui_ability6 test_intent8.vert test_intent8.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
+add_std_glsl_target(test_ui_ability7 test_intent8.vert test_intent8.frag)
+ADD_MSDF_DEF(${TARGET_NAME})
+
 # end
 std_glsl_env_destroy()
