@@ -213,6 +213,189 @@ add_std_glsl_target(test_ui_ability7 test_intent8.vert test_intent8.frag)
 - 设备支持（vulkaninfo）：ext2/ext3 在；`ColorBlendAdvanced=false`（未使用，也不影响本演示）。
 - 验证：`VUID-` 计数 0。
 
+### 2.10 着色器 + ABI + DAO 实践：9-slice
+
+一次完整的“加能力”改动，作为后续（dash / arc / 多 stop / 曲线 / LUT）的模板：
+
+| 层 | 改动 |
+|---|---|
+| GLSL ABI | `TexQuad` 追加 `vec2 src_size`、`vec4 border`；`TEX_QUAD_SIZE` 180 → 204 |
+| C++ ABI | 同步字段与 `TEX_QUAD_SIZE=204`；新增 `offsetof(src_size)==180`、`offsetof(border)==188` |
+| 着色器 | 新增 `nineSliceUv(p, dst, src, border)`；`PROGRAM_TEXTURE` 在 `border` 非零时改用它采样 |
+| DAO | 新增 `ui_dao::nine_slice(...)`，其余走现有 `texture()` |
+| 演示 | 96×96 源图 → 300×150 目标，边框固定 32px |
+
+验证：0 VUID；主 scope 的 heap 从 3984 B 增到 4188 B，正好 +204 B，与 ABI 尺寸一致。
+截图：`output/ability7_nineslice.png`（角保持、边/中拉伸）。
+
+### 2.11 着色器 + ABI + DAO 实践：虚线 + 圆弧
+
+| 能力 | ABI | 着色器 | DAO |
+|---|---|---|---|
+| 虚线 | `PathStroke` 256 → 264，末尾追加 `vec2 dash`（on/off px） | 遍历线段时累计弧长，记录最近点的 `best_s`；`mod(best_s, on+off) < on` 才保留；虚线时跳过端点圆帽 | `ui_dao::path_stroke_dashed(...)` |
+| 圆弧 | `Shape` 248 → 256，末尾追加 `vec2 arc`（start/end 弧度） | `drawShape` 末尾用 `atan2` + `mod` 做角度裁剪，边缘 0.01 rad 软化 | `ui_dao::shape_arc(...)` |
+
+验证：0 VUID；主 scope heap = **4820 B**，逐项吻合：
+9×Shape(256) + 5×dots(256) + 2×PathFill(252) + 2×PathStroke(264) + 1×TexQuad(204) = 4820。
+截图：`output/ability7_dash_arc.png`（黄色虚线波浪 + 青色圆弧环）。
+
+### 2.12 多 stop 渐变：新增第 8 个 program
+
+| 层 | 改动 |
+|---|---|
+| GLSL ABI | `PROGRAM_GRADIENT=7`；`GradientQuad`（292 B）：`mode`(linear/radial/conic) + `p0/p1` + `stop_color[8]` + `stop_pos[8]` + `opacity` |
+| C++ ABI | `Program::Gradient=7`、`GRADIENT_SIZE=292`、`GRADIENT_MAX_STOPS=8`；新增结构体与 offset 断言 |
+| 着色器 | VS/FS 各加一个 `PROGRAM_GRADIENT` case：按 `t` 在 8 个 stop 之间线性插值，圆角遮罩复用 `maskCoverage` |
+| DAO | `ui_dao::gradient(...)`：positions/colors 最多 8 个，自动补齐并夹取 |
+
+选“内联 8 个 stop”而不是 SSBO，是为了**不新增 descriptor 绑定**（色标直接跟着实例行走）。
+
+验证：0 VUID；主 scope heap = **5112 B** = 4820 + 292，ABI 尺寸一致。
+截图：`output/ability7_gradient.png`（底部 蓝→青→黄→粉 四 stop 渐变条）。
+
+### 2.13 三次贝塞尔曲线（PathFill / PathStroke）
+
+| 层 | 改动 |
+|---|---|
+| GLSL ABI | `PathFill` 252 → **384**、`PathStroke` 264 → **396**：各追加 `uint curve_count` + `vec2 curve[16]`（每段 4 点：p0,c1,c2,p3） |
+| C++ ABI | 同步尺寸与字段；新增 `offsetof(PathFill,curve_count)==252`、`offsetof(PathStroke,curve_count)==264` 等断言 |
+| 着色器 | 新增 `flattenCurve()`：每段 8 步采样，最多 4 段 → 最多 33 个展平点；`PATH_FILL`/`PATH_STROKE` 在 `curve_count>0` 时改用展平点（填充的 even-odd、描边的距离/虚线弧长都直接复用） |
+| DAO | `ui_dao::path_curve_fill(...)`、`ui_dao::path_curve_stroke(...)`，controls 每 4 点一段 |
+
+验证：0 VUID；主 scope heap = **6420 B**，逐项吻合：
+5112 + 2×132（已有 PathFill 变大）+ 2×132（已有 PathStroke 变大）+ 384（曲线填充）+ 396（曲线描边）= 6420。
+截图：`output/ability7_curve.png`（粉色 S 形曲线描边 + 绿色叶形曲线填充）。
+
+### 2.14 迁移已有能力：文本渲染（MSDF / CJK / emoji）
+
+仓库里本来就有 shaping + 字形表（`uiUnicodeLines` / `text_glyph`），但 ability7 只打印日志、从不上屏。
+本轮把它接到绘制链路（**不改 shader/ABI**，只补 CPU 侧字段）：
+
+| 改动 | 内容 |
+|---|---|
+| `text_glyph` | 增加 `offset`、`yDown`（atlas 方向）、`shaderFont`（`FONT_*` 2..6）、`pxRange` |
+| `shapeLine` | 从 shaped glyph 填上述字段；按 UTF-8 首字节粗判 RTL |
+| 绘制 | 在玻璃卡的 scope 里按行/字距发 `ui_dao::glyph_quad(...)`，4 行：`UI ABILITY` / `世界 ABC` / `MSDF 0123` / `😀 OK` |
+
+验证：0 VUID；玻璃 scope 的 heap 从 460 B 增到 **4948 B**（22 个 glyph × 204 B）。
+截图：`output/ability7_text.png`。
+
+已知限制：**RTL（阿拉伯语）** 的 shaping/advance 在现有 CPU 管线里仍会拆成孤立字形并留空隙
+（`run_text_pipeline` 的语言/脚本参数没有真正驱动 Arabic joining），所以演示先用 CJK/ASCII/emoji；
+RTL 需要修 CPU shaping/排版，不属于 GPU 侧。
+
+### 2.15 能力条：纹理 / 颜色 / 裁剪 / 组透明度（9 个 tile）
+
+窗口高度改为 1000（实际被工作区夹到 882），面板下方空出一条 120×65 的 tile 带：
+
+| tile | 用的能力 | 实现 |
+|---|---|---|
+| alpha mask | `TexQuad.maskFlags/maskUv` | `texture_masked(checker, alphaMask)` |
+| mip LOD | `TexQuad.lod/lodMode` | `texture_lod` 三条 0/2/4 |
+| blur | `PROGRAM_BLUR` | `ui_dao::blur(checker, radius 4, taps 5)` |
+| noise | `PROGRAM_NOISE` | fBm 4 octave |
+| sepia | `PROGRAM_COLOR_MATRIX` | 4×4 sepia + bias |
+| invert | `PROGRAM_COLOR_MATRIX` | 负对角 + 1 |
+| text outline | glyph 多份发射 | 3 个字形 × 8 偏移暗色 + 本体 |
+| nested clip | 两级 stencil | star(INCR) → circle(EQUAL 1, INCR) → content(EQUAL 2) |
+| group opacity | `layer2` 离屏 + 合成 | 两个 0.85 alpha 形状先画进 layer2，再整体 0.55 叠上 |
+
+验证：0 VUID；scopes = 5（group / main / blur / glass / outer）；
+heap = **20768 B**（group 512 + main 14540 + blur 136 + glass 5560），各 scope 区间不重叠。
+截图：`output/ability7_strip.png`。
+
+### 2.16 ability7 文件独立化（不再影响 intent8 / ability3）
+
+本轮所有改动原先落在共享文件上，会影响 intent7/8 与 ability3~6。现已把改动复制成 ability7 专属文件，
+共享文件全部还原到 HEAD：
+
+| 新文件（ability7 专属） | 来源 |
+|---|---|
+| `shaders/test_ui_ability7.vert` / `.frag` / `_abi.glsl` | 本轮改过的 `test_intent8.*` 副本；include 改为 `test_ui_ability7_abi.glsl` |
+| `test_ui_ability7_shader_abi.hpp` | ability3 ABI 副本（含 9-slice/dash/arc/curve/gradient 字段与 program 7） |
+| `test_ui_ability7_dao.hpp` | ability3 DAO 副本（含新 builder） |
+| `test_ui_ability7_shader_buffers.hpp` | ability3 buffers 副本 |
+
+`vma.cmake` 中 `test_ui_ability7` 改为 `add_std_glsl_target(test_ui_ability7 test_ui_ability7.vert test_ui_ability7.frag)`。
+`git status` 中 `test_intent8.*`、`test_ui_ability3_dao.hpp`、`test_ui_ability3_shader_abi.hpp` 均为未修改状态。
+ability7 重新构建、运行：0 VUID，heap 20768 B 与独立前一致。
+
+### 2.17 覆盖审计：ability1 / ability2 / intent8 → ability7
+
+| 类别 | 子项 | 来源 | ability7 |
+|---|---|---|---|
+| 形状 | 圆角、逐角、椭圆、边框、多边框、环/圆弧、旋转、斜切 | ability1 `MODE_*`、intent8 tile | ✅ 面板 + tile |
+| 渐变 | linear / radial / conic / 多 stop | ability1、intent8 | ✅ 渐变条 + tile |
+| 阴影 | 外阴影、内阴影（软边框近似）、多层阴影、文字阴影 | ability1、ability2、intent8 | ✅ tile |
+| 图像 | 纹理、9-slice、alpha mask、mip LOD、模糊 | ability1、intent8 | ✅ tile |
+| 文本 | MSDF、CJK、emoji、描边/字影 | ability1、ability2、intent8 | ✅ 玻璃卡 |
+| 模糊/背景 | 内容模糊、backdrop、玻璃、组模糊 | ability1、ability2、intent8 | ✅ 玻璃卡 |
+| 颜色 | sepia、gray、invert、noise、aurora、vignette | ability1、intent8 | ✅ tile |
+| 混合 | over / add / multiply / erase | ability1、ability2、intent8 | ✅ 动态状态 tile |
+| 裁剪 | 矩形、圆角/任意路径、嵌套（2 级） | ability1、ability2、intent8 | ✅ stencil tile |
+| 变换 | 平移、旋转、斜切 | ability1、intent8 | ✅ tile |
+| 组/图层 | 组透明度、layer blur/composite | ability1、ability2、intent8 | ✅ group tile |
+| 交互 | 拾取 / hover | ability1、intent8 | ✅ picking 附件 |
+| 几何 | 多边形填充、even-odd、描边、虚线、三次贝塞尔 | ability1、intent8 | ✅ 面板 + tile |
+| 后处理 | aurora/vignette/noise/grain | intent8 | ✅ tile |
+| 色彩 | sRGB 输出（swapchain B8G8R8A8_SRGB + 线性着色） | ability1 | ✅ 隐式 |
+| 3D/透视 | 3D 管线、深度 | intent8 | ⚠️ 有管线，未建场景 |
+| 滚动缓存 | retained layer + damage | intent8 `CLIP/SCROLL` | ❌ 服务层未做 |
+
+### 2.18 不能直接移植的项（需要新工作）
+
+| 项 | 现状 | 原因 | 需要什么 |
+|---|---|---|---|
+| 多轮廓 even-odd / 孔洞 | 仅单轮廓 | `PathFill` 一个 points 数组 + 单一 contour | 多 contour 数据（SSBO）+ 模板并集/nonzero |
+| 真正的内阴影 | 软边框近似 | shader 没有 inner offset/blur 参数 | Shape 加 inner shadow 字段并改 SDF 合成 |
+| RTL / Arabic joining | 孤立字形 + 空隙 | `run_text_pipeline` 的 script/language 未驱动 joining | 修 CPU shaping + 方向感知排版 |
+| screen / overlay / hue 混合 | 不可用 | GPU 无 `blendOperationAdvanced`（`ColorBlendAdvanced=false`） | 抓 dst 纹理 + 双输入 shader program |
+| 3D LUT | 未做 | 只有 `texture2D[]` bindless 数组 | 3D 纹理 + 新 descriptor 绑定 |
+| HDR / 宽色域 | 未做 | WSI/色彩服务缺失 | swapchain colorspace + HDR metadata + 10bit |
+| 滚动缓存 / damage rect | 未做 | 需要 retained layer 与 damage 服务 | 服务层（非渲染 API） |
+| bloom | 未做 demo | 需要多级 downsample + 加法合成 | 多 pass（能力已有，缺 demo） |
+| 3D / 网格 | 未建场景 | 管线/BDA 已有 | 场景与 mesh 数据 |
+
+结论：**intent8 的 42 个 tile 中 41 个已有对应能力/demo，唯一缺的是 `CLIP/SCROLL`；ability1 的 34 个 mode 中除多轮廓、真内阴影、screen/overlay 外都有对应实现。**
+
+### 2.19 与 Qt / Skia / ImGui 的能力对比
+
+参考：Qt Quick `MultiEffect`（blur/shadow/mask/colorization/brightness/contrast/saturation + custom shader）
+与 Qt5 GraphicalEffects；Skia 的 `SkImageFilter` / `SkBlendMode` / `SkPathEffect` / `SkCanvas::saveLayer`；
+ImGui 的 `ImDrawList`（矩形裁剪栈 + 顶点色，无滤镜/混合模式/变换）。
+
+| 类别 | Qt Quick | Skia | ImGui | ability7 |
+|---|---|---|---|---|
+| 形状 | Rectangle/Shape/Path（直线/二次/三次/弧） | 全路径（quad/cubic/conic/arc）+ path effect | 矩形/圆角/圆/椭圆/多边形 | SDF：圆角/逐角/椭圆/环/圆弧（无二次曲线、无多轮廓） |
+| 渐变 | 线性/径向/圆锥 + stops | 线性/径向/扫描/两点圆锥 + 任意 stop + shader | 仅顶点色（手写渐变） | 线性/径向/圆锥 + 8 stop |
+| 边框/描边 | border + Shape stroke + dash | stroke + dash/trim/corner/discrete | 手画线段 | border + path stroke + dash + 贝塞尔 |
+| 阴影 | DropShadow/InnerShadow/Glow/RectangularGlow | DropShadow filter（内阴影需组合） | 无 | 外阴影 + 多层 + 软边框内阴影近似 |
+| 模糊 | Gaussian/Fast/Recursive/Directional/Radial/Zoom/MaskedBlur | Gaussian/Box + 任意半径（filter） | 无 | 2D Gaussian（每 pass 固定 taps） |
+| 图像滤镜 | MultiEffect + GraphicalEffects（displace/level/gamma/hue/desaturate） | 20+：morphology/displacement/lighting/convolution/magnifier/arithmetic/merge/tile/threshold | 无 | blur / color matrix / noise / aurora |
+| 颜色调整 | brightness/contrast/saturation/colorization/levels/gamma | matrix/lighting/high-contrast/table/compose | 无 | 4×4 matrix（sepia/gray/invert/sat） |
+| 混合模式 | QPainter composition modes + Blend effect | 30+ (`SkBlendMode`) | 仅 alpha（后端决定） | over/add/mul/erase（4 种） |
+| 裁剪 | 矩形 clip；任意用 OpacityMask/ShaderEffect | rect/rrect/path clip 栈 + AA + clip shader | 仅轴对齐矩形 clip 栈 | 矩形 scissor + stencil 路径/嵌套（2 级） |
+| 文本 | Text 样式（Outline/Raised/Sunken）、wrap、elide、rich text、bidi | SkParagraph：shaping/bidi/line break/variable font | 位图字形，无 bidi/复杂排版 | MSDF/CJK/emoji/描边；无 wrap/rich/RTL |
+| 变换 | 2D + 3D（rotation x/y/z、perspective） | 矩阵（2D/3D） | 基本无 | model 矩阵（2D 仿射） |
+| 图层/组 | `layer.enabled` + effect + ShaderEffectSource | `saveLayer`（opacity/filter/backdrop） | 无 | 离屏 layer + 组透明度 + backdrop |
+| 动画/粒子 | Transitions/Animations + Particles | 无（库不管） | 无 | 无（静态场景） |
+| 拾取 | 命中测试 | 无（应用层） | ID 栈/hover | MRT picking + 回读 |
+| 色彩管理 | color space | 全色彩空间/HDR | 无 | sRGB only |
+| 自定义着色器 | ShaderEffect / MultiEffect fragmentShader | SkSL runtime effect | 无 | 固定 8 个 program |
+
+**ability7 相对它们的优势**：SDF 形状 + 9-slice + mask + MRT picking + 间接实例化在**同一套 UI 原语**里；Qt/Skia 要用 path/filter 组合才能达到。
+
+**差距（按影响排序）**：
+
+1. **混合模式族**：Skia 30+、Qt composition modes；ability7 只有 4 种。缺 screen/overlay/soft-light/hue/saturation/color/luminosity 等。
+2. **滤镜族**：缺 morphology（dilate/erode）、displacement、lighting、convolution、threshold、levels/gamma，以及 directional/radial/zoom/masked blur、glow、真 inner shadow。
+3. **路径裁剪**：Skia 是 AA path clip 栈；ability7 只有 2 级 stencil，边缘靠 MSAA，没有 clip 栈 API。
+4. **文本排版**：Qt/Skia 有 wrap/elide/rich text/bidi/line break；ability7 只有 shaping，RTL 仍破。
+5. **色彩管理**：Skia/Qt 有 color space/宽色域；ability7 只有 sRGB。
+6. **动画/粒子/3D**：Qt 有；ability7 无时间线、无粒子、无 3D 场景。
+7. **自定义着色器**：Skia SkSL、Qt ShaderEffect；ability7 固定 program。
+8. **路径能力**：缺二次曲线/弧段/trim/corner/discrete（Skia 全有）。
+
 ---
 
 ## 3. 表达力：7 个 program 到底能覆盖什么

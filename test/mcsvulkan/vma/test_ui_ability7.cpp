@@ -104,7 +104,19 @@ using mcs::vulkan::match;
 using mcs::vulkan::fatal_error;
 
 constexpr uint32_t WIDTH = 1280;
-constexpr uint32_t HEIGHT = 800;
+constexpr uint32_t HEIGHT = 1000; // 给底部能力条留空间
+
+// 3D 占用的屏幕区域（UI 不覆盖这里）
+constexpr float k3dAreaW = 300.0F;
+constexpr float k3dAreaH = 240.0F;
+
+// 共用的混合/写掩码常量，避免每个 demo 块重复定义
+constexpr VkColorComponentFlags kColorWriteRGBA =
+    VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+    VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+constexpr VkColorBlendEquationEXT kBlendNone{
+    VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
+    VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD};
 constexpr auto TITLE = "test_my_triangle";
 
 static constexpr auto MAX_FRAMES_IN_FLIGHT = 2;
@@ -635,9 +647,10 @@ struct mesh_data
         return vertexCount != 0 && indexCount != 0;
     }
 };
+inline constexpr mesh_data kQuadMesh{4, 0, 0, 6};
 
-#include "test_ui_ability3_dao.hpp"
-#include "test_ui_ability3_shader_buffers.hpp"
+#include "test_ui_ability7_dao.hpp"
+#include "test_ui_ability7_shader_buffers.hpp"
 
 struct record_info
 {
@@ -1111,6 +1124,9 @@ namespace command
         named_resource::resource_table *resources{};
         std::vector<shader_data::CommandConstant> constants;
         std::vector<VkDrawIndexedIndirectCommand> commands;
+        // 与 commands 一一对应的几何范围（CPU 侧，不上传）
+        std::vector<mesh_data> command_meshes;
+        mesh_data current_mesh{kQuadMesh};
 
         // 共享堆：由 record_builder 提供；本段只占 [heap_begin, heap_end)。
         ByteBuffer *heap = nullptr;
@@ -1458,11 +1474,12 @@ namespace command
         {
             assert(draw_state.valid());
             constexpr auto program_value = shader_data::program_value<T>();
-            constexpr auto initcmd =
-                VkDrawIndexedIndirectCommand{.indexCount = recorder_config::index_count,
+            const auto initcmd =
+                VkDrawIndexedIndirectCommand{.indexCount = current_mesh.indexCount,
                                              .instanceCount = 1,
-                                             .firstIndex = 0,
-                                             .vertexOffset = 0,
+                                             .firstIndex = current_mesh.indexOffset,
+                                             .vertexOffset = static_cast<std::int32_t>(
+                                                 current_mesh.vertexOffset),
                                              .firstInstance = 0};
             const auto address_offset =
                 static_cast<std::uint32_t>(heap->size() - heap_begin);
@@ -1475,6 +1492,7 @@ namespace command
                 // new realy memory
                 constants.emplace_back(init_cc);
                 commands.emplace_back(initcmd);
+                command_meshes.emplace_back(current_mesh);
                 pendingData =
                     draw_data_range{.data_span = {.offset = static_cast<std::uint32_t>(
                                                       constants.size() - 1),
@@ -1484,9 +1502,10 @@ namespace command
 
             assert(pendingData.valid());
             if (auto &back_constant = pendingData.to_span(constants).back();
-                program_value == back_constant.program)
+                program_value == back_constant.program &&
+                command_meshes.back() == current_mesh)
             {
-                // NOTE: 同一类型,在多实例绘制支持下,不需要增加命令
+                // NOTE: 同一类型 + 同一 mesh,在多实例绘制支持下,不需要增加命令
                 auto &back_command = pendingData.to_span(commands).back();
                 back_command.instanceCount++; // 注意 gl_InstanceIndex = [0,instanceCount)
             }
@@ -1495,14 +1514,21 @@ namespace command
                 // NOTE: 需要增加命令.多实例只需要增加命令数据,无法合批. 才需要新 draw. state又不变
                 constants.emplace_back(init_cc);
                 commands.emplace_back(initcmd);
+                command_meshes.emplace_back(current_mesh);
                 pendingData.data_span.size++; //drawIndexedIndirect 命令参数的 count ++
             }
+        }
+        constexpr void setMesh(mesh_data mesh) noexcept
+        {
+            current_mesh = mesh;
         }
         void clear() noexcept
         {
             draws.clear();
             constants.clear();
             commands.clear();
+            command_meshes.clear();
+            current_mesh = kQuadMesh;
             if (heap)
             {
                 heap_begin = static_cast<std::uint32_t>(heap->size());
@@ -1868,6 +1894,11 @@ namespace command
         void setCameraIndex(A &&...a)
         {
             active_inter().setCameraIndex(std::forward<A>(a)...);
+        }
+        template <class... A>
+        void setMesh(A &&...a)
+        {
+            active_inter().setMesh(std::forward<A>(a)...);
         }
         template <class... A>
         void setStencilRef(A &&...a)
@@ -2376,7 +2407,7 @@ constexpr auto init()
                      //diff: [test_indirectdraw_no_pick] start
                      .independentBlend = VK_TRUE, // 新增
                      //diff: [test_indirectdraw_no_pick] end
-                     // NOTE: test_intent8.frag 用 gl_PrimitiveID，SPIR-V 会声明 Geometry
+                     // NOTE: test_ui_ability7.frag 用 gl_PrimitiveID，SPIR-V 会声明 Geometry
                      // capability；必须在 device 上打开 geometryShader。
                      .geometryShader = VK_TRUE,
                      //NOTE: gcc 要求。严格的初始化顺序。 multiDrawIndirect 要在前面
@@ -3166,12 +3197,13 @@ struct text_glyph
     float advance{0.0F};
     uint32_t tex{0};
     uint32_t samp{0};
-    uint32_t fontType{0}; // 0=MSDF/SDF（median3），1=bitmap（直接采 RGBA）
+    uint32_t shaderFont{4}; // FONT_*：2=SDF 3=PSDF 4=MSDF 5=MTSDF 6=BITMAP
+    float pxRange{0.0F};
+    bool yDown{false}; // atlas yOrigin == "top"
 };
 struct text_line
 {
     std::vector<text_glyph> glyphs;
-    float width{0.0F}; // 1em 单位
 };
 inline std::unordered_map<char32_t, text_glyph> &uiAsciiGlyphs() noexcept
 {
@@ -3246,6 +3278,7 @@ struct ui_texture_ctx
     uint32_t nineSlice{};
     uint32_t alphaMask{};
     uint32_t checker{};
+    uint32_t photo{~0u}; // descriptorInit 里已加载的 "texture" 槽（槽 0 合法）
     uint32_t sampler{};
     VkExtent2D nineSliceExtent{};
     VkExtent2D alphaMaskExtent{};
@@ -3253,6 +3286,17 @@ struct ui_texture_ctx
 ui_texture_ctx &uiTextures()
 {
     static ui_texture_ctx ctx;
+    return ctx;
+}
+
+// 3D 演示用的 mesh range（draw lambda 不能捕获局部变量，和 uiTextures 同款访问器）
+struct ui_mesh_ctx
+{
+    mesh_data cube{};
+};
+ui_mesh_ctx &uiMeshes()
+{
+    static ui_mesh_ctx ctx;
     return ctx;
 }
 
@@ -3402,6 +3446,10 @@ constexpr auto initUiTextures(const LogicalDevice &device, const CommandPool &po
         ctx.checker = create_ui_texture({S, S}, MIPS, px);
     }
 
+    // ── 4. 复用 descriptorInit 已加载的 "texture"（textures/texture.jpg，带 mip）
+    if (auto slot = textureManager.find_slot_by_name("texture"))
+        ctx.photo = *slot;
+
     descriptorSetManager.update_texture(textureManager.view_used_indexes());
 }
 
@@ -3440,6 +3488,52 @@ constexpr auto initMeshManager()
 {
     mesh_manager m;
     m.addMesh("quad", std::span{quadVerts}, std::span{quadIdx});
+
+    // 单位立方体：6 面 × 4 顶点，pos + uv；验证“任意 mesh + 相机槽”的最小几何
+    const std::array<Vertex, 24> cubeVerts = {
+        // +Z
+        Vertex{{-0.5F, -0.5F, 0.5F}, {0.0F, 1.0F}},
+        Vertex{{0.5F, -0.5F, 0.5F}, {1.0F, 1.0F}},
+        Vertex{{0.5F, 0.5F, 0.5F}, {1.0F, 0.0F}},
+        Vertex{{-0.5F, 0.5F, 0.5F}, {0.0F, 0.0F}},
+        // -Z
+        Vertex{{0.5F, -0.5F, -0.5F}, {0.0F, 1.0F}},
+        Vertex{{-0.5F, -0.5F, -0.5F}, {1.0F, 1.0F}},
+        Vertex{{-0.5F, 0.5F, -0.5F}, {1.0F, 0.0F}},
+        Vertex{{0.5F, 0.5F, -0.5F}, {0.0F, 0.0F}},
+        // +X
+        Vertex{{0.5F, -0.5F, 0.5F}, {0.0F, 1.0F}},
+        Vertex{{0.5F, -0.5F, -0.5F}, {1.0F, 1.0F}},
+        Vertex{{0.5F, 0.5F, -0.5F}, {1.0F, 0.0F}},
+        Vertex{{0.5F, 0.5F, 0.5F}, {0.0F, 0.0F}},
+        // -X
+        Vertex{{-0.5F, -0.5F, -0.5F}, {0.0F, 1.0F}},
+        Vertex{{-0.5F, -0.5F, 0.5F}, {1.0F, 1.0F}},
+        Vertex{{-0.5F, 0.5F, 0.5F}, {1.0F, 0.0F}},
+        Vertex{{-0.5F, 0.5F, -0.5F}, {0.0F, 0.0F}},
+        // +Y
+        Vertex{{-0.5F, 0.5F, 0.5F}, {0.0F, 0.0F}},
+        Vertex{{0.5F, 0.5F, 0.5F}, {1.0F, 0.0F}},
+        Vertex{{0.5F, 0.5F, -0.5F}, {1.0F, 1.0F}},
+        Vertex{{-0.5F, 0.5F, -0.5F}, {0.0F, 1.0F}},
+        // -Y
+        Vertex{{-0.5F, -0.5F, -0.5F}, {0.0F, 0.0F}},
+        Vertex{{0.5F, -0.5F, -0.5F}, {1.0F, 0.0F}},
+        Vertex{{0.5F, -0.5F, 0.5F}, {1.0F, 1.0F}},
+        Vertex{{-0.5F, -0.5F, 0.5F}, {0.0F, 1.0F}},
+    };
+    std::array<uint32_t, 36> cubeIdx{};
+    for (uint32_t f = 0; f < 6; ++f)
+    {
+        const uint32_t b = f * 4;
+        cubeIdx[f * 6 + 0] = b;
+        cubeIdx[f * 6 + 1] = b + 1;
+        cubeIdx[f * 6 + 2] = b + 2;
+        cubeIdx[f * 6 + 3] = b;
+        cubeIdx[f * 6 + 4] = b + 2;
+        cubeIdx[f * 6 + 5] = b + 3;
+    }
+    m.addMesh("cube", std::span{cubeVerts}, std::span{cubeIdx});
     return m;
 }
 
@@ -10785,6 +10879,7 @@ try
 
     auto meshManager = initMeshManager();
     auto &[allVertices, allIndices, meshMap] = meshManager;
+    uiMeshes().cube = meshMap.at("cube");
 
     // ============================================================
     // 简单 Glyph 测试：只 shape 一个字符 "A"，生成 1 个 Glyph 实例。
@@ -10814,14 +10909,31 @@ try
                 tg.advance = static_cast<float>(g.advance_x);
                 tg.tex = g.font_ctx->bind.texture_index;
                 tg.samp = g.font_ctx->bind.sampler_index;
+                tg.yDown = (g.font_ctx->font.atlas.yOrigin == "top");
+                tg.pxRange = static_cast<float>(
+                    g.font_ctx->font.atlas.distanceRange.value_or(0.0));
                 // FontType 决定着色器走距离场还是位图采样
                 using FT = mcs::vulkan::font::FontType;
                 const FT ftype = g.font_ctx->type;
-                const bool isDistance = (ftype == FT::eSDF || ftype == FT::ePSDF ||
-                                         ftype == FT::eMSDF || ftype == FT::eMTSDF);
-                tg.fontType = isDistance ? 0u : 1u;
+                switch (ftype)
+                {
+                case FT::eSDF:
+                    tg.shaderFont = 2;
+                    break;
+                case FT::ePSDF:
+                    tg.shaderFont = 3;
+                    break;
+                case FT::eMSDF:
+                    tg.shaderFont = 4;
+                    break;
+                case FT::eMTSDF:
+                    tg.shaderFont = 5;
+                    break;
+                default:
+                    tg.shaderFont = 6; // bitmap
+                    break;
+                }
                 line.glyphs.push_back(tg);
-                line.width += tg.advance + static_cast<float>(g.offset_x);
             }
         }
         return line;
@@ -10869,8 +10981,8 @@ try
     {
         auto &lines = uiUnicodeLines();
         lines[0] = shapeLine("UI ABILITY");
-        lines[1] = shapeLine("你好，世界");
-        lines[2] = shapeLine("مرحبا");
+        lines[1] = shapeLine("世界 ABC");
+        lines[2] = shapeLine("MSDF 0123");
         lines[3] = shapeLine("😀 OK"); // 😀 在 atlas 里（🙂 不在）
         for (int i = 0; i < 4; ++i)
         {
@@ -10912,8 +11024,8 @@ try
     constexpr VkDeviceSize kFrameHeapBytes = 64u * 1024u;
     constexpr VkDeviceSize kFrameIndirectBytes = 8u * 1024u;
     constexpr VkDeviceSize kFrameConstantBytes = 4u * 1024u;
-    constexpr VkDeviceSize kCorpusVertexBytes = 1024u;
-    constexpr VkDeviceSize kCorpusIndexBytes = 1024u;
+    constexpr VkDeviceSize kCorpusVertexBytes = 64u * 1024u;
+    constexpr VkDeviceSize kCorpusIndexBytes = 64u * 1024u;
     // 每个 frame-in-flight 一套 ShaderBuffers；扩容只影响自己的那一套。
     std::array<shader_data::ShaderBuffers, MAX_FRAMES_IN_FLIGHT> shaderBuffers;
     for (auto &sb : shaderBuffers)
@@ -10921,19 +11033,16 @@ try
                                         kFrameHeapBytes, kFrameIndirectBytes,
                                         kFrameConstantBytes);
 
-    // 所有 recorder 程序共用的 quad carrier：4 个唯一顶点 + 6 个索引。
+    // 所有 recorder 程序共用的顶点/索引池：quad + cube（任意 mesh 都从这里切 range）
     {
-        const std::array<Vertex, 4> quadVerts = {
-            Vertex{{-0.5F, -0.5F, 0.0F}, {0.0F, 0.0F}},
-            Vertex{{0.5F, -0.5F, 0.0F}, {1.0F, 0.0F}},
-            Vertex{{0.5F, 0.5F, 0.0F}, {1.0F, 1.0F}},
-            Vertex{{-0.5F, 0.5F, 0.0F}, {0.0F, 1.0F}}};
-        const std::array<std::uint32_t, command::recorder_config::index_count> quadIdx = {
-            0, 1, 2, 0, 2, 3};
+        const auto vertBytes =
+            static_cast<VkDeviceSize>(allVertices.size() * sizeof(Vertex));
+        const auto idxBytes =
+            static_cast<VkDeviceSize>(allIndices.size() * sizeof(uint32_t));
         for (auto &sb : shaderBuffers)
         {
-            sb.globalVertexBuffer.write(0, quadVerts.data(), sizeof(quadVerts));
-            sb.globalIndexBuffer.write(0, quadIdx.data(), sizeof(quadIdx));
+            sb.globalVertexBuffer.write(0, allVertices.data(), vertBytes);
+            sb.globalIndexBuffer.write(0, allIndices.data(), idxBytes);
         }
     }
 
@@ -11426,6 +11535,8 @@ try
 
             auto &pipelineTransparentUI = *named_resource::find(
                 r.pipelines, static_string{"pipelineTransparentUI"}.view());
+            auto &pipelineOpaque3D = *named_resource::find(
+                r.pipelines, static_string{"pipelineOpaque3D"}.view());
 
             // 一个 VkCommandBuffer；绘制录入交给 command_recorder。
             const auto &[currentFrame, imageIndex] = *fs.frameInfo;
@@ -11450,10 +11561,24 @@ try
             frame.resources = &r;
 
             // 每个 frame-in-flight 一份 UBO；当前 fence 已经等过，写当前槽安全。
+            static const auto k3dStart = std::chrono::steady_clock::now();
+            const float t3d = std::chrono::duration<float>(
+                                  std::chrono::steady_clock::now() - k3dStart)
+                                  .count();
             UniformBufferObject ubo{};
-            ubo.cameraInfo[0].view = glm::mat4(1.0F);
-            ubo.cameraInfo[0].proj = glm::mat4(1.0F);
-            ubo.cameraInfo[1] = ubo.cameraInfo[0];
+            // 槽 0：3D 相机（每帧更新 view，绕 Y 轴环绕；MVP 在动）
+            {
+                const float orbit = t3d * 0.6F;
+                const glm::vec3 eye(glm::sin(orbit) * 3.4F, 1.0F,
+                                    glm::cos(orbit) * 3.4F);
+                ubo.cameraInfo[0].view = glm::lookAt(
+                    eye, glm::vec3(0.0F), glm::vec3(0.0F, 1.0F, 0.0F));
+            }
+            ubo.cameraInfo[0].proj = glm::perspectiveRH_ZO(
+                glm::radians(45.0F), k3dAreaW / k3dAreaH, 0.1F, 10.0F);
+            // 槽 1：UI 正交（单位矩阵）
+            ubo.cameraInfo[1].view = glm::mat4(1.0F);
+            ubo.cameraInfo[1].proj = glm::mat4(1.0F);
             std::memcpy(uniformBuffers[currentFrame].mapPtr(), &ubo, sizeof(ubo));
 
             const bool hasStencil = depthResourcesBuild.hasStencilComponent();
@@ -11492,6 +11617,7 @@ try
             //   layerBlur   ：对 layerCapture 做高斯模糊
             auto &layerCapture = uiLayers().layers[currentFrame][0];
             auto &layerBlur = uiLayers().layers[currentFrame][1];
+            auto &layerGroup = uiLayers().layers[currentFrame][2];
             auto &layerPipeline = *named_resource::find(
                 r.pipelines, static_string{"pipelineUILayer"}.view());
 
@@ -11540,6 +11666,25 @@ try
                             .access_mask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                             .stage_mask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT}});
             };
+
+            // ── group 层：两个半透明形状先合成，再整体按 0.55 合成（组透明度）──
+            frame.add_transition(my_render::image_info{
+                .image = layerGroup.image,
+                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                        .access_mask = VK_ACCESS_2_NONE,
+                        .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
+            layer_begin(layerGroup.view);
+            frame.addInsteance(ui_dao::sdf_shape(
+                {20.0F, 40.0F, 170.0F, 120.0F}, layerView, 24.0F,
+                glm::vec4(0.95F, 0.4F, 0.25F, 0.85F)));
+            frame.addInsteance(ui_dao::sdf_shape(
+                {120.0F, 60.0F, 170.0F, 120.0F}, layerView, 24.0F,
+                glm::vec4(0.25F, 0.7F, 0.95F, 0.85F)));
+            layer_to_sampled(layerGroup.image);
 
             VkRenderingAttachmentInfo color0_clear{
                 .sType = sType<VkRenderingAttachmentInfo>(),
@@ -11745,6 +11890,75 @@ try
                 frame.setAlphaToCoverage(VK_FALSE);
             }
 
+            // 九宫格：边框保持源像素宽度，中间拉伸（新 ABI 字段 src_size/border）
+            {
+                auto &uiTex = uiTextures();
+                frame.addInsteance(ui_dao::nine_slice(
+                    {left_panel.x + 60.0F, left_panel.y + 50.0F, 300.0F, 150.0F},
+                    view, uiTex.nineSlice, uiTex.sampler,
+                    glm::vec2(static_cast<float>(uiTex.nineSliceExtent.width),
+                              static_cast<float>(uiTex.nineSliceExtent.height)),
+                    glm::vec4(32.0F), glm::vec4(1.0F), 0.0F, 30));
+            }
+
+            // 虚线：沿折线按弧长取模（PathStroke.dash）
+            {
+                const std::array<glm::vec2, 7> wave = {
+                    glm::vec2{0.05F, 0.50F}, glm::vec2{0.18F, 0.12F},
+                    glm::vec2{0.34F, 0.88F}, glm::vec2{0.50F, 0.12F},
+                    glm::vec2{0.66F, 0.88F}, glm::vec2{0.82F, 0.12F},
+                    glm::vec2{0.95F, 0.50F}};
+                frame.addInsteance(ui_dao::path_stroke_dashed(
+                    {left_panel.x + 40.0F, left_panel.y + 240.0F, 520.0F, 90.0F},
+                    view, std::span{wave}, 9.0F, 18.0F, 12.0F,
+                    glm::vec4(0.95F, 0.85F, 0.3F, 1.0F), {}, 0, 40));
+            }
+
+            // 圆弧：圆环 + 角度裁剪（Shape.arc）
+            {
+                frame.addInsteance(ui_dao::shape_arc(
+                    {right_panel.x + 170.0F, right_panel.y + 470.0F, 190.0F, 190.0F},
+                    view, 95.0F, glm::vec4(0.3F, 0.95F, 0.85F, 1.0F), 14.0F,
+                    -1.0F, 2.2F, 41));
+            }
+
+            // 多 stop 渐变：4 个色标（新 program 7，linear）
+            {
+                const std::array<float, 4> pos{0.0F, 0.35F, 0.65F, 1.0F};
+                const std::array<glm::vec4, 4> cols{
+                    glm::vec4(0.2F, 0.35F, 0.95F, 1.0F),
+                    glm::vec4(0.2F, 0.85F, 0.95F, 1.0F),
+                    glm::vec4(0.95F, 0.85F, 0.25F, 1.0F),
+                    glm::vec4(0.95F, 0.35F, 0.65F, 1.0F)};
+                frame.addInsteance(ui_dao::gradient(
+                    {left_panel.x + 40.0F, left_panel.y + 600.0F, 520.0F, 60.0F},
+                    view, 0, {0.0F, 0.0F}, {520.0F, 0.0F}, pos, cols,
+                    glm::vec4(1.0F), 12.0F, 1.0F, 50));
+            }
+
+            // 三次贝塞尔：S 形描边 + 闭合叶形填充（每 4 点一段）
+            {
+                const std::array<glm::vec2, 8> scurve = {
+                    glm::vec2{0.05F, 0.50F}, glm::vec2{0.25F, 0.05F},
+                    glm::vec2{0.35F, 0.95F}, glm::vec2{0.50F, 0.50F},
+                    glm::vec2{0.50F, 0.50F}, glm::vec2{0.65F, 0.05F},
+                    glm::vec2{0.75F, 0.95F}, glm::vec2{0.95F, 0.50F}};
+                frame.addInsteance(ui_dao::path_curve_stroke(
+                    {right_panel.x + 40.0F, right_panel.y + 380.0F, 560.0F, 80.0F},
+                    view, std::span{scurve}, 8.0F,
+                    glm::vec4(0.95F, 0.45F, 0.85F, 1.0F), {}, 1, 60));
+
+                const std::array<glm::vec2, 8> leaf = {
+                    glm::vec2{0.50F, 0.05F}, glm::vec2{0.95F, 0.25F},
+                    glm::vec2{0.85F, 0.95F}, glm::vec2{0.50F, 0.95F},
+                    glm::vec2{0.50F, 0.95F}, glm::vec2{0.15F, 0.95F},
+                    glm::vec2{0.05F, 0.25F}, glm::vec2{0.50F, 0.05F}};
+                frame.addInsteance(ui_dao::path_curve_fill(
+                    {left_panel.x + 380.0F, left_panel.y + 80.0F, 160.0F, 130.0F},
+                    view, std::span{leaf}, glm::vec4(0.2F, 1.0F, 0.3F, 1.0F),
+                    {}, 61));
+            }
+
             // 玻璃区域背后的真实场景内容：一排彩色圆点（部分伸出卡片外，
             // 便于对比“卡片外清晰 / 卡片内模糊”）。
             for (int i = 0; i < 5; ++i)
@@ -11755,6 +11969,364 @@ try
                      70.0F},
                     view, 35.0F,
                     glm::vec4(0.95F, 0.45F + t * 0.08F, 0.25F + t * 0.12F, 1.0F)));
+            }
+
+            // ── 能力条：纹理 / 颜色 / 裁剪 / 组透明度（复用现有 program）────
+            {
+                auto &uiTex = uiTextures();
+                const auto tile = [](const ui_dao::rect_px &panel, int col, int row) {
+                    constexpr float tw = 120.0F;
+                    constexpr float th = 65.0F;
+                    constexpr float gap = 10.0F;
+                    return ui_dao::rect_px{
+                        panel.x + 20.0F + static_cast<float>(col) * (tw + gap),
+                        panel.y + 664.0F + static_cast<float>(row) * (th + gap), tw,
+                        th};
+                };
+                constexpr VkColorComponentFlags rgba =
+                    VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                    VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+                const VkColorBlendEquationEXT over{
+                    VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                    VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE,
+                    VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD};
+                const VkColorBlendEquationEXT none{
+                    VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
+                    VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD};
+
+                // 1. 纹理 alpha mask
+                frame.addInsteance(ui_dao::texture_masked(
+                    tile(left_panel, 0, 0), view, uiTex.checker, uiTex.sampler,
+                    uiTex.alphaMask, uiTex.sampler, UvTransform{}, glm::vec4(1.0F),
+                    {}, 8.0F, 80));
+
+                // 2. mip LOD：三条不同 lod
+                for (int k = 0; k < 3; ++k)
+                {
+                    auto t = tile(left_panel, 1, 0);
+                    t.y += static_cast<float>(k) * 20.0F;
+                    t.h = 20.0F;
+                    frame.addInsteance(ui_dao::texture_lod(
+                        t, view, uiTex.checker, uiTex.sampler,
+                        static_cast<float>(k) * 2.0F, glm::vec4(1.0F), {}, 4.0F, 81));
+                }
+
+                // 3. 纹理模糊
+                frame.addInsteance(ui_dao::blur(
+                    tile(left_panel, 2, 0), view, uiTex.checker, uiTex.sampler, 4.0F,
+                    5, glm::vec4(1.0F), {}, 8.0F, 82));
+
+                // 4. aurora + vignette + noise（同一 tile，覆盖程序化后处理）
+                {
+                    const auto t = tile(left_panel, 3, 0);
+                    const VkColorBlendEquationEXT add2{
+                        VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD,
+                        VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD};
+                    frame.addInsteance(ui_dao::sdf_shape(
+                        t, view, 8.0F, glm::vec4(0.03F, 0.05F, 0.09F, 1.0F)));
+                    frame.setBlendState({VK_TRUE, VK_FALSE}, {add2, none},
+                                        {rgba, rgba});
+                    frame.addInsteance(ui_dao::sdf_radial(
+                        t, view, 8.0F, glm::vec4(0.2F, 1.0F, 0.7F, 0.55F),
+                        glm::vec4(0.0F)));
+                    frame.addInsteance(ui_dao::sdf_radial(
+                        t, view, 8.0F, glm::vec4(0.6F, 0.3F, 1.0F, 0.55F),
+                        glm::vec4(0.0F)));
+                    frame.setBlendState({VK_TRUE, VK_FALSE}, {over, none},
+                                        {rgba, rgba});
+                    frame.addInsteance(ui_dao::sdf_radial(
+                        t, view, 8.0F, glm::vec4(0.0F),
+                        glm::vec4(0.0F, 0.0F, 0.0F, 0.65F)));
+                    frame.addInsteance(ui_dao::noise(
+                        t, view, glm::vec4(0.0F),
+                        glm::vec4(1.0F, 1.0F, 1.0F, 0.18F), 8.0F, 1.0F, 4, 8.0F,
+                        83));
+                }
+
+                // 5. 颜色矩阵：sepia
+                glm::mat4 sepia(1.0F);
+                sepia[0] = {0.393F, 0.349F, 0.272F, 0.0F};
+                sepia[1] = {0.769F, 0.686F, 0.534F, 0.0F};
+                sepia[2] = {0.189F, 0.168F, 0.131F, 0.0F};
+                sepia[3] = {0.0F, 0.0F, 0.0F, 1.0F};
+                frame.addInsteance(ui_dao::color_matrix(
+                    tile(right_panel, 0, 0), view, uiTex.checker, uiTex.sampler, sepia,
+                    glm::vec4(0.02F, 0.01F, 0.0F, 0.0F), glm::vec4(1.0F), {}, 8.0F,
+                    84));
+
+                // 6. 颜色矩阵：左灰 / 右反相
+                {
+                    const auto t = tile(right_panel, 1, 0);
+                    glm::mat4 gray(1.0F);
+                    gray[0] = {0.299F, 0.587F, 0.114F, 0.0F};
+                    gray[1] = {0.299F, 0.587F, 0.114F, 0.0F};
+                    gray[2] = {0.299F, 0.587F, 0.114F, 0.0F};
+                    gray[3] = {0.0F, 0.0F, 0.0F, 1.0F};
+                    frame.addInsteance(ui_dao::color_matrix(
+                        {t.x, t.y, t.w * 0.48F, t.h}, view, uiTex.checker,
+                        uiTex.sampler, gray, glm::vec4(0.0F), glm::vec4(1.0F), {},
+                        8.0F, 85));
+                    glm::mat4 invert(1.0F);
+                    invert[0][0] = -1.0F;
+                    invert[1][1] = -1.0F;
+                    invert[2][2] = -1.0F;
+                    frame.addInsteance(ui_dao::color_matrix(
+                        {t.x + t.w * 0.52F, t.y, t.w * 0.48F, t.h}, view,
+                        uiTex.checker, uiTex.sampler, invert,
+                        glm::vec4(1.0F, 1.0F, 1.0F, 0.0F), glm::vec4(1.0F), {}, 8.0F,
+                        85));
+                }
+
+                // 7. 文字描边/字影：每个字形先画 8 份偏移暗色，再画本体
+                {
+                    const auto t = tile(right_panel, 2, 0);
+                    const float fs = 18.0F;
+                    float cursor = t.x + 10.0F;
+                    const float baseline = t.y + 40.0F;
+                    const auto &line = uiUnicodeLines()[0];
+                    for (int gi = 0;
+                         gi < 3 && gi < static_cast<int>(line.glyphs.size()); ++gi)
+                    {
+                        const auto &g = line.glyphs[static_cast<std::size_t>(gi)];
+                        const float ydir = g.yDown ? 1.0F : -1.0F;
+                        float l = cursor + g.plane.x * fs;
+                        float r = cursor + g.plane.z * fs;
+                        float tp = baseline + ydir * g.plane.y * fs;
+                        float bt = baseline + ydir * g.plane.w * fs;
+                        if (r < l)
+                            std::swap(l, r);
+                        if (bt < tp)
+                            std::swap(tp, bt);
+                        UvTransform uv{};
+                        uv.scale = {g.uv.z - g.uv.x, g.uv.w - g.uv.y};
+                        uv.offset = {g.uv.x, g.uv.y};
+                        for (int oy = -1; oy <= 1; ++oy)
+                            for (int ox = -1; ox <= 1; ++ox)
+                            {
+                                if (ox == 0 && oy == 0)
+                                    continue;
+                                frame.addInsteance(ui_dao::glyph_quad(
+                                    {l + static_cast<float>(ox) * 1.5F,
+                                     tp + static_cast<float>(oy) * 1.5F, r - l, bt - tp},
+                                    view, g.tex, g.samp, g.shaderFont, g.pxRange,
+                                    glm::vec4(0.05F, 0.05F, 0.05F, 1.0F), uv, 86));
+                            }
+                        frame.addInsteance(ui_dao::glyph_quad(
+                            {l, tp, r - l, bt - tp}, view, g.tex, g.samp, g.shaderFont,
+                            g.pxRange, glm::vec4(1.0F), uv, 87));
+                        cursor += g.advance * fs;
+                    }
+                }
+
+                // 8. 嵌套裁剪：star ∩ circle（两级 stencil）
+                {
+                    const auto t = tile(right_panel, 3, 0);
+                    std::array<glm::vec2, 10> star{};
+                    for (int i = 0; i < 10; ++i)
+                    {
+                        const float a =
+                            -1.5707963F + static_cast<float>(i) * 0.62831853F;
+                        const float r = (i & 1) == 0 ? 0.46F : 0.20F;
+                        star[static_cast<std::size_t>(i)] = {0.5F + r * glm::cos(a),
+                                                             0.5F + r * glm::sin(a)};
+                    }
+                    frame.setBlendState({VK_FALSE, VK_FALSE}, {none, none}, {0, 0});
+                    frame.setAlphaToCoverage(VK_TRUE);
+                    frame.setStencilTest(VK_TRUE);
+                    frame.setStencilOp(VkStencilOpState{
+                        .failOp = VK_STENCIL_OP_KEEP,
+                        .passOp = VK_STENCIL_OP_INCREMENT_AND_CLAMP,
+                        .depthFailOp = VK_STENCIL_OP_KEEP,
+                        .compareOp = VK_COMPARE_OP_ALWAYS,
+                        .compareMask = 0xFF,
+                        .writeMask = 0xFF,
+                        .reference = 0});
+                    frame.setStencilRef(0);
+                    frame.addInsteance(ui_dao::path_fill(
+                        t, view, std::span{star}, glm::vec4(1.0F), {}, 0, 1.0F));
+
+                    frame.setStencilOp(VkStencilOpState{
+                        .failOp = VK_STENCIL_OP_KEEP,
+                        .passOp = VK_STENCIL_OP_INCREMENT_AND_CLAMP,
+                        .depthFailOp = VK_STENCIL_OP_KEEP,
+                        .compareOp = VK_COMPARE_OP_EQUAL,
+                        .compareMask = 0xFF,
+                        .writeMask = 0xFF,
+                        .reference = 0});
+                    frame.setStencilRef(1);
+                    frame.addInsteance(ui_dao::sdf_shape(
+                        {t.x + 8.0F, t.y + 10.0F, 45.0F, 45.0F}, view, 22.5F,
+                        glm::vec4(1.0F)));
+
+                    frame.setAlphaToCoverage(VK_FALSE);
+                    frame.setBlendState({VK_TRUE, VK_FALSE}, {over, none},
+                                        {rgba, rgba});
+                    frame.setStencilOp(VkStencilOpState{
+                        .failOp = VK_STENCIL_OP_KEEP,
+                        .passOp = VK_STENCIL_OP_KEEP,
+                        .depthFailOp = VK_STENCIL_OP_KEEP,
+                        .compareOp = VK_COMPARE_OP_EQUAL,
+                        .compareMask = 0xFF,
+                        .writeMask = 0x00,
+                        .reference = 0});
+                    frame.setStencilRef(2);
+                    frame.addInsteance(ui_dao::sdf_linear(
+                        t, view, 8.0F, glm::vec4(1.0F, 0.5F, 0.2F, 1.0F),
+                        glm::vec4(0.2F, 0.8F, 1.0F, 1.0F), true));
+                    frame.setStencilTest(VK_FALSE);
+                }
+
+                // 9. 组透明度：两个形状先在 layer2 合成，再整体 0.55 叠上
+                frame.addInsteance(ui_dao::texture(
+                    tile(left_panel, 0, 1), view, layerGroup.texture, layerGroup.sampler,
+                    glm::vec4(1.0F, 1.0F, 1.0F, 0.55F), {}, 8.0F, 88));
+
+                // 10. 径向渐变
+                frame.addInsteance(ui_dao::sdf_radial(
+                    tile(left_panel, 1, 1), view, 8.0F,
+                    glm::vec4(1.0F, 0.9F, 0.3F, 1.0F),
+                    glm::vec4(0.15F, 0.1F, 0.25F, 1.0F)));
+                // 11. 圆锥渐变
+                frame.addInsteance(ui_dao::sdf_conic(
+                    tile(left_panel, 2, 1), view, 8.0F,
+                    glm::vec4(0.2F, 0.9F, 0.95F, 1.0F),
+                    glm::vec4(0.95F, 0.35F, 0.65F, 1.0F), 3.0F));
+                // 12. 逐角半径
+                frame.addInsteance(ui_dao::shape_per_corner(
+                    tile(left_panel, 3, 1), view,
+                    glm::vec4(28.0F, 4.0F, 28.0F, 4.0F),
+                    glm::vec4(0.55F, 0.75F, 0.95F, 1.0F)));
+                // 13. 椭圆
+                frame.addInsteance(ui_dao::shape_ellipse(
+                    tile(right_panel, 0, 1), view,
+                    glm::vec4(0.95F, 0.6F, 0.3F, 0.9F)));
+                // 14. 旋转 + 斜切
+                {
+                    const auto t = tile(right_panel, 1, 1);
+                    auto a = ui_dao::sdf_shape(
+                        {t.x + 4.0F, t.y + 8.0F, 50.0F, 50.0F}, view, 10.0F,
+                        glm::vec4(0.95F, 0.45F, 0.85F, 1.0F));
+                    a.model = a.model * glm::rotate(glm::mat4(1.0F),
+                                                    glm::radians(18.0F),
+                                                    glm::vec3(0.0F, 0.0F, 1.0F));
+                    frame.addInsteance(a);
+                    auto b = ui_dao::sdf_shape(
+                        {t.x + 62.0F, t.y + 8.0F, 50.0F, 50.0F}, view, 6.0F,
+                        glm::vec4(0.35F, 0.9F, 0.7F, 1.0F));
+                    glm::mat4 shear(1.0F);
+                    shear[1][0] = 0.35F;
+                    b.model = b.model * shear;
+                    frame.addInsteance(b);
+                }
+                // 15. multiply 混合
+                {
+                    const auto t = tile(right_panel, 2, 1);
+                    frame.addInsteance(ui_dao::sdf_shape(
+                        t, view, 8.0F, glm::vec4(0.95F, 0.7F, 0.2F, 1.0F)));
+                    const VkColorBlendEquationEXT mul{
+                        VK_BLEND_FACTOR_DST_COLOR, VK_BLEND_FACTOR_ZERO,
+                        VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE,
+                        VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD};
+                    frame.setBlendState({VK_TRUE, VK_FALSE}, {mul, none},
+                                        {rgba, rgba});
+                    frame.addInsteance(ui_dao::sdf_shape(
+                        {t.x + 40.0F, t.y + 8.0F, 70.0F, 50.0F}, view, 20.0F,
+                        glm::vec4(0.3F, 0.6F, 0.95F, 1.0F)));
+                    const VkColorBlendEquationEXT erase{
+                        VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                        VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ZERO,
+                        VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD};
+                    frame.setBlendState({VK_TRUE, VK_FALSE}, {erase, none},
+                                        {rgba, rgba});
+                    frame.addInsteance(ui_dao::sdf_shape(
+                        {t.x + 10.0F, t.y + 22.0F, 34.0F, 22.0F}, view, 8.0F,
+                        glm::vec4(1.0F)));
+                    frame.setBlendState({VK_TRUE, VK_FALSE}, {over, none},
+                                        {rgba, rgba});
+                }
+                // 16. 多层阴影 + 多边框
+                {
+                    const auto t = tile(right_panel, 3, 1);
+                    frame.addInsteance(ui_dao::shape_blurred(
+                        {t.x + 18.0F, t.y + 18.0F, 80.0F, 34.0F}, view, 10.0F,
+                        glm::vec4(0.0F, 0.0F, 0.0F, 0.8F), 10.0F));
+                    frame.addInsteance(ui_dao::shape_blurred(
+                        {t.x + 14.0F, t.y + 12.0F, 90.0F, 42.0F}, view, 10.0F,
+                        glm::vec4(0.2F, 0.8F, 0.9F, 0.5F), 6.0F));
+                    frame.addInsteance(ui_dao::sdf_shape(
+                        {t.x + 16.0F, t.y + 12.0F, 88.0F, 42.0F}, view, 10.0F,
+                        glm::vec4(0.16F, 0.2F, 0.28F, 1.0F)));
+                    frame.addInsteance(ui_dao::shape_border(
+                        {t.x + 16.0F, t.y + 12.0F, 88.0F, 42.0F}, view, 10.0F,
+                        glm::vec4(0.2F, 0.85F, 0.95F, 1.0F), 3.0F, 90));
+                    frame.addInsteance(ui_dao::shape_border(
+                        {t.x + 22.0F, t.y + 17.0F, 76.0F, 32.0F}, view, 8.0F,
+                        glm::vec4(0.95F, 0.85F, 0.3F, 1.0F), 1.5F, 91));
+                }
+            }
+
+            // ── 3D 段：任意 mesh + cameraInfo[0]（静态 MVP；input 未接）────
+            {
+                auto &uiTex = uiTextures();
+                // 显式划定 3D 占用的屏幕区域：先画一块 UI 背板，再只在该矩形内画 3D
+                const ui_dao::rect_px area3d{right_panel.x + 140.0F,
+                                             right_panel.y + 430.0F, k3dAreaW,
+                                             k3dAreaH};
+                frame.addInsteance(ui_dao::sdf_shape(
+                    area3d, view, 12.0F, glm::vec4(0.03F, 0.05F, 0.09F, 1.0F), {},
+                    0.0F, 0.0F, 1.0F, 210));
+                frame.addInsteance(ui_dao::shape_border(
+                    area3d, view, 12.0F, glm::vec4(0.25F, 0.8F, 0.95F, 0.9F), 2.0F,
+                    211));
+                if (uiMeshes().cube.valid())
+                {
+                    const VkViewport vp3{area3d.x + 6.0F, area3d.y + 6.0F,
+                                         area3d.w - 12.0F, area3d.h - 12.0F, 0.0F,
+                                         1.0F};
+                    const VkRect2D sc3{
+                        {static_cast<std::int32_t>(area3d.x + 6.0F),
+                         static_cast<std::int32_t>(area3d.y + 6.0F)},
+                        {static_cast<std::uint32_t>(k3dAreaW - 12.0F),
+                         static_cast<std::uint32_t>(k3dAreaH - 12.0F)}};
+                    frame.setPipeline(*pipelineOpaque3D);
+                    frame.setPipelineLayout(*pipelineLayout);
+                    frame.setDescriptorSet(descriptorSet);
+                    frame.setViewport(vp3);
+                    frame.setScissor(sc3);
+                    frame.setCameraIndex(0);
+                    // 3D 不透明：显式关掉上一段 UI 留下的动态混合
+                    frame.setDynamicUI(true);
+                    frame.setBlendState({VK_FALSE, VK_FALSE},
+                                        {kBlendNone, kBlendNone},
+                                        {kColorWriteRGBA, kColorWriteRGBA});
+                    frame.setAlphaToCoverage(VK_FALSE);
+                    frame.setStencilTest(VK_FALSE);
+                    frame.setMesh(uiMeshes().cube);
+                    const uint32_t tex3d =
+                        uiTex.photo != ~0u ? uiTex.photo : uiTex.checker;
+                    for (int i = 0; i < 6; ++i)
+                    {
+                        auto t = ui_dao::texture(
+                            {0.0F, 0.0F, 1.0F, 1.0F}, view, tex3d,
+                            uiTex.sampler, glm::vec4(1.0F), {}, 0.0F,
+                            static_cast<std::uint32_t>(200 + i));
+                        const float x =
+                            (static_cast<float>(i % 3) - 1.0F) * 1.25F;
+                        const float y =
+                            (static_cast<float>(i / 3) - 0.5F) * 1.25F;
+                        // 每个 cube 给不同 z，避免同深度面相交产生 z-fighting 闪烁
+                        const float z =
+                            (static_cast<float>(i) - 2.5F) * 0.22F;
+                        t.model =
+                            glm::translate(glm::mat4(1.0F), glm::vec3(x, y, z)) *
+                            glm::rotate(glm::mat4(1.0F),
+                                        glm::radians(30.0F + 12.0F * i) +
+                                            t3d * 0.9F,
+                                        glm::vec3(0.35F, 1.0F, 0.2F)) *
+                            glm::scale(glm::mat4(1.0F), glm::vec3(0.78F));
+                        frame.addInsteance(t);
+                    }
+                }
             }
 
             // ── 抓主 framebuffer → 模糊 → 玻璃合成 ────────────────────────
@@ -11871,6 +12443,41 @@ try
                 frame.addInsteance(ui_dao::texture(
                     glassArea, view, layerBlur.texture, layerBlur.sampler,
                     glm::vec4(1.0F, 1.0F, 1.0F, 1.0F), {}, 18.0F, 20));
+                // 文本：把仓库里已有的 MSDF/CJK/emoji 字形表迁到玻璃卡上
+                {
+                    const float fs = 21.0F;
+                    float baseline = glassArea.y + 36.0F;
+                    for (int li = 0; li < 4; ++li)
+                    {
+                        const auto &line = uiUnicodeLines()[li];
+                        float cursor = glassArea.x + 18.0F;
+                        for (const auto &g : line.glyphs)
+                        {
+                            const float ydir = g.yDown ? 1.0F : -1.0F;
+                            float left = cursor + g.plane.x * fs;
+                            float right = cursor + g.plane.z * fs;
+                            float top = baseline + ydir * g.plane.y * fs;
+                            float bottom = baseline + ydir * g.plane.w * fs;
+                            if (right < left)
+                                std::swap(left, right);
+                            if (bottom < top)
+                                std::swap(top, bottom);
+                            if (right - left > 0.0F && bottom - top > 0.0F)
+                            {
+                                UvTransform uv{};
+                                uv.scale = {g.uv.z - g.uv.x, g.uv.w - g.uv.y};
+                                uv.offset = {g.uv.x, g.uv.y};
+                                frame.addInsteance(ui_dao::glyph_quad(
+                                    {left, top, right - left, bottom - top}, view, g.tex,
+                                    g.samp, g.shaderFont, g.pxRange,
+                                    glm::vec4(1.0F, 1.0F, 1.0F, 0.95F), uv, 70));
+                            }
+                            cursor += g.advance * fs;
+                        }
+                        baseline += 30.0F;
+                    }
+                }
+
                 frame.addInsteance(ui_dao::shape_border(
                     glassArea, view, 18.0F, glm::vec4(1.0F, 1.0F, 1.0F, 0.55F), 2.0F,
                     21));
