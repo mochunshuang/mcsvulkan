@@ -103,7 +103,7 @@ using mcs::vulkan::match;
 
 using mcs::vulkan::fatal_error;
 
-constexpr uint32_t WIDTH = 1280;
+constexpr uint32_t WIDTH = 1536;
 constexpr uint32_t HEIGHT = 1000; // 给底部能力条留空间
 
 // 3D 占用的屏幕区域（UI 不覆盖这里）
@@ -11975,9 +11975,9 @@ try
             {
                 auto &uiTex = uiTextures();
                 const auto tile = [](const ui_dao::rect_px &panel, int col, int row) {
-                    constexpr float tw = 120.0F;
+                    constexpr float tw = 100.0F;
                     constexpr float th = 65.0F;
-                    constexpr float gap = 10.0F;
+                    constexpr float gap = 8.0F;
                     return ui_dao::rect_px{
                         panel.x + 20.0F + static_cast<float>(col) * (tw + gap),
                         panel.y + 664.0F + static_cast<float>(row) * (th + gap), tw,
@@ -12262,6 +12262,26 @@ try
                     frame.addInsteance(ui_dao::shape_border(
                         {t.x + 22.0F, t.y + 17.0F, 76.0F, 32.0F}, view, 8.0F,
                         glm::vec4(0.95F, 0.85F, 0.3F, 1.0F), 1.5F, 91));
+                }
+                // 17. 滤镜族：dilate / levels / edge / displace（第 5 列）
+                {
+                    const uint32_t src =
+                        uiTex.photo != ~0u ? uiTex.photo : uiTex.checker;
+                    const glm::vec4 texel{1.0F / 512.0F, 1.0F / 512.0F, 0.0F, 0.0F};
+                    frame.addInsteance(ui_dao::filter_quad(
+                        tile(left_panel, 4, 0), view, src, uiTex.sampler, 0, 2.0F,
+                        glm::vec4(0.0F), texel, 0, 0, glm::vec4(1.0F), {}, 100));
+                    frame.addInsteance(ui_dao::filter_quad(
+                        tile(left_panel, 4, 1), view, src, uiTex.sampler, 5, 0.0F,
+                        glm::vec4(0.15F, 0.85F, 1.4F, 0.5F), texel, 0, 0,
+                        glm::vec4(1.0F), {}, 101));
+                    frame.addInsteance(ui_dao::filter_quad(
+                        tile(right_panel, 4, 0), view, src, uiTex.sampler, 2, 1.0F,
+                        glm::vec4(0.0F), texel, 0, 0, glm::vec4(1.0F), {}, 102));
+                    frame.addInsteance(ui_dao::filter_quad(
+                        tile(right_panel, 4, 1), view, src, uiTex.sampler, 7, 0.06F,
+                        glm::vec4(0.0F), texel, uiTex.checker, uiTex.sampler,
+                        glm::vec4(1.0F), {}, 103));
                 }
             }
 

@@ -27,6 +27,7 @@ const uint PROGRAM_BLUR = 4u;
 const uint PROGRAM_COLOR_MATRIX = 5u;
 const uint PROGRAM_NOISE = 6u;
 const uint PROGRAM_GRADIENT = 7u;
+const uint PROGRAM_FILTER = 8u;
 
 // ───────────────────────────────────────────────────────────────────────────
 // §1 命令流契约：indirect draw 一条对应一条命令
@@ -255,6 +256,33 @@ struct GradientQuad
 layout(buffer_reference, scalar) readonly buffer GradientQuadBuffer
 {
     GradientQuad quads[];
+};
+
+// ── 3.8 机制 8：Filter（0=dilate 1=erode 2=edge 3=emboss 4=sharpen
+//                      5=levels 6=threshold 7=displace）────────────
+#define FILTER_SIZE 176
+struct FilterQuad
+{
+    uint entity_index;
+    uint hover_fn;
+    mat4 model;
+    vec2 uv_scale;
+    vec2 uv_offset;
+    vec4 color;
+    vec2 px_size;
+    vec2 shape;
+    uint textureIndex;
+    uint samplerIndex;
+    uint texture2;
+    uint sampler2;
+    uint mode;
+    float radius;
+    vec4 params;  // levels: x=black,y=white,z=gamma,w=threshold
+    vec4 params2;
+};
+layout(buffer_reference, scalar) readonly buffer FilterQuadBuffer
+{
+    FilterQuad quads[];
 };
 
 // ───────────────────────────────────────────────────────────────────────────

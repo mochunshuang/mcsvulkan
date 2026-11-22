@@ -568,6 +568,88 @@ void main()
         outPicking = uvec4(program, inst.entity_index, packed_z, inst.hover_fn);
     }
     break;
+    // ── 机制 8：Filter（形态学 / 卷积 / levels / threshold / displace）────
+    case PROGRAM_FILTER: {
+        FilterQuad inst = FilterQuadBuffer(instancePtr).quads[0];
+        vec2 uv = fragTexCoord;
+        vec2 texel = max(inst.params2.xy, vec2(1e-6));
+        vec4 center = sampleBindless(inst.textureIndex, inst.samplerIndex, uv);
+        vec3 c = center.rgb;
+
+        if (inst.mode <= 1u) // dilate / erode
+        {
+            int r = clamp(int(inst.radius + 0.5), 1, 2);
+            float best = inst.mode == 0u ? -1.0 : 2.0;
+            for (int y = -2; y <= 2; ++y)
+            {
+                for (int x = -2; x <= 2; ++x)
+                {
+                    if (abs(x) > r || abs(y) > r)
+                        continue;
+                    vec3 s = sampleBindless(inst.textureIndex, inst.samplerIndex,
+                                            uv + vec2(x, y) * texel)
+                                 .rgb;
+                    float l = dot(s, vec3(0.299, 0.587, 0.114));
+                    if ((inst.mode == 0u && l > best) ||
+                        (inst.mode == 1u && l < best))
+                    {
+                        best = l;
+                        c = s;
+                    }
+                }
+            }
+        }
+        else if (inst.mode <= 4u) // edge / emboss / sharpen
+        {
+            vec3 s00 = sampleBindless(inst.textureIndex, inst.samplerIndex,
+                                      uv + vec2(-1, -1) * texel).rgb;
+            vec3 s01 = sampleBindless(inst.textureIndex, inst.samplerIndex,
+                                      uv + vec2(0, -1) * texel).rgb;
+            vec3 s02 = sampleBindless(inst.textureIndex, inst.samplerIndex,
+                                      uv + vec2(1, -1) * texel).rgb;
+            vec3 s10 = sampleBindless(inst.textureIndex, inst.samplerIndex,
+                                      uv + vec2(-1, 0) * texel).rgb;
+            vec3 s12 = sampleBindless(inst.textureIndex, inst.samplerIndex,
+                                      uv + vec2(1, 0) * texel).rgb;
+            vec3 s20 = sampleBindless(inst.textureIndex, inst.samplerIndex,
+                                      uv + vec2(-1, 1) * texel).rgb;
+            vec3 s21 = sampleBindless(inst.textureIndex, inst.samplerIndex,
+                                      uv + vec2(0, 1) * texel).rgb;
+            vec3 s22 = sampleBindless(inst.textureIndex, inst.samplerIndex,
+                                      uv + vec2(1, 1) * texel).rgb;
+            if (inst.mode == 2u)
+                c = abs(s00 + 2.0 * s01 + s02 - s20 - 2.0 * s21 - s22) +
+                    abs(s00 + 2.0 * s10 + s20 - s02 - 2.0 * s12 - s22);
+            else if (inst.mode == 3u)
+                c = (s00 - s22) * 0.5 + 0.5;
+            else
+                c = clamp(5.0 * center.rgb - s01 - s10 - s12 - s21, 0.0, 1.0);
+        }
+        else if (inst.mode == 5u) // levels
+        {
+            float black = inst.params.x;
+            float white = max(inst.params.y, black + 1e-4);
+            float g = max(inst.params.z, 1e-3);
+            c = pow(clamp((c - black) / (white - black), 0.0, 1.0),
+                    vec3(1.0 / g));
+        }
+        else if (inst.mode == 6u) // threshold
+        {
+            c = step(vec3(inst.params.w), c);
+        }
+        else // displace
+        {
+            vec2 d = sampleBindless(inst.texture2, inst.sampler2, uv).rg - 0.5;
+            c = sampleBindless(inst.textureIndex, inst.samplerIndex,
+                               uv + d * inst.radius)
+                    .rgb;
+        }
+
+        float a = center.a * inst.color.a;
+        outColor = vec4(c * inst.color.rgb * a, a);
+        outPicking = uvec4(program, inst.entity_index, packed_z, inst.hover_fn);
+    }
+    break;
     default:
         break;
     }

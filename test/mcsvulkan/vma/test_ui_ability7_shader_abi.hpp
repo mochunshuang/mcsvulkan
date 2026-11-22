@@ -42,6 +42,7 @@ namespace shader_data
         ColorMatrix = 5,
         Noise = 6,
         Gradient = 7,
+        Filter = 8,
     };
 
     inline constexpr std::uint32_t SHAPE_SIZE = 256;
@@ -53,6 +54,7 @@ namespace shader_data
     inline constexpr std::uint32_t COLOR_MATRIX_SIZE = 212;
     inline constexpr std::uint32_t NOISE_QUAD_SIZE = 136;
     inline constexpr std::uint32_t GRADIENT_SIZE = 292;
+    inline constexpr std::uint32_t FILTER_SIZE = 176;
     inline constexpr std::size_t GRADIENT_MAX_STOPS = 8;
     inline constexpr std::uint32_t COMMAND_CONSTANT_SIZE = 8;
 
@@ -76,6 +78,8 @@ namespace shader_data
             return NOISE_QUAD_SIZE;
         case Program::Gradient:
             return GRADIENT_SIZE;
+        case Program::Filter:
+            return FILTER_SIZE;
         }
         return 0;
     }
@@ -238,6 +242,27 @@ namespace shader_data
         float opacity{1.0F};
     };
 
+    // ── 机制 8：Filter（邻域/逐点滤镜；mode 决定算法）
+    //   0=dilate 1=erode 2=edge 3=emboss 4=sharpen 5=levels 6=threshold 7=displace
+    struct FilterQuad
+    {
+        std::uint32_t entity_index{0};
+        std::uint32_t hover_fn{~0U};
+        glm::mat4 model{1.0F};
+        UvTransform uvTransform{};
+        glm::vec4 color{1.0F};
+        glm::vec2 px_size{1.0F};
+        glm::vec2 shape{0.0F};
+        std::uint32_t textureIndex{0};
+        std::uint32_t samplerIndex{0};
+        std::uint32_t texture2{0};   // displacement / 第二输入
+        std::uint32_t sampler2{0};
+        std::uint32_t mode{0};
+        float radius{1.0F};          // 形态学半径 / 位移强度
+        glm::vec4 params{0.0F};      // levels: x=black,y=white,z=gamma,w=threshold
+        glm::vec4 params2{0.0F};     // 预留
+    };
+
     // ── 每条 indirect draw 一条：program + 堆偏移（8 B）
     struct CommandConstant
     {
@@ -254,6 +279,16 @@ namespace shader_data
     static_assert(sizeof(ColorMatrix) == COLOR_MATRIX_SIZE);
     static_assert(sizeof(NoiseQuad) == NOISE_QUAD_SIZE);
     static_assert(sizeof(GradientQuad) == GRADIENT_SIZE);
+    static_assert(sizeof(FilterQuad) == FILTER_SIZE);
+    static_assert(offsetof(FilterQuad, uvTransform) == 72);
+    static_assert(offsetof(FilterQuad, color) == 88);
+    static_assert(offsetof(FilterQuad, px_size) == 104);
+    static_assert(offsetof(FilterQuad, textureIndex) == 120);
+    static_assert(offsetof(FilterQuad, texture2) == 128);
+    static_assert(offsetof(FilterQuad, mode) == 136);
+    static_assert(offsetof(FilterQuad, radius) == 140);
+    static_assert(offsetof(FilterQuad, params) == 144);
+    static_assert(offsetof(FilterQuad, params2) == 160);
 
     static_assert(offsetof(GradientQuad, px_size) == 72);
     static_assert(offsetof(GradientQuad, shape) == 80);
@@ -366,6 +401,7 @@ namespace shader_data
     static_assert(static_cast<std::uint32_t>(Program::ColorMatrix) == 5);
     static_assert(static_cast<std::uint32_t>(Program::Noise) == 6);
     static_assert(static_cast<std::uint32_t>(Program::Gradient) == 7);
+    static_assert(static_cast<std::uint32_t>(Program::Filter) == 8);
 
     /*
   static_assert(sizeof(Shape) == SHAPE_SIZE);
@@ -395,6 +431,8 @@ namespace shader_data
             return Program::Noise;
         else if constexpr (std::is_same_v<GradientQuad, T>)
             return Program::Gradient;
+        else if constexpr (std::is_same_v<FilterQuad, T>)
+            return Program::Filter;
         else
             static_assert(false, "program_of error: none type");
     }

@@ -150,6 +150,16 @@ void main()
         pos = v.pos;
     }
     break;
+    case PROGRAM_FILTER: {
+        instancePtr = heapBaseStart + gl_InstanceIndex * FILTER_SIZE;
+        FilterQuad inst = FilterQuadBuffer(instancePtr).quads[0];
+        model = inst.model;
+        fragColor = inst.color;
+        fragTexCoord = inst.uv_offset + v.texCoord * inst.uv_scale;
+        localPos = v.pos.xy;
+        pos = v.pos;
+    }
+    break;
     default:
         break;
     }

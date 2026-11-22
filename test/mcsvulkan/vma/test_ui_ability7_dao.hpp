@@ -344,6 +344,33 @@ namespace ui_dao
         return out;
     }
 
+    // 滤镜：mode 0=dilate 1=erode 2=edge 3=emboss 4=sharpen 5=levels
+    //       6=threshold 7=displace；params2.xy = 一个 texel 的 UV 步长
+    inline shader_data::FilterQuad filter_quad(
+        const rect_px &r, const view &v, std::uint32_t tex, std::uint32_t sampler,
+        std::uint32_t mode, float radius, const glm::vec4 &params,
+        const glm::vec4 &params2, std::uint32_t tex2 = 0, std::uint32_t samp2 = 0,
+        const glm::vec4 &tint = glm::vec4(1.0F), const UvTransform &uv = {},
+        std::uint32_t entity = 0)
+    {
+        shader_data::FilterQuad out{};
+        out.model = model_for(r, v);
+        out.uvTransform = uv;
+        out.color = tint;
+        out.px_size = {std::max(r.w, 1.0F), std::max(r.h, 1.0F)};
+        out.shape = {0.0F, 1.0F};
+        out.textureIndex = tex;
+        out.samplerIndex = sampler;
+        out.texture2 = tex2;
+        out.sampler2 = samp2;
+        out.mode = mode;
+        out.radius = radius;
+        out.params = params;
+        out.params2 = params2;
+        out.entity_index = entity;
+        return out;
+    }
+
     // 九宫格：边框保持源像素宽度，中间拉伸（shader 里按 border 分区采样）
     inline shader_data::TexQuad nine_slice(
         const rect_px &r, const view &v, std::uint32_t tex, std::uint32_t sampler,
