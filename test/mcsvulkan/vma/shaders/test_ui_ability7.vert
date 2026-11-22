@@ -6,22 +6,11 @@
 
 #include "test_ui_ability7_abi.glsl"
 
-struct CameraInfo
-{
-    mat4 view;
-    mat4 proj;
-};
-
-layout(set = 0, binding = 0) uniform UniformBufferObject
-{
-    CameraInfo cameraInfo[2];
-}
-ubo;
-
 struct VertexData
 {
     vec3 pos;
     vec2 texCoord;
+    vec3 normal;
 };
 
 layout(buffer_reference, scalar) readonly buffer VertexBuffer
@@ -40,6 +29,8 @@ layout(location = 2) flat out uint program;
 layout(location = 3) flat out uint64_t instancePtr;
 layout(location = 4) out vec2 localPos;
 layout(location = 5) flat out uint instanceId;
+layout(location = 6) out vec3 fragNormal;
+layout(location = 7) out vec3 fragWorldPos;
 
 void main()
 {
@@ -156,6 +147,18 @@ void main()
         model = inst.model;
         fragColor = inst.color;
         fragTexCoord = inst.uv_offset + v.texCoord * inst.uv_scale;
+        localPos = v.pos.xy;
+        pos = v.pos;
+    }
+    break;
+    case PROGRAM_MESH: {
+        instancePtr = heapBaseStart + gl_InstanceIndex * MESH_QUAD_SIZE;
+        MeshQuad inst = MeshQuadBuffer(instancePtr).quads[0];
+        model = inst.model;
+        fragColor = inst.color;
+        fragTexCoord = inst.uv_offset + v.texCoord * inst.uv_scale;
+        fragNormal = mat3(model) * v.normal;
+        fragWorldPos = (model * vec4(v.pos, 1.0)).xyz;
         localPos = v.pos.xy;
         pos = v.pos;
     }

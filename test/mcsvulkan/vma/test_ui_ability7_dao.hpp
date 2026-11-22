@@ -371,6 +371,27 @@ namespace ui_dao
         return out;
     }
 
+    // 3D mesh：pos+normal+uv 顶点，Lambert/Blinn；model 由调用者覆盖
+    inline shader_data::MeshQuad mesh_quad(
+        const rect_px &r, const view &v, std::uint32_t tex, std::uint32_t sampler,
+        const glm::vec4 &tint = glm::vec4(1.0F), const UvTransform &uv = {},
+        float specular = 0.35F, std::uint32_t entity = 0,
+        std::uint32_t flags = 1)
+    {
+        shader_data::MeshQuad out{};
+        out.model = model_for(r, v);
+        out.uvTransform = uv;
+        out.color = tint;
+        out.px_size = {1.0F, 1.0F};
+        out.shape = {0.0F, 1.0F};
+        out.textureIndex = tex;
+        out.samplerIndex = sampler;
+        out.flags = flags;
+        out.specular = specular;
+        out.entity_index = entity;
+        return out;
+    }
+
     // 九宫格：边框保持源像素宽度，中间拉伸（shader 里按 border 分区采样）
     inline shader_data::TexQuad nine_slice(
         const rect_px &r, const view &v, std::uint32_t tex, std::uint32_t sampler,

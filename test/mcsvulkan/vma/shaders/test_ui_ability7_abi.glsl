@@ -28,6 +28,7 @@ const uint PROGRAM_COLOR_MATRIX = 5u;
 const uint PROGRAM_NOISE = 6u;
 const uint PROGRAM_GRADIENT = 7u;
 const uint PROGRAM_FILTER = 8u;
+const uint PROGRAM_MESH = 9u;
 
 // ───────────────────────────────────────────────────────────────────────────
 // §1 命令流契约：indirect draw 一条对应一条命令
@@ -285,6 +286,29 @@ layout(buffer_reference, scalar) readonly buffer FilterQuadBuffer
     FilterQuad quads[];
 };
 
+// ── 3.9 机制 9：Mesh（带法线的 3D 实例）────────────────────────────
+#define MESH_QUAD_SIZE 152
+struct MeshQuad
+{
+    uint entity_index;
+    uint hover_fn;
+    mat4 model;
+    vec2 uv_scale;
+    vec2 uv_offset;
+    vec4 color;
+    vec2 px_size;
+    vec2 shape;
+    uint textureIndex;
+    uint samplerIndex;
+    uint flags; // bit0: lit
+    float specular;
+    vec4 params;
+};
+layout(buffer_reference, scalar) readonly buffer MeshQuadBuffer
+{
+    MeshQuad quads[];
+};
+
 // ───────────────────────────────────────────────────────────────────────────
 // §4 每帧输入：push constant
 // ───────────────────────────────────────────────────────────────────────────
@@ -303,5 +327,24 @@ pc;
 // ───────────────────────────────────────────────────────────────────────────
 const int RENDER_VERSION_BIT_WIDTH = 16;
 #define PRIMITIVE_MASK ((1u << (32 - RENDER_VERSION_BIT_WIDTH)) - 1u)
+
+// ── 每帧 UBO：两个相机 + 灯光（vert/frag 共用同一块）────────────────
+struct CameraInfo
+{
+    mat4 view;
+    mat4 proj;
+};
+struct LightInfo
+{
+    vec4 pos; // xyz=世界位置, w=强度
+    vec4 color;
+    vec4 ambient;
+};
+layout(set = 0, binding = 0) uniform UniformBufferObject
+{
+    CameraInfo cameraInfo[2];
+    LightInfo light;
+}
+ubo;
 
 #endif // TEST_UI_ABILITY7_ABI_GLSL

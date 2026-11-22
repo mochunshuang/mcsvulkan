@@ -23,6 +23,26 @@ namespace shader_data
     };
     static_assert(sizeof(PushData) == 32);
 
+    // ── 每帧 UBO：3D/UI 相机 + 灯光（vert/frag 共用同一个块）
+    struct CameraInfo
+    {
+        glm::mat4 view{1.0F};
+        glm::mat4 proj{1.0F};
+    };
+    struct LightInfo
+    {
+        glm::vec4 pos{0.8F, 0.7F, 1.1F, 1.0F}; // xyz=世界位置, w=强度
+        glm::vec4 color{1.0F};
+        glm::vec4 ambient{0.0F};
+    };
+    struct UniformBufferObject
+    {
+        CameraInfo cameraInfo[2]{};
+        LightInfo light{};
+    };
+    static_assert(sizeof(UniformBufferObject) == 304);
+    static_assert(offsetof(UniformBufferObject, light) == 256);
+
     // ── 协议：7 个机制程序，密集 0..6 ────────────────────────────
     //   shape        SDF coverage：fill / border / shadow 都是它的参数
     //   path_fill    路径谓词 coverage
@@ -43,6 +63,7 @@ namespace shader_data
         Noise = 6,
         Gradient = 7,
         Filter = 8,
+        Mesh = 9,
     };
 
     inline constexpr std::uint32_t SHAPE_SIZE = 256;
@@ -55,6 +76,7 @@ namespace shader_data
     inline constexpr std::uint32_t NOISE_QUAD_SIZE = 136;
     inline constexpr std::uint32_t GRADIENT_SIZE = 292;
     inline constexpr std::uint32_t FILTER_SIZE = 176;
+    inline constexpr std::uint32_t MESH_QUAD_SIZE = 152;
     inline constexpr std::size_t GRADIENT_MAX_STOPS = 8;
     inline constexpr std::uint32_t COMMAND_CONSTANT_SIZE = 8;
 
@@ -80,6 +102,8 @@ namespace shader_data
             return GRADIENT_SIZE;
         case Program::Filter:
             return FILTER_SIZE;
+        case Program::Mesh:
+            return MESH_QUAD_SIZE;
         }
         return 0;
     }
@@ -263,6 +287,23 @@ namespace shader_data
         glm::vec4 params2{0.0F};     // 预留
     };
 
+    // ── 机制 9：Mesh（带法线的 3D 实例；Lambert/Blinn）
+    struct MeshQuad
+    {
+        std::uint32_t entity_index{0};
+        std::uint32_t hover_fn{~0U};
+        glm::mat4 model{1.0F};
+        UvTransform uvTransform{};
+        glm::vec4 color{1.0F};
+        glm::vec2 px_size{1.0F};
+        glm::vec2 shape{0.0F};
+        std::uint32_t textureIndex{0};
+        std::uint32_t samplerIndex{0};
+        std::uint32_t flags{0}; // bit0: lit
+        float specular{0.0F};   // Blinn 高光强度
+        glm::vec4 params{0.0F};
+    };
+
     // ── 每条 indirect draw 一条：program + 堆偏移（8 B）
     struct CommandConstant
     {
@@ -280,6 +321,13 @@ namespace shader_data
     static_assert(sizeof(NoiseQuad) == NOISE_QUAD_SIZE);
     static_assert(sizeof(GradientQuad) == GRADIENT_SIZE);
     static_assert(sizeof(FilterQuad) == FILTER_SIZE);
+    static_assert(sizeof(MeshQuad) == MESH_QUAD_SIZE);
+    static_assert(offsetof(MeshQuad, uvTransform) == 72);
+    static_assert(offsetof(MeshQuad, color) == 88);
+    static_assert(offsetof(MeshQuad, textureIndex) == 120);
+    static_assert(offsetof(MeshQuad, flags) == 128);
+    static_assert(offsetof(MeshQuad, specular) == 132);
+    static_assert(offsetof(MeshQuad, params) == 136);
     static_assert(offsetof(FilterQuad, uvTransform) == 72);
     static_assert(offsetof(FilterQuad, color) == 88);
     static_assert(offsetof(FilterQuad, px_size) == 104);
@@ -402,6 +450,7 @@ namespace shader_data
     static_assert(static_cast<std::uint32_t>(Program::Noise) == 6);
     static_assert(static_cast<std::uint32_t>(Program::Gradient) == 7);
     static_assert(static_cast<std::uint32_t>(Program::Filter) == 8);
+    static_assert(static_cast<std::uint32_t>(Program::Mesh) == 9);
 
     /*
   static_assert(sizeof(Shape) == SHAPE_SIZE);
@@ -433,6 +482,8 @@ namespace shader_data
             return Program::Gradient;
         else if constexpr (std::is_same_v<FilterQuad, T>)
             return Program::Filter;
+        else if constexpr (std::is_same_v<MeshQuad, T>)
+            return Program::Mesh;
         else
             static_assert(false, "program_of error: none type");
     }

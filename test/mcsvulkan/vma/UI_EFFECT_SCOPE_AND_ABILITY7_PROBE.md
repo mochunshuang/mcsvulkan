@@ -1,9 +1,9 @@
 # test_ui_ability7 · UI 特效表达力与实现状态（修订版）
 
-日期：2026-11-21
-范围：`test/mcsvulkan/vma/test_ui_ability7.cpp` + `shaders/test_intent8.{vert,frag}` + `shaders/test_intent8_abi.glsl`
-性质：只读收集，未改任何代码。
-说明：本文修正了此前报告中的五处错误判断，见 §7「修订记录」。
+日期：2026-11-22
+范围：`test/mcsvulkan/vma/test_ui_ability7.cpp` + `shaders/test_ui_ability7.{vert,frag,abi.glsl}` + `test_ui_ability7_{shader_abi,dao,shader_buffers}.hpp`
+性质：本轮已实际实现并运行验证；§2 是历史修订记录，**§9 是当前能力清单，§10 是未实现项**。
+说明：当前为 10 个 program（含 FILTER / MESH），不再是 §2 所述的 7 个。
 
 ---
 
@@ -547,6 +547,102 @@ ImGui 的 `ImDrawList`（矩形裁剪栈 + 顶点色，无滤镜/混合模式/�
 | ability2 的 Recorder / FramePlan | `test_ui_ability2.cpp:1442-1446`、`2571-2578`、`3166-3183` |
 | program 数量 = 7（文档口径） | `INTENT7_HANDOFF.md` §1.6 / §3 / 结论；`INTENT8_HANDOFF.md:98`、`173` |
 | 新增 9 项未改 ABI | `INTENT8_HANDOFF.md:27-47`、`161-175` |
+
+---
+
+## 9. 当前能力清单（本轮结束状态）
+
+> 本节是“现在能跑什么”的清单；§2 是历史修订记录，部分“未实现”已被本节覆盖。
+
+### 9.1 Program（10 个）
+
+| id | program | 行大小 | 用途 / demo |
+|---|---|---|---|
+| 0 | SHAPE | 256 | SDF 圆角/逐角/椭圆/环/圆弧、边框、外/内阴影、checker mask、linear/radial/conic 渐变 |
+| 1 | PATH_FILL | 384 | 多边形 even-odd + 三次贝塞尔（≤4 段） |
+| 2 | PATH_STROKE | 396 | 折线/曲线描边、caps/joins、dash、曲线 |
+| 3 | TEXTURE | 204 | 纹理、9-slice、alpha mask、mip LOD、MSDF/CJK/emoji 字形 |
+| 4 | BLUR | 136 | 邻域高斯（CSS blur 近似） |
+| 5 | COLOR_MATRIX | 212 | sepia / gray / invert / 任意 4×4 + bias |
+| 6 | NOISE | 136 | fBm 噪波 |
+| 7 | GRADIENT | 292 | 多 stop（≤8）linear/radial/conic；mode 3 = sRGB→linear 正确插值 |
+| 8 | FILTER | 176 | dilate/erode/edge/emboss/sharpen/levels/threshold/displace（第二张纹理） |
+| 9 | MESH | 152 | pos+normal+uv 3D mesh；Lambert + Blinn；flags bit0=lit、bit1=emissive gizmo |
+
+### 9.2 UI / 2D 渲染
+
+- 形状：圆角、逐角、椭圆、环/圆弧、边框、多边框、外阴影、软边框内阴影、多层阴影。
+- 渐变：linear / radial / conic、多 stop；mode 3 做 sRGB→linear。
+- 图像：纹理、9-slice、alpha mask、mip LOD、blur。
+- 文本：MSDF/SDF/PSDF/MTSDF/bitmap、CJK、emoji、描边/字影。
+- 裁剪：矩形 scissor、路径 stencil、嵌套 2 级、组透明度。
+- 混合：over / add / multiply / erase（动态状态）。
+- 后处理：blur、颜色矩阵、noise、aurora/vignette、滤镜族。
+- 拾取：MRT + 回读；hover 函数。
+- 标注：ASCII 字形 + 深色 chip，给滤镜/sRGB/3D 区域做说明。
+
+### 9.3 3D
+
+- 任意 mesh：`pos + normal + uv`（32 B），全局顶点/索引池，`MeshRange` 由每 draw 的 `indexCount/firstIndex/vertexOffset` 指定。
+- 相机：`cameraInfo[0]` 透视（可 orbit），`cameraInfo[1]` UI 单位矩阵。
+- 光照：点光源 `LightInfo{pos, color, ambient}`，距离衰减，Blinn 高光，eye 由 view 矩阵反解。
+- 光源 gizmo：程序化 UV 球 + rim 自发光，位置与 `light_pos` 一致并随其移动。
+- 管线：`pipelineOpaque3D`（depth test/write、blend off）；3D 先/后 UI 都可控。
+- 显式屏幕区域：`area3d`（300×240），UI 背板 + 边框 + 独立 viewport/scissor。
+
+### 9.4 ABI / 基础设施
+
+- `test_ui_ability7_abi.glsl` 是 GLSL 单一来源：program id、实例行、`CameraInfo/LightInfo/UniformBufferObject`、push constant。
+- `test_ui_ability7_shader_abi.hpp` 是 C++ 单一来源：结构、`sizeof/offsetof` 断言、`program_of`。
+- 两阶段 replay：`resolveStorage` 定地址 + `record` 只录 `vkCmd*`；`scope_binding` 保证多 scope 不重叠。
+- 动态状态：blend / A2C / stencil（ext2/3），不新建管线。
+- 间接绘制：一个 program 一条 `vkCmdDrawIndexedIndirect`，实例合并；mesh 变化自动拆命令。
+- 文件独立：ability7 只依赖 `test_ui_ability7.*` 六个文件，`test_intent8.*` / `test_ui_ability3_*` 未修改。
+
+---
+
+## 10. 未实现 / 可能需要
+
+### 10.1 渲染能力
+
+| 项 | 现状 | 需要什么 | 难度 |
+|---|---|---|---|
+| 背面剔除 | `cullMode = NONE` | 统一绕序 + `cullMode = BACK` | 低 |
+| 透明排序 | 无 | 不透明前→后、透明后→前；逐实例排序需拆命令或 OIT | 中 |
+| 多轮廓 / 孔洞 | 单 contour | 多 contour 数据 + even-odd/nonzero | 中 |
+| 真内阴影 | 软边框近似 | Shape 加 inner offset/blur | 低–中 |
+| 高级混合 | 4 种 | `VK_EXT_blend_operation_advanced`（本机不支持）→ 抓 dst + 双输入 shader | 中 |
+| Bloom / 光晕 | 仅 rim 发光 | 亮度提取 + blur + 加法合成（可复用玻璃 blur） | 中 |
+| 3D 阴影 | 无 | shadow map / CSM | 中–高 |
+| 法线贴图 / PBR | 无法线贴图 | 第二张法线纹理 + 切线空间 | 中 |
+| 多光源 | 单点光 | 灯光 SSBO/UBO 数组 | 低–中 |
+| 骨骼 / 动画 | 无 | joint/weight 顶点流 + palette | 高 |
+| LOD / 视锥剔除 | 无 | 每 mesh LOD + CPU/GPU cull | 中 |
+| 文本排版 | 单行 shaping | wrap/elide/bidi/rich text（CPU 服务） | 中–高 |
+| 色彩管理 HDR | sRGB only | `VK_EXT_swapchain_colorspace` + tonemap + 显示器支持 | 中 |
+| 动画 / 时间线 | 仅 demo time | 属性动画、缓动、状态机 | 中 |
+| 滚动缓存 / damage | 无 | retained layer + damage rect 服务 | 中 |
+| 运行时 shader | 固定 program | SPIR-V 编译 + 管线缓存（SkSL 级） | 高 |
+
+### 10.2 工程 / 数据
+
+| 项 | 说明 |
+|---|---|
+| 实例行膨胀 | SHAPE/PathFill/… 固定行较大；量大时考虑 offset 指向变长 payload |
+| mesh 加载器 | `tinygltf` 已在 `third_party`，尚未接 CMake；OBJ/glTF 加载是“数据源”，不涉及框架 |
+| 布局系统 | `yoga` 已在 `third_party`，尚未接；布局不属于渲染层，但接上后能做真正的 UI |
+| 拾取 | 当前 MRT + 回读；世界空间旋转 UI 需要射线拾取 |
+| 5 列 tile 布局 | 窗口较窄时第 5 列会被裁；可改 4 列或自适应列数 |
+| 3D 相机输入 | 目前只有 orbit 演示；鼠标/键盘未接 |
+| 排序策略 | 目前 draw 顺序 = 提交顺序；kind/深度排序未接 |
+
+### 10.3 明确不在“渲染 API”范围
+
+- 布局、输入、动画、无障碍、平台/窗口管理；
+- 字体 shaping 的 RTL/BiDi 修正（CPU 管线问题）；
+- 资源生命周期、atlas 分配、线程模型。
+
+> 结论：渲染层的“能不能画”已经覆盖 UI 常用效果；剩余项主要是**排序策略、滤镜/混合广度、3D 进阶、文本排版、色彩管理**，没有一项需要新的 Vulkan 能力（高级混合除外，受硬件扩展限制）。
 | pass API “功能完备” + `pass.vk()` | `output/intent7_pass_api_coverage.md:95-124` |
 | 能力矩阵截图 | `output/intent8_ability.png` |
 | 文档自列保真度限制 | `INTENT8_HANDOFF.md:198-216` |

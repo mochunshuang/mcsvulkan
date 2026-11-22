@@ -110,6 +110,13 @@ constexpr uint32_t HEIGHT = 1000; // 给底部能力条留空间
 constexpr float k3dAreaW = 300.0F;
 constexpr float k3dAreaH = 240.0F;
 
+// 底部能力条的 tile 网格
+constexpr float kTileW = 100.0F;
+constexpr float kTileH = 65.0F;
+constexpr float kTileGap = 8.0F;
+constexpr float kTileX = 20.0F;
+constexpr float kTileY = 664.0F;
+
 // 共用的混合/写掩码常量，避免每个 demo 块重复定义
 constexpr VkColorComponentFlags kColorWriteRGBA =
     VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -359,7 +366,8 @@ struct my_render
 struct Vertex // NOLINT
 {
     glm::vec3 pos;
-    glm::vec2 texCoord; // diff: [texture] 添加纹理坐标
+    glm::vec2 texCoord;
+    glm::vec3 normal{0.0F, 0.0F, 1.0F};
 };
 struct VertexAttribute
 {
@@ -367,15 +375,7 @@ struct VertexAttribute
 };
 
 // diff: [test_dod14] start: 让3D和UI各自一份。推送常量切换
-struct CameraInfo
-{
-    glm::mat4 view;
-    glm::mat4 proj;
-};
-struct UniformBufferObject
-{
-    CameraInfo cameraInfo[2]; // 0: 3D, 1: UI
-};
+// 相机/灯光 UBO 定义在 test_ui_ability7_shader_abi.hpp
 // diff: [test_dod14] end
 
 // diff: [texture] start
@@ -651,6 +651,8 @@ inline constexpr mesh_data kQuadMesh{4, 0, 0, 6};
 
 #include "test_ui_ability7_dao.hpp"
 #include "test_ui_ability7_shader_buffers.hpp"
+
+using shader_data::UniformBufferObject;
 
 struct record_info
 {
@@ -2633,7 +2635,8 @@ constexpr auto descriptorInit(auto &hardwareCtx)
                              .binding = 0,
                              .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                              .descriptorCount = 1,
-                             .stageFlags = VK_SHADER_STAGE_VERTEX_BIT},
+                             .stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
+                                          VK_SHADER_STAGE_FRAGMENT_BIT},
                          VkDescriptorSetLayoutBinding{
                              .binding = 1,
                              .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
@@ -3279,6 +3282,7 @@ struct ui_texture_ctx
     uint32_t alphaMask{};
     uint32_t checker{};
     uint32_t photo{~0u}; // descriptorInit 里已加载的 "texture" 槽（槽 0 合法）
+    uint32_t white{~0u}; // descriptorInit 里已加载的 1x1 白纹理
     uint32_t sampler{};
     VkExtent2D nineSliceExtent{};
     VkExtent2D alphaMaskExtent{};
@@ -3293,6 +3297,7 @@ ui_texture_ctx &uiTextures()
 struct ui_mesh_ctx
 {
     mesh_data cube{};
+    mesh_data sphere{};
 };
 ui_mesh_ctx &uiMeshes()
 {
@@ -3449,6 +3454,8 @@ constexpr auto initUiTextures(const LogicalDevice &device, const CommandPool &po
     // ── 4. 复用 descriptorInit 已加载的 "texture"（textures/texture.jpg，带 mip）
     if (auto slot = textureManager.find_slot_by_name("texture"))
         ctx.photo = *slot;
+    if (auto slot = textureManager.find_slot_by_name("white"))
+        ctx.white = *slot;
 
     descriptorSetManager.update_texture(textureManager.view_used_indexes());
 }
@@ -3490,8 +3497,7 @@ constexpr auto initMeshManager()
     m.addMesh("quad", std::span{quadVerts}, std::span{quadIdx});
 
     // 单位立方体：6 面 × 4 顶点，pos + uv；验证“任意 mesh + 相机槽”的最小几何
-    const std::array<Vertex, 24> cubeVerts = {
-        // +Z
+    std::array<Vertex, 24> cubeVerts = {        // +Z
         Vertex{{-0.5F, -0.5F, 0.5F}, {0.0F, 1.0F}},
         Vertex{{0.5F, -0.5F, 0.5F}, {1.0F, 1.0F}},
         Vertex{{0.5F, 0.5F, 0.5F}, {1.0F, 0.0F}},
@@ -3522,6 +3528,11 @@ constexpr auto initMeshManager()
         Vertex{{0.5F, -0.5F, 0.5F}, {1.0F, 1.0F}},
         Vertex{{-0.5F, -0.5F, 0.5F}, {0.0F, 1.0F}},
     };
+    const std::array<glm::vec3, 6> faceNormals = {
+        glm::vec3{0, 0, 1},  glm::vec3{0, 0, -1}, glm::vec3{1, 0, 0},
+        glm::vec3{-1, 0, 0}, glm::vec3{0, 1, 0},  glm::vec3{0, -1, 0}};
+    for (std::size_t i = 0; i < cubeVerts.size(); ++i)
+        cubeVerts[i].normal = faceNormals[i / 4];
     std::array<uint32_t, 36> cubeIdx{};
     for (uint32_t f = 0; f < 6; ++f)
     {
@@ -3534,6 +3545,35 @@ constexpr auto initMeshManager()
         cubeIdx[f * 6 + 5] = b + 3;
     }
     m.addMesh("cube", std::span{cubeVerts}, std::span{cubeIdx});
+
+    // 程序化 UV 球：光源 gizmo 用
+    constexpr int kStacks = 8;
+    constexpr int kSlices = 16;
+    std::vector<Vertex> sphereVerts;
+    std::vector<uint32_t> sphereIdx;
+    for (int i = 0; i <= kStacks; ++i)
+    {
+        const float phi = 3.14159265F * static_cast<float>(i) / kStacks;
+        for (int j = 0; j <= kSlices; ++j)
+        {
+            const float theta =
+                6.2831853F * static_cast<float>(j) / kSlices;
+            const glm::vec3 n{glm::sin(phi) * glm::cos(theta), glm::cos(phi),
+                              glm::sin(phi) * glm::sin(theta)};
+            sphereVerts.push_back(Vertex{n * 0.5F,
+                                         {static_cast<float>(j) / kSlices,
+                                          static_cast<float>(i) / kStacks},
+                                         n});
+        }
+    }
+    for (int i = 0; i < kStacks; ++i)
+        for (int j = 0; j < kSlices; ++j)
+        {
+            const uint32_t a = static_cast<uint32_t>(i * (kSlices + 1) + j);
+            const uint32_t b = a + static_cast<uint32_t>(kSlices + 1);
+            sphereIdx.insert(sphereIdx.end(), {a, b, a + 1, a + 1, b, b + 1});
+        }
+    m.addMesh("sphere", std::span{sphereVerts}, std::span{sphereIdx});
     return m;
 }
 
@@ -10880,6 +10920,7 @@ try
     auto meshManager = initMeshManager();
     auto &[allVertices, allIndices, meshMap] = meshManager;
     uiMeshes().cube = meshMap.at("cube");
+    uiMeshes().sphere = meshMap.at("sphere");
 
     // ============================================================
     // 简单 Glyph 测试：只 shape 一个字符 "A"，生成 1 个 Glyph 实例。
@@ -11565,6 +11606,9 @@ try
             const float t3d = std::chrono::duration<float>(
                                   std::chrono::steady_clock::now() - k3dStart)
                                   .count();
+            // 点光源绕场景转：gizmo 和着色共用同一位置，肉眼可验证
+            const glm::vec3 light_pos{glm::cos(t3d * 0.7F) * 1.15F, 0.8F,
+                                      glm::sin(t3d * 0.7F) * 1.15F};
             UniformBufferObject ubo{};
             // 槽 0：3D 相机（每帧更新 view，绕 Y 轴环绕；MVP 在动）
             {
@@ -11579,6 +11623,9 @@ try
             // 槽 1：UI 正交（单位矩阵）
             ubo.cameraInfo[1].view = glm::mat4(1.0F);
             ubo.cameraInfo[1].proj = glm::mat4(1.0F);
+            ubo.light.pos = glm::vec4(light_pos, 1.0F);
+            ubo.light.color = glm::vec4(0.95F, 0.95F, 0.92F, 1.0F);
+            ubo.light.ambient = glm::vec4(0.22F, 0.24F, 0.30F, 1.0F);
             std::memcpy(uniformBuffers[currentFrame].mapPtr(), &ubo, sizeof(ubo));
 
             const bool hasStencil = depthResourcesBuild.hasStencilComponent();
@@ -11922,7 +11969,7 @@ try
                     -1.0F, 2.2F, 41));
             }
 
-            // 多 stop 渐变：4 个色标（新 program 7，linear）
+            // 多 stop 渐变：左 = mode 3（sRGB→linear 插值），右 = mode 0（直接插值）
             {
                 const std::array<float, 4> pos{0.0F, 0.35F, 0.65F, 1.0F};
                 const std::array<glm::vec4, 4> cols{
@@ -11931,9 +11978,13 @@ try
                     glm::vec4(0.95F, 0.85F, 0.25F, 1.0F),
                     glm::vec4(0.95F, 0.35F, 0.65F, 1.0F)};
                 frame.addInsteance(ui_dao::gradient(
-                    {left_panel.x + 40.0F, left_panel.y + 600.0F, 520.0F, 60.0F},
-                    view, 0, {0.0F, 0.0F}, {520.0F, 0.0F}, pos, cols,
+                    {left_panel.x + 40.0F, left_panel.y + 600.0F, 255.0F, 60.0F},
+                    view, 3, {0.0F, 0.0F}, {255.0F, 0.0F}, pos, cols,
                     glm::vec4(1.0F), 12.0F, 1.0F, 50));
+                frame.addInsteance(ui_dao::gradient(
+                    {left_panel.x + 300.0F, left_panel.y + 600.0F, 255.0F, 60.0F},
+                    view, 0, {0.0F, 0.0F}, {255.0F, 0.0F}, pos, cols,
+                    glm::vec4(1.0F), 12.0F, 1.0F, 51));
             }
 
             // 三次贝塞尔：S 形描边 + 闭合叶形填充（每 4 点一段）
@@ -11975,13 +12026,10 @@ try
             {
                 auto &uiTex = uiTextures();
                 const auto tile = [](const ui_dao::rect_px &panel, int col, int row) {
-                    constexpr float tw = 100.0F;
-                    constexpr float th = 65.0F;
-                    constexpr float gap = 8.0F;
                     return ui_dao::rect_px{
-                        panel.x + 20.0F + static_cast<float>(col) * (tw + gap),
-                        panel.y + 664.0F + static_cast<float>(row) * (th + gap), tw,
-                        th};
+                        panel.x + kTileX + static_cast<float>(col) * (kTileW + kTileGap),
+                        panel.y + kTileY + static_cast<float>(row) * (kTileH + kTileGap),
+                        kTileW, kTileH};
                 };
                 constexpr VkColorComponentFlags rgba =
                     VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
@@ -12285,6 +12333,80 @@ try
                 }
             }
 
+            // ── 最近三个功能的屏幕标注（滤镜 / sRGB / 3D 光照）──────────
+            {
+                auto &glyphs = uiAsciiGlyphs();
+                const auto label = [&](const char *text, float x, float baseline,
+                                       float fs, const glm::vec4 &color,
+                                       std::uint32_t entity) {
+                    float cursor = x;
+                    for (const char *p = text; *p != 0; ++p)
+                    {
+                        const auto it = glyphs.find(
+                            static_cast<char32_t>(static_cast<unsigned char>(*p)));
+                        if (it == glyphs.end())
+                        {
+                            cursor += fs * 0.3F;
+                            continue;
+                        }
+                        const auto &g = it->second;
+                        const float ydir = g.yDown ? 1.0F : -1.0F;
+                        float l = cursor + g.plane.x * fs;
+                        float r = cursor + g.plane.z * fs;
+                        float tp = baseline + ydir * g.plane.y * fs;
+                        float bt = baseline + ydir * g.plane.w * fs;
+                        if (r < l)
+                            std::swap(l, r);
+                        if (bt < tp)
+                            std::swap(tp, bt);
+                        if (r - l > 0.0F && bt - tp > 0.0F)
+                        {
+                            UvTransform uv{};
+                            uv.scale = {g.uv.z - g.uv.x, g.uv.w - g.uv.y};
+                            uv.offset = {g.uv.x, g.uv.y};
+                            frame.addInsteance(ui_dao::glyph_quad(
+                                {l, tp, r - l, bt - tp}, view, g.tex, g.samp,
+                                g.shaderFont, g.pxRange, color, uv, entity));
+                        }
+                        cursor += g.advance * fs;
+                    }
+                };
+                const auto chip = [&](const ui_dao::rect_px &r) {
+                    frame.addInsteance(ui_dao::sdf_shape(
+                        r, view, 3.0F, glm::vec4(0.0F, 0.0F, 0.0F, 0.62F), {},
+                        0.0F, 0.0F, 1.0F, 299));
+                };
+                // 滤镜 tile（第 5 列）
+                const std::array<const char *, 4> names = {"DILATE", "LEVELS",
+                                                          "EDGE", "DISPLACE"};
+                for (int i = 0; i < 4; ++i)
+                {
+                    const auto &panel = (i < 2) ? left_panel : right_panel;
+                    const int row = i % 2;
+                    const ui_dao::rect_px t{
+                        panel.x + kTileX +
+                            4.0F * (kTileW + kTileGap),
+                        panel.y + kTileY +
+                            static_cast<float>(row) * (kTileH + kTileGap),
+                        kTileW, 14.0F};
+                    chip(t);
+                    label(names[i], t.x + 3.0F, t.y + 11.0F, 9.0F,
+                          glm::vec4(1.0F), static_cast<std::uint32_t>(300 + i));
+                }
+                // sRGB 对比条
+                chip({left_panel.x + 40.0F, left_panel.y + 600.0F, 90.0F, 14.0F});
+                label("LINEAR", left_panel.x + 43.0F, left_panel.y + 611.0F, 9.0F,
+                      glm::vec4(1.0F), 304);
+                chip({left_panel.x + 300.0F, left_panel.y + 600.0F, 60.0F, 14.0F});
+                label("SRGB", left_panel.x + 303.0F, left_panel.y + 611.0F, 9.0F,
+                      glm::vec4(1.0F), 305);
+                // 3D 区域
+                chip({right_panel.x + 140.0F,
+                      right_panel.y + 430.0F - 14.0F, k3dAreaW, 14.0F});
+                label("3D LIGHT", right_panel.x + 143.0F,
+                      right_panel.y + 430.0F - 3.0F, 9.0F, glm::vec4(1.0F), 306);
+            }
+
             // ── 3D 段：任意 mesh + cameraInfo[0]（静态 MVP；input 未接）────
             {
                 auto &uiTex = uiTextures();
@@ -12326,9 +12448,9 @@ try
                         uiTex.photo != ~0u ? uiTex.photo : uiTex.checker;
                     for (int i = 0; i < 6; ++i)
                     {
-                        auto t = ui_dao::texture(
+                        auto t = ui_dao::mesh_quad(
                             {0.0F, 0.0F, 1.0F, 1.0F}, view, tex3d,
-                            uiTex.sampler, glm::vec4(1.0F), {}, 0.0F,
+                            uiTex.sampler, glm::vec4(1.0F), {}, 0.45F,
                             static_cast<std::uint32_t>(200 + i));
                         const float x =
                             (static_cast<float>(i % 3) - 1.0F) * 1.25F;
@@ -12346,6 +12468,17 @@ try
                             glm::scale(glm::mat4(1.0F), glm::vec3(0.78F));
                         frame.addInsteance(t);
                     }
+                    // 光源 gizmo：球体 + 自发光边缘，和真实点光源同一位置
+                    const uint32_t white =
+                        uiTex.white != ~0u ? uiTex.white : uiTex.checker;
+                    auto light_gizmo = ui_dao::mesh_quad(
+                        {0.0F, 0.0F, 1.0F, 1.0F}, view, white, uiTex.sampler,
+                        glm::vec4(1.0F, 0.85F, 0.35F, 1.0F), {}, 0.0F, 999, 2);
+                    light_gizmo.model =
+                        glm::translate(glm::mat4(1.0F), light_pos) *
+                        glm::scale(glm::mat4(1.0F), glm::vec3(0.34F));
+                    frame.setMesh(uiMeshes().sphere);
+                    frame.addInsteance(light_gizmo);
                 }
             }
 

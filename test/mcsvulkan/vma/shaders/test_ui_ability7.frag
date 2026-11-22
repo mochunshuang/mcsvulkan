@@ -16,6 +16,9 @@ layout(location = 2) flat in uint program;
 layout(location = 3) flat in uint64_t instancePtr;
 layout(location = 4) in vec2 localPos;
 layout(location = 5) flat in uint instanceId;
+layout(location = 6) in vec3 fragNormal;
+layout(location = 7) in vec3 fragWorldPos;
+
 
 layout(location = 0) out vec4 outColor;
 layout(location = 1) out uvec4 outPicking;
@@ -551,7 +554,17 @@ void main()
         t = clamp(t, 0.0, 1.0);
 
         int n = clamp(int(inst.stop_count), 2, 8);
-        vec4 c = inst.stop_color[0];
+        // mode 3：stop 颜色按 sRGB 解释，先转线性再插值（正确的 sRGB 渐变）
+        vec4 stops[8];
+        for (int i = 0; i < 8; ++i)
+        {
+            stops[i] = inst.mode == 3u
+                           ? vec4(pow(max(inst.stop_color[i].rgb, vec3(0.0)),
+                                      vec3(2.2)),
+                                  inst.stop_color[i].a)
+                           : inst.stop_color[i];
+        }
+        vec4 c = stops[0];
         for (int i = 0; i < 7; ++i)
         {
             if (i + 1 >= n)
@@ -559,7 +572,7 @@ void main()
             float a = inst.stop_pos[i];
             float b = inst.stop_pos[i + 1];
             if (t >= a)
-                c = mix(inst.stop_color[i], inst.stop_color[i + 1],
+                c = mix(stops[i], stops[i + 1],
                         clamp((t - a) / max(b - a, 1e-6), 0.0, 1.0));
         }
 
@@ -647,6 +660,42 @@ void main()
 
         float a = center.a * inst.color.a;
         outColor = vec4(c * inst.color.rgb * a, a);
+        outPicking = uvec4(program, inst.entity_index, packed_z, inst.hover_fn);
+    }
+    break;
+    // ── 机制 9：Mesh（Lambert + Blinn 高光）
+    case PROGRAM_MESH: {
+        MeshQuad inst = MeshQuadBuffer(instancePtr).quads[0];
+        vec4 tex = sampleBindless(inst.textureIndex, inst.samplerIndex, fragTexCoord);
+        vec3 lit = tex.rgb;
+        if ((inst.flags & 2u) != 0u) // bit1: 自发光球（光源 gizmo）
+        {
+            vec3 N = normalize(fragNormal);
+            mat4 view = ubo.cameraInfo[pc.cameraIndex].view;
+            vec3 eye = -transpose(mat3(view)) * view[3].xyz;
+            vec3 V = normalize(eye - fragWorldPos);
+            float rim = pow(1.0 - abs(dot(N, V)), 1.5);
+            lit = inst.color.rgb * (0.55 + 1.9 * rim);
+        }
+        else if ((inst.flags & 1u) != 0u) // bit0: lit
+        {
+            vec3 N = normalize(fragNormal);
+            vec3 Lv = ubo.light.pos.xyz - fragWorldPos;
+            float d = length(Lv);
+            vec3 L = Lv / max(d, 1e-4);
+            mat4 view = ubo.cameraInfo[pc.cameraIndex].view;
+            vec3 eye = -transpose(mat3(view)) * view[3].xyz;
+            vec3 V = normalize(eye - fragWorldPos);
+            vec3 H = normalize(L + V);
+            float ndl = max(dot(N, L), 0.0);
+            float atten = ubo.light.pos.w / (1.0 + 0.35 * d * d);
+            float spec = pow(max(dot(N, H), 0.0), 32.0) * inst.specular * atten;
+            lit = tex.rgb *
+                      (ubo.light.ambient.rgb + ubo.light.color.rgb * ndl * atten) +
+                  ubo.light.color.rgb * spec;
+        }
+        float a = tex.a * inst.color.a;
+        outColor = vec4(lit * inst.color.rgb * a, a);
         outPicking = uvec4(program, inst.entity_index, packed_z, inst.hover_fn);
     }
     break;
