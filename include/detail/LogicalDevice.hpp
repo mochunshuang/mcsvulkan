@@ -783,5 +783,35 @@ namespace mcs::vulkan
             MCS_ASSERT(table_.vkCmdDrawIndirect != nullptr);
             table_.vkCmdDrawIndirect(commandBuffer, buffer, offset, drawCount, stride);
         }
+
+        constexpr void cmdSetStencilTestEnable(VkCommandBuffer commandBuffer,
+                                               VkBool32 stencilTestEnable) const noexcept
+        {
+            MCS_ASSERT(table_.vkCmdSetStencilTestEnable != nullptr);
+            table_.vkCmdSetStencilTestEnable(commandBuffer, stencilTestEnable);
+        }
+        constexpr void cmdSetStencilOp(VkCommandBuffer commandBuffer,
+                                       VkStencilFaceFlags faceMask, VkStencilOp failOp,
+                                       VkStencilOp passOp, VkStencilOp depthFailOp,
+                                       VkCompareOp compareOp) const noexcept
+        {
+            MCS_ASSERT(table_.vkCmdSetStencilOp != nullptr);
+            table_.vkCmdSetStencilOp(commandBuffer, faceMask, failOp, passOp, depthFailOp,
+                                     compareOp);
+        }
+        constexpr void cmdSetStencilCompareMask(VkCommandBuffer commandBuffer,
+                                                VkStencilFaceFlags faceMask,
+                                                uint32_t compareMask) const noexcept
+        {
+            MCS_ASSERT(table_.vkCmdSetStencilCompareMask != nullptr);
+            table_.vkCmdSetStencilCompareMask(commandBuffer, faceMask, compareMask);
+        }
+        constexpr void cmdSetStencilWriteMask(VkCommandBuffer commandBuffer,
+                                              VkStencilFaceFlags faceMask,
+                                              uint32_t writeMask) const noexcept
+        {
+            MCS_ASSERT(table_.vkCmdSetStencilWriteMask != nullptr);
+            table_.vkCmdSetStencilWriteMask(commandBuffer, faceMask, writeMask);
+        }
     };
 }; // namespace mcs::vulkan

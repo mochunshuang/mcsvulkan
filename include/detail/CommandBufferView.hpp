@@ -409,6 +409,28 @@ namespace mcs::vulkan
         {
             pool_->device()->cmdDrawIndirect(value_, buffer, offset, drawCount, stride);
         }
+        constexpr void setStencilTestEnable(VkBool32 stencilTestEnable) const noexcept
+        {
+            pool_->device()->cmdSetStencilTestEnable(value_, stencilTestEnable);
+        }
+        constexpr void setStencilOp(VkStencilFaceFlags faceMask, VkStencilOp failOp,
+                                    VkStencilOp passOp, VkStencilOp depthFailOp,
+                                    VkCompareOp compareOp) const noexcept
+        {
+            pool_->device()->cmdSetStencilOp(value_, faceMask, failOp, passOp,
+                                             depthFailOp, compareOp);
+        }
+        constexpr void setStencilCompareMask(VkStencilFaceFlags faceMask,
+                                             uint32_t compareMask) const noexcept
+        {
+            pool_->device()->cmdSetStencilCompareMask(value_, faceMask, compareMask);
+        }
+        constexpr void setStencilWriteMask(VkStencilFaceFlags faceMask,
+                                           uint32_t writeMask) const noexcept
+        {
+
+            pool_->device()->cmdSetStencilWriteMask(value_, faceMask, writeMask);
+        }
     };
 
 }; // namespace mcs::vulkan

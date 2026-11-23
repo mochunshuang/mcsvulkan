@@ -119,11 +119,11 @@ constexpr float kTileY = 664.0F;
 
 // 共用的混合/写掩码常量，避免每个 demo 块重复定义
 constexpr VkColorComponentFlags kColorWriteRGBA =
-    VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-    VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-constexpr VkColorBlendEquationEXT kBlendNone{
-    VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
-    VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD};
+    VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+    VK_COLOR_COMPONENT_A_BIT;
+constexpr VkColorBlendEquationEXT kBlendNone{VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO,
+                                             VK_BLEND_OP_ADD,      VK_BLEND_FACTOR_ZERO,
+                                             VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD};
 constexpr auto TITLE = "test_my_triangle";
 
 static constexpr auto MAX_FRAMES_IN_FLIGHT = 2;
@@ -351,13 +351,12 @@ struct my_render
         const auto *count = reinterpret_cast<const std::uint32_t *>(
             data.data() + sizeof(blit_image_header));
         constexpr auto align = static_cast<std::uint32_t>(alignof(VkImageBlit));
-        const auto header = static_cast<std::uint32_t>(sizeof(blit_image_header) +
-                                                       sizeof(std::uint32_t));
+        const auto header =
+            static_cast<std::uint32_t>(sizeof(blit_image_header) + sizeof(std::uint32_t));
         const auto offset = (header + align - 1) / align * align;
         const auto *regions = reinterpret_cast<const VkImageBlit *>(data.data() + offset);
 
-        commandBuffer.blitImage(head->src, head->src_layout, head->dst,
-                                head->dst_layout,
+        commandBuffer.blitImage(head->src, head->src_layout, head->dst, head->dst_layout,
                                 std::span<const VkImageBlit>{regions, *count},
                                 head->filter);
     }
@@ -651,6 +650,7 @@ inline constexpr mesh_data kQuadMesh{4, 0, 0, 6};
 
 #include "test_ui_ability7_dao.hpp"
 #include "test_ui_ability7_shader_buffers.hpp"
+#include "test_ui_ability7_table.hpp"
 
 using shader_data::UniformBufferObject;
 
@@ -825,10 +825,9 @@ namespace command
         std::array<VkBool32, 2> color_blend_enable{VK_TRUE, VK_FALSE};
         std::array<VkColorBlendEquationEXT, 2> color_blend_equation{
             VkColorBlendEquationEXT{VK_BLEND_FACTOR_ONE,
-                                    VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
-                                    VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE,
-                                    VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
-                                    VK_BLEND_OP_ADD},
+                                    VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD,
+                                    VK_BLEND_FACTOR_ONE,
+                                    VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD},
             VkColorBlendEquationEXT{VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO,
                                     VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ZERO,
                                     VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD}};
@@ -1243,10 +1242,8 @@ namespace command
         {
             if (draw_state.color_blend_enable == enable &&
                 draw_state.color_write_mask == mask &&
-                blend_equation_equal(draw_state.color_blend_equation[0],
-                                     equation[0]) &&
-                blend_equation_equal(draw_state.color_blend_equation[1],
-                                     equation[1]))
+                blend_equation_equal(draw_state.color_blend_equation[0], equation[0]) &&
+                blend_equation_equal(draw_state.color_blend_equation[1], equation[1]))
                 return;
             trySubmit();
             draw_state.color_blend_enable = enable;
@@ -1371,26 +1368,22 @@ namespace command
             // ext_dynamic_state2/3：blend / A2C / stencil 一律走动态状态
             const auto emit_dynamic = [&](const command::draw_state &s) {
                 const auto &vk = commandBuffer.functions();
-                vk.vkCmdSetColorBlendEnableEXT(
-                    *commandBuffer, 0, 2, s.color_blend_enable.data());
-                vk.vkCmdSetColorBlendEquationEXT(
-                    *commandBuffer, 0, 2, s.color_blend_equation.data());
-                vk.vkCmdSetColorWriteMaskEXT(
-                    *commandBuffer, 0, 2, s.color_write_mask.data());
-                vk.vkCmdSetAlphaToCoverageEnableEXT(*commandBuffer,
-                                                    s.alpha_to_coverage);
-                vk.vkCmdSetStencilTestEnable(*commandBuffer,
-                                             s.stencil_test_enable);
-                vk.vkCmdSetStencilOp(
-                    *commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK,
-                    s.stencil_op.failOp, s.stencil_op.passOp,
-                    s.stencil_op.depthFailOp, s.stencil_op.compareOp);
-                vk.vkCmdSetStencilCompareMask(
-                    *commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK,
-                    s.stencil_op.compareMask);
-                vk.vkCmdSetStencilWriteMask(
-                    *commandBuffer, VK_STENCIL_FACE_FRONT_AND_BACK,
-                    s.stencil_op.writeMask);
+                vk.vkCmdSetColorBlendEnableEXT(*commandBuffer, 0, 2,
+                                               s.color_blend_enable.data());
+                vk.vkCmdSetColorBlendEquationEXT(*commandBuffer, 0, 2,
+                                                 s.color_blend_equation.data());
+                vk.vkCmdSetColorWriteMaskEXT(*commandBuffer, 0, 2,
+                                             s.color_write_mask.data());
+                vk.vkCmdSetAlphaToCoverageEnableEXT(*commandBuffer, s.alpha_to_coverage);
+                commandBuffer.setStencilTestEnable(s.stencil_test_enable);
+                commandBuffer.setStencilOp(VK_STENCIL_FACE_FRONT_AND_BACK,
+                                           s.stencil_op.failOp, s.stencil_op.passOp,
+                                           s.stencil_op.depthFailOp,
+                                           s.stencil_op.compareOp);
+                commandBuffer.setStencilCompareMask(VK_STENCIL_FACE_FRONT_AND_BACK,
+                                                    s.stencil_op.compareMask);
+                commandBuffer.setStencilWriteMask(VK_STENCIL_FACE_FRONT_AND_BACK,
+                                                  s.stencil_op.writeMask);
             };
 
             auto &first = draws[0];
@@ -1413,9 +1406,9 @@ namespace command
             if (pre.dynamic_ui)
                 emit_dynamic(pre);
 
-            auto offset = binding.indirect_offset +
-                          first.data_ranges.data_span.offset *
-                              sizeof(VkDrawIndexedIndirectCommand);
+            auto offset =
+                binding.indirect_offset +
+                first.data_ranges.data_span.offset * sizeof(VkDrawIndexedIndirectCommand);
             auto count = first.data_ranges.draw_count();
             commandBuffer.drawIndexedIndirect(binding.indirect_buffer, offset, count,
                                               sizeof(VkDrawIndexedIndirectCommand));
@@ -1456,9 +1449,9 @@ namespace command
                     (cur.pipeline != pre.pipeline || !cur.dynamic_equal(pre)))
                     emit_dynamic(cur);
 
-                offset = binding.indirect_offset +
-                         item.data_ranges.data_span.offset *
-                             sizeof(VkDrawIndexedIndirectCommand);
+                offset =
+                    binding.indirect_offset + item.data_ranges.data_span.offset *
+                                                  sizeof(VkDrawIndexedIndirectCommand);
                 count = item.data_ranges.draw_count();
                 commandBuffer.drawIndexedIndirect(binding.indirect_buffer, offset, count,
                                                   sizeof(VkDrawIndexedIndirectCommand));
@@ -1476,13 +1469,12 @@ namespace command
         {
             assert(draw_state.valid());
             constexpr auto program_value = shader_data::program_value<T>();
-            const auto initcmd =
-                VkDrawIndexedIndirectCommand{.indexCount = current_mesh.indexCount,
-                                             .instanceCount = 1,
-                                             .firstIndex = current_mesh.indexOffset,
-                                             .vertexOffset = static_cast<std::int32_t>(
-                                                 current_mesh.vertexOffset),
-                                             .firstInstance = 0};
+            const auto initcmd = VkDrawIndexedIndirectCommand{
+                .indexCount = current_mesh.indexCount,
+                .instanceCount = 1,
+                .firstIndex = current_mesh.indexOffset,
+                .vertexOffset = static_cast<std::int32_t>(current_mesh.vertexOffset),
+                .firstInstance = 0};
             const auto address_offset =
                 static_cast<std::uint32_t>(heap->size() - heap_begin);
             heap->write(data);
@@ -1802,8 +1794,8 @@ namespace command
     {
         std::uint32_t outer = no_scope;
         std::uint32_t inter = no_scope;
-        bool opened = false; // beginRendering 已录
-        bool closed = false; // endRendering 已录（显式或自动）
+        bool opened = false;     // beginRendering 已录
+        bool closed = false;     // endRendering 已录（显式或自动）
         scope_binding binding{}; // 阶段 1 产出的 GPU 落地地址
     };
 
@@ -2083,8 +2075,8 @@ namespace command
                 if (scope.outer != no_scope)
                     outers[scope.outer].flush(commandBuffer);
                 if (scope.inter != no_scope)
-                    inters[scope.inter].record(commandBuffer, scope.binding, renderVersion,
-                                               scope.closed);
+                    inters[scope.inter].record(commandBuffer, scope.binding,
+                                               renderVersion, scope.closed);
             }
         }
 
@@ -2390,10 +2382,8 @@ constexpr auto init()
         VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
         VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME}; // NOLINTEND
     requiredDeviceExtension.emplace_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
-    requiredDeviceExtension.emplace_back(
-        VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
-    requiredDeviceExtension.emplace_back(
-        VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
+    requiredDeviceExtension.emplace_back(VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
+    requiredDeviceExtension.emplace_back(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
     structure_chain<VkPhysicalDeviceFeatures2, VkPhysicalDeviceVulkan13Features,
                     VkPhysicalDeviceVulkan12Features, VkPhysicalDeviceVulkan11Features,
                     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT,
@@ -2444,8 +2434,9 @@ constexpr auto init()
 
     // ext3 的字段太多，按需在链上就地打开（不用逐个写进聚合初始化）。
     {
-        auto &ext3 = enablefeatureChain
-                         .template get<VkPhysicalDeviceExtendedDynamicState3FeaturesEXT>();
+        auto &ext3 =
+            enablefeatureChain
+                .template get<VkPhysicalDeviceExtendedDynamicState3FeaturesEXT>();
         ext3.extendedDynamicState3ColorBlendEnable = VK_TRUE;
         ext3.extendedDynamicState3ColorBlendEquation = VK_TRUE;
         ext3.extendedDynamicState3ColorWriteMask = VK_TRUE;
@@ -2471,8 +2462,8 @@ constexpr auto init()
                     VkPhysicalDeviceVulkan12Features, VkPhysicalDeviceVulkan11Features,
                     VkPhysicalDeviceExtendedDynamicStateFeaturesEXT,
                     VkPhysicalDeviceExtendedDynamicState2FeaturesEXT,
-                    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT>{
-                    {}, {}, {}, {}, {}, {}, {}};
+                    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT>{{}, {}, {}, {},
+                                                                      {}, {}, {}};
                 physicalDevice.getFeatures2(&query.head());
                 auto &features2 = query.template get<VkPhysicalDeviceFeatures2>();
                 auto &query_vulkan13_features =
@@ -2484,9 +2475,11 @@ constexpr auto init()
                 auto &query_extended_dynamic_state_features =
                     query.template get<VkPhysicalDeviceExtendedDynamicStateFeaturesEXT>();
                 auto &query_ext2 =
-                    query.template get<VkPhysicalDeviceExtendedDynamicState2FeaturesEXT>();
+                    query
+                        .template get<VkPhysicalDeviceExtendedDynamicState2FeaturesEXT>();
                 auto &query_ext3 =
-                    query.template get<VkPhysicalDeviceExtendedDynamicState3FeaturesEXT>();
+                    query
+                        .template get<VkPhysicalDeviceExtendedDynamicState3FeaturesEXT>();
                 return features2.features.samplerAnisotropy &&
                        features2.features.shaderInt64 &&
                        features2.features.geometryShader &&
@@ -2635,8 +2628,7 @@ constexpr auto descriptorInit(auto &hardwareCtx)
                              .binding = 0,
                              .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                              .descriptorCount = 1,
-                             .stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
-                                          VK_SHADER_STAGE_FRAGMENT_BIT},
+                             .stageFlags = command::recorder_config::push_stages},
                          VkDescriptorSetLayoutBinding{
                              .binding = 1,
                              .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
@@ -3497,7 +3489,8 @@ constexpr auto initMeshManager()
     m.addMesh("quad", std::span{quadVerts}, std::span{quadIdx});
 
     // 单位立方体：6 面 × 4 顶点，pos + uv；验证“任意 mesh + 相机槽”的最小几何
-    std::array<Vertex, 24> cubeVerts = {        // +Z
+    std::array<Vertex, 24> cubeVerts = {
+        // +Z
         Vertex{{-0.5F, -0.5F, 0.5F}, {0.0F, 1.0F}},
         Vertex{{0.5F, -0.5F, 0.5F}, {1.0F, 1.0F}},
         Vertex{{0.5F, 0.5F, 0.5F}, {1.0F, 0.0F}},
@@ -3556,14 +3549,13 @@ constexpr auto initMeshManager()
         const float phi = 3.14159265F * static_cast<float>(i) / kStacks;
         for (int j = 0; j <= kSlices; ++j)
         {
-            const float theta =
-                6.2831853F * static_cast<float>(j) / kSlices;
+            const float theta = 6.2831853F * static_cast<float>(j) / kSlices;
             const glm::vec3 n{glm::sin(phi) * glm::cos(theta), glm::cos(phi),
                               glm::sin(phi) * glm::sin(theta)};
-            sphereVerts.push_back(Vertex{n * 0.5F,
-                                         {static_cast<float>(j) / kSlices,
-                                          static_cast<float>(i) / kStacks},
-                                         n});
+            sphereVerts.push_back(
+                Vertex{n * 0.5F,
+                       {static_cast<float>(j) / kSlices, static_cast<float>(i) / kStacks},
+                       n});
         }
     }
     for (int i = 0; i < kStacks; ++i)
@@ -10866,6 +10858,306 @@ namespace render
 }; // namespace render
 //diff: [test_intent] end
 
+// ═══════════════════════════════════════════════════════════════════════════
+// table：dao → 实例 → shader → 像素；picking 回读 → zone → 交互
+//
+//   一个 draw 和一个 table 的 hover 回调没有本质区别：
+//     写：实例行 entity_index = zone_key(zone)，hover_fn = 表的下标
+//     读：回读 → 版本过滤 → zone_from(entity) → 固定分发
+// ═══════════════════════════════════════════════════════════════════════════
+namespace table_glue
+{
+    // canvas：widget 只认识这两个动作（强类型，杜绝可变参数把实参吃错）
+    struct canvas
+    {
+        command::record_builder *rb{nullptr};
+        void add(const shader_data::Shape &s)
+        {
+            rb->addInsteance(s);
+        }
+        void add(const shader_data::TexQuad &t)
+        {
+            rb->addInsteance(t);
+        }
+    };
+
+    inline ui_table::model &model_ref() noexcept
+    {
+        static ui_table::model v{};
+        return v;
+    }
+    inline ui_table::style &style_ref() noexcept
+    {
+        static ui_table::style v{};
+        return v;
+    }
+    inline ui_table::font &font_ref() noexcept
+    {
+        static ui_table::font v{};
+        return v;
+    }
+
+    // 统一 hover 处理函数：所有单元共用一个下标，按 entity 里的 zone 分发
+    inline void on_hover(picking_result r, bool enter, InputCtx &,
+                         ui_new::ScreenWidget *) noexcept
+    {
+        auto &s = ui_table::state_ref();
+        const auto z = ui_table::zone_from(r.key.entity_index);
+        ui_table::trace("[hover] {} part={} row={} col={} (raw_entity={})",
+                        enter ? "ENTER" : "LEAVE", ui_table::part_name(z.kind), z.row,
+                        z.col, r.key.entity_index);
+        if (enter)
+            s.hover = z;
+        else
+            s.hover = {};
+    }
+
+    inline std::uint32_t index()
+    {
+        static const std::uint32_t fn = hoverPool().bind(&on_hover);
+        return fn;
+    }
+
+    // 光标：GLFW 标准光标池（同 wsi/test_glfw2.cpp 的写法），只在变化时设置一次
+    inline void apply_cursor(GLFWwindow *win, ui_table::cursor c) noexcept
+    {
+        if (win == nullptr)
+            return;
+        static GLFWcursor *pool[7] = {};
+        static int current = -1;
+        const int idx = static_cast<int>(c);
+        if (idx == current)
+            return;
+        if (idx >= 0 && pool[idx] == nullptr)
+        {
+            // 顺序必须和 ui_table::cursor 一致
+            static constexpr int kShape[7] = {
+                GLFW_ARROW_CURSOR,         GLFW_IBEAM_CURSOR,
+                GLFW_RESIZE_EW_CURSOR,     GLFW_RESIZE_NS_CURSOR,
+                GLFW_RESIZE_NWSE_CURSOR,   GLFW_RESIZE_NESW_CURSOR,
+                GLFW_POINTING_HAND_CURSOR,
+            };
+            pool[idx] = glfwCreateStandardCursor(kShape[idx]);
+        }
+        current = idx;
+        glfwSetCursor(win, pool[idx]);
+        ui_table::trace("[cursor] {}", idx);
+    }
+
+    // 字符输入：订阅 char_event，攒成 UTF-8 字符串，draw 里取走
+    struct text_sink
+    {
+        std::string buf;
+
+        text_sink()
+        {
+            mcs::vulkan::event::char_event_dispatcher::instance().subscribe(
+                this, &text_sink::on_char);
+        }
+        ~text_sink()
+        {
+            mcs::vulkan::event::char_event_dispatcher::instance().unsubscribe(
+                this, &text_sink::on_char);
+        }
+        text_sink(const text_sink &) = delete;
+        text_sink &operator=(const text_sink &) = delete;
+
+        static void on_char(void *self, mcs::vulkan::event::char_event e) noexcept
+        {
+            auto *impl = static_cast<text_sink *>(self);
+            const auto cp = static_cast<std::uint32_t>(e.codepoint);
+            if (cp < 0x80u)
+                impl->buf.push_back(static_cast<char>(cp));
+            else if (cp < 0x800u)
+            {
+                impl->buf.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+                impl->buf.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            }
+            else if (cp < 0x10000u)
+            {
+                impl->buf.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+                impl->buf.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                impl->buf.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            }
+            else
+            {
+                impl->buf.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+                impl->buf.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+                impl->buf.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                impl->buf.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            }
+        }
+
+        std::string take()
+        {
+            std::string out = std::move(buf);
+            buf.clear();
+            return out;
+        }
+    };
+
+    inline text_sink &text() noexcept
+    {
+        static text_sink s{};
+        return s;
+    }
+
+    // 系统剪贴板（GLFW 提供）：读 / 写
+    inline std::string read_clipboard(GLFWwindow *win)
+    {
+        if (win == nullptr)
+            return {};
+        const char *s = glfwGetClipboardString(win);
+        return s == nullptr ? std::string{} : std::string{s};
+    }
+    inline void write_clipboard(GLFWwindow *win, std::string_view text)
+    {
+        if (win == nullptr || text.empty())
+            return;
+        glfwSetClipboardString(win, std::string{text}.c_str());
+    }
+
+    // IME 预编辑串：动态加载 imm32（不改链接依赖），拿不到就返回空
+    inline std::string ime_preedit(GLFWwindow *win) noexcept
+    {
+        if (win == nullptr)
+            return {};
+        struct api_t
+        {
+            void *(*get_ctx)(void *){};
+            long (*get_str)(void *, unsigned long, void *, long){};
+            int (*rel_ctx)(void *, void *){};
+        };
+        static const api_t api = [] {
+            api_t a{};
+            HMODULE imm = ::LoadLibraryW(L"imm32.dll");
+            if (imm == nullptr)
+                return a;
+            a.get_ctx = reinterpret_cast<void *(*)(void *)>(
+                ::GetProcAddress(imm, "ImmGetContext"));
+            a.get_str = reinterpret_cast<long (*)(void *, unsigned long, void *, long)>(
+                ::GetProcAddress(imm, "ImmGetCompositionStringW"));
+            a.rel_ctx = reinterpret_cast<int (*)(void *, void *)>(
+                ::GetProcAddress(imm, "ImmReleaseContext"));
+            return a;
+        }();
+        if (api.get_ctx == nullptr || api.get_str == nullptr || api.rel_ctx == nullptr)
+            return {};
+        void *himc = api.get_ctx(win);
+        if (himc == nullptr)
+            return {};
+        std::string out;
+        constexpr unsigned long kGcsCompStr = 0x0008UL; // GCS_COMPSTR（避开同名宏）
+        const long bytes = api.get_str(himc, kGcsCompStr, nullptr, 0);
+        if (bytes > 0)
+        {
+            std::wstring w(static_cast<std::size_t>(bytes) / sizeof(wchar_t), L'\0');
+            api.get_str(himc, kGcsCompStr, w.data(), bytes);
+            const int need =
+                ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                                      nullptr, 0, nullptr, nullptr);
+            if (need > 0)
+            {
+                out.resize(static_cast<std::size_t>(need));
+                ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                                      out.data(), need, nullptr, nullptr);
+            }
+        }
+        api.rel_ctx(win, himc);
+        return out;
+    }
+
+    // 字体：ASCII 字形表已经建好，拷成 table 自己的度量
+    inline void init_font()
+    {
+        auto &F = font_ref();
+        F.px = 15.0F;
+        for (const auto &[cp, g] : uiAsciiGlyphs())
+        {
+            ui_table::glyph_metrics m{};
+            m.uv = g.uv;
+            m.plane = g.plane;
+            m.advance = g.advance;
+            m.tex = g.tex;
+            m.samp = g.samp;
+            m.font = g.shaderFont;
+            m.px_range = g.pxRange;
+            m.y_down = g.yDown;
+            F.glyphs.emplace(cp, m);
+        }
+        std::println("[table] font glyphs: {}", F.glyphs.size());
+    }
+
+    // ── JSON 数据驱动 ──────────────────────────────────────────────────
+    //   表 = 数据：列定义 / 样式 / 行数据全部来自 JSON，代码不认识任何具体字段。
+    //   rows 两种写法都支持：对象（按 column.key 取）或数组（按列顺序）。
+    inline constexpr const char *kTableJson = R"json(
+{
+  "style": { "header_h": 40, "row_h": 30, "row_gap": 2, "bar": 8,
+             "radius": 10, "cell_pad": 10, "frozen": 1 },
+  "columns": [
+    { "key": "name",     "title": "Name",     "width": 220, "min": 120, "max": 320, "group": "Identity" },
+    { "key": "status",   "title": "Status",   "width": 116, "min": 90,  "max": 180, "align": "left", "group": "Identity",
+      "render": "tag",
+      "tags": { "ready": "#4fbf7a", "busy": "#e0a83c", "error": "#e0574f" } },
+    { "key": "size",     "title": "Size",     "width": 100, "min": 60,  "max": 160, "align": "right", "group": "Metrics" },
+    { "key": "modified", "title": "Modified", "width": 160, "min": 100, "max": 220, "group": "Metrics" },
+    { "key": "kind",     "title": "Kind",     "width": 140, "min": 80,  "max": 220,
+      "group": "Source", "render": "dot",
+      "tags": { "gltf": "#5aa9e6", "png": "#b07ad8", "bin": "#6ec2a0", "json": "#e0a83c" } },
+    { "key": "path",     "title": "Path",     "width": 420, "min": 200, "max": 900, "group": "Source" },
+    { "key": "sha",      "title": "SHA",      "width": 300, "min": 120, "max": 600, "group": "Source" },
+    { "key": "note",     "title": "Note",     "width": 200, "min": 80,  "max": 300, "group": "Source" }
+  ],
+  "rows": [
+    { "name": "asset_00.gltf", "status": "ready", "size": "12.0 KB",
+      "modified": "2026-01-01", "kind": "gltf",
+      "path": "assets/scene/asset_00.gltf", "sha": "9f2a1c3d", "note": "cached" },
+    { "name": "asset_01.gltf", "status": "busy", "size": "19.1 KB",
+      "modified": "2026-02-02", "kind": "gltf",
+      "path": "assets/scene/asset_01.gltf", "sha": "8b1f22aa", "note": "3 blocks" },
+    { "name": "asset_02.gltf", "status": "error", "size": "26.2 KB",
+      "modified": "2026-03-03", "kind": "gltf",
+      "path": "assets/scene/asset_02.gltf", "sha": "7c0e9b11", "note": "hot" },
+    { "name": "asset_03.gltf", "status": "ready", "size": "33.3 KB",
+      "modified": "2026-04-04", "kind": "png",
+      "path": "assets/scene/asset_03.gltf", "sha": "6d3f8c02", "note": "cold" }
+  ]
+}
+)json";
+
+    inline void init_model()
+    {
+        auto &M = model_ref();
+        if (!M.cols.empty())
+            return;
+
+        auto j = nlohmann::json::parse(kTableJson);
+
+        // 追加数据：真实场景里这就是"从文件/网络来的 JSON"，形状完全一样
+        static constexpr const char *kStatus[3] = {"ready", "busy", "error"};
+        static constexpr const char *kKind[4] = {"gltf", "png", "bin", "json"};
+        static constexpr const char *kNote[4] = {"cached", "3 blocks", "hot", "cold"};
+        for (int i = 4; i < 60; ++i)
+        {
+            j["rows"].push_back(nlohmann::json::array(
+                {std::format("asset_{:02d}.gltf", i), kStatus[i % 3],
+                 std::format("{}.{} KB", 12 + i * 7, i % 10),
+                 std::format("2026-{:02d}-{:02d}", 1 + (i % 12), 1 + (i % 28)),
+                 kKind[i % 4],
+                 std::format("assets/scene/sub{:02d}/asset_{:02d}.gltf", i / 12, i),
+                 std::format("sha256:{:012x}", 0x9f2a1c3d4e5fULL + i * 7919ULL),
+                 kNote[i % 4]}));
+        }
+
+        if (j.contains("style"))
+            style_ref().apply_json(j.at("style"));
+        M = ui_table::model::from_json(j);
+        std::println("[table] json model: {} cols x {} rows, frozen={}", M.cols.size(),
+                     M.rows.size(), style_ref().frozen);
+    }
+} // namespace table_glue
+
 int main()
 try
 {
@@ -10875,6 +11167,13 @@ try
 #ifdef FRAG_SHADER_PATH
     std::cout << "FRAG_SHADER_PATH: " << FRAG_SHADER_PATH << '\n';
 #endif
+    // 表格自测：只驱动 update/normalize 的数据面，不碰窗口 / GPU / Vulkan。
+    // TABLE_SELFTEST=1 时先跑再退出，失败返回非 0。
+    if (std::getenv("TABLE_SELFTEST") != nullptr)
+    {
+        const int fails = ui_table::selftest();
+        return fails == 0 ? 0 : 1;
+    }
     auto hardwareCtx = init();
     auto &window = *hardwareCtx.window.get();
     auto &physical_device = *hardwareCtx.physicalDevice.get();
@@ -11012,6 +11311,31 @@ try
                 tg.advance = static_cast<float>(g.advance_x);
                 tg.tex = g.font_ctx->bind.texture_index;
                 tg.samp = g.font_ctx->bind.sampler_index;
+                // NOTE: 这三项之前漏了 —— yDown 决定字形矩形的上下方向，
+                //       shaderFont / pxRange 决定 frag 的 MSDF 分支和抗锯齿范围
+                tg.yDown = (g.font_ctx->font.atlas.yOrigin == "top");
+                tg.pxRange = static_cast<float>(
+                    g.font_ctx->font.atlas.distanceRange.value_or(0.0));
+                using FT = mcs::vulkan::font::FontType;
+                const FT ftype = g.font_ctx->type;
+                switch (ftype)
+                {
+                case FT::eSDF:
+                    tg.shaderFont = 2;
+                    break;
+                case FT::ePSDF:
+                    tg.shaderFont = 3;
+                    break;
+                case FT::eMSDF:
+                    tg.shaderFont = 4;
+                    break;
+                case FT::eMTSDF:
+                    tg.shaderFont = 5;
+                    break;
+                default:
+                    tg.shaderFont = 6; // bitmap
+                    break;
+                }
                 glyphs[static_cast<char32_t>(static_cast<unsigned char>(corpus[ci]))] =
                     tg;
                 ++idx;
@@ -11116,6 +11440,12 @@ try
     ui_new::ScreenWidget screen{ui_new::Size{WIDTH, HEIGHT}, ui_new::Container("panel")};
 
     shader_data::hover_manager hoverManager{.screen = &screen};
+
+    // table：字体 / 数据 / hover 下标（一个表一个池实体）
+    table_glue::init_font();
+    table_glue::init_model();
+    ui_table::hover_fn_ref() = table_glue::index();
+    std::println("[table] hover_fn = {}", ui_table::hover_fn_ref());
     // 新的 soaCtx 仅包含 uiRects 和 uiWireRects
     auto soaCtx = make_aggregate_ref<"soaCtx", "screen">(screen);
 
@@ -11557,7 +11887,8 @@ try
         method<"transitionImageLayout">([](world_type &, input_type &, data_type &) {}),
         method<"beginRendering">([](world_type &, input_type &, data_type &) {}),
         method<"setPipelineState">([](world_type &, input_type &, data_type &) {}),
-        method<"draw">([](world_type &, input_type &, data_type &soaCtx) {
+        method<"draw">([](world_type &world, input_type &inputCtx, data_type &soaCtx) {
+            (void)world;
             // 资源从 resources() 取，宿主状态（每帧序号/UI 场景）从 frameState() 取
             auto &r = named_resource::resources();
             auto &fs = named_resource::frameState();
@@ -11603,9 +11934,9 @@ try
 
             // 每个 frame-in-flight 一份 UBO；当前 fence 已经等过，写当前槽安全。
             static const auto k3dStart = std::chrono::steady_clock::now();
-            const float t3d = std::chrono::duration<float>(
-                                  std::chrono::steady_clock::now() - k3dStart)
-                                  .count();
+            const float t3d =
+                std::chrono::duration<float>(std::chrono::steady_clock::now() - k3dStart)
+                    .count();
             // 点光源绕场景转：gizmo 和着色共用同一位置，肉眼可验证
             const glm::vec3 light_pos{glm::cos(t3d * 0.7F) * 1.15F, 0.8F,
                                       glm::sin(t3d * 0.7F) * 1.15F};
@@ -11613,10 +11944,9 @@ try
             // 槽 0：3D 相机（每帧更新 view，绕 Y 轴环绕；MVP 在动）
             {
                 const float orbit = t3d * 0.6F;
-                const glm::vec3 eye(glm::sin(orbit) * 3.4F, 1.0F,
-                                    glm::cos(orbit) * 3.4F);
-                ubo.cameraInfo[0].view = glm::lookAt(
-                    eye, glm::vec3(0.0F), glm::vec3(0.0F, 1.0F, 0.0F));
+                const glm::vec3 eye(glm::sin(orbit) * 3.4F, 1.0F, glm::cos(orbit) * 3.4F);
+                ubo.cameraInfo[0].view =
+                    glm::lookAt(eye, glm::vec3(0.0F), glm::vec3(0.0F, 1.0F, 0.0F));
             }
             ubo.cameraInfo[0].proj = glm::perspectiveRH_ZO(
                 glm::radians(45.0F), k3dAreaW / k3dAreaH, 0.1F, 10.0F);
@@ -11684,8 +12014,7 @@ try
                         .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                         .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
                         .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-                        .clearValue = {.color = {
-                                           .float32 = {0.0F, 0.0F, 0.0F, 1.0F}}}});
+                        .clearValue = {.color = {.float32 = {0.0F, 0.0F, 0.0F, 1.0F}}}});
                 frame.begin_rendering(std::move(info));
                 frame.setPipeline(*layerPipeline);
                 frame.setPipelineLayout(*pipelineLayout);
@@ -11725,12 +12054,12 @@ try
                         .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
                         .stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
             layer_begin(layerGroup.view);
-            frame.addInsteance(ui_dao::sdf_shape(
-                {20.0F, 40.0F, 170.0F, 120.0F}, layerView, 24.0F,
-                glm::vec4(0.95F, 0.4F, 0.25F, 0.85F)));
-            frame.addInsteance(ui_dao::sdf_shape(
-                {120.0F, 60.0F, 170.0F, 120.0F}, layerView, 24.0F,
-                glm::vec4(0.25F, 0.7F, 0.95F, 0.85F)));
+            frame.addInsteance(ui_dao::sdf_shape({20.0F, 40.0F, 170.0F, 120.0F},
+                                                 layerView, 24.0F,
+                                                 glm::vec4(0.95F, 0.4F, 0.25F, 0.85F)));
+            frame.addInsteance(ui_dao::sdf_shape({120.0F, 60.0F, 170.0F, 120.0F},
+                                                 layerView, 24.0F,
+                                                 glm::vec4(0.25F, 0.7F, 0.95F, 0.85F)));
             layer_to_sampled(layerGroup.image);
 
             VkRenderingAttachmentInfo color0_clear{
@@ -11798,844 +12127,120 @@ try
             frame.setViewport(full_vp);
             frame.setScissor(full_scissor);
 
-            // renderVersion 是 picking/UI 的语义输入，不是 buffer 地址；
-            // 取当前屏幕版本，避免硬编码 0 后 picking 被 wait 阶段丢弃。
-            const auto renderVersion =
-                static_cast<std::uint32_t>(soaCtx.screen.renderVersion());
+            // renderVersion = 表格的几何版本：picking 回读用它过滤"数据切换中间帧"
+            auto renderVersion = ui_table::state_ref().version;
             frame.setCameraIndex(0);
             // 主 UI 管线声明了 ext2/3 动态状态：blend / A2C / stencil 全部动态设置
             frame.setDynamicUI(true);
 
-            const float margin = 36.0F;
-            const float gap = 24.0F;
-            const float panelW = std::max((W - 2.0F * margin - gap) * 0.5F, 1.0F);
-            const float panelH = std::max(H - 2.0F * margin, 1.0F);
-            const ui_dao::rect_px left_panel{margin, margin, panelW, panelH};
-            const ui_dao::rect_px right_panel{margin + panelW + gap, margin, panelW,
-                                              panelH};
-            const auto inset = [](ui_dao::rect_px rect, float m) {
-                rect.x += m;
-                rect.y += m;
-                rect.w = std::max(rect.w - 2.0F * m, 1.0F);
-                rect.h = std::max(rect.h - 2.0F * m, 1.0F);
-                return rect;
-            };
-
-            const glm::vec4 left_bg{0.08F, 0.10F, 0.14F, 1.0F};
-            const glm::vec4 left_card{0.16F, 0.20F, 0.28F, 1.0F};
-            const glm::vec4 left_accent{0.20F, 0.85F, 0.95F, 1.0F};
-            const glm::vec4 right_bg{0.13F, 0.09F, 0.15F, 1.0F};
-            const glm::vec4 right_card{0.23F, 0.16F, 0.27F, 1.0F};
-            const glm::vec4 right_accent{0.95F, 0.50F, 0.75F, 1.0F};
-
-            // 第一段 state：左侧面板。Shape ×3 走一条 indirect command 的 3 个实例，
-            // PathStroke 另起一条 command；一次 drawIndexedIndirect 即可。
-            const auto left_card_rect = inset(left_panel, 20.0F);
-            frame.addInsteance(ui_dao::sdf_shape(left_panel, view, 18.0F, left_bg, {},
-                                                    0.0F, 0.0F, 1.0F, 1));
-            frame.addInsteance(ui_dao::sdf_shape(left_card_rect, view, 14.0F,
-                                                    left_card, {}, 0.0F, 0.0F, 1.0F, 2));
-            frame.addInsteance(
-                ui_dao::shape_border(left_card_rect, view, 14.0F, left_accent, 3.0F, 3));
-            const std::array<glm::vec2, 5> zig = {
-                glm::vec2{0.10F, 0.20F}, glm::vec2{0.50F, 0.82F}, glm::vec2{0.82F, 0.20F},
-                glm::vec2{0.22F, 0.62F}, glm::vec2{0.90F, 0.72F}};
-            frame.addInsteance(
-                ui_dao::path_stroke(inset(left_panel, 48.0F), view, std::span{zig}, 10.0F,
-                                    glm::vec4(0.95F, 0.35F, 0.75F, 1.0F),
-                                    glm::vec4(0.20F, 0.95F, 0.95F, 1.0F), 1, 4));
-
-            // 换 push（cameraIndex 变化）会提交左侧 draw_item；右侧是新 state。
-            // 两个 UBO 相机都是单位矩阵，画面不受影响，但 push 变化足以切 batch。
+            // ══════════════════════════════════════════════════════════════
+            // 表格 widget：z 序 = 交互优先级（最后画的在拾取上赢）
+            //   外框 → 列头 → 行带 → 格 → 文字 → 列分隔 → 滚动条 → 8 向把手
+            //   每个实例都带 zone；文字用"格子"的 zone
+            // ══════════════════════════════════════════════════════════════
             frame.setCameraIndex(1);
 
-            const auto right_card_rect = inset(right_panel, 20.0F);
-            frame.addInsteance(ui_dao::sdf_shape(right_panel, view, 18.0F, right_bg,
-                                                    {}, 0.0F, 0.0F, 1.0F, 5));
-            frame.addInsteance(ui_dao::sdf_shape(right_card_rect, view, 14.0F,
-                                                    right_card, {}, 0.0F, 0.0F, 1.0F, 6));
-            frame.addInsteance(ui_dao::shape_border(right_card_rect, view, 14.0F,
-                                                       right_accent, 3.0F, 7));
-            const std::array<glm::vec2, 3> tri = {glm::vec2{0.50F, 0.10F},
-                                                  glm::vec2{0.10F, 0.90F},
-                                                  glm::vec2{0.90F, 0.90F}};
-            frame.addInsteance(
-                ui_dao::path_fill(inset(right_panel, 48.0F), view, std::span{tri},
-                                  glm::vec4(0.20F, 0.65F, 0.95F, 1.0F),
-                                  glm::vec4(0.95F, 0.85F, 0.25F, 1.0F), 8));
+            auto &M = table_glue::model_ref();
+            auto &St = table_glue::style_ref();
+            auto &F = table_glue::font_ref();
+            auto &S = ui_table::state_ref();
+            auto &tbl_mouse = *fs.pickMouse;
 
-            // ── 动态状态演示：stencil 裁剪 + A2C + 动态混合（不新建管线）──
+            const float margin = 48.0F;
+            const ui_dao::rect_px avail{margin, margin, W - 2.0F * margin,
+                                        H - 2.0F * margin};
+
+            // 指针 / 按钮 / 键盘 / 滚轮；命中来自 picking（hover 回调已写进 S.hover）
+            ui_table::input_view in{};
+            in.px = static_cast<float>(tbl_mouse.pos.x);
+            in.py = static_cast<float>(tbl_mouse.pos.y);
+            in.left = inputCtx.input.isMouseButtonPressed(
+                mcs::vulkan::event::MouseButtons::eMOUSE_BUTTON_LEFT);
+            in.shift = inputCtx.input.isKeyPressedOrRepeat(
+                           mcs::vulkan::event::Key::eLEFT_SHIFT) ||
+                       inputCtx.input.isKeyPressedOrRepeat(
+                           mcs::vulkan::event::Key::eRIGHT_SHIFT);
+            in.ctrl = inputCtx.input.isKeyPressedOrRepeat(
+                          mcs::vulkan::event::Key::eLEFT_CONTROL) ||
+                      inputCtx.input.isKeyPressedOrRepeat(
+                          mcs::vulkan::event::Key::eRIGHT_CONTROL);
+            using mcs::vulkan::event::Key;
+            in.key_left = inputCtx.input.isKeyPressedOrRepeat(Key::eLEFT);
+            in.key_right = inputCtx.input.isKeyPressedOrRepeat(Key::eRIGHT);
+            in.key_up = inputCtx.input.isKeyPressedOrRepeat(Key::eUP);
+            in.key_down = inputCtx.input.isKeyPressedOrRepeat(Key::eDOWN);
+            in.key_home = inputCtx.input.isKeyPressedOrRepeat(Key::eHOME);
+            in.key_end = inputCtx.input.isKeyPressedOrRepeat(Key::eEND);
+            in.key_pgup = inputCtx.input.isKeyPressedOrRepeat(Key::ePAGE_UP);
+            in.key_pgdn = inputCtx.input.isKeyPressedOrRepeat(Key::ePAGE_DOWN);
+            in.key_a = inputCtx.input.isKeyPressedOrRepeat(Key::eA);
+            in.key_backspace = inputCtx.input.isKeyPressedOrRepeat(Key::eBACKSPACE);
+            in.key_del = inputCtx.input.isKeyPressedOrRepeat(Key::eDELETE);
+            in.key_enter = inputCtx.input.isKeyPressedOrRepeat(Key::eENTER);
+            in.key_esc = inputCtx.input.isKeyPressedOrRepeat(Key::eESCAPE);
+            in.key_tab = inputCtx.input.isKeyPressedOrRepeat(Key::eTAB);
+            in.key_x = inputCtx.input.isKeyPressedOrRepeat(Key::eX);
+            in.key_c = inputCtx.input.isKeyPressedOrRepeat(Key::eC);
+            in.key_v = inputCtx.input.isKeyPressedOrRepeat(Key::eV);
+            in.key_z = inputCtx.input.isKeyPressedOrRepeat(Key::eZ);
+            in.key_y = inputCtx.input.isKeyPressedOrRepeat(Key::eY);
+            in.key_f2 = inputCtx.input.isKeyPressedOrRepeat(Key::eF2);
+            in.key_space = inputCtx.input.isKeyPressedOrRepeat(Key::eSPACE);
+            // NOTE: 必须用局部 string 兜住 take() 的返回值 ——
+            //       直接 in.text = take() 会绑定到临时量，string_view 立刻悬空。
+            const std::string typed = table_glue::text().take();
+            in.text = typed;
+            // 平台层负责系统剪贴板：Ctrl+V 读、update 里要写就写
+            static bool prev_v = false;
+            const bool now_v = in.ctrl && in.key_v;
+            const std::string clip = (now_v && !prev_v)
+                                         ? table_glue::read_clipboard(fs.window->data())
+                                         : std::string{};
+            prev_v = now_v;
+            in.clipboard = clip;
+            const std::string ime = S.edit.active()
+                                        ? table_glue::ime_preedit(fs.window->data())
+                                        : std::string{};
+            in.compose = ime;
+            in.wheel = S.wheel_in;
+            in.picked = S.hover;
+            S.wheel_in = 0.0F;
             {
-                std::array<glm::vec2, 10> star{};
-                for (int i = 0; i < 10; ++i)
-                {
-                    const float a = -1.5707963F + static_cast<float>(i) * 0.62831853F;
-                    const float r = (i & 1) == 0 ? 0.46F : 0.20F;
-                    star[static_cast<std::size_t>(i)] = {
-                        0.5F + r * glm::cos(a), 0.5F + r * glm::sin(a)};
-                }
-                const ui_dao::rect_px clipRect{left_panel.x + 120.0F,
-                                               left_panel.y + 330.0F, 260.0F, 260.0F};
-                constexpr VkColorComponentFlags rgba =
-                    VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                    VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-                const VkColorBlendEquationEXT over{
-                    VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
-                    VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE,
-                    VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD};
-                const VkColorBlendEquationEXT add{
-                    VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD,
-                    VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD};
-                const VkColorBlendEquationEXT none{
-                    VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
-                    VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD};
-
-                // 1) mask：不写颜色，A2C 把解析覆盖率写进 stencil（INCR）
-                frame.setBlendState({VK_FALSE, VK_FALSE}, {none, none}, {0, 0});
-                frame.setAlphaToCoverage(VK_TRUE);
-                frame.setStencilTest(VK_TRUE);
-                frame.setStencilOp(VkStencilOpState{
-                    .failOp = VK_STENCIL_OP_KEEP,
-                    .passOp = VK_STENCIL_OP_INCREMENT_AND_CLAMP,
-                    .depthFailOp = VK_STENCIL_OP_KEEP,
-                    .compareOp = VK_COMPARE_OP_ALWAYS,
-                    .compareMask = 0xFF,
-                    .writeMask = 0xFF,
-                    .reference = 0});
-                frame.setStencilRef(0);
-                frame.addInsteance(ui_dao::path_fill(clipRect, view, std::span{star},
-                                                     glm::vec4(1.0F), {}, 0, 1.0F));
-
-                // 2) content：stencil EQUAL 1 才写，over 混合
-                frame.setBlendState({VK_TRUE, VK_FALSE}, {over, none}, {rgba, rgba});
-                frame.setAlphaToCoverage(VK_FALSE);
-                frame.setStencilOp(VkStencilOpState{
-                    .failOp = VK_STENCIL_OP_KEEP,
-                    .passOp = VK_STENCIL_OP_KEEP,
-                    .depthFailOp = VK_STENCIL_OP_KEEP,
-                    .compareOp = VK_COMPARE_OP_EQUAL,
-                    .compareMask = 0xFF,
-                    .writeMask = 0x00,
-                    .reference = 0});
-                frame.setStencilRef(1);
-                frame.addInsteance(ui_dao::sdf_linear(
-                    clipRect, view, 0.0F, glm::vec4(1.0F, 0.55F, 0.2F, 1.0F),
-                    glm::vec4(0.2F, 0.8F, 1.0F, 1.0F), true));
-
-                // 3) glow：add 混合，不测 stencil
-                frame.setStencilTest(VK_FALSE);
-                frame.setBlendState({VK_TRUE, VK_FALSE}, {add, none}, {rgba, rgba});
-                frame.addInsteance(ui_dao::sdf_radial(
-                    {clipRect.x - 70.0F, clipRect.y - 70.0F, clipRect.w + 140.0F,
-                     clipRect.h + 140.0F},
-                    view, 0.0F, glm::vec4(1.0F, 0.85F, 0.25F, 0.45F),
-                    glm::vec4(0.0F)));
-
-                // 4) 恢复默认，后续圆点/抓屏按 over 走
-                frame.setBlendState({VK_TRUE, VK_FALSE}, {over, none}, {rgba, rgba});
-                frame.setStencilTest(VK_FALSE);
-                frame.setAlphaToCoverage(VK_FALSE);
+                static const auto t0 = std::chrono::steady_clock::now();
+                in.now =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+                        .count();
             }
 
-            // 九宫格：边框保持源像素宽度，中间拉伸（新 ABI 字段 src_size/border）
+            ui_table::update(S, M, St, F, in);
+            ui_table::normalize(S, M, St, avail);
+            renderVersion = S.version;
+            if (S.clip_out.set)
             {
-                auto &uiTex = uiTextures();
-                frame.addInsteance(ui_dao::nine_slice(
-                    {left_panel.x + 60.0F, left_panel.y + 50.0F, 300.0F, 150.0F},
-                    view, uiTex.nineSlice, uiTex.sampler,
-                    glm::vec2(static_cast<float>(uiTex.nineSliceExtent.width),
-                              static_cast<float>(uiTex.nineSliceExtent.height)),
-                    glm::vec4(32.0F), glm::vec4(1.0F), 0.0F, 30));
+                table_glue::write_clipboard(fs.window->data(), S.clip_out.text);
+                S.clip_out.set = false;
+                S.clip_out.text.clear();
             }
 
-            // 虚线：沿折线按弧长取模（PathStroke.dash）
+            // [LAYOUT] 每 60 帧打一次：列的 x/w + 滚动量（诊断用）
+            if (std::getenv("TABLE_TRACE_LAYOUT") != nullptr)
             {
-                const std::array<glm::vec2, 7> wave = {
-                    glm::vec2{0.05F, 0.50F}, glm::vec2{0.18F, 0.12F},
-                    glm::vec2{0.34F, 0.88F}, glm::vec2{0.50F, 0.12F},
-                    glm::vec2{0.66F, 0.88F}, glm::vec2{0.82F, 0.12F},
-                    glm::vec2{0.95F, 0.50F}};
-                frame.addInsteance(ui_dao::path_stroke_dashed(
-                    {left_panel.x + 40.0F, left_panel.y + 240.0F, 520.0F, 90.0F},
-                    view, std::span{wave}, 9.0F, 18.0F, 12.0F,
-                    glm::vec4(0.95F, 0.85F, 0.3F, 1.0F), {}, 0, 40));
-            }
-
-            // 圆弧：圆环 + 角度裁剪（Shape.arc）
-            {
-                frame.addInsteance(ui_dao::shape_arc(
-                    {right_panel.x + 170.0F, right_panel.y + 470.0F, 190.0F, 190.0F},
-                    view, 95.0F, glm::vec4(0.3F, 0.95F, 0.85F, 1.0F), 14.0F,
-                    -1.0F, 2.2F, 41));
-            }
-
-            // 多 stop 渐变：左 = mode 3（sRGB→linear 插值），右 = mode 0（直接插值）
-            {
-                const std::array<float, 4> pos{0.0F, 0.35F, 0.65F, 1.0F};
-                const std::array<glm::vec4, 4> cols{
-                    glm::vec4(0.2F, 0.35F, 0.95F, 1.0F),
-                    glm::vec4(0.2F, 0.85F, 0.95F, 1.0F),
-                    glm::vec4(0.95F, 0.85F, 0.25F, 1.0F),
-                    glm::vec4(0.95F, 0.35F, 0.65F, 1.0F)};
-                frame.addInsteance(ui_dao::gradient(
-                    {left_panel.x + 40.0F, left_panel.y + 600.0F, 255.0F, 60.0F},
-                    view, 3, {0.0F, 0.0F}, {255.0F, 0.0F}, pos, cols,
-                    glm::vec4(1.0F), 12.0F, 1.0F, 50));
-                frame.addInsteance(ui_dao::gradient(
-                    {left_panel.x + 300.0F, left_panel.y + 600.0F, 255.0F, 60.0F},
-                    view, 0, {0.0F, 0.0F}, {255.0F, 0.0F}, pos, cols,
-                    glm::vec4(1.0F), 12.0F, 1.0F, 51));
-            }
-
-            // 三次贝塞尔：S 形描边 + 闭合叶形填充（每 4 点一段）
-            {
-                const std::array<glm::vec2, 8> scurve = {
-                    glm::vec2{0.05F, 0.50F}, glm::vec2{0.25F, 0.05F},
-                    glm::vec2{0.35F, 0.95F}, glm::vec2{0.50F, 0.50F},
-                    glm::vec2{0.50F, 0.50F}, glm::vec2{0.65F, 0.05F},
-                    glm::vec2{0.75F, 0.95F}, glm::vec2{0.95F, 0.50F}};
-                frame.addInsteance(ui_dao::path_curve_stroke(
-                    {right_panel.x + 40.0F, right_panel.y + 380.0F, 560.0F, 80.0F},
-                    view, std::span{scurve}, 8.0F,
-                    glm::vec4(0.95F, 0.45F, 0.85F, 1.0F), {}, 1, 60));
-
-                const std::array<glm::vec2, 8> leaf = {
-                    glm::vec2{0.50F, 0.05F}, glm::vec2{0.95F, 0.25F},
-                    glm::vec2{0.85F, 0.95F}, glm::vec2{0.50F, 0.95F},
-                    glm::vec2{0.50F, 0.95F}, glm::vec2{0.15F, 0.95F},
-                    glm::vec2{0.05F, 0.25F}, glm::vec2{0.50F, 0.05F}};
-                frame.addInsteance(ui_dao::path_curve_fill(
-                    {left_panel.x + 380.0F, left_panel.y + 80.0F, 160.0F, 130.0F},
-                    view, std::span{leaf}, glm::vec4(0.2F, 1.0F, 0.3F, 1.0F),
-                    {}, 61));
-            }
-
-            // 玻璃区域背后的真实场景内容：一排彩色圆点（部分伸出卡片外，
-            // 便于对比“卡片外清晰 / 卡片内模糊”）。
-            for (int i = 0; i < 5; ++i)
-            {
-                const float t = static_cast<float>(i);
-                frame.addInsteance(ui_dao::sdf_shape(
-                    {right_panel.x + 40.0F + t * 95.0F, right_panel.y + 190.0F, 70.0F,
-                     70.0F},
-                    view, 35.0F,
-                    glm::vec4(0.95F, 0.45F + t * 0.08F, 0.25F + t * 0.12F, 1.0F)));
-            }
-
-            // ── 能力条：纹理 / 颜色 / 裁剪 / 组透明度（复用现有 program）────
-            {
-                auto &uiTex = uiTextures();
-                const auto tile = [](const ui_dao::rect_px &panel, int col, int row) {
-                    return ui_dao::rect_px{
-                        panel.x + kTileX + static_cast<float>(col) * (kTileW + kTileGap),
-                        panel.y + kTileY + static_cast<float>(row) * (kTileH + kTileGap),
-                        kTileW, kTileH};
-                };
-                constexpr VkColorComponentFlags rgba =
-                    VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                    VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-                const VkColorBlendEquationEXT over{
-                    VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
-                    VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE,
-                    VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD};
-                const VkColorBlendEquationEXT none{
-                    VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD,
-                    VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD};
-
-                // 1. 纹理 alpha mask
-                frame.addInsteance(ui_dao::texture_masked(
-                    tile(left_panel, 0, 0), view, uiTex.checker, uiTex.sampler,
-                    uiTex.alphaMask, uiTex.sampler, UvTransform{}, glm::vec4(1.0F),
-                    {}, 8.0F, 80));
-
-                // 2. mip LOD：三条不同 lod
-                for (int k = 0; k < 3; ++k)
+                static int dbg = 0;
+                if ((++dbg % 60) == 1)
                 {
-                    auto t = tile(left_panel, 1, 0);
-                    t.y += static_cast<float>(k) * 20.0F;
-                    t.h = 20.0F;
-                    frame.addInsteance(ui_dao::texture_lod(
-                        t, view, uiTex.checker, uiTex.sampler,
-                        static_cast<float>(k) * 2.0F, glm::vec4(1.0F), {}, 4.0F, 81));
-                }
-
-                // 3. 纹理模糊
-                frame.addInsteance(ui_dao::blur(
-                    tile(left_panel, 2, 0), view, uiTex.checker, uiTex.sampler, 4.0F,
-                    5, glm::vec4(1.0F), {}, 8.0F, 82));
-
-                // 4. aurora + vignette + noise（同一 tile，覆盖程序化后处理）
-                {
-                    const auto t = tile(left_panel, 3, 0);
-                    const VkColorBlendEquationEXT add2{
-                        VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD,
-                        VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE, VK_BLEND_OP_ADD};
-                    frame.addInsteance(ui_dao::sdf_shape(
-                        t, view, 8.0F, glm::vec4(0.03F, 0.05F, 0.09F, 1.0F)));
-                    frame.setBlendState({VK_TRUE, VK_FALSE}, {add2, none},
-                                        {rgba, rgba});
-                    frame.addInsteance(ui_dao::sdf_radial(
-                        t, view, 8.0F, glm::vec4(0.2F, 1.0F, 0.7F, 0.55F),
-                        glm::vec4(0.0F)));
-                    frame.addInsteance(ui_dao::sdf_radial(
-                        t, view, 8.0F, glm::vec4(0.6F, 0.3F, 1.0F, 0.55F),
-                        glm::vec4(0.0F)));
-                    frame.setBlendState({VK_TRUE, VK_FALSE}, {over, none},
-                                        {rgba, rgba});
-                    frame.addInsteance(ui_dao::sdf_radial(
-                        t, view, 8.0F, glm::vec4(0.0F),
-                        glm::vec4(0.0F, 0.0F, 0.0F, 0.65F)));
-                    frame.addInsteance(ui_dao::noise(
-                        t, view, glm::vec4(0.0F),
-                        glm::vec4(1.0F, 1.0F, 1.0F, 0.18F), 8.0F, 1.0F, 4, 8.0F,
-                        83));
-                }
-
-                // 5. 颜色矩阵：sepia
-                glm::mat4 sepia(1.0F);
-                sepia[0] = {0.393F, 0.349F, 0.272F, 0.0F};
-                sepia[1] = {0.769F, 0.686F, 0.534F, 0.0F};
-                sepia[2] = {0.189F, 0.168F, 0.131F, 0.0F};
-                sepia[3] = {0.0F, 0.0F, 0.0F, 1.0F};
-                frame.addInsteance(ui_dao::color_matrix(
-                    tile(right_panel, 0, 0), view, uiTex.checker, uiTex.sampler, sepia,
-                    glm::vec4(0.02F, 0.01F, 0.0F, 0.0F), glm::vec4(1.0F), {}, 8.0F,
-                    84));
-
-                // 6. 颜色矩阵：左灰 / 右反相
-                {
-                    const auto t = tile(right_panel, 1, 0);
-                    glm::mat4 gray(1.0F);
-                    gray[0] = {0.299F, 0.587F, 0.114F, 0.0F};
-                    gray[1] = {0.299F, 0.587F, 0.114F, 0.0F};
-                    gray[2] = {0.299F, 0.587F, 0.114F, 0.0F};
-                    gray[3] = {0.0F, 0.0F, 0.0F, 1.0F};
-                    frame.addInsteance(ui_dao::color_matrix(
-                        {t.x, t.y, t.w * 0.48F, t.h}, view, uiTex.checker,
-                        uiTex.sampler, gray, glm::vec4(0.0F), glm::vec4(1.0F), {},
-                        8.0F, 85));
-                    glm::mat4 invert(1.0F);
-                    invert[0][0] = -1.0F;
-                    invert[1][1] = -1.0F;
-                    invert[2][2] = -1.0F;
-                    frame.addInsteance(ui_dao::color_matrix(
-                        {t.x + t.w * 0.52F, t.y, t.w * 0.48F, t.h}, view,
-                        uiTex.checker, uiTex.sampler, invert,
-                        glm::vec4(1.0F, 1.0F, 1.0F, 0.0F), glm::vec4(1.0F), {}, 8.0F,
-                        85));
-                }
-
-                // 7. 文字描边/字影：每个字形先画 8 份偏移暗色，再画本体
-                {
-                    const auto t = tile(right_panel, 2, 0);
-                    const float fs = 18.0F;
-                    float cursor = t.x + 10.0F;
-                    const float baseline = t.y + 40.0F;
-                    const auto &line = uiUnicodeLines()[0];
-                    for (int gi = 0;
-                         gi < 3 && gi < static_cast<int>(line.glyphs.size()); ++gi)
-                    {
-                        const auto &g = line.glyphs[static_cast<std::size_t>(gi)];
-                        const float ydir = g.yDown ? 1.0F : -1.0F;
-                        float l = cursor + g.plane.x * fs;
-                        float r = cursor + g.plane.z * fs;
-                        float tp = baseline + ydir * g.plane.y * fs;
-                        float bt = baseline + ydir * g.plane.w * fs;
-                        if (r < l)
-                            std::swap(l, r);
-                        if (bt < tp)
-                            std::swap(tp, bt);
-                        UvTransform uv{};
-                        uv.scale = {g.uv.z - g.uv.x, g.uv.w - g.uv.y};
-                        uv.offset = {g.uv.x, g.uv.y};
-                        for (int oy = -1; oy <= 1; ++oy)
-                            for (int ox = -1; ox <= 1; ++ox)
-                            {
-                                if (ox == 0 && oy == 0)
-                                    continue;
-                                frame.addInsteance(ui_dao::glyph_quad(
-                                    {l + static_cast<float>(ox) * 1.5F,
-                                     tp + static_cast<float>(oy) * 1.5F, r - l, bt - tp},
-                                    view, g.tex, g.samp, g.shaderFont, g.pxRange,
-                                    glm::vec4(0.05F, 0.05F, 0.05F, 1.0F), uv, 86));
-                            }
-                        frame.addInsteance(ui_dao::glyph_quad(
-                            {l, tp, r - l, bt - tp}, view, g.tex, g.samp, g.shaderFont,
-                            g.pxRange, glm::vec4(1.0F), uv, 87));
-                        cursor += g.advance * fs;
-                    }
-                }
-
-                // 8. 嵌套裁剪：star ∩ circle（两级 stencil）
-                {
-                    const auto t = tile(right_panel, 3, 0);
-                    std::array<glm::vec2, 10> star{};
-                    for (int i = 0; i < 10; ++i)
-                    {
-                        const float a =
-                            -1.5707963F + static_cast<float>(i) * 0.62831853F;
-                        const float r = (i & 1) == 0 ? 0.46F : 0.20F;
-                        star[static_cast<std::size_t>(i)] = {0.5F + r * glm::cos(a),
-                                                             0.5F + r * glm::sin(a)};
-                    }
-                    frame.setBlendState({VK_FALSE, VK_FALSE}, {none, none}, {0, 0});
-                    frame.setAlphaToCoverage(VK_TRUE);
-                    frame.setStencilTest(VK_TRUE);
-                    frame.setStencilOp(VkStencilOpState{
-                        .failOp = VK_STENCIL_OP_KEEP,
-                        .passOp = VK_STENCIL_OP_INCREMENT_AND_CLAMP,
-                        .depthFailOp = VK_STENCIL_OP_KEEP,
-                        .compareOp = VK_COMPARE_OP_ALWAYS,
-                        .compareMask = 0xFF,
-                        .writeMask = 0xFF,
-                        .reference = 0});
-                    frame.setStencilRef(0);
-                    frame.addInsteance(ui_dao::path_fill(
-                        t, view, std::span{star}, glm::vec4(1.0F), {}, 0, 1.0F));
-
-                    frame.setStencilOp(VkStencilOpState{
-                        .failOp = VK_STENCIL_OP_KEEP,
-                        .passOp = VK_STENCIL_OP_INCREMENT_AND_CLAMP,
-                        .depthFailOp = VK_STENCIL_OP_KEEP,
-                        .compareOp = VK_COMPARE_OP_EQUAL,
-                        .compareMask = 0xFF,
-                        .writeMask = 0xFF,
-                        .reference = 0});
-                    frame.setStencilRef(1);
-                    frame.addInsteance(ui_dao::sdf_shape(
-                        {t.x + 8.0F, t.y + 10.0F, 45.0F, 45.0F}, view, 22.5F,
-                        glm::vec4(1.0F)));
-
-                    frame.setAlphaToCoverage(VK_FALSE);
-                    frame.setBlendState({VK_TRUE, VK_FALSE}, {over, none},
-                                        {rgba, rgba});
-                    frame.setStencilOp(VkStencilOpState{
-                        .failOp = VK_STENCIL_OP_KEEP,
-                        .passOp = VK_STENCIL_OP_KEEP,
-                        .depthFailOp = VK_STENCIL_OP_KEEP,
-                        .compareOp = VK_COMPARE_OP_EQUAL,
-                        .compareMask = 0xFF,
-                        .writeMask = 0x00,
-                        .reference = 0});
-                    frame.setStencilRef(2);
-                    frame.addInsteance(ui_dao::sdf_linear(
-                        t, view, 8.0F, glm::vec4(1.0F, 0.5F, 0.2F, 1.0F),
-                        glm::vec4(0.2F, 0.8F, 1.0F, 1.0F), true));
-                    frame.setStencilTest(VK_FALSE);
-                }
-
-                // 9. 组透明度：两个形状先在 layer2 合成，再整体 0.55 叠上
-                frame.addInsteance(ui_dao::texture(
-                    tile(left_panel, 0, 1), view, layerGroup.texture, layerGroup.sampler,
-                    glm::vec4(1.0F, 1.0F, 1.0F, 0.55F), {}, 8.0F, 88));
-
-                // 10. 径向渐变
-                frame.addInsteance(ui_dao::sdf_radial(
-                    tile(left_panel, 1, 1), view, 8.0F,
-                    glm::vec4(1.0F, 0.9F, 0.3F, 1.0F),
-                    glm::vec4(0.15F, 0.1F, 0.25F, 1.0F)));
-                // 11. 圆锥渐变
-                frame.addInsteance(ui_dao::sdf_conic(
-                    tile(left_panel, 2, 1), view, 8.0F,
-                    glm::vec4(0.2F, 0.9F, 0.95F, 1.0F),
-                    glm::vec4(0.95F, 0.35F, 0.65F, 1.0F), 3.0F));
-                // 12. 逐角半径
-                frame.addInsteance(ui_dao::shape_per_corner(
-                    tile(left_panel, 3, 1), view,
-                    glm::vec4(28.0F, 4.0F, 28.0F, 4.0F),
-                    glm::vec4(0.55F, 0.75F, 0.95F, 1.0F)));
-                // 13. 椭圆
-                frame.addInsteance(ui_dao::shape_ellipse(
-                    tile(right_panel, 0, 1), view,
-                    glm::vec4(0.95F, 0.6F, 0.3F, 0.9F)));
-                // 14. 旋转 + 斜切
-                {
-                    const auto t = tile(right_panel, 1, 1);
-                    auto a = ui_dao::sdf_shape(
-                        {t.x + 4.0F, t.y + 8.0F, 50.0F, 50.0F}, view, 10.0F,
-                        glm::vec4(0.95F, 0.45F, 0.85F, 1.0F));
-                    a.model = a.model * glm::rotate(glm::mat4(1.0F),
-                                                    glm::radians(18.0F),
-                                                    glm::vec3(0.0F, 0.0F, 1.0F));
-                    frame.addInsteance(a);
-                    auto b = ui_dao::sdf_shape(
-                        {t.x + 62.0F, t.y + 8.0F, 50.0F, 50.0F}, view, 6.0F,
-                        glm::vec4(0.35F, 0.9F, 0.7F, 1.0F));
-                    glm::mat4 shear(1.0F);
-                    shear[1][0] = 0.35F;
-                    b.model = b.model * shear;
-                    frame.addInsteance(b);
-                }
-                // 15. multiply 混合
-                {
-                    const auto t = tile(right_panel, 2, 1);
-                    frame.addInsteance(ui_dao::sdf_shape(
-                        t, view, 8.0F, glm::vec4(0.95F, 0.7F, 0.2F, 1.0F)));
-                    const VkColorBlendEquationEXT mul{
-                        VK_BLEND_FACTOR_DST_COLOR, VK_BLEND_FACTOR_ZERO,
-                        VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ONE,
-                        VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD};
-                    frame.setBlendState({VK_TRUE, VK_FALSE}, {mul, none},
-                                        {rgba, rgba});
-                    frame.addInsteance(ui_dao::sdf_shape(
-                        {t.x + 40.0F, t.y + 8.0F, 70.0F, 50.0F}, view, 20.0F,
-                        glm::vec4(0.3F, 0.6F, 0.95F, 1.0F)));
-                    const VkColorBlendEquationEXT erase{
-                        VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
-                        VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ZERO,
-                        VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD};
-                    frame.setBlendState({VK_TRUE, VK_FALSE}, {erase, none},
-                                        {rgba, rgba});
-                    frame.addInsteance(ui_dao::sdf_shape(
-                        {t.x + 10.0F, t.y + 22.0F, 34.0F, 22.0F}, view, 8.0F,
-                        glm::vec4(1.0F)));
-                    frame.setBlendState({VK_TRUE, VK_FALSE}, {over, none},
-                                        {rgba, rgba});
-                }
-                // 16. 多层阴影 + 多边框
-                {
-                    const auto t = tile(right_panel, 3, 1);
-                    frame.addInsteance(ui_dao::shape_blurred(
-                        {t.x + 18.0F, t.y + 18.0F, 80.0F, 34.0F}, view, 10.0F,
-                        glm::vec4(0.0F, 0.0F, 0.0F, 0.8F), 10.0F));
-                    frame.addInsteance(ui_dao::shape_blurred(
-                        {t.x + 14.0F, t.y + 12.0F, 90.0F, 42.0F}, view, 10.0F,
-                        glm::vec4(0.2F, 0.8F, 0.9F, 0.5F), 6.0F));
-                    frame.addInsteance(ui_dao::sdf_shape(
-                        {t.x + 16.0F, t.y + 12.0F, 88.0F, 42.0F}, view, 10.0F,
-                        glm::vec4(0.16F, 0.2F, 0.28F, 1.0F)));
-                    frame.addInsteance(ui_dao::shape_border(
-                        {t.x + 16.0F, t.y + 12.0F, 88.0F, 42.0F}, view, 10.0F,
-                        glm::vec4(0.2F, 0.85F, 0.95F, 1.0F), 3.0F, 90));
-                    frame.addInsteance(ui_dao::shape_border(
-                        {t.x + 22.0F, t.y + 17.0F, 76.0F, 32.0F}, view, 8.0F,
-                        glm::vec4(0.95F, 0.85F, 0.3F, 1.0F), 1.5F, 91));
-                }
-                // 17. 滤镜族：dilate / levels / edge / displace（第 5 列）
-                {
-                    const uint32_t src =
-                        uiTex.photo != ~0u ? uiTex.photo : uiTex.checker;
-                    const glm::vec4 texel{1.0F / 512.0F, 1.0F / 512.0F, 0.0F, 0.0F};
-                    frame.addInsteance(ui_dao::filter_quad(
-                        tile(left_panel, 4, 0), view, src, uiTex.sampler, 0, 2.0F,
-                        glm::vec4(0.0F), texel, 0, 0, glm::vec4(1.0F), {}, 100));
-                    frame.addInsteance(ui_dao::filter_quad(
-                        tile(left_panel, 4, 1), view, src, uiTex.sampler, 5, 0.0F,
-                        glm::vec4(0.15F, 0.85F, 1.4F, 0.5F), texel, 0, 0,
-                        glm::vec4(1.0F), {}, 101));
-                    frame.addInsteance(ui_dao::filter_quad(
-                        tile(right_panel, 4, 0), view, src, uiTex.sampler, 2, 1.0F,
-                        glm::vec4(0.0F), texel, 0, 0, glm::vec4(1.0F), {}, 102));
-                    frame.addInsteance(ui_dao::filter_quad(
-                        tile(right_panel, 4, 1), view, src, uiTex.sampler, 7, 0.06F,
-                        glm::vec4(0.0F), texel, uiTex.checker, uiTex.sampler,
-                        glm::vec4(1.0F), {}, 103));
+                    std::print("[layout] sx={:.0f} sy={:.0f} frozen={} cols={}", S.sx,
+                               S.sy, S.last.frozen, S.last.cols.size());
+                    for (const auto &c : S.last.cols)
+                        std::print(" ({}:{:.0f},{:.0f})", c.index, c.x, c.w);
+                    std::println("");
                 }
             }
 
-            // ── 最近三个功能的屏幕标注（滤镜 / sRGB / 3D 光照）──────────
-            {
-                auto &glyphs = uiAsciiGlyphs();
-                const auto label = [&](const char *text, float x, float baseline,
-                                       float fs, const glm::vec4 &color,
-                                       std::uint32_t entity) {
-                    float cursor = x;
-                    for (const char *p = text; *p != 0; ++p)
-                    {
-                        const auto it = glyphs.find(
-                            static_cast<char32_t>(static_cast<unsigned char>(*p)));
-                        if (it == glyphs.end())
-                        {
-                            cursor += fs * 0.3F;
-                            continue;
-                        }
-                        const auto &g = it->second;
-                        const float ydir = g.yDown ? 1.0F : -1.0F;
-                        float l = cursor + g.plane.x * fs;
-                        float r = cursor + g.plane.z * fs;
-                        float tp = baseline + ydir * g.plane.y * fs;
-                        float bt = baseline + ydir * g.plane.w * fs;
-                        if (r < l)
-                            std::swap(l, r);
-                        if (bt < tp)
-                            std::swap(tp, bt);
-                        if (r - l > 0.0F && bt - tp > 0.0F)
-                        {
-                            UvTransform uv{};
-                            uv.scale = {g.uv.z - g.uv.x, g.uv.w - g.uv.y};
-                            uv.offset = {g.uv.x, g.uv.y};
-                            frame.addInsteance(ui_dao::glyph_quad(
-                                {l, tp, r - l, bt - tp}, view, g.tex, g.samp,
-                                g.shaderFont, g.pxRange, color, uv, entity));
-                        }
-                        cursor += g.advance * fs;
-                    }
-                };
-                const auto chip = [&](const ui_dao::rect_px &r) {
-                    frame.addInsteance(ui_dao::sdf_shape(
-                        r, view, 3.0F, glm::vec4(0.0F, 0.0F, 0.0F, 0.62F), {},
-                        0.0F, 0.0F, 1.0F, 299));
-                };
-                // 滤镜 tile（第 5 列）
-                const std::array<const char *, 4> names = {"DILATE", "LEVELS",
-                                                          "EDGE", "DISPLACE"};
-                for (int i = 0; i < 4; ++i)
-                {
-                    const auto &panel = (i < 2) ? left_panel : right_panel;
-                    const int row = i % 2;
-                    const ui_dao::rect_px t{
-                        panel.x + kTileX +
-                            4.0F * (kTileW + kTileGap),
-                        panel.y + kTileY +
-                            static_cast<float>(row) * (kTileH + kTileGap),
-                        kTileW, 14.0F};
-                    chip(t);
-                    label(names[i], t.x + 3.0F, t.y + 11.0F, 9.0F,
-                          glm::vec4(1.0F), static_cast<std::uint32_t>(300 + i));
-                }
-                // sRGB 对比条
-                chip({left_panel.x + 40.0F, left_panel.y + 600.0F, 90.0F, 14.0F});
-                label("LINEAR", left_panel.x + 43.0F, left_panel.y + 611.0F, 9.0F,
-                      glm::vec4(1.0F), 304);
-                chip({left_panel.x + 300.0F, left_panel.y + 600.0F, 60.0F, 14.0F});
-                label("SRGB", left_panel.x + 303.0F, left_panel.y + 611.0F, 9.0F,
-                      glm::vec4(1.0F), 305);
-                // 3D 区域
-                chip({right_panel.x + 140.0F,
-                      right_panel.y + 430.0F - 14.0F, k3dAreaW, 14.0F});
-                label("3D LIGHT", right_panel.x + 143.0F,
-                      right_panel.y + 430.0F - 3.0F, 9.0F, glm::vec4(1.0F), 306);
-            }
+            // 光标形状跟着 hover 的 zone 走（只在变化时 glfwSetCursor）
+            table_glue::apply_cursor(fs.window->data(), ui_table::cursor_for(S, S.hover));
 
-            // ── 3D 段：任意 mesh + cameraInfo[0]（静态 MVP；input 未接）────
-            {
-                auto &uiTex = uiTextures();
-                // 显式划定 3D 占用的屏幕区域：先画一块 UI 背板，再只在该矩形内画 3D
-                const ui_dao::rect_px area3d{right_panel.x + 140.0F,
-                                             right_panel.y + 430.0F, k3dAreaW,
-                                             k3dAreaH};
-                frame.addInsteance(ui_dao::sdf_shape(
-                    area3d, view, 12.0F, glm::vec4(0.03F, 0.05F, 0.09F, 1.0F), {},
-                    0.0F, 0.0F, 1.0F, 210));
-                frame.addInsteance(ui_dao::shape_border(
-                    area3d, view, 12.0F, glm::vec4(0.25F, 0.8F, 0.95F, 0.9F), 2.0F,
-                    211));
-                if (uiMeshes().cube.valid())
-                {
-                    const VkViewport vp3{area3d.x + 6.0F, area3d.y + 6.0F,
-                                         area3d.w - 12.0F, area3d.h - 12.0F, 0.0F,
-                                         1.0F};
-                    const VkRect2D sc3{
-                        {static_cast<std::int32_t>(area3d.x + 6.0F),
-                         static_cast<std::int32_t>(area3d.y + 6.0F)},
-                        {static_cast<std::uint32_t>(k3dAreaW - 12.0F),
-                         static_cast<std::uint32_t>(k3dAreaH - 12.0F)}};
-                    frame.setPipeline(*pipelineOpaque3D);
-                    frame.setPipelineLayout(*pipelineLayout);
-                    frame.setDescriptorSet(descriptorSet);
-                    frame.setViewport(vp3);
-                    frame.setScissor(sc3);
-                    frame.setCameraIndex(0);
-                    // 3D 不透明：显式关掉上一段 UI 留下的动态混合
-                    frame.setDynamicUI(true);
-                    frame.setBlendState({VK_FALSE, VK_FALSE},
-                                        {kBlendNone, kBlendNone},
-                                        {kColorWriteRGBA, kColorWriteRGBA});
-                    frame.setAlphaToCoverage(VK_FALSE);
-                    frame.setStencilTest(VK_FALSE);
-                    frame.setMesh(uiMeshes().cube);
-                    const uint32_t tex3d =
-                        uiTex.photo != ~0u ? uiTex.photo : uiTex.checker;
-                    for (int i = 0; i < 6; ++i)
-                    {
-                        auto t = ui_dao::mesh_quad(
-                            {0.0F, 0.0F, 1.0F, 1.0F}, view, tex3d,
-                            uiTex.sampler, glm::vec4(1.0F), {}, 0.45F,
-                            static_cast<std::uint32_t>(200 + i));
-                        const float x =
-                            (static_cast<float>(i % 3) - 1.0F) * 1.25F;
-                        const float y =
-                            (static_cast<float>(i / 3) - 0.5F) * 1.25F;
-                        // 每个 cube 给不同 z，避免同深度面相交产生 z-fighting 闪烁
-                        const float z =
-                            (static_cast<float>(i) - 2.5F) * 0.22F;
-                        t.model =
-                            glm::translate(glm::mat4(1.0F), glm::vec3(x, y, z)) *
-                            glm::rotate(glm::mat4(1.0F),
-                                        glm::radians(30.0F + 12.0F * i) +
-                                            t3d * 0.9F,
-                                        glm::vec3(0.35F, 1.0F, 0.2F)) *
-                            glm::scale(glm::mat4(1.0F), glm::vec3(0.78F));
-                        frame.addInsteance(t);
-                    }
-                    // 光源 gizmo：球体 + 自发光边缘，和真实点光源同一位置
-                    const uint32_t white =
-                        uiTex.white != ~0u ? uiTex.white : uiTex.checker;
-                    auto light_gizmo = ui_dao::mesh_quad(
-                        {0.0F, 0.0F, 1.0F, 1.0F}, view, white, uiTex.sampler,
-                        glm::vec4(1.0F, 0.85F, 0.35F, 1.0F), {}, 0.0F, 999, 2);
-                    light_gizmo.model =
-                        glm::translate(glm::mat4(1.0F), light_pos) *
-                        glm::scale(glm::mat4(1.0F), glm::vec3(0.34F));
-                    frame.setMesh(uiMeshes().sphere);
-                    frame.addInsteance(light_gizmo);
-                }
-            }
-
-            // ── 抓主 framebuffer → 模糊 → 玻璃合成 ────────────────────────
-            //   1) 主通道刚 resolve 到 swapchain（1x），先转 TRANSFER_SRC
-            //   2) blit 玻璃区域 → layerCapture（真实 UI 内容）
-            //   3) layerCapture →(高斯模糊)→ layerBlur
-            //   4) swapchain 转回 COLOR_ATTACHMENT，LOAD 后画玻璃
-            if (W >= 320.0F && H >= 192.0F)
-            {
-                const float gx = std::clamp(right_panel.x + 120.0F, 0.0F,
-                                            W - static_cast<float>(ui_layer_ctx::kExtent.width));
-                const float gy = std::clamp(right_panel.y + 140.0F, 0.0F,
-                                            H - static_cast<float>(ui_layer_ctx::kExtent.height));
-                const ui_dao::rect_px glassArea{
-                    gx, gy, static_cast<float>(ui_layer_ctx::kExtent.width),
-                    static_cast<float>(ui_layer_ctx::kExtent.height)};
-
-                frame.add_transition(my_render::image_info{
-                    .image = image,
-                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                            .stage_mask =
-                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
-                    .dst = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
-                            .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
-
-                frame.add_transition(my_render::image_info{
-                    .image = layerCapture.image,
-                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
-                            .access_mask = VK_ACCESS_2_NONE,
-                            .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
-                    .dst = {.layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                            .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
-
-                const VkImageBlit blit{
-                    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                    .srcOffsets = {
-                        {static_cast<std::int32_t>(glassArea.x),
-                         static_cast<std::int32_t>(glassArea.y), 0},
-                        {static_cast<std::int32_t>(glassArea.x + glassArea.w),
-                         static_cast<std::int32_t>(glassArea.y + glassArea.h), 1}},
-                    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                    .dstOffsets = {
-                        {0, 0, 0},
-                        {static_cast<std::int32_t>(ui_layer_ctx::kExtent.width),
-                         static_cast<std::int32_t>(ui_layer_ctx::kExtent.height), 1}}};
-                frame.add_blit_image(
-                    image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, layerCapture.image,
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, std::span{&blit, 1},
-                    VK_FILTER_NEAREST);
-
-                frame.add_transition(my_render::image_info{
-                    .image = layerCapture.image,
-                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .src = {.layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                            .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT},
-                    .dst = {.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                            .stage_mask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT}});
-
-                // 模糊：layerCapture → layerBlur
-                frame.add_transition(my_render::image_info{
-                    .image = layerBlur.image,
-                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
-                            .access_mask = VK_ACCESS_2_NONE,
-                            .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
-                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                            .stage_mask =
-                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
-                layer_begin(layerBlur.view);
-                frame.addInsteance(ui_dao::blur(
-                    {0.0F, 0.0F, static_cast<float>(ui_layer_ctx::kExtent.width),
-                     static_cast<float>(ui_layer_ctx::kExtent.height)},
-                    layerView, layerCapture.texture, layerCapture.sampler, 10.0F, 6));
-                layer_to_sampled(layerBlur.image);
-
-                // swapchain 回到 COLOR_ATTACHMENT，LOAD 后画玻璃
-                frame.add_transition(my_render::image_info{
-                    .image = image,
-                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
-                    .src = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
-                            .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT},
-                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
-                                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                            .stage_mask =
-                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
-
-                command::rendering_info glass_info;
-                glass_info.renderArea = {.offset = {.x = 0, .y = 0}, .extent = extent};
-                glass_info.layerCount = 1;
-                glass_info.viewMask = 0;
-                glass_info.colorAttachments.emplace_back(
-                    command::rendering_info::rendering_attachment{
-                        .imageView = swapchain.imageView(imageIndex),
-                        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-                        .storeOp = VK_ATTACHMENT_STORE_OP_STORE});
-                frame.begin_rendering(std::move(glass_info));
-                frame.setPipeline(*layerPipeline);
-                frame.setPipelineLayout(*pipelineLayout);
-                frame.setDescriptorSet(descriptorSet);
-                frame.setViewport(full_vp);
-                frame.setScissor(full_scissor);
-                frame.setCameraIndex(1);
-                frame.addInsteance(ui_dao::texture(
-                    glassArea, view, layerBlur.texture, layerBlur.sampler,
-                    glm::vec4(1.0F, 1.0F, 1.0F, 1.0F), {}, 18.0F, 20));
-                // 文本：把仓库里已有的 MSDF/CJK/emoji 字形表迁到玻璃卡上
-                {
-                    const float fs = 21.0F;
-                    float baseline = glassArea.y + 36.0F;
-                    for (int li = 0; li < 4; ++li)
-                    {
-                        const auto &line = uiUnicodeLines()[li];
-                        float cursor = glassArea.x + 18.0F;
-                        for (const auto &g : line.glyphs)
-                        {
-                            const float ydir = g.yDown ? 1.0F : -1.0F;
-                            float left = cursor + g.plane.x * fs;
-                            float right = cursor + g.plane.z * fs;
-                            float top = baseline + ydir * g.plane.y * fs;
-                            float bottom = baseline + ydir * g.plane.w * fs;
-                            if (right < left)
-                                std::swap(left, right);
-                            if (bottom < top)
-                                std::swap(top, bottom);
-                            if (right - left > 0.0F && bottom - top > 0.0F)
-                            {
-                                UvTransform uv{};
-                                uv.scale = {g.uv.z - g.uv.x, g.uv.w - g.uv.y};
-                                uv.offset = {g.uv.x, g.uv.y};
-                                frame.addInsteance(ui_dao::glyph_quad(
-                                    {left, top, right - left, bottom - top}, view, g.tex,
-                                    g.samp, g.shaderFont, g.pxRange,
-                                    glm::vec4(1.0F, 1.0F, 1.0F, 0.95F), uv, 70));
-                            }
-                            cursor += g.advance * fs;
-                        }
-                        baseline += 30.0F;
-                    }
-                }
-
-                frame.addInsteance(ui_dao::shape_border(
-                    glassArea, view, 18.0F, glm::vec4(1.0F, 1.0F, 1.0F, 0.55F), 2.0F,
-                    21));
-            }
-
+            table_glue::canvas cv{&frame};
+            ui_table::draw(cv, S.last, M, S, St, F, view);
             // 外部 API 调用会自动闭合当前 pass
             auto &pickMouse = *fs.pickMouse;
             frame.add_transition(my_render::image_info{
@@ -12896,21 +12501,28 @@ try
         [] {
             return schedulable_task{
                 .task = {.name = "input_handle",
-                         .function =
-                             ^^decltype([](world_type &world, input_type &inputCtx,
-                                           data_type &soaCtx) {
-                                 tickClock(inputCtx); // ① 唯一的时间推进
-                                 limit_frame_rate(inputCtx,
-                                                  60.0f); // ② 帧率限制（可选）
-                                 InputController(world, inputCtx, soaCtx);
-                                 views_matrix_update(world, inputCtx, soaCtx);
-                                 views_perspective_update(world, inputCtx, soaCtx);
-                                 views_ui_camera_update(world, inputCtx, soaCtx);
-                                 // model_update 已空，可删除此行
-                                 FrameRateMonitor(world, inputCtx,
-                                                  soaCtx);     // ③ 纯监控
-                                 inputCtx.input.scroll() = {}; // 滚轮清零放在最后
-                             })},
+                         .function = ^^decltype([](world_type &world,
+                                                   input_type &inputCtx,
+                                                   data_type &soaCtx) {
+                             tickClock(inputCtx); // ① 唯一的时间推进
+                             limit_frame_rate(inputCtx,
+                                              60.0f); // ② 帧率限制（可选）
+                             InputController(world, inputCtx, soaCtx);
+                             views_matrix_update(world, inputCtx, soaCtx);
+                             views_perspective_update(world, inputCtx, soaCtx);
+                             views_ui_camera_update(world, inputCtx, soaCtx);
+                             // model_update 已空，可删除此行
+                             FrameRateMonitor(world, inputCtx,
+                                              soaCtx); // ③ 纯监控
+                             // 滚动增量交给表格（draw 里消费），再清零
+                             {
+                                 const auto &sc = inputCtx.input.scroll();
+                                 if (sc.yoffset != mcs::vulkan::event::UNDEFINED_double)
+                                     ui_table::state_ref().wheel_in +=
+                                         static_cast<float>(sc.yoffset);
+                             }
+                             inputCtx.input.scroll() = {}; // 滚轮清零放在最后
+                         })},
                 .befores = {"input_start"},
                 .afters = {"input_end"}};
         },
@@ -12942,7 +12554,7 @@ try
                                  pickingFrames[readIdx].mapPtr());
                              picking_result r = *data;
                              // ★ 版本不匹配 → 旧世界的 picking，作废悬停状态，丢弃
-                             if (r.render_version() != soaCtx.screen.renderVersion())
+                             if (r.render_version() != ui_table::state_ref().version)
                              {
                                  world.hoverManager.resetPicking();
                                  return;
