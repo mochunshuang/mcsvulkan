@@ -4199,7 +4199,8 @@ constexpr auto &hoverPool() noexcept
 }
 struct render_context
 {
-    command::command_recorder &commandRecorder;
+    picking_result last_pick{};       // 本帧 GPU 拾取结果（宿主填）
+    command::record_builder &builder; // 表直接往 builder 里录 UI 实例
     glfw_input &input;
     FrameClock &clock;
     FontSelect &fontSelect;
@@ -4431,8 +4432,11 @@ namespace ui_new
     struct ScreenWidget;
     struct Widget;
     struct RenderObject
-    {   
-    virtual constexpr void render(ScreenWidget*screen,Widget* owner,render_context &context) = 0;
+    {
+        virtual constexpr void render(ScreenWidget *screen, Widget *owner,
+                                      render_context &context) = 0;
+        // 每帧一次，从树根往下传（ScreenWidget::tick → DFS）
+        virtual void tick(double /*now*/) {}
         virtual ~RenderObject() = default;
     };
 
@@ -4516,6 +4520,15 @@ namespace ui_new
                 ptr->layout(BoxConstraints{0,size_.width,0,size_.height});
                 ptr->updateOffset({0,0});
             }
+        }
+        // 每帧一次：从根 DFS，把 now 传给每个 renderObject
+        void tick(double now)
+        {
+            if (auto *p = root_.get())
+                p->visit([now](Widget &w) {
+                    if (w.renderObject)
+                        w.renderObject->tick(now);
+                });
         }
         constexpr void updateSize(double width, double height) noexcept
         {
@@ -10897,11 +10910,18 @@ namespace table_glue
         return v;
     }
 
+    inline picking_result &last_pick() noexcept
+    {
+        static picking_result g{};
+        return g;
+    }
+
     // 统一 hover 处理函数：所有单元共用一个下标，按 entity 里的 zone 分发
     inline void on_hover(picking_result r, bool enter, InputCtx &,
                          ui_new::ScreenWidget *) noexcept
     {
         auto &s = ui_table::state_ref();
+        last_pick() = r; // 本帧拾取结果：render_context 用它
         const auto z = ui_table::zone_from(r.key.entity_index);
         ui_table::trace("[hover] {} part={} row={} col={} (raw_entity={})",
                         enter ? "ENTER" : "LEAVE", ui_table::part_name(z.kind), z.row,
@@ -11157,6 +11177,230 @@ namespace table_glue
                      M.rows.size(), style_ref().frozen);
     }
 } // namespace table_glue
+
+// ══════════════════════════════════════════════════════════════════════
+// table ⇄ UI 树 + glfw_input_translation（最小关联）
+//   · 表 = 一个 RenderObject：render = update+normalize+draw
+//   · 输入 = 订阅 glfw_input_translation，事件 → input_state
+//   · 不依赖反射/aggregate：普通类 + 名为 input_event 的成员
+// ══════════════════════════════════════════════════════════════════════
+namespace table_ui
+{
+    namespace ev = mcs::vulkan::event;
+
+    struct input_state
+    {
+        std::array<bool, 512> key_down{};
+        bool left{false};
+        float wheel{0.0F};
+        std::string text;
+        glm::vec2 pos{0.0F, 0.0F};
+        bool has_pos{false};
+
+        [[nodiscard]] bool down(ev::Key k) const noexcept
+        {
+            const auto i = static_cast<std::size_t>(k);
+            return i < key_down.size() && key_down[i];
+        }
+        void on(const ev::keyboard_event &e) noexcept
+        {
+            const auto i = static_cast<std::size_t>(e.key);
+            if (i < key_down.size())
+                key_down[i] = !e.release();
+        }
+        void on(const ev::mousebutton_event &e) noexcept
+        {
+            if (e.button == ev::MouseButtons::eMOUSE_BUTTON_LEFT)
+                left = !e.release();
+        }
+        void on(const ev::scroll_event &e) noexcept
+        {
+            wheel += static_cast<float>(e.yoffset);
+        }
+        void on(const ev::char_event &e) noexcept
+        {
+            encode_utf8(e.codepoint, text);
+        }
+        void on(const ev::position2d_event &e) noexcept
+        {
+            pos = {static_cast<float>(e.xpos), static_cast<float>(e.ypos)};
+            has_pos = true;
+        }
+        template <class E>
+        void on(const E &) noexcept
+        {
+        } // 其余事件与表无关
+
+        [[nodiscard]] std::string take_text()
+        {
+            std::string out;
+            out.swap(text);
+            return out;
+        }
+        float take_wheel() noexcept
+        {
+            const float w = wheel;
+            wheel = 0.0F;
+            return w;
+        }
+        static void encode_utf8(std::uint32_t cp, std::string &out)
+        {
+            if (cp < 0x80)
+                out += static_cast<char>(cp);
+            else if (cp < 0x800)
+            {
+                out += static_cast<char>(0xC0 | (cp >> 6));
+                out += static_cast<char>(0x80 | (cp & 0x3F));
+            }
+            else if (cp < 0x10000)
+            {
+                out += static_cast<char>(0xE0 | (cp >> 12));
+                out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                out += static_cast<char>(0x80 | (cp & 0x3F));
+            }
+            else
+            {
+                out += static_cast<char>(0xF0 | (cp >> 18));
+                out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+                out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                out += static_cast<char>(0x80 | (cp & 0x3F));
+            }
+        }
+    };
+
+    struct table_ro final : ui_new::RenderObject
+    {
+        glfw_input_translation::scoped_binding binding; // RAII：析构自动解绑
+        input_state in_state;
+        ui_dao::view view{};
+        command::record_builder *builder{nullptr};
+        float margin{48.0F};
+        double now{0.0};
+
+        // 唯一约定：成员叫 input_event（库内部按名字找，不需要会反射）
+        // NOTE: 必须是"每个事件一个重载"，模板成员 find_function 认但 invoke 不认
+        // 必须是"一个 noexcept 的模板成员"：库按名字找到后会用 template[:m:] 展开，
+        // 重载集合只会取第一个，反而编译不过
+        template <class E>
+        void input_event(const E &e) noexcept
+        {
+            in_state.on(e);
+        }
+
+        // 每帧一次（树根下传）：光标 / 剪贴板 / IME 这类"帧级副作用"
+        void tick(double t) override
+        {
+            now = t;
+            auto &fs = named_resource::frameState();
+            GLFWwindow *win = fs.window->data();
+            auto &S = ui_table::state_ref();
+            if (S.clip_out.set)
+            {
+                table_glue::write_clipboard(win, S.clip_out.text);
+                S.clip_out.set = false;
+                S.clip_out.text.clear();
+            }
+            table_glue::apply_cursor(win, ui_table::cursor_for(S, S.hover));
+        }
+
+        void render(ui_new::ScreenWidget *, ui_new::Widget *owner,
+                    render_context &ctx) override
+        {
+            auto &M = table_glue::model_ref();
+            auto &St = table_glue::style_ref();
+            auto &F = table_glue::font_ref();
+            auto &S = ui_table::state_ref();
+            auto &fs = named_resource::frameState();
+            GLFWwindow *win = fs.window->data();
+            auto &pickMouse = *fs.pickMouse;
+
+            const float m = margin;
+            const ui_dao::rect_px avail{
+                static_cast<float>(owner->offset.x) + m,
+                static_cast<float>(owner->offset.y) + m,
+                std::max(static_cast<float>(owner->size.width) - 2.0F * m, 1.0F),
+                std::max(static_cast<float>(owner->size.height) - 2.0F * m, 1.0F)};
+
+            ui_table::input_view iv{};
+            // 位置：事件里有过就把最新值，否则退回拾取用的鼠标位置
+            iv.px =
+                in_state.has_pos ? in_state.pos.x : static_cast<float>(pickMouse.pos.x);
+            iv.py =
+                in_state.has_pos ? in_state.pos.y : static_cast<float>(pickMouse.pos.y);
+            iv.left = in_state.left;
+            using ev::Key;
+            iv.shift =
+                in_state.down(Key::eLEFT_SHIFT) || in_state.down(Key::eRIGHT_SHIFT);
+            iv.ctrl =
+                in_state.down(Key::eLEFT_CONTROL) || in_state.down(Key::eRIGHT_CONTROL);
+            iv.key_left = in_state.down(Key::eLEFT);
+            iv.key_right = in_state.down(Key::eRIGHT);
+            iv.key_up = in_state.down(Key::eUP);
+            iv.key_down = in_state.down(Key::eDOWN);
+            iv.key_home = in_state.down(Key::eHOME);
+            iv.key_end = in_state.down(Key::eEND);
+            iv.key_pgup = in_state.down(Key::ePAGE_UP);
+            iv.key_pgdn = in_state.down(Key::ePAGE_DOWN);
+            iv.key_a = in_state.down(Key::eA);
+            iv.key_backspace = in_state.down(Key::eBACKSPACE);
+            iv.key_del = in_state.down(Key::eDELETE);
+            iv.key_enter = in_state.down(Key::eENTER);
+            iv.key_esc = in_state.down(Key::eESCAPE);
+            iv.key_tab = in_state.down(Key::eTAB);
+            iv.key_x = in_state.down(Key::eX);
+            iv.key_c = in_state.down(Key::eC);
+            iv.key_v = in_state.down(Key::eV);
+            iv.key_z = in_state.down(Key::eZ);
+            iv.key_y = in_state.down(Key::eY);
+            iv.key_f2 = in_state.down(Key::eF2);
+            iv.key_space = in_state.down(Key::eSPACE);
+
+            const std::string typed = in_state.take_text();
+            iv.text = typed;
+            static bool prev_v = false;
+            const bool now_v = iv.ctrl && iv.key_v;
+            const std::string clip =
+                (now_v && !prev_v) ? table_glue::read_clipboard(win) : std::string{};
+            prev_v = now_v;
+            iv.clipboard = clip;
+            iv.compose = S.edit.active() ? table_glue::ime_preedit(win) : std::string{};
+            iv.wheel = in_state.take_wheel();
+            // 命中：优先用宿主填进 render_context 的拾取值，否则退回 hover 结果
+            iv.picked = ctx.last_pick.key.entity_index != 0
+                            ? ui_table::zone_from(ctx.last_pick.key.entity_index)
+                            : S.hover;
+            iv.now = now;
+
+            ui_table::update(S, M, St, F, iv);
+            ui_table::normalize(S, M, St, avail);
+
+            table_glue::canvas cv{builder};
+            ui_table::draw(cv, S.last, M, S, St, F, view);
+        }
+    };
+
+    inline table_ro *&current() noexcept
+    {
+        static table_ro *p = nullptr;
+        return p;
+    }
+    inline ui_new::ScreenWidget *&screen_ptr() noexcept
+    {
+        static ui_new::ScreenWidget *p = nullptr;
+        return p;
+    }
+    // 建 panel + 表 RO，并订阅 glfw_input_translation
+    inline ui_new::ScreenWidget make_screen(double w, double h)
+    {
+        auto ro = std::make_unique<table_ro>();
+        ro->binding = inputTranslation().attach(*ro); // ← 事件关联在这里
+        current() = ro.get();
+        ui_new::ScreenWidget screen{
+            ui_new::Size{w, h}, ui_new::Container("panel").renderObject(std::move(ro))};
+        screen_ptr() = &screen;
+        return screen;
+    }
+} // namespace table_ui
 
 int main()
 try
@@ -11437,7 +11681,7 @@ try
         make_aggregate_ref<"mainShaderCtx", "uniformBuffers", "descriptorSets">(
             uniformBuffers, descriptorSets);
 
-    ui_new::ScreenWidget screen{ui_new::Size{WIDTH, HEIGHT}, ui_new::Container("panel")};
+    auto screen = table_ui::make_screen(WIDTH, HEIGHT);
 
     shader_data::hover_manager hoverManager{.screen = &screen};
 
@@ -12140,107 +12384,21 @@ try
             // ══════════════════════════════════════════════════════════════
             frame.setCameraIndex(1);
 
-            auto &M = table_glue::model_ref();
-            auto &St = table_glue::style_ref();
-            auto &F = table_glue::font_ref();
+            // ══ 表走 UI 树：布局由 Container 给，事件来自 glfw_input_translation ══
             auto &S = ui_table::state_ref();
-            auto &tbl_mouse = *fs.pickMouse;
-
-            const float margin = 48.0F;
-            const ui_dao::rect_px avail{margin, margin, W - 2.0F * margin,
-                                        H - 2.0F * margin};
-
-            // 指针 / 按钮 / 键盘 / 滚轮；命中来自 picking（hover 回调已写进 S.hover）
-            ui_table::input_view in{};
-            in.px = static_cast<float>(tbl_mouse.pos.x);
-            in.py = static_cast<float>(tbl_mouse.pos.y);
-            in.left = inputCtx.input.isMouseButtonPressed(
-                mcs::vulkan::event::MouseButtons::eMOUSE_BUTTON_LEFT);
-            in.shift = inputCtx.input.isKeyPressedOrRepeat(
-                           mcs::vulkan::event::Key::eLEFT_SHIFT) ||
-                       inputCtx.input.isKeyPressedOrRepeat(
-                           mcs::vulkan::event::Key::eRIGHT_SHIFT);
-            in.ctrl = inputCtx.input.isKeyPressedOrRepeat(
-                          mcs::vulkan::event::Key::eLEFT_CONTROL) ||
-                      inputCtx.input.isKeyPressedOrRepeat(
-                          mcs::vulkan::event::Key::eRIGHT_CONTROL);
-            using mcs::vulkan::event::Key;
-            in.key_left = inputCtx.input.isKeyPressedOrRepeat(Key::eLEFT);
-            in.key_right = inputCtx.input.isKeyPressedOrRepeat(Key::eRIGHT);
-            in.key_up = inputCtx.input.isKeyPressedOrRepeat(Key::eUP);
-            in.key_down = inputCtx.input.isKeyPressedOrRepeat(Key::eDOWN);
-            in.key_home = inputCtx.input.isKeyPressedOrRepeat(Key::eHOME);
-            in.key_end = inputCtx.input.isKeyPressedOrRepeat(Key::eEND);
-            in.key_pgup = inputCtx.input.isKeyPressedOrRepeat(Key::ePAGE_UP);
-            in.key_pgdn = inputCtx.input.isKeyPressedOrRepeat(Key::ePAGE_DOWN);
-            in.key_a = inputCtx.input.isKeyPressedOrRepeat(Key::eA);
-            in.key_backspace = inputCtx.input.isKeyPressedOrRepeat(Key::eBACKSPACE);
-            in.key_del = inputCtx.input.isKeyPressedOrRepeat(Key::eDELETE);
-            in.key_enter = inputCtx.input.isKeyPressedOrRepeat(Key::eENTER);
-            in.key_esc = inputCtx.input.isKeyPressedOrRepeat(Key::eESCAPE);
-            in.key_tab = inputCtx.input.isKeyPressedOrRepeat(Key::eTAB);
-            in.key_x = inputCtx.input.isKeyPressedOrRepeat(Key::eX);
-            in.key_c = inputCtx.input.isKeyPressedOrRepeat(Key::eC);
-            in.key_v = inputCtx.input.isKeyPressedOrRepeat(Key::eV);
-            in.key_z = inputCtx.input.isKeyPressedOrRepeat(Key::eZ);
-            in.key_y = inputCtx.input.isKeyPressedOrRepeat(Key::eY);
-            in.key_f2 = inputCtx.input.isKeyPressedOrRepeat(Key::eF2);
-            in.key_space = inputCtx.input.isKeyPressedOrRepeat(Key::eSPACE);
-            // NOTE: 必须用局部 string 兜住 take() 的返回值 ——
-            //       直接 in.text = take() 会绑定到临时量，string_view 立刻悬空。
-            const std::string typed = table_glue::text().take();
-            in.text = typed;
-            // 平台层负责系统剪贴板：Ctrl+V 读、update 里要写就写
-            static bool prev_v = false;
-            const bool now_v = in.ctrl && in.key_v;
-            const std::string clip = (now_v && !prev_v)
-                                         ? table_glue::read_clipboard(fs.window->data())
-                                         : std::string{};
-            prev_v = now_v;
-            in.clipboard = clip;
-            const std::string ime = S.edit.active()
-                                        ? table_glue::ime_preedit(fs.window->data())
-                                        : std::string{};
-            in.compose = ime;
-            in.wheel = S.wheel_in;
-            in.picked = S.hover;
-            S.wheel_in = 0.0F;
+            auto *screen = table_ui::screen_ptr();
+            table_ui::current()->view = view;
+            table_ui::current()->builder = &frame;
+            screen->updateSize(W, H);
+            screen->layout();
+            screen->tick(inputCtx.clock.getElapsed()); // 帧级副作用：从根 DFS
             {
-                static const auto t0 = std::chrono::steady_clock::now();
-                in.now =
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
-                        .count();
+                // 本帧 GPU 拾取结果（hover 回调里记下的）→ 表直接用
+                render_context ctx{table_glue::last_pick(), frame, inputCtx.input,
+                                   inputCtx.clock, world.fontCtx.fontSelect};
+                screen->render(ctx);
             }
-
-            ui_table::update(S, M, St, F, in);
-            ui_table::normalize(S, M, St, avail);
             renderVersion = S.version;
-            if (S.clip_out.set)
-            {
-                table_glue::write_clipboard(fs.window->data(), S.clip_out.text);
-                S.clip_out.set = false;
-                S.clip_out.text.clear();
-            }
-
-            // [LAYOUT] 每 60 帧打一次：列的 x/w + 滚动量（诊断用）
-            if (std::getenv("TABLE_TRACE_LAYOUT") != nullptr)
-            {
-                static int dbg = 0;
-                if ((++dbg % 60) == 1)
-                {
-                    std::print("[layout] sx={:.0f} sy={:.0f} frozen={} cols={}", S.sx,
-                               S.sy, S.last.frozen, S.last.cols.size());
-                    for (const auto &c : S.last.cols)
-                        std::print(" ({}:{:.0f},{:.0f})", c.index, c.x, c.w);
-                    std::println("");
-                }
-            }
-
-            // 光标形状跟着 hover 的 zone 走（只在变化时 glfwSetCursor）
-            table_glue::apply_cursor(fs.window->data(), ui_table::cursor_for(S, S.hover));
-
-            table_glue::canvas cv{&frame};
-            ui_table::draw(cv, S.last, M, S, St, F, view);
             // 外部 API 调用会自动闭合当前 pass
             auto &pickMouse = *fs.pickMouse;
             frame.add_transition(my_render::image_info{
