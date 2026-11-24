@@ -10852,6 +10852,12 @@ namespace render
         {
             agg.template invoke<"render">(s, owner, ctx);
         }
+
+        void tick(double now) override
+        {
+            if constexpr (requires { agg.template invoke<"tick">(now); })
+                agg.template invoke<"tick">(now);
+        }
     };
 
     static constexpr auto postBindInputTranslation = [](auto &agg) {
@@ -10880,8 +10886,7 @@ namespace render
 // ═══════════════════════════════════════════════════════════════════════════
 namespace table_glue
 {
-    // ── encode：DL → dao → addInstance ────────────────────────────────
-    //   这是全工程唯一允许碰 shader ABI 的地方；核心头文件不认识 dao。
+    // ── encode：frame_data → dao → addInstance（唯一 shader ABI 边界）──────
     inline void clip_glyph(ui_dao::rect_px &r, UvTransform &uv,
                            const ui_dao::rect_px &clip) noexcept
     {
@@ -10902,11 +10907,12 @@ namespace table_glue
         r = {l, t, q - l, b - t};
     }
 
-    inline void encode(const ui_table::dl &in, command::record_builder &rb,
-                       const ui_table::table &t, const ui_dao::view &v)
+    inline void encode(const ui_table::frame_data &in, command::record_builder &rb,
+                       const ui_table::font &f, const ui_dao::view &v)
     {
         const std::uint32_t hfn = ui_table::hover_fn_ref();
-        const auto emit_shape = [&](const ui_table::shape_op &o) {
+        const auto emit_shape = [&](const ui_table::shape_op &o)
+        {
             auto s = ui_dao::sdf_shape({o.r.x, o.r.y, o.r.w, o.r.h}, v, o.radius, o.color,
                                        {}, 0.0F, 0.0F, 1.0F, o.zone);
             s.hover_fn = hfn;
@@ -10923,9 +10929,9 @@ namespace table_glue
             if (s.effects != 0U || o.zone != 0U)
                 rb.addInsteance(s);
         };
-
-        const auto emit_text = [&](const ui_table::text_op &o) {
-            const float px = t.ft.px;
+        const auto emit_text = [&](const ui_table::text_op &o)
+        {
+            const float px = f.px;
             const std::string_view str{o.p, o.len};
             float x = o.r.x;
             std::size_t i = 0;
@@ -10933,7 +10939,7 @@ namespace table_glue
             {
                 char32_t cp = 0;
                 const std::size_t n = ui_table::utf8_decode(str.substr(i), cp);
-                if (const auto *g = t.ft.find(cp))
+                if (const auto *g = f.find(cp))
                 {
                     const float ydir = g->y_down ? 1.0F : -1.0F;
                     const float left = x + g->plane.x * px;
@@ -10947,134 +10953,29 @@ namespace table_glue
                     clip_glyph(r, uv, {o.r.x, o.r.y, o.r.w, o.r.h});
                     if (r.w > 0.0F && r.h > 0.0F)
                         rb.addInsteance(ui_dao::glyph_quad(r, v, g->tex, g->samp, g->font,
-                                                           g->px_range, o.color, uv, 0));
+                                                          g->px_range, o.color, uv, 0));
                     x += g->advance * px;
                 }
                 i += n;
             }
         };
-
-        // chrome → content → proxy（最后画 = 拾取赢）
-        for (const auto &s : in.shapes[0])
+        for (const auto &s : in.draw.shapes[0])
             emit_shape(s);
-        for (const auto &s : in.shapes[1])
+        for (const auto &t : in.draw.texts[0])
+            emit_text(t);
+        for (const auto &s : in.draw.shapes[1])
             emit_shape(s);
-        for (const auto &s : in.texts[0])
-            emit_text(s);
-        for (const auto &s : in.texts[1])
-            emit_text(s);
-        for (const auto &s : in.shapes[2])
+        for (const auto &t : in.draw.texts[1])
+            emit_text(t);
+        for (const auto &s : in.draw.shapes[2])
+            emit_shape(s);
+        for (const auto &t : in.draw.texts[2])
+            emit_text(t);
+        for (const auto &s : in.draw.shapes[3])
             emit_shape(s);
     }
 
-    inline picking_result &last_pick() noexcept
-    {
-        static picking_result g{};
-        return g;
-    }
-
-    // 统一 hover 处理函数：所有单元共用一个下标，按 entity 里的 zone 分发
-    inline void on_hover(picking_result r, bool enter, InputCtx &,
-                         ui_new::ScreenWidget *) noexcept
-    {
-        last_pick() = r; // 本帧拾取结果：render_context 用它
-        const auto z = ui_table::zone_from(r.key.entity_index);
-        ui_table::trace("[hover] {} part={} row={} col={} (raw_entity={})",
-                        enter ? "ENTER" : "LEAVE", ui_table::part_name(z.kind), z.row,
-                        z.col, r.key.entity_index);
-    }
-
-    inline std::uint32_t index()
-    {
-        static const std::uint32_t fn = hoverPool().bind(&on_hover);
-        return fn;
-    }
-
-    // 光标：GLFW 标准光标池（同 wsi/test_glfw2.cpp 的写法），只在变化时设置一次
-    inline void apply_cursor(GLFWwindow *win, ui_table::cursor c) noexcept
-    {
-        if (win == nullptr)
-            return;
-        static GLFWcursor *pool[7] = {};
-        static int current = -1;
-        const int idx = static_cast<int>(c);
-        if (idx == current)
-            return;
-        if (idx >= 0 && pool[idx] == nullptr)
-        {
-            // 顺序必须和 ui_table::cursor 一致
-            static constexpr int kShape[7] = {
-                GLFW_ARROW_CURSOR,         GLFW_IBEAM_CURSOR,
-                GLFW_RESIZE_EW_CURSOR,     GLFW_RESIZE_NS_CURSOR,
-                GLFW_RESIZE_NWSE_CURSOR,   GLFW_RESIZE_NESW_CURSOR,
-                GLFW_POINTING_HAND_CURSOR,
-            };
-            pool[idx] = glfwCreateStandardCursor(kShape[idx]);
-        }
-        current = idx;
-        glfwSetCursor(win, pool[idx]);
-        ui_table::trace("[cursor] {}", idx);
-    }
-
-    // 字符输入：订阅 char_event，攒成 UTF-8 字符串，draw 里取走
-    struct text_sink
-    {
-        std::string buf;
-
-        text_sink()
-        {
-            mcs::vulkan::event::char_event_dispatcher::instance().subscribe(
-                this, &text_sink::on_char);
-        }
-        ~text_sink()
-        {
-            mcs::vulkan::event::char_event_dispatcher::instance().unsubscribe(
-                this, &text_sink::on_char);
-        }
-        text_sink(const text_sink &) = delete;
-        text_sink &operator=(const text_sink &) = delete;
-
-        static void on_char(void *self, mcs::vulkan::event::char_event e) noexcept
-        {
-            auto *impl = static_cast<text_sink *>(self);
-            const auto cp = static_cast<std::uint32_t>(e.codepoint);
-            if (cp < 0x80u)
-                impl->buf.push_back(static_cast<char>(cp));
-            else if (cp < 0x800u)
-            {
-                impl->buf.push_back(static_cast<char>(0xC0 | (cp >> 6)));
-                impl->buf.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-            }
-            else if (cp < 0x10000u)
-            {
-                impl->buf.push_back(static_cast<char>(0xE0 | (cp >> 12)));
-                impl->buf.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-                impl->buf.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-            }
-            else
-            {
-                impl->buf.push_back(static_cast<char>(0xF0 | (cp >> 18)));
-                impl->buf.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
-                impl->buf.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-                impl->buf.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-            }
-        }
-
-        std::string take()
-        {
-            std::string out = std::move(buf);
-            buf.clear();
-            return out;
-        }
-    };
-
-    inline text_sink &text() noexcept
-    {
-        static text_sink s{};
-        return s;
-    }
-
-    // 系统剪贴板（GLFW 提供）：读 / 写
+    // ── 平台小工具 ────────────────────────────────────────────────────────
     inline std::string read_clipboard(GLFWwindow *win)
     {
         if (win == nullptr)
@@ -11088,8 +10989,6 @@ namespace table_glue
             return;
         glfwSetClipboardString(win, std::string{text}.c_str());
     }
-
-    // IME 预编辑串：动态加载 imm32（不改链接依赖），拿不到就返回空
     inline std::string ime_preedit(GLFWwindow *win) noexcept
     {
         if (win == nullptr)
@@ -11100,7 +10999,8 @@ namespace table_glue
             long (*get_str)(void *, unsigned long, void *, long){};
             int (*rel_ctx)(void *, void *){};
         };
-        static const api_t api = [] {
+        static const api_t api = []
+        {
             api_t a{};
             HMODULE imm = ::LoadLibraryW(L"imm32.dll");
             if (imm == nullptr)
@@ -11119,15 +11019,15 @@ namespace table_glue
         if (himc == nullptr)
             return {};
         std::string out;
-        constexpr unsigned long kGcsCompStr = 0x0008UL; // GCS_COMPSTR（避开同名宏）
+        constexpr unsigned long kGcsCompStr = 0x0008UL;
         const long bytes = api.get_str(himc, kGcsCompStr, nullptr, 0);
         if (bytes > 0)
         {
             std::wstring w(static_cast<std::size_t>(bytes) / sizeof(wchar_t), L'\0');
             api.get_str(himc, kGcsCompStr, w.data(), bytes);
-            const int need =
-                ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
-                                      nullptr, 0, nullptr, nullptr);
+            const int need = ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(),
+                                                   static_cast<int>(w.size()), nullptr, 0,
+                                                   nullptr, nullptr);
             if (need > 0)
             {
                 out.resize(static_cast<std::size_t>(need));
@@ -11139,7 +11039,45 @@ namespace table_glue
         return out;
     }
 
-    // 字体：ASCII 字形表已经建好，拷成 table 自己的度量
+    inline void apply_cursor(GLFWwindow *win, ui_table::cursor c) noexcept
+    {
+        if (win == nullptr)
+            return;
+        static GLFWcursor *pool[7] = {};
+        static int current = -1;
+        const int idx = static_cast<int>(c);
+        if (idx == current)
+            return;
+        if (idx >= 0 && pool[idx] == nullptr)
+        {
+            static constexpr int kShape[7] = {
+                GLFW_ARROW_CURSOR,       GLFW_IBEAM_CURSOR,      GLFW_RESIZE_EW_CURSOR,
+                GLFW_RESIZE_NS_CURSOR,   GLFW_RESIZE_NWSE_CURSOR, GLFW_RESIZE_NESW_CURSOR,
+                GLFW_POINTING_HAND_CURSOR,
+            };
+            pool[idx] = glfwCreateStandardCursor(kShape[idx]);
+        }
+        current = idx;
+        glfwSetCursor(win, pool[idx]);
+    }
+
+    // ── 数据 ──────────────────────────────────────────────────────────────
+    inline ui_table::font &font_ref() noexcept
+    {
+        static ui_table::font v{};
+        return v;
+    }
+    inline ui_table::prefs &prefs_ref() noexcept
+    {
+        static ui_table::prefs v{};
+        return v;
+    }
+    inline ui_table::table_data &data_ref() noexcept
+    {
+        static ui_table::table_data v{};
+        return v;
+    }
+
     inline void init_font(ui_table::font &F)
     {
         F.px = 15.0F;
@@ -11156,12 +11094,18 @@ namespace table_glue
             m.y_down = g.yDown;
             F.put(cp, m);
         }
-        std::println("[table] font glyphs: {}", F.ascii_has.size());
+        std::println("[table] font glyphs: {}", F.ascii.size());
     }
 
-    // ── JSON 数据驱动 ──────────────────────────────────────────────────
-    //   表 = 数据：列定义 / 样式 / 行数据全部来自 JSON，代码不认识任何具体字段。
-    //   rows 两种写法都支持：对象（按 column.key 取）或数组（按列顺序）。
+    inline std::string cell_text(const nlohmann::json &v)
+    {
+        if (v.is_string())
+            return v.get<std::string>();
+        if (v.is_null())
+            return {};
+        return v.dump();
+    }
+
     inline constexpr const char *kTableJson = R"json(
 {
   "style": { "header_h": 40, "row_h": 30, "row_gap": 2, "bar": 8,
@@ -11180,41 +11124,17 @@ namespace table_glue
     { "key": "sha",      "title": "SHA",      "width": 300, "min": 120, "max": 600, "group": "Source" },
     { "key": "note",     "title": "Note",     "width": 200, "min": 80,  "max": 300, "group": "Source" }
   ],
-  "rows": [
-    { "name": "asset_00.gltf", "status": "ready", "size": "12.0 KB",
-      "modified": "2026-01-01", "kind": "gltf",
-      "path": "assets/scene/asset_00.gltf", "sha": "9f2a1c3d", "note": "cached" },
-    { "name": "asset_01.gltf", "status": "busy", "size": "19.1 KB",
-      "modified": "2026-02-02", "kind": "gltf",
-      "path": "assets/scene/asset_01.gltf", "sha": "8b1f22aa", "note": "3 blocks" },
-    { "name": "asset_02.gltf", "status": "error", "size": "26.2 KB",
-      "modified": "2026-03-03", "kind": "gltf",
-      "path": "assets/scene/asset_02.gltf", "sha": "7c0e9b11", "note": "hot" },
-    { "name": "asset_03.gltf", "status": "ready", "size": "33.3 KB",
-      "modified": "2026-04-04", "kind": "png",
-      "path": "assets/scene/asset_03.gltf", "sha": "6d3f8c02", "note": "cold" }
-  ]
+  "rows": []
 }
 )json";
 
-    inline std::string cell_text(const nlohmann::json &v)
-    {
-        if (v.is_string())
-            return v.get<std::string>();
-        if (v.is_null())
-            return {};
-        return v.dump();
-    }
-
-    // JSON → Schema + ArrayRowSource（adapter 住在宿主侧，核心不认识 JSON）
-    inline void init_model(ui_table::table &T)
+    inline void init_model()
     {
         auto j = nlohmann::json::parse(kTableJson);
-
         static constexpr const char *kStatus[3] = {"ready", "busy", "error"};
         static constexpr const char *kKind[4] = {"gltf", "png", "bin", "json"};
         static constexpr const char *kNote[4] = {"cached", "3 blocks", "hot", "cold"};
-        for (int i = 4; i < 60; ++i)
+        for (int i = 0; i < 60; ++i)
         {
             j["rows"].push_back(nlohmann::json::array(
                 {std::format("asset_{:02d}.gltf", i), kStatus[i % 3],
@@ -11226,7 +11146,8 @@ namespace table_glue
                  kNote[i % 4]}));
         }
 
-        ui_table::schema sc;
+        auto &d = data_ref();
+        d = {};
         for (const auto &c : j.at("columns"))
         {
             ui_table::column col;
@@ -11237,9 +11158,9 @@ namespace table_glue
             col.max_w = c.value("max", 640.0F);
             col.weight = c.value("weight", 0.0F);
             const auto a = c.value("align", std::string{"left"});
-            col.text_align = a == "center"  ? ui_table::align::center
-                             : a == "right" ? ui_table::align::right
-                                            : ui_table::align::left;
+            col.a = a == "center"  ? ui_table::align::center
+                    : a == "right" ? ui_table::align::right
+                                   : ui_table::align::left;
             col.filterable = c.value("filterable", true);
             col.wrap = c.value("wrap", false);
             col.group = c.value("group", std::string{});
@@ -11251,20 +11172,16 @@ namespace table_glue
             if (c.contains("tags") && c["tags"].is_object())
                 for (const auto &[k, v] : c["tags"].items())
                     if (v.is_string())
-                        col.tags.emplace_back(
-                            k, ui_table::hex_color(v.get<std::string>(),
-                                                   {0.5F, 0.5F, 0.5F, 1.0F}));
-            if (col.key.empty())
-                throw std::runtime_error("table json: column.key 缺失");
-            sc.cols.push_back(std::move(col));
+                        col.tags.emplace_back(k, ui_table::hex_color(
+                                                     v.get<std::string>(),
+                                                     {0.5F, 0.5F, 0.5F, 1.0F}));
+            d.cols.push_back(std::move(col));
         }
-
-        ui_table::array_row_source src;
-        src.cells.resize(sc.cols.size());
+        d.cells.resize(d.cols.size());
         std::uint64_t next_id = 1;
         for (const auto &r : j.at("rows"))
         {
-            for (std::size_t c = 0; c < sc.cols.size(); ++c)
+            for (std::size_t c = 0; c < d.cols.size(); ++c)
             {
                 std::string text;
                 if (r.is_array())
@@ -11272,292 +11189,506 @@ namespace table_glue
                     if (c < r.size())
                         text = cell_text(r[c]);
                 }
-                else if (r.is_object())
-                {
-                    if (r.contains(sc.cols[c].key))
-                        text = cell_text(r.at(sc.cols[c].key));
-                }
-                src.cells[c].push_back(std::move(text));
+                else if (r.is_object() && r.contains(d.cols[c].key))
+                    text = cell_text(r.at(d.cols[c].key));
+                d.cells[c].push_back({std::move(text), {}});
             }
-            src.ids.push_back(ui_table::row_id{next_id++});
+            d.ids.push_back(ui_table::row_id{next_id++});
         }
 
-        auto &st = T.st;
+        auto &p = prefs_ref();
         if (j.contains("style"))
         {
             const auto &s = j.at("style");
-            st.header_h = s.value("header_h", st.header_h);
-            st.row_h = s.value("row_h", st.row_h);
-            st.row_gap = s.value("row_gap", st.row_gap);
-            st.bar = s.value("bar", st.bar);
-            st.radius = s.value("radius", st.radius);
-            st.cell_pad = s.value("cell_pad", st.cell_pad);
-            st.frozen = s.value("frozen", st.frozen);
-            st.row_select = s.value("row_select", st.row_select);
-            st.wrap = s.value("wrap", st.wrap);
-            st.group_h = s.value("group_h", st.group_h);
+            p.header_h = s.value("header_h", p.header_h);
+            p.row_h = s.value("row_h", p.row_h);
+            p.row_gap = s.value("row_gap", p.row_gap);
+            p.bar = s.value("bar", p.bar);
+            p.radius = s.value("radius", p.radius);
+            p.cell_pad = s.value("cell_pad", p.cell_pad);
+            p.frozen = s.value("frozen", p.frozen);
+            p.row_select = s.value("row_select", p.row_select);
+            p.wrap = s.value("wrap", p.wrap);
+            p.group_h = s.value("group_h", p.group_h);
         }
-
-        const auto cols = sc.count();
-        const auto rows = src.row_count();
-        T.bind(std::move(sc), std::move(src));
-        std::println("[table] json model: {} cols x {} rows, frozen={}", cols, rows,
-                     T.st.frozen);
+        std::println("[table] json: {} cols x {} rows, frozen={}", d.cols.size(), d.ids.size(),
+                     p.frozen);
+    }
+    inline picking_result &last_pick() noexcept
+    {
+        static picking_result g{};
+        return g;
+    }
+    inline void on_hover(picking_result r, bool enter, InputCtx &,
+                         ui_new::ScreenWidget *) noexcept
+    {
+        last_pick() = r;
+        const auto z = ui_table::zone_from(r.key.entity_index);
+        ui_table::trace("[hover] {} part={} row={} col={} (raw_entity={})",
+                        enter ? "ENTER" : "LEAVE", ui_table::part_name(z.kind), z.row,
+                        z.col, r.key.entity_index);
+    }
+    inline std::uint32_t index()
+    {
+        static const std::uint32_t fn = hoverPool().bind(&on_hover);
+        return fn;
     }
 } // namespace table_glue
 
-// ══════════════════════════════════════════════════════════════════════
-// table ⇄ UI 树 + glfw_input_translation（最小关联）
-//   · 表 = 一个 RenderObject：render = update+normalize+draw
-//   · 输入 = 订阅 glfw_input_translation，事件 → input_state
-//   · 不依赖反射/aggregate：普通类 + 名为 input_event 的成员
-// ══════════════════════════════════════════════════════════════════════
 namespace table_ui
 {
     namespace ev = mcs::vulkan::event;
 
-    // 事件 → Command 适配器：只做边沿/位置/修饰键，不做表逻辑
-    struct table_ro final : ui_new::RenderObject
+    struct host_t
     {
-        glfw_input_translation::scoped_binding binding;
-        ui_table::table tbl;
-        ui_table::dl dl_;
-        ui_dao::view view{};
-
-        glm::vec2 pos{0.0F, 0.0F};
-        bool left{false};
-        bool press_pending{false};
-        bool release_pending{false};
-        bool shift{false}, ctrl{false};
-        bool has_pos{false};
-
-        std::vector<ui_table::cmd_key> keys;
-        std::string text;
-        float wheel{0.0F};
-        double now{0.0};
-        double last_click_t{-1.0e9};
-        glm::vec2 last_click_pos{};
-
-        template <class E>
-        void input_event(const E &e) noexcept
-        {
-            handle(e);
-        }
-
-        void handle(const ev::keyboard_event &e)
-        {
-            shift = e.key == ev::Key::eLEFT_SHIFT || e.key == ev::Key::eRIGHT_SHIFT;
-            ctrl = e.key == ev::Key::eLEFT_CONTROL || e.key == ev::Key::eRIGHT_CONTROL;
-            if (!e.release())
-                if (const auto k = map_key(e.key))
-                    keys.push_back({*k, shift, ctrl});
-        }
-        void handle(const ev::mousebutton_event &e)
-        {
-            if (e.button != ev::MouseButtons::eMOUSE_BUTTON_LEFT)
-                return;
-            if (e.release())
-            {
-                release_pending = true;
-                left = false;
-            }
-            else
-            {
-                press_pending = true;
-                left = true;
-            }
-        }
-        void handle(const ev::position2d_event &e)
-        {
-            pos = {static_cast<float>(e.xpos), static_cast<float>(e.ypos)};
-            has_pos = true;
-        }
-        void handle(const ev::scroll_event &e)
-        {
-            wheel += static_cast<float>(e.yoffset);
-        }
-        void handle(const ev::char_event &e)
-        {
-            encode_utf8(e.codepoint, text);
-        }
-        template <class E>
-        void handle(const E &) noexcept
-        {
-        }
-
-        [[nodiscard]] std::uint32_t version() const noexcept
-        {
-            return tbl.version();
-        }
-
-        void tick(double t) override
-        {
-            now = t;
-            tbl.set_now(t);
-        }
-
-        void render(ui_new::ScreenWidget *, ui_new::Widget *owner,
-                    render_context &ctx) override
-        {
-            auto &fs = named_resource::frameState();
-            GLFWwindow *win = fs.window->data();
-
-            const float m = 48.0F;
-            const ui_table::rect avail{
-                static_cast<float>(owner->offset.x) + m,
-                static_cast<float>(owner->offset.y) + m,
-                std::max(static_cast<float>(owner->size.width) - 2.0F * m, 1.0F),
-                std::max(static_cast<float>(owner->size.height) - 2.0F * m, 1.0F)};
-            (void)tbl.derive(avail);
-
-            // 1) 事件 → 命令（边沿在这里做，核心只收语义）
-            std::vector<ui_table::command> cmds;
-            const ui_table::zone hz = ui_table::zone_from(ctx.last_pick.key.entity_index);
-            cmds.push_back(ui_table::cmd_hover{hz});
-
-            if (press_pending)
-            {
-                const float dx = pos.x - last_click_pos.x;
-                const float dy = pos.y - last_click_pos.y;
-                const bool dbl = (now - last_click_t < 0.40) && dx * dx + dy * dy < 25.0F;
-                last_click_t = now;
-                last_click_pos = pos;
-                cmds.push_back(ui_table::cmd_press{pos.x, pos.y, tbl.hit(pos.x, pos.y),
-                                                   dbl, shift, ctrl});
-                press_pending = false;
-            }
-            if (release_pending)
-            {
-                cmds.push_back(ui_table::cmd_release{pos.x, pos.y});
-                release_pending = false;
-            }
-            else if (left)
-            {
-                cmds.push_back(ui_table::cmd_drag{pos.x, pos.y});
-            }
-            for (const auto &k : keys)
-                cmds.push_back(k);
-            keys.clear();
-            if (!text.empty())
-            {
-                cmds.push_back(ui_table::cmd_text{text});
-                text.clear();
-            }
-            if (wheel != 0.0F)
-            {
-                cmds.push_back(ui_table::cmd_wheel{wheel, 0.0F, shift});
-                wheel = 0.0F;
-            }
-
-            // 2) reduce：只改 state；数据变更走 effect，由数据所有者应用
-            std::vector<ui_table::effect> fx;
-            for (const auto &c : cmds)
-                tbl.dispatch(c, fx);
-            for (auto &e : fx)
-            {
-                if (auto *p = std::get_if<ui_table::fx_set_cell>(&e))
-                    tbl.source.set_cell(p->id, p->col, std::move(p->text));
-                else if (auto *p = std::get_if<ui_table::fx_clipboard>(&e))
-                    table_glue::write_clipboard(win, p->text);
-            }
-
-            // 3) derive → present → encode
-            (void)tbl.derive(avail);
-            tbl.present(dl_);
-            table_glue::encode(dl_, ctx.builder, tbl, view);
-            table_glue::apply_cursor(win, ui_table::cursor_for(tbl.state.hover));
-        }
-
-      private:
-        static std::optional<ui_table::key> map_key(ev::Key k) noexcept
-        {
-            switch (k)
-            {
-            case ev::Key::eUP:
-                return ui_table::key::up;
-            case ev::Key::eDOWN:
-                return ui_table::key::down;
-            case ev::Key::eLEFT:
-                return ui_table::key::left;
-            case ev::Key::eRIGHT:
-                return ui_table::key::right;
-            case ev::Key::eHOME:
-                return ui_table::key::home;
-            case ev::Key::eEND:
-                return ui_table::key::end;
-            case ev::Key::ePAGE_UP:
-                return ui_table::key::pgup;
-            case ev::Key::ePAGE_DOWN:
-                return ui_table::key::pgdn;
-            case ev::Key::eENTER:
-                return ui_table::key::enter;
-            case ev::Key::eESCAPE:
-                return ui_table::key::esc;
-            case ev::Key::eTAB:
-                return ui_table::key::tab;
-            case ev::Key::eBACKSPACE:
-                return ui_table::key::backspace;
-            case ev::Key::eDELETE:
-                return ui_table::key::del;
-            case ev::Key::eSPACE:
-                return ui_table::key::space;
-            case ev::Key::eF2:
-                return ui_table::key::f2;
-            case ev::Key::eA:
-                return ui_table::key::a;
-            case ev::Key::eC:
-                return ui_table::key::c;
-            case ev::Key::eV:
-                return ui_table::key::v;
-            case ev::Key::eX:
-                return ui_table::key::x;
-            case ev::Key::eZ:
-                return ui_table::key::z;
-            case ev::Key::eY:
-                return ui_table::key::y;
-            default:
-                return std::nullopt;
-            }
-        }
-
-        static void encode_utf8(std::uint32_t cp, std::string &out)
-        {
-            if (cp < 0x80)
-                out += static_cast<char>(cp);
-            else if (cp < 0x800)
-            {
-                out += static_cast<char>(0xC0 | (cp >> 6));
-                out += static_cast<char>(0x80 | (cp & 0x3F));
-            }
-            else if (cp < 0x10000)
-            {
-                out += static_cast<char>(0xE0 | (cp >> 12));
-                out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-                out += static_cast<char>(0x80 | (cp & 0x3F));
-            }
-            else
-            {
-                out += static_cast<char>(0xF0 | (cp >> 18));
-                out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
-                out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-                out += static_cast<char>(0x80 | (cp & 0x3F));
-            }
-        }
+        ui_new::ScreenWidget *screen{};
+        ui_new::Widget *owner{};
+        ui_dao::view draw_view{};
+        float mx{0}, my{0};
+        float vw{1}, vh{1};
+        float sx{1}, sy{1}; // window 像素 → owner 逻辑坐标
+        std::vector<ui_table::effect> fx;
     };
 
-    inline table_ro *&current() noexcept
+    inline std::optional<ui_table::key> map_key(ev::Key k) noexcept
     {
-        static table_ro *p = nullptr;
+        switch (k)
+        {
+        case ev::Key::eUP: return ui_table::key::up;
+        case ev::Key::eDOWN: return ui_table::key::down;
+        case ev::Key::eLEFT: return ui_table::key::left;
+        case ev::Key::eRIGHT: return ui_table::key::right;
+        case ev::Key::eHOME: return ui_table::key::home;
+        case ev::Key::eEND: return ui_table::key::end;
+        case ev::Key::ePAGE_UP: return ui_table::key::pgup;
+        case ev::Key::ePAGE_DOWN: return ui_table::key::pgdn;
+        case ev::Key::eENTER: return ui_table::key::enter;
+        case ev::Key::eESCAPE: return ui_table::key::esc;
+        case ev::Key::eTAB: return ui_table::key::tab;
+        case ev::Key::eBACKSPACE: return ui_table::key::backspace;
+        case ev::Key::eDELETE: return ui_table::key::del;
+        case ev::Key::eSPACE: return ui_table::key::space;
+        case ev::Key::eF2: return ui_table::key::f2;
+        case ev::Key::eA: return ui_table::key::a;
+        case ev::Key::eC: return ui_table::key::c;
+        case ev::Key::eV: return ui_table::key::v;
+        case ev::Key::eX: return ui_table::key::x;
+        case ev::Key::eZ: return ui_table::key::z;
+        case ev::Key::eY: return ui_table::key::y;
+        case ev::Key::eF: return ui_table::key::f;
+        default: return std::nullopt;
+        }
+    }
+
+    inline void encode_utf8(std::uint32_t cp, std::string &out)
+    {
+        if (cp < 0x80)
+            out += static_cast<char>(cp);
+        else if (cp < 0x800)
+        {
+            out += static_cast<char>(0xC0 | (cp >> 6));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+        else if (cp < 0x10000)
+        {
+            out += static_cast<char>(0xE0 | (cp >> 12));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+        else
+        {
+            out += static_cast<char>(0xF0 | (cp >> 18));
+            out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    }
+
+    // make_table：数据 + 派生 + 输入，全部字段化；没有 table 类
+    inline auto make_table(ui_table::table_data data, ui_table::prefs p, ui_table::font *f)
+    {
+        auto t = make_aggregate<"Table">(
+            field<"data">(std::move(data)), field<"view">(ui_table::view{}),
+            field<"geom">(ui_table::geometry{}), field<"frame">(ui_table::frame_data{}),
+            field<"prefs">(p), field<"font">(f), field<"pipe">(ui_table::row_pipeline{}),
+            field<"sys">(ui_table::systems{}),
+            field<"host">(host_t{}),
+            field<"input_binding">(glfw_input_translation::scoped_binding{}),
+
+            method<"sync">([](auto &self, float x, float y, float w, float h)
+            {
+                self.host.vw = w;
+                self.host.vh = h;
+                ui_table::sync(self.data, self.view, self.prefs, self.geom,
+                               {x, y, w, h}, *self.font, self.sys, self.pipe);
+            }),
+
+            method<"input_event">([](auto &self, auto e) noexcept
+            {
+                using T = std::remove_cvref_t<decltype(e)>;
+                using namespace mcs::vulkan::event;
+                bool shift = false, ctrl = false;
+                auto feed = [&](const auto &ev) {
+                    ui_table::system_event(self.data, self.view, self.prefs,
+                                           self.geom, self.sys, *self.font, ev,
+                                           self.host.fx);
+                    for (auto &e : self.host.fx)
+                    {
+                        if (auto *p = std::get_if<ui_table::fx_set_cell>(&e))
+                            self.data.set_cell(self.data.index_of(p->id), p->col,
+                                               std::move(p->text));
+                        else if (auto *p = std::get_if<ui_table::fx_clipboard>(&e))
+                            if (auto *w = named_resource::frameState().window->data())
+                                table_glue::write_clipboard(w, p->text);
+                    }
+                    self.host.fx.clear();
+                    self.view.ui.touch();
+                };
+
+                if constexpr (requires { e.template hasModifiers<ModifierKey::eSHIFT>(); })
+                {
+                    shift = e.template hasModifiers<ModifierKey::eSHIFT>();
+                    ctrl = e.template hasModifiers<ModifierKey::eCONTROL>();
+                }
+                if constexpr (std::same_as<T, position2d_event>)
+                {
+                    self.host.mx = static_cast<float>(e.xpos) * self.host.sx;
+                    self.host.my = static_cast<float>(e.ypos) * self.host.sy;
+                    if (self.view.ui.left)
+                        feed(ui_table::cmd_drag{self.host.mx, self.host.my});
+                    else
+                        ui_table::system_hover(
+                            self.view,
+                            ui_table::hit_test(self.data, self.geom, self.view,
+                                               self.host.mx, self.host.my));
+                }
+                else if constexpr (std::same_as<T, mousebutton_event>)
+                {
+                    if (auto *win = named_resource::frameState().window->data())
+                    {
+                        double cx = 0, cy = 0;
+                        glfwGetCursorPos(win, &cx, &cy);
+                        self.host.mx = static_cast<float>(cx) * self.host.sx;
+                        self.host.my = static_cast<float>(cy) * self.host.sy;
+                    }
+                    const auto z = ui_table::hit_test(self.data, self.geom, self.view, self.host.mx,
+                                           self.host.my);
+                    if (e.button == MouseButtons::eMOUSE_BUTTON_RIGHT && e.press())
+                    {
+                        ui_table::table_ctx tc{self.data, self.view, self.prefs,
+                                               self.geom, *self.font, &self.host.fx, nullptr};
+                        self.sys.menu.open(tc, z.col, self.host.mx, self.host.my);
+                        return;
+                    }
+                    if (e.button != MouseButtons::eMOUSE_BUTTON_LEFT)
+                        return;
+                    if (e.release())
+                        feed(ui_table::cmd_release{self.host.mx, self.host.my});
+                    else if (e.press())
+                        feed(ui_table::cmd_press{
+                        self.host.mx, self.host.my, z, false, shift, ctrl});
+                }
+                else if constexpr (std::same_as<T, scroll_event>)
+                {
+                    ui_table::system_wheel(self.view, self.prefs,
+                                           static_cast<float>(e.xoffset),
+                                           static_cast<float>(e.yoffset), shift);
+                }
+                else if constexpr (std::same_as<T, window_focus_event>)
+                {
+                    if (!e.focused)
+                    {
+                        self.view.ui.left = false;
+                        self.view.ui.drag = ui_table::drag_mode::none;
+                        self.view.menu.open = false;
+                        self.view.ui.touch();
+                    }
+                }
+                else if constexpr (std::same_as<T, keyboard_event>)
+                {
+                    if (e.release())
+                        return;
+                    if (e.key == Key::eV && ctrl)
+                    {
+                        if (auto *w = named_resource::frameState().window->data())
+                        {
+                            auto s = table_glue::read_clipboard(w);
+                            ui_table::table_ctx tc{self.data, self.view, self.prefs,
+                                                   self.geom, *self.font,
+                                                   &self.host.fx, nullptr};
+                            self.sys.edit.paste(tc, std::move(s));
+                        }
+                        return;
+                    }
+                    if (const auto k = map_key(e.key))
+                        feed(ui_table::cmd_key{*k, shift, ctrl});
+                }
+                else if constexpr (std::same_as<T, char_event>)
+                {
+                    std::string s;
+                    encode_utf8(e.codepoint, s);
+                    { ui_table::table_ctx tc{self.data, self.view, self.prefs, self.geom, *self.font, &self.host.fx, nullptr}; ui_table::system_text(tc, self.sys, s); }
+                }
+            }),
+
+            method<"tick">([](auto &self, double t)
+            {
+                self.view.ui.now = t;
+                auto feed = [&](const auto &ev) {
+                    ui_table::system_event(self.data, self.view, self.prefs,
+                                           self.geom, self.sys, *self.font, ev,
+                                           self.host.fx);
+                    for (auto &e : self.host.fx)
+                    {
+                        if (auto *p = std::get_if<ui_table::fx_set_cell>(&e))
+                            self.data.set_cell(self.data.index_of(p->id), p->col,
+                                               std::move(p->text));
+                        else if (auto *p = std::get_if<ui_table::fx_clipboard>(&e))
+                            if (auto *w = named_resource::frameState().window->data())
+                                table_glue::write_clipboard(w, p->text);
+                    }
+                    self.host.fx.clear();
+                    self.view.ui.touch();
+                };
+                if (std::getenv("TABLE_WHEELTEST") != nullptr)
+                {
+                    static bool once = false;
+                    if (!once)
+                    {
+                        once = true;
+                        mcs::vulkan::event::distribute<
+                            mcs::vulkan::event::scroll_event_dispatcher>(
+                            {.xoffset = 0.0, .yoffset = -5.0});
+                    }
+                }
+                if (std::getenv("TABLE_SORTTEST") != nullptr)
+                {
+                    static bool once = false;
+                    if (!once)
+                    {
+                        once = true;
+                        { ui_table::table_ctx tc{self.data, self.view, self.prefs, self.geom, *self.font, &self.host.fx, nullptr}; self.sys.sort.toggle(tc, 1); }
+                    }
+                }
+                if (std::getenv("TABLE_SELTEST") != nullptr)
+                {
+                    static bool once = false;
+                    if (!once)
+                    {
+                        once = true;
+                        { ui_table::table_ctx tc{self.data, self.view, self.prefs, self.geom, *self.font, &self.host.fx, nullptr}; self.sys.selection.set(tc, 2, 1); }
+                        { ui_table::table_ctx tc{self.data, self.view, self.prefs, self.geom, *self.font, &self.host.fx, nullptr}; self.sys.selection.extend(tc, 6, 3); }
+                        { ui_table::table_ctx tc{self.data, self.view, self.prefs, self.geom, *self.font, &self.host.fx, nullptr}; self.sys.checks.toggle(tc, 0, false); }
+                        { ui_table::table_ctx tc{self.data, self.view, self.prefs, self.geom, *self.font, &self.host.fx, nullptr}; self.sys.checks.toggle(tc, 1, false); }
+                    }
+                }
+                if (std::getenv("TABLE_EDITTEST") != nullptr)
+                {
+                    static bool once = false;
+                    if (!once)
+                    {
+                        once = true;
+                        { ui_table::table_ctx tc{self.data, self.view, self.prefs, self.geom, *self.font, &self.host.fx, nullptr}; self.sys.edit.begin(tc, 2, 0); }
+                        { ui_table::table_ctx tc{self.data, self.view, self.prefs, self.geom, *self.font, &self.host.fx, nullptr}; ui_table::system_text(tc, self.sys, "Z"); }
+                    }
+                }
+                if (std::getenv("TABLE_RESIZETEST") != nullptr)
+                {
+                    static bool once = false;
+                    if (!once)
+                    {
+                        once = true;
+                        ui_table::table_ctx tc{self.data, self.view, self.prefs,
+                                               self.geom, *self.font,
+                                               &self.host.fx, nullptr};
+                        self.sys.resize.begin(tc, 0, 0.0F, 220.0F);
+                        self.sys.resize.move(tc, 340.0F);
+                        self.sys.resize.end(tc);
+                    }
+                }
+                if (std::getenv("TABLE_FILTERTEST") != nullptr)
+                {
+                    static bool once = false;
+                    if (!once)
+                    {
+                        once = true;
+                        { ui_table::table_ctx tc{self.data, self.view, self.prefs, self.geom, *self.font, &self.host.fx, nullptr}; self.sys.filter.begin(tc, 1); }
+                        { ui_table::table_ctx tc{self.data, self.view, self.prefs, self.geom, *self.font, &self.host.fx, nullptr}; ui_table::system_text(tc, self.sys, "err"); }
+                        feed(ui_table::cmd_key{ui_table::key::enter, false, false});
+                    }
+                }
+                if (std::getenv("TABLE_MENUTEST") != nullptr)
+                {
+                    static bool once = false;
+                    if (!once)
+                    {
+                        once = true;
+                        ui_table::table_ctx tc{self.data, self.view, self.prefs,
+                                                  self.geom, *self.font, &self.host.fx,
+                                                  nullptr};
+                        self.sys.menu.open(tc, 0, 320.0F, 90.0F);
+                    }
+                }
+                if (std::getenv("TABLE_FINDINPUT") != nullptr)
+                {
+                    static bool once = false;
+                    if (!once)
+                    {
+                        once = true;
+                        { ui_table::table_ctx tc{self.data, self.view, self.prefs, self.geom, *self.font, &self.host.fx, nullptr}; self.sys.find.toggle(tc); }
+                        { ui_table::table_ctx tc{self.data, self.view, self.prefs, self.geom, *self.font, &self.host.fx, nullptr}; ui_table::system_text(tc, self.sys, "busy"); }
+                    }
+                }
+                if (std::getenv("TABLE_FILTEREDIT") != nullptr)
+                {
+                    static bool once = false;
+                    if (!once)
+                    {
+                        once = true;
+                        { ui_table::table_ctx tc{self.data, self.view, self.prefs, self.geom, *self.font, &self.host.fx, nullptr}; self.sys.filter.begin(tc, 1); }
+                        { ui_table::table_ctx tc{self.data, self.view, self.prefs, self.geom, *self.font, &self.host.fx, nullptr}; ui_table::system_text(tc, self.sys, "err"); }
+                    }
+                }
+                if (std::getenv("TABLE_TOOLTIP") != nullptr)
+                {
+                    static bool once = false;
+                    if (!once)
+                    {
+                        once = true;
+                        self.view.ui.hover = {ui_table::part::cell, 2, 1};
+                        self.view.tip.hover_t = self.view.ui.now;
+                        self.view.ui.pointer = {300.0F, 200.0F};
+                    }
+                }
+                if (std::getenv("TABLE_EDITSEL") != nullptr)
+                {
+                    static bool once = false;
+                    if (!once)
+                    {
+                        once = true;
+                        { ui_table::table_ctx tc{self.data, self.view, self.prefs, self.geom, *self.font, &self.host.fx, nullptr}; self.sys.edit.begin(tc, 0, 0); }
+                        feed(ui_table::cmd_key{ui_table::key::end, false, false});
+                        for (int i = 0; i < 5; ++i)
+                            feed(ui_table::cmd_key{ui_table::key::left, true, false});
+                    }
+                }
+            }),
+
+            method<"render">([](auto &self, ui_new::ScreenWidget *s, ui_new::Widget *owner,
+                                render_context &ctx)
+            {
+                self.host.screen = s;
+                self.host.owner = owner;
+                if (self.view.edit.active())
+                    if (auto *w = named_resource::frameState().window->data())
+                    {
+                        auto pre = table_glue::ime_preedit(w);
+                        if (pre != self.view.edit.compose)
+                        {
+                            ui_table::table_ctx tc{self.data, self.view, self.prefs,
+                                                   self.geom, *self.font,
+                                                   &self.host.fx, nullptr};
+                            self.sys.edit.compose(tc, std::move(pre));
+                        }
+                    }
+                const float m = 48.0F;
+                const float x = static_cast<float>(owner->offset.x) + m;
+                const float y = static_cast<float>(owner->offset.y) + m;
+                const float w = std::max(static_cast<float>(owner->size.width) - 2.0F * m,
+                                         1.0F);
+                const float h = std::max(static_cast<float>(owner->size.height) - 2.0F * m,
+                                         1.0F);
+                if (auto *win = named_resource::frameState().window->data())
+                {
+                    int ww = 1, wh = 1;
+                    glfwGetWindowSize(win, &ww, &wh);
+                    if (ww > 0 && wh > 0)
+                    {
+                        self.host.sx = (w + 2.0F * m) / static_cast<float>(ww);
+                        self.host.sy = (h + 2.0F * m) / static_cast<float>(wh);
+                    }
+                }
+                self.template invoke<"sync">(x, y, w, h);
+                ui_table::build_frame(self.data, self.view, self.prefs, self.geom,
+                                      *self.font, self.sys, self.frame);
+                if (std::getenv("TABLE_GEOMLOG") != nullptr)
+                {
+                    static bool once = false;
+                    if (!once)
+                    {
+                        once = true;
+                        if (FILE *f = std::fopen(
+                                "E:/0_github_project/mcsvulkan/output/geom.log", "a"))
+                        {
+                            const auto &g = self.geom;
+                            std::fprintf(
+                                f,
+                                "box=%.1f,%.1f,%.1f,%.1f owner=%d,%d %dx%d "
+                                "vtrack=%.1f,%.1f,%.1f,%.1f vthumb=%.1f,%.1f,%.1f,%.1f "
+                                "ese=%.1f,%.1f,%.1f,%.1f mouse=%.1f,%.1f\n",
+                                g.box.x, g.box.y, g.box.w, g.box.h, owner->offset.x,
+                                owner->offset.y, owner->size.width, owner->size.height,
+                                g.vtrack.x, g.vtrack.y, g.vtrack.w, g.vtrack.h, g.vthumb.x,
+                                g.vthumb.y, g.vthumb.w, g.vthumb.h, g.edge_se.x, g.edge_se.y,
+                                g.edge_se.w, g.edge_se.h, self.host.mx, self.host.my);
+                            std::fclose(f);
+                        }
+                    }
+                }
+                table_glue::encode(self.frame, ctx.builder, *self.font,
+                                   self.host.draw_view);
+                if (auto *win = named_resource::frameState().window->data())
+                    table_glue::apply_cursor(
+                        win, ui_table::cursor_for(self.view.ui.hover));
+            }));
+        t.view.reset(t.data);
+        return t;
+    }
+
+    using table_agg = decltype(make_table(std::declval<ui_table::table_data>(),
+                                          std::declval<ui_table::prefs>(),
+                                          static_cast<ui_table::font *>(nullptr)));
+
+    inline table_agg *&current() noexcept
+    {
+        static table_agg *p = nullptr;
         return p;
     }
 
     inline ui_new::ScreenWidget make_screen(double w, double h)
     {
-        auto ro = std::make_unique<table_ro>();
-        ro->binding = inputTranslation().attach(*ro); // 事件关联在这里
-        current() = ro.get();
+        auto t = make_table(std::move(table_glue::data_ref()), table_glue::prefs_ref(),
+                            &table_glue::font_ref());
+        auto ro = render::asRenderObject(std::move(t));
+        current() = &ro->agg;
         return ui_new::ScreenWidget{
             ui_new::Size{w, h}, ui_new::Container("panel").renderObject(std::move(ro))};
+    }
+
+    // 事件通路 + 数据链路自检（不建窗口）
+    inline int event_probe()
+    {
+        ui_table::table_data d;
+        ui_table::column c;
+        c.key = "v";
+        c.title = "V";
+        c.w = 100;
+        d.cols.push_back(c);
+        d.cells.resize(1);
+        for (int i = 0; i < 50; ++i)
+        {
+            d.cells[0].push_back({std::format("r{}", i), {}});
+            d.ids.push_back(ui_table::row_id{static_cast<std::uint64_t>(i + 1)});
+        }
+        ui_table::prefs p;
+        ui_table::font f;
+        auto t = make_table(std::move(d), p, &f);
+        t.template invoke<"sync">(0, 0, 400, 200);
+        auto b = inputTranslation().attach(t);
+        using namespace mcs::vulkan::event;
+        distribute<scroll_event_dispatcher>({.xoffset = 0.0, .yoffset = -3.0});
+        std::println("[evtest] chain sy={} rows={}", t.view.scroll.y, t.geom.view_rows.size());
+        return t.view.scroll.y > 0.0F ? 0 : 1;
     }
 } // namespace table_ui
 
@@ -11572,6 +11703,8 @@ try
 #endif
     // 表格自测：只驱动 update/normalize 的数据面，不碰窗口 / GPU / Vulkan。
     // TABLE_SELFTEST=1 时先跑再退出，失败返回非 0。
+    if (std::getenv("TABLE_EVTEST") != nullptr)
+        return table_ui::event_probe();
     if (std::getenv("TABLE_SELFTEST") != nullptr)
     {
         const int fails = ui_table::selftest();
@@ -11840,13 +11973,10 @@ try
         make_aggregate_ref<"mainShaderCtx", "uniformBuffers", "descriptorSets">(
             uniformBuffers, descriptorSets);
 
+    table_glue::init_font(table_glue::font_ref());
+    table_glue::init_model();
     auto screen = table_ui::make_screen(WIDTH, HEIGHT);
-
     shader_data::hover_manager hoverManager{.screen = &screen};
-
-    // table：字体 / 数据 / hover 下标（一个表一个池实体）
-    table_glue::init_font(table_ui::current()->tbl.ft);
-    table_glue::init_model(table_ui::current()->tbl);
     ui_table::hover_fn_ref() = table_glue::index();
     std::println("[table] hover_fn = {}", ui_table::hover_fn_ref());
     // 新的 soaCtx 仅包含 uiRects 和 uiWireRects
@@ -12545,7 +12675,7 @@ try
 
             // ══ 表走 UI 树：布局由 Container 给，事件来自 glfw_input_translation ══
             auto *ro = table_ui::current();
-            ro->view = view;
+            ro->host.draw_view = view;
             auto &screen = soaCtx.screen;
             screen.updateSize(W, H);
             screen.layout();
@@ -12556,7 +12686,7 @@ try
                                    inputCtx.clock, world.fontCtx.fontSelect};
                 screen.render(ctx);
             }
-            renderVersion = ro->version();
+            renderVersion = ro->view.ui.version;
             // 外部 API 调用会自动闭合当前 pass
             auto &pickMouse = *fs.pickMouse;
             frame.add_transition(my_render::image_info{
@@ -12830,14 +12960,8 @@ try
                              // model_update 已空，可删除此行
                              FrameRateMonitor(world, inputCtx,
                                               soaCtx); // ③ 纯监控
-                             // 滚动增量交给表格（draw 里消费），再清零
-                             {
-                                 const auto &sc = inputCtx.input.scroll();
-                                 if (sc.yoffset != mcs::vulkan::event::UNDEFINED_double)
-                                     (void)0; // wheel 由事件适配器处理
-                                 ;
-                             }
-                             inputCtx.input.scroll() = {}; // 滚轮清零放在最后
+                             // 表只用 glfw_input_translation 的事件；这里清掉旧快照
+                             inputCtx.input.scroll() = {};
                          })},
                 .befores = {"input_start"},
                 .afters = {"input_end"}};
@@ -12870,7 +12994,7 @@ try
                                  pickingFrames[readIdx].mapPtr());
                              picking_result r = *data;
                              // ★ 版本不匹配 → 旧世界的 picking，作废悬停状态，丢弃
-                             if (r.render_version() != table_ui::current()->version())
+                             if (r.render_version() != table_ui::current()->view.ui.version)
                              {
                                  world.hoverManager.resetPicking();
                                  return;
