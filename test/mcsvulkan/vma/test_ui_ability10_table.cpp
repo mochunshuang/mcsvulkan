@@ -33,6 +33,10 @@
 
 #include "../head.hpp"
 
+// IME 预编辑需要真正的 Win32 HWND（GLFWwindow* 不是 HWND）
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
+
 using mcs::vulkan::Instance;
 using mcs::vulkan::tool::create_instance;
 using mcs::vulkan::tool::create_debugger;
@@ -4199,11 +4203,11 @@ constexpr auto &hoverPool() noexcept
 }
 struct render_context
 {
-    picking_result last_pick{};       // 本帧 GPU 拾取结果（宿主填）
     command::record_builder &builder; // 表直接往 builder 里录 UI 实例
     glfw_input &input;
     FrameClock &clock;
     FontSelect &fontSelect;
+    ui_dao::view view;                // 绘制目标尺寸（像素坐标 → NDC）
 };
 
 //diff: [test_dod24.cpp] start
@@ -9885,6 +9889,7 @@ namespace gesture
         Key key{};
         input_frame::Transition transition{};
         time_point at{};
+        bool repeat{};
     };
 
     // ── click_template ──────────────────────────────────────────────
@@ -10282,9 +10287,8 @@ namespace gesture
                                    const input_frame::frame<input_frame::key_change> &f,
                                    time_point now) noexcept
         {
-            if (f.change.repeat)
-                return state::keep(cur);
-            in.collect(now, key_event{f.change.key, f.change.transition, now});
+            in.collect(now, key_event{f.change.key, f.change.transition, now,
+                                      f.change.repeat});
             return state::ready(cur);
         }
 
@@ -10877,16 +10881,47 @@ namespace render
 }; // namespace render
 //diff: [test_intent] end
 
-// ═══════════════════════════════════════════════════════════════════════════
-// table：dao → 实例 → shader → 像素；picking 回读 → zone → 交互
+// ===========================================================================
+//  table: one table = data + derive + draw + input
 //
-//   一个 draw 和一个 table 的 hover 回调没有本质区别：
-//     写：实例行 entity_index = zone_key(zone)，hover_fn = 表的下标
-//     读：回读 → 版本过滤 → zone_from(entity) → 固定分发
-// ═══════════════════════════════════════════════════════════════════════════
+//  This is the only seam between the table and the host (GLFW / Vulkan / ui_new).
+//  Two chains run independently and meet only at target_key.
+//
+//  draw chain (data -> draw data -> shader -> pixels)
+//    data + view
+//        | draw_sync
+//        v
+//    geometry
+//        | draw_build
+//        v
+//    frame_data (shape_op/text_op, every op carries zone = target_key)
+//        | draw_encode
+//        v
+//    shader instances (entity_index = target_key) -> GPU -> pixels
+//
+//  input chain (gesture -> data update -> redraw next frame)
+//    GLFW event
+//        | input_event
+//        v
+//    cmd_press / cmd_drag / cmd_key / cmd_wheel ...
+//        | input_dispatch
+//        v
+//    systems (handle) -> visit_owner (single dispatch point) -> view / data
+//        | apply_effects (fx_set_cell / fx_clipboard)
+//        v
+//    view.ui.version++ -> next draw_sync rebuilds geometry/frame
+//
+//  Merge point (single):
+//    draw:   shape_op.zone = zone_key(target)
+//    shader: instance.entity_index = zone_key(target)
+//    input:  hit_target(...) / resolve(data, key) -> target -> to_owner -> visit_owner
+//  Same target_key, same resolve, same owner variant in all three places.
+// ===========================================================================
 namespace table_glue
 {
-    // ── encode：frame_data → dao → addInstance（唯一 shader ABI 边界）──────
+    // ---- encode: frame_data -> shader instances (the only shader ABI boundary)
+    // Pure data transform: no Vulkan, no globals. Host supplies a sink
+    // (record_builder::addInsteance in production, a counter in tests).
     inline void clip_glyph(ui_dao::rect_px &r, UvTransform &uv,
                            const ui_dao::rect_px &clip) noexcept
     {
@@ -10907,8 +10942,9 @@ namespace table_glue
         r = {l, t, q - l, b - t};
     }
 
-    inline void encode(const ui_table::frame_data &in, command::record_builder &rb,
-                       const ui_table::font &f, const ui_dao::view &v)
+    template <class Sink>
+    inline void encode(const ui_table::frame_data &in, const ui_table::font &f,
+                       const ui_dao::view &v, Sink &&sink)
     {
         const std::uint32_t hfn = ui_table::hover_fn_ref();
         const auto emit_shape = [&](const ui_table::shape_op &o) {
@@ -10926,7 +10962,7 @@ namespace table_glue
             if (o.color.a <= 0.0F)
                 s.effects = has_border ? shader_data::FX_BORDER : 0U;
             if (s.effects != 0U || o.zone != 0U)
-                rb.addInsteance(s);
+                sink(s);
         };
         const auto emit_text = [&](const ui_table::text_op &o) {
             const float px = f.px;
@@ -10950,9 +10986,8 @@ namespace table_glue
                     uv.offset = {g->uv.x, g->uv.y};
                     clip_glyph(r, uv, {o.r.x, o.r.y, o.r.w, o.r.h});
                     if (r.w > 0.0F && r.h > 0.0F)
-                        rb.addInsteance(ui_dao::glyph_quad(r, v, g->tex, g->samp, g->font,
-                                                           g->px_range, o.color, uv,
-                                                           o.zone));
+                        sink(ui_dao::glyph_quad(r, v, g->tex, g->samp, g->font,
+                                                g->px_range, o.color, uv, o.zone));
                     x += g->advance * px;
                 }
                 i += n;
@@ -10974,7 +11009,7 @@ namespace table_glue
             emit_shape(s);
     }
 
-    // ── 平台小工具 ────────────────────────────────────────────────────────
+    // ---- platform helpers (GLFW / clipboard / IME / cursor)
     inline std::string read_clipboard(GLFWwindow *win)
     {
         if (win == nullptr)
@@ -11013,7 +11048,10 @@ namespace table_glue
         }();
         if (api.get_ctx == nullptr || api.get_str == nullptr || api.rel_ctx == nullptr)
             return {};
-        void *himc = api.get_ctx(win);
+        HWND hwnd = glfwGetWin32Window(win);
+        if (hwnd == nullptr)
+            return {};
+        void *himc = api.get_ctx(hwnd);
         if (himc == nullptr)
             return {};
         std::string out;
@@ -11033,10 +11071,9 @@ namespace table_glue
                                       out.data(), need, nullptr, nullptr);
             }
         }
-        api.rel_ctx(win, himc);
+        api.rel_ctx(hwnd, himc);
         return out;
     }
-
     inline void apply_cursor(GLFWwindow *win, ui_table::cursor c) noexcept
     {
         if (win == nullptr)
@@ -11060,23 +11097,7 @@ namespace table_glue
         glfwSetCursor(win, pool[idx]);
     }
 
-    // ── 数据 ──────────────────────────────────────────────────────────────
-    inline ui_table::font &font_ref() noexcept
-    {
-        static ui_table::font v{};
-        return v;
-    }
-    inline ui_table::prefs &prefs_ref() noexcept
-    {
-        static ui_table::prefs v{};
-        return v;
-    }
-    inline ui_table::table_data &data_ref() noexcept
-    {
-        static ui_table::table_data v{};
-        return v;
-    }
-
+    // ---- font / model (one-time init, ownership moved into table_arena)
     inline void init_font(ui_table::font &F)
     {
         F.px = 15.0F;
@@ -11127,7 +11148,7 @@ namespace table_glue
 }
 )json";
 
-    inline void init_model()
+    inline void init_model(ui_table::table_data &d, ui_table::prefs &p)
     {
         auto j = nlohmann::json::parse(kTableJson);
         static constexpr const char *kStatus[3] = {"ready", "busy", "error"};
@@ -11145,7 +11166,6 @@ namespace table_glue
                  kNote[i % 4]}));
         }
 
-        auto &d = data_ref();
         d = {};
         for (const auto &c : j.at("columns"))
         {
@@ -11195,7 +11215,6 @@ namespace table_glue
             d.ids.push_back(ui_table::row_id{next_id++});
         }
 
-        auto &p = prefs_ref();
         if (j.contains("style"))
         {
             const auto &s = j.at("style");
@@ -11213,46 +11232,455 @@ namespace table_glue
         std::println("[table] json: {} cols x {} rows, frozen={}", d.cols.size(),
                      d.ids.size(), p.frozen);
     }
-    inline picking_result &last_pick() noexcept
-    {
-        static picking_result g{};
-        return g;
-    }
-    inline ui_table::table_id &active_table() noexcept
-    {
-        static ui_table::table_id t{};
-        return t;
-    }
-    inline void on_hover(picking_result r, bool enter, InputCtx &,
-                         ui_new::ScreenWidget *) noexcept
-    {
-        last_pick() = r;
-        const auto z = ui_table::zone_from(r.key.entity_index);
-        ui_table::trace("[hover] {} part={} row={} col={} (raw_entity={})",
-                        enter ? "ENTER" : "LEAVE", ui_table::part_name(z.kind), z.row,
-                        z.col, r.key.entity_index);
-    }
-    inline std::uint32_t index()
-    {
-        static const std::uint32_t fn = hoverPool().bind(&on_hover);
-        return fn;
-    }
 } // namespace table_glue
 
 namespace table_ui
 {
     namespace ev = mcs::vulkan::event;
+    inline bool cancel_modal() noexcept; // 定义在 input 链末尾
 
-    struct host_t
+    // =====================================================================
+    // table arena input：input_frame -> arbiter -> gesture::Trait -> on_*
+    //
+    //   GLFW event
+    //     -> input_frame::build_change   （归一成 key/button/move/char change）
+    //     -> arbiter.feed                （唯一裁决点）
+    //     -> table_tree：gesture 现成识别器
+    //        click / right_click / drag / wheel / key_observer
+    //     -> on_press / on_right_click / on_drag / on_wheel /
+    //        on_key / on_char            （唯一副作用入口）
+    //
+    //   之前按事件类型手写的一排 input_event 重载全部删除；现在只有
+    //   table_arena::handle_event<E> 一个模板入口。
+    // =====================================================================
+    namespace arena_input
     {
+        using intent::time_point;
+
+        // 语义事件的 payload：只装“识别器给的量”，不装 target
+        struct click_payload
+        {
+            double x{}, y{};
+            time_point at{};
+        };
+        struct drag_payload
+        {
+            gesture::drag_phase phase{};
+            double x{}, y{}, dx{}, dy{};
+            double total_dx{}, total_dy{};
+            ModifierKey modifier{};
+            time_point at{};
+        };
+        struct wheel_payload
+        {
+            int delta{};
+            time_point at{};
+        };
+        struct key_payload
+        {
+            Key key{};
+            input_frame::Transition transition{};
+            time_point at{};
+            bool repeat{};
+        };
+        struct char_payload
+        {
+            unsigned codepoint{};
+            time_point at{};
+        };
+
+        struct none_policy
+        {
+        };
+        // 表的点击不限制按住时长（只有 4px 的抖动阈值）；双击节奏由 core 判定
+        struct click_policy
+        {
+            static constexpr auto button = input_frame::MouseButton::eMOUSE_BUTTON_LEFT;
+            static constexpr std::int64_t tap_max_ms = 60000;
+            static constexpr double slop_px = mcs::app::drag_slop_px;
+        };
+        struct right_click_policy
+        {
+            static constexpr auto button = input_frame::MouseButton::eMOUSE_BUTTON_RIGHT;
+            static constexpr std::int64_t tap_max_ms = 60000;
+            static constexpr double slop_px = mcs::app::drag_slop_px;
+        };
+
+        // Trait 只写 collect（payload 怎么从语义事件来）；
+        // 坐标有效性 / press-release / slop / repeat 全在 input_frame + gesture。
+        struct Trait_press
+            : gesture::trait_base<click_payload, static_string{"press"},
+                                  static_string{"on_press"}, click_policy>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::click_event &e) noexcept
+            {
+                d = {e.x, e.y, e.at};
+            }
+        };
+        struct Trait_right_click
+            : gesture::trait_base<click_payload, static_string{"right_click"},
+                                  static_string{"on_right_click"}, right_click_policy>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::click_event &e) noexcept
+            {
+                d = {e.x, e.y, e.at};
+            }
+        };
+        struct Trait_drag
+            : gesture::trait_base<drag_payload, static_string{"drag"},
+                                  static_string{"on_drag"}, mcs::app::policy::drag>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::drag_event &e) noexcept
+            {
+                d.phase = e.phase;
+                d.x = e.x;
+                d.y = e.y;
+                d.dx = e.dx;
+                d.dy = e.dy;
+                d.total_dx = e.total_dx;
+                d.total_dy = e.total_dy;
+                d.modifier = e.modifier;
+                d.at = e.at;
+            }
+        };
+        struct Trait_wheel
+            : gesture::trait_base<wheel_payload, static_string{"wheel"},
+                                  static_string{"on_wheel"}, mcs::app::policy::wheel>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::wheel_event &e) noexcept
+            {
+                d = {e.delta, e.at};
+            }
+        };
+        struct Trait_key
+            : gesture::trait_base<key_payload, static_string{"key"},
+                                  static_string{"on_key"}, none_policy>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::key_event &e) noexcept
+            {
+                d = {e.key, e.transition, e.at, e.repeat};
+            }
+        };
+
+
+        // 直接复用 gesture 的现成识别器：click / right_click / drag / wheel /
+        // key_observer。双击/三击不另设识别器：core 的 note_click 在同一次
+        // click 里按时间/位置累计（单击不会被“等待双击”吞掉）。
+        using table_tree = intent::all_of<
+            intent::leaf<gesture::click_template<Trait_press>>,
+            intent::leaf<gesture::click_template<Trait_right_click>>,
+            intent::leaf<gesture::drag_template<Trait_drag>>,
+            intent::leaf<gesture::wheel_template<Trait_wheel>>,
+            intent::leaf<gesture::key_observer_template<Trait_key>>>;
+
+        using table_arbiter = intent::debug_arbiter<table_tree>;
+    } // namespace arena_input
+
+    using table_tree = arena_input::table_tree;
+    using table_arbiter = arena_input::table_arbiter;
+
+    // =====================================================================
+    // table_arena: all mutable state of one table.
+    // No static, no globals: the host owns the single instance (Table node).
+    // =====================================================================
+    struct table_arena
+    {
+        // ---- data (input writes, draw reads)
+        ui_table::table_data data;
+        ui_table::prefs prefs{};
+        ui_table::font font{};
+        ui_table::table_id id{};
+
+        // ---- derived (intermediate results of the draw chain)
+        ui_table::view view{};
+        ui_table::geometry geom{};
+        ui_table::row_pipeline pipe{};
+        ui_table::systems sys{};
+        ui_table::frame_data frame{};
+
+        // ---- input/draw merge point
+        ui_table::target pointer{};        // current pointer target (from hit_target)
+        picking_result pick{};             // GPU readback (verification only)
+        std::uint32_t pick_version{0};
+        std::vector<ui_table::effect> fx;  // host effects produced by input
+
+        // ---- input arena：input_frame -> arbiter -> gesture -> on_*
+        arena_input::table_arbiter arbiter{};
+        input_frame::event_context input_state{};
+        intent::time_point now{};
+        bool esc_cancelled{false}; // on_key 成功取消了 modal，主循环据此吞掉关窗
+
+        // ---- 宿主回调（模型/选择/勾选变化）
+        struct callbacks
+        {
+            std::function<void()> on_model_changed;
+            std::function<void()> on_selection_changed;
+            std::function<void()> on_checks_changed;
+        };
+        callbacks cb{};
+
+        // 上一次已通知的选区/勾选快照（去重：输入、筛选、模型都走同一处）
+        int cb_r0{-1}, cb_c0{-1}, cb_r1{-1}, cb_c1{-1}, cb_cur_r{-1}, cb_cur_c{-1};
+        std::uint64_t cb_checks{0};
+        bool cb_valid{false};
+
+        // 唯一输入入口：任何平台事件都从这里进 arena
+        template <class E>
+        void handle_event(const E &e);
+        void advance(double seconds);
+
+        // 给库里的识别器用（drag_template 等按 fn_name 调成员）
+        template <static_string Name, class... A>
+        constexpr decltype(auto) invoke(A &&...a)
+        {
+            constexpr auto m = *type_erased_invoker<>::find_function(^^table_arena, Name);
+            return (this->[:m:])(std::forward<A>(a)...);
+        }
+
+        // arena 的 on_*（由 gesture 识别器 win 通过反射调用）
+        void on_press(const arena_input::click_payload &e);
+        void on_right_click(const arena_input::click_payload &e);
+        void on_drag(const arena_input::drag_payload &e);
+        void on_wheel(const arena_input::wheel_payload &e);
+        void on_key(const arena_input::key_payload &e);
+        void on_char(const arena_input::char_payload &e);
+        void handle_key_event(const ev::keyboard_event &e);
+
+        // ---- host
         ui_new::ScreenWidget *screen{};
         ui_new::Widget *owner{};
-        ui_dao::view draw_view{};
-        float mx{0}, my{0};
+        GLFWwindow *win{};
+        float mx{0}, my{0};   // pointer in owner coordinates
+        float wx{0}, wy{0};   // raw window cursor
+        float sx{1}, sy{1};   // window logical -> owner coordinates
         float vw{1}, vh{1};
-        float sx{1}, sy{1}; // window 像素 → owner 逻辑坐标
-        std::vector<ui_table::effect> fx;
+
+        // ---- draw statistics (tests / verification)
+        struct draw_info
+        {
+            std::uint32_t version{};
+            std::uint32_t shapes{};
+            std::uint32_t texts{};
+            std::uint32_t zoned{};
+            std::uint32_t instances{};
+        };
+        draw_info info{};
+        std::uint32_t inputs{};
+        // 输入产生的语义变化（宿主可以据此回调；draw 不读它）
+        struct change_flags
+        {
+            bool selection{};
+            bool checks{};
+            bool model{};
+        };
+        change_flags changes{};
     };
+
+    // The current table: the host widget tree contains exactly one Table node.
+    inline table_arena *&current_arena() noexcept
+    {
+        static table_arena *p = nullptr;
+        return p;
+    }
+
+
+    // =====================================================================
+    // draw chain: three named steps, fixed order, one job each
+    // =====================================================================
+
+    // 1) data + view -> geometry
+    inline void draw_sync(table_arena &s, const ui_table::rect &box)
+    {
+        const float m = 48.0F;
+        const ui_table::rect vp{box.x + m, box.y + m, std::max(box.w - 2.0F * m, 1.0F),
+                                std::max(box.h - 2.0F * m, 1.0F)};
+        s.vw = vp.w;
+        s.vh = vp.h;
+        ui_table::sync(s.data, s.view, s.prefs, s.geom, vp, s.font, s.sys, s.pipe);
+        if (std::getenv("TABLE_GEOMLOG") != nullptr)
+        {
+            static std::uint32_t last_ver = ~0U;
+            static float last_w = -1, last_h = -1;
+            if (last_ver != s.geom.version || last_w != s.geom.box.w ||
+                last_h != s.geom.box.h)
+            {
+                last_ver = s.geom.version;
+                last_w = s.geom.box.w;
+                last_h = s.geom.box.h;
+                const auto &g = s.geom;
+                std::print("[geom] box=({:.1f},{:.1f},{:.1f},{:.1f}) header_y={:.1f} "
+                           "body=({:.1f},{:.1f},{:.1f},{:.1f}) scroll=({:.1f},{:.1f}) "
+                           "cols=",
+                           g.box.x, g.box.y, g.box.w, g.box.h, g.col_header.y, g.body.x,
+                           g.body.y, g.body.w, g.body.h, g.sx, g.sy);
+                for (int i = 0; i < g.col_count(); ++i)
+                    std::print("{}:{:.1f}/{:.1f} ", g.col_index[static_cast<std::size_t>(i)],
+                               g.col_x_at(i), g.col_w[static_cast<std::size_t>(i)]);
+                std::println("");
+            }
+        }
+    }
+
+    // 2) data + view + geometry -> frame_data (DL, every op carries zone)
+    inline void draw_build(table_arena &s)
+    {
+        ui_table::build_frame(s.data, s.view, s.prefs, s.geom, s.font, s.sys, s.frame,
+                              s.id);
+        s.frame.table = s.id;
+    }
+
+    // 3) frame_data -> shader instances (entity_index = zone_key)
+    template <class Sink>
+    inline void draw_encode(const table_arena &s, const ui_dao::view &view, Sink &&sink)
+    {
+        table_glue::encode(s.frame, s.font, view, std::forward<Sink>(sink));
+    }
+
+    // full draw chain: sync -> build -> encode
+    inline const table_arena::draw_info &draw(table_arena &s, const ui_table::rect &box,
+                                              const ui_dao::view &view,
+                                              command::record_builder &rb)
+    {
+        draw_sync(s, box);
+        draw_build(s);
+
+        auto &info = s.info;
+        info = {};
+        info.version = s.view.ui.version;
+        for (const auto &ops : s.frame.draw.shapes)
+            info.shapes += static_cast<std::uint32_t>(ops.size());
+        for (const auto &ops : s.frame.draw.texts)
+            info.texts += static_cast<std::uint32_t>(ops.size());
+        for (const auto &ops : s.frame.draw.shapes)
+            for (const auto &o : ops)
+                info.zoned += o.zone != 0 ? 1U : 0U;
+
+        draw_encode(s, view, [&](auto &&inst) {
+            ++info.instances;
+            rb.addInsteance(std::forward<decltype(inst)>(inst));
+        });
+        return info;
+    }
+
+    // 六个接口的显式名字（内部实现仍是上面三条；命名对齐 HANDOFF_table_arena）
+    inline void on_pick(table_arena &s, const picking_result &r);
+    inline void sync(table_arena &s, const ui_table::rect &box) { draw_sync(s, box); }
+    inline void build_frame(table_arena &s) { draw_build(s); }
+    template <class Sink>
+    inline void encode(const table_arena &s, const ui_dao::view &view, Sink &&sink)
+    {
+        draw_encode(s, view, std::forward<Sink>(sink));
+    }
+    inline void picking(table_arena &s, const picking_result &r) { on_pick(s, r); }
+
+    // =====================================================================
+    // input chain: translate (event -> cmd) -> dispatch (cmd -> systems/visit_owner)
+    // =====================================================================
+
+    // input/draw merge point: pointer -> target (same zone_key protocol as draw)
+    inline ui_table::target pointer_target(table_arena &s, float x, float y)
+    {
+        s.pointer = ui_table::hit_target(s.data, s.geom, s.view, x, y, s.id);
+        return s.pointer;
+    }
+
+    // host effects produced by input: write data / clipboard, then bump version
+    inline void apply_effects(table_arena &s)
+    {
+        bool model_changed = false;
+        for (auto &e : s.fx)
+        {
+            if (auto *p = std::get_if<ui_table::fx_set_cell>(&e))
+            {
+                const int r = s.data.index_of(p->id);
+                if (r >= 0)
+                {
+                    s.data.set_cell(r, p->col, std::move(p->text));
+                    model_changed = true;
+                }
+            }
+            else if (auto *p = std::get_if<ui_table::fx_clipboard>(&e))
+                table_glue::write_clipboard(s.win, p->text);
+        }
+        s.fx.clear();
+        s.view.ui.touch();
+        if (model_changed)
+        {
+            s.changes.model = true;
+            if (s.cb.on_model_changed)
+                s.cb.on_model_changed();
+        }
+    }
+
+    // the only semantic dispatch: systems first, fallback visit_owner lives in core
+    struct ui_signature
+    {
+        int r0{}, c0{}, r1{}, c1{}, cur_r{}, cur_c{};
+        std::uint64_t checks{};
+        friend bool operator==(const ui_signature &, const ui_signature &) = default;
+    };
+    inline ui_signature signature_of(const table_arena &s) noexcept
+    {
+        ui_signature g{s.view.sel.r0,    s.view.sel.c0,    s.view.sel.r1,
+                       s.view.sel.c1,    s.view.sel.cur_r, s.view.sel.cur_c,
+                       0};
+        std::uint64_t h = 1469598103934665603ULL;
+        for (const auto v : s.view.checks.on)
+            h = (h ^ v) * 1099511628211ULL;
+        g.checks = h;
+        return g;
+    }
+
+    // 选区/勾选变化的唯一通知点：输入、筛选、模型对齐都走这里（去重）
+    inline void notify_change(table_arena &s)
+    {
+        const auto sig = signature_of(s);
+        const bool sel = !s.cb_valid || sig.r0 != s.cb_r0 || sig.c0 != s.cb_c0 ||
+                         sig.r1 != s.cb_r1 || sig.c1 != s.cb_c1 ||
+                         sig.cur_r != s.cb_cur_r || sig.cur_c != s.cb_cur_c;
+        const bool chk = !s.cb_valid || sig.checks != s.cb_checks;
+        if (sel)
+        {
+            s.changes.selection = true;
+            if (s.cb.on_selection_changed)
+                s.cb.on_selection_changed();
+        }
+        if (chk)
+        {
+            s.changes.checks = true;
+            if (s.cb.on_checks_changed)
+                s.cb.on_checks_changed();
+        }
+        s.cb_r0 = sig.r0;
+        s.cb_c0 = sig.c0;
+        s.cb_r1 = sig.r1;
+        s.cb_c1 = sig.c1;
+        s.cb_cur_r = sig.cur_r;
+        s.cb_cur_c = sig.cur_c;
+        s.cb_checks = sig.checks;
+        s.cb_valid = true;
+    }
+
+    template <class Cmd>
+    inline void input_dispatch(table_arena &s, const Cmd &cmd)
+    {
+        ui_table::system_event(s.data, s.view, s.prefs, s.geom, s.sys, s.font, cmd, s.fx);
+        apply_effects(s);
+        notify_change(s);
+        ++s.inputs;
+    }
+
+    // keyboard focus: single-table program, remember the last pressed table
+    inline std::uint32_t &active_table() noexcept
+    {
+        static std::uint32_t id = 0;
+        return id;
+    }
 
     inline std::optional<ui_table::key> map_key(ev::Key k) noexcept
     {
@@ -11331,563 +11759,812 @@ namespace table_ui
         }
     }
 
-    // make_table：数据 + 派生 + 输入，全部字段化；没有 table 类
+    // owner coordinates: window logical -> table coordinates (DPI/layout scale once)
+    inline void set_pointer(table_arena &s, double wx, double wy) noexcept
+    {
+        s.wx = static_cast<float>(wx);
+        s.wy = static_cast<float>(wy);
+        s.mx = s.wx * s.sx + (s.owner ? static_cast<float>(s.owner->offset.x) : 0.0F);
+        s.my = s.wy * s.sy + (s.owner ? static_cast<float>(s.owner->offset.y) : 0.0F);
+    }
+
+    // =====================================================================
+    // arena 的 on_*：唯一副作用入口（识别器 win 通过反射调到这里）
+    // =====================================================================
+    inline bool cancel_modal(table_arena &s) noexcept; // 定义在 input 链末尾
+
+    // 单击（含双击/三击的每一击）：press + release 一起发；
+    // 双击/三击的判定由 core 的 note_click 按时间/位置完成。
+    inline void click_dispatch(table_arena &s, double x, double y)
+    {
+        if (!s.input_state.pointer_position_valid && s.win != nullptr)
+        {
+            double cx = 0, cy = 0;
+            glfwGetCursorPos(s.win, &cx, &cy);
+            x = cx;
+            y = cy;
+        }
+        set_pointer(s, x, y);
+        active_table() = s.id.value;
+        const auto tgt = pointer_target(s, s.mx, s.my);
+        if (std::getenv("TABLE_INPUTLOG") != nullptr)
+            std::println("[click] at=({:.1f},{:.1f}) kind={} row={} col={}", s.mx, s.my,
+                         ui_table::part_name(tgt.kind), tgt.row_index, tgt.col_index);
+        const bool shift = s.input_state.modifier.shift();
+        const bool ctrl = s.input_state.modifier.control();
+        input_dispatch(s, ui_table::cmd_press{s.mx, s.my, tgt.to_zone(), false, shift,
+                                              ctrl, tgt});
+        input_dispatch(s, ui_table::cmd_release{s.mx, s.my, s.view.ui.drag_target});
+    }
+
+    inline void table_arena::on_press(const arena_input::click_payload &e)
+    {
+        click_dispatch(*this, e.x, e.y);
+    }
+
+    inline void table_arena::on_right_click(const arena_input::click_payload &e)
+    {
+        set_pointer(*this, e.x, e.y);
+        const auto tgt = pointer_target(*this, mx, my);
+        ui_table::table_ctx tc{data, view, prefs, geom, font, &fx, nullptr, id};
+        sys.menu.open(tc, tgt.to_zone().col, mx, my);
+    }
+
+    inline void table_arena::on_drag(const arena_input::drag_payload &e)
+    {
+        switch (e.phase)
+        {
+        case gesture::drag_phase::begin: {
+            // 按下点 = 当前点 - 总位移：先补一发 press，再发 drag
+            set_pointer(*this, e.x - e.total_dx, e.y - e.total_dy);
+            active_table() = id.value;
+            view.ui.last_click_t = -1.0e9; // 拖拽的 press 不参与双击判定
+            const auto tgt = pointer_target(*this, mx, my);
+            input_dispatch(*this,
+                           ui_table::cmd_press{mx, my, tgt.to_zone(), false,
+                                               e.modifier.shift(), e.modifier.control(),
+                                               tgt});
+            set_pointer(*this, e.x, e.y);
+            input_dispatch(*this, ui_table::cmd_drag{mx, my, view.ui.drag_target});
+            break;
+        }
+        case gesture::drag_phase::move:
+            set_pointer(*this, e.x, e.y);
+            input_dispatch(*this, ui_table::cmd_drag{mx, my, view.ui.drag_target});
+            break;
+        case gesture::drag_phase::end:
+            set_pointer(*this, e.x, e.y);
+            input_dispatch(*this, ui_table::cmd_release{mx, my, view.ui.drag_target});
+            break;
+        }
+    }
+
+    inline void table_arena::on_wheel(const arena_input::wheel_payload &e)
+    {
+        if (!input_state.pointer_position_valid && win != nullptr)
+        {
+            double cx = 0, cy = 0;
+            glfwGetCursorPos(win, &cx, &cy);
+            set_pointer(*this, cx, cy);
+        }
+        else
+            set_pointer(*this, input_state.pointer_x, input_state.pointer_y);
+        if (std::getenv("TABLE_INPUTLOG") != nullptr)
+            std::println("[wheel] delta={} at=({:.1f},{:.1f})", e.delta, mx, my);
+        // 只滚指针下面的表；Shift 或悬停横向条 = 横向滚动
+        if (mx < geom.box.x || mx >= geom.box.x1() || my < geom.box.y ||
+            my >= geom.box.y1())
+            return;
+        ui_table::system_wheel(view, prefs, 0.0F, static_cast<float>(e.delta),
+                               input_state.modifier.shift(), &geom);
+        ++inputs;
+    }
+
+    inline void table_arena::on_key(const arena_input::key_payload &e)
+    {
+        if (e.transition != input_frame::Transition::Press)
+            return;
+        // 只有导航键接受 repeat；Ctrl+V / F2 / 字母等只认首次 press
+        const bool nav = e.key == ev::Key::eUP || e.key == ev::Key::eDOWN ||
+                         e.key == ev::Key::eLEFT || e.key == ev::Key::eRIGHT ||
+                         e.key == ev::Key::eHOME || e.key == ev::Key::eEND ||
+                         e.key == ev::Key::ePAGE_UP || e.key == ev::Key::ePAGE_DOWN;
+        if (e.repeat && !nav)
+            return;
+        if (active_table() != 0 && active_table() != id.value)
+            return;
+        const auto key_down = [&](ev::Key k) {
+            return input_state.get_keyboard_event(k) ==
+                   input_frame::HeldState::Down;
+        };
+        const bool ctrl = input_state.modifier.control() ||
+                          key_down(ev::Key::eLEFT_CONTROL) ||
+                          key_down(ev::Key::eRIGHT_CONTROL);
+        const bool shift = input_state.modifier.shift() ||
+                           key_down(ev::Key::eLEFT_SHIFT) ||
+                           key_down(ev::Key::eRIGHT_SHIFT);
+        if (std::getenv("TABLE_INPUTLOG") != nullptr)
+            std::println("[in] key={} repeat={} sel=({},{})", e.key, e.repeat,
+                         view.sel.cur_r, view.sel.cur_c);
+        if (e.key == ev::Key::eV && ctrl)
+        {
+            ui_table::table_ctx c{data, view, prefs, geom, font, &fx, nullptr, id};
+            sys.edit.paste(c, table_glue::read_clipboard(win));
+            apply_effects(*this);
+            ++inputs;
+            return;
+        }
+        if (e.key == ev::Key::eESCAPE)
+        {
+            if (cancel_modal(*this))
+                esc_cancelled = true;
+            return;
+        }
+        if (const auto k = map_key(e.key))
+            input_dispatch(*this, ui_table::cmd_key{
+                                      *k, shift, ctrl,
+                                      ui_table::target_of(
+                                          data, id,
+                                          ui_table::zone{ui_table::part::cell,
+                                                         view.sel.cur_r,
+                                                         view.sel.cur_c, id})});
+    }
+
+    inline void table_arena::on_char(const arena_input::char_payload &e)
+    {
+        std::string text;
+        encode_utf8(e.codepoint, text);
+        if (std::getenv("TABLE_INPUTLOG") != nullptr)
+            std::println("[char] cp={:#x} filter={} find={} edit={}", e.codepoint,
+                         view.filter.edit, view.find.mode, view.edit.active());
+        ui_table::table_ctx tc{data, view, prefs, geom, font, &fx, nullptr, id};
+        ui_table::system_text(tc, sys, text);
+        apply_effects(*this);
+    }
+
+    inline void table_arena::handle_key_event(const ev::keyboard_event &e)
+    {
+        now = mcs::app::now_ms();
+        view.ui.now = static_cast<double>(now.count()) / 1000.0;
+        auto f = input_frame::build_change(input_state, e);
+        arbiter.feed(*this, f, now);
+        input_frame::apply_change(input_state, f);
+    }
+
+    // =====================================================================
+    // 唯一输入入口：event -> input_frame -> arbiter -> gesture -> on_*
+    // =====================================================================
+    template <class E>
+    inline void table_arena::handle_event(const E &e)
+    {
+        if constexpr (std::same_as<E, ev::window_focus_event>)
+        {
+            if (!e.focused)
+            {
+                view.ui.left = false;
+                view.ui.drag = ui_table::drag_mode::none;
+                view.menu.open = false;
+                view.ui.touch();
+            }
+            return;
+        }
+        else
+        {
+            now = mcs::app::now_ms();
+            view.ui.now = static_cast<double>(now.count()) / 1000.0;
+            if constexpr (std::same_as<E, ev::char_event>)
+            {
+                // 文本不是手势：直接进 on_char（不经过 arbiter）
+                on_char(arena_input::char_payload{e.codepoint, now});
+                return;
+            }
+            if constexpr (std::same_as<E, ev::keyboard_event>)
+            {
+                handle_key_event(e);
+                return;
+            }
+            using frame_t = decltype(input_frame::build_change(input_state, e));
+            if constexpr (!std::is_void_v<frame_t>)
+            {
+                auto f = input_frame::build_change(input_state, e);
+                arbiter.feed(*this, f, now);
+                input_frame::apply_change(input_state, f);
+            }
+        }
+    }
+
+    inline void table_arena::advance(double /*seconds*/)
+    {
+        // 表的输入/悬停/双击全部用同一个时钟（now_ms），不混 GLFW elapsed
+        now = mcs::app::now_ms();
+        view.ui.now = static_cast<double>(now.count()) / 1000.0;
+        if (!view.ui.left)
+        {
+            // hover 是帧派生态（pointer + geometry），不是手写输入分支
+            set_pointer(*this, input_state.pointer_x, input_state.pointer_y);
+            view.ui.pointer = {mx, my};
+            ui_table::system_hover(view, pointer_target(*this, mx, my));
+        }
+        arbiter.tick(*this, now);
+        notify_change(*this);
+    }
+
+    // IME preedit is polled, not event driven: sync once per frame on the input side
+    inline void input_ime(table_arena &s)
+    {
+        if (s.win == nullptr)
+            return;
+        const bool filter = s.view.filter.edit >= 0;
+        const bool find = s.view.find.mode;
+        const bool edit = s.view.edit.active();
+        if (!filter && !find && !edit)
+            return;
+        auto pre = table_glue::ime_preedit(s.win);
+        if (filter)
+        {
+            if (pre != s.view.filter.compose)
+            {
+                s.view.filter.compose = std::move(pre);
+                s.view.ui.touch();
+            }
+            return;
+        }
+        if (find)
+        {
+            if (pre != s.view.find.compose)
+            {
+                s.view.find.compose = std::move(pre);
+                s.view.ui.touch();
+            }
+            return;
+        }
+        if (pre == s.view.edit.compose)
+            return;
+        ui_table::table_ctx tc{s.data, s.view, s.prefs, s.geom, s.font,
+                               &s.fx,  nullptr,    s.id};
+        s.sys.edit.compose(tc, std::move(pre));
+    }
+
+    // Esc 取消：编辑/筛选/查找/菜单任一打开时，优先取消它而不是关窗口
+    inline bool modal_open() noexcept
+    {
+        auto *s = current_arena();
+        return s != nullptr &&
+               (s->view.filter.edit >= 0 || s->view.find.mode ||
+                s->view.edit.active() || s->view.menu.open);
+    }
+    inline bool cancel_modal(table_arena &st) noexcept
+    {
+        auto &v = st.view;
+        if (v.filter.edit >= 0)
+        {
+            const auto col = static_cast<std::size_t>(v.filter.edit);
+            if (col < v.filter.text.size())
+                v.filter.text[col] = v.filter.orig;
+            v.filter.input = v.filter.orig;
+            v.filter.orig.clear();
+            v.filter.compose.clear();
+            v.filter.edit = -1;
+            v.ui.touch();
+            return true;
+        }
+        if (v.find.mode)
+        {
+            v.find.mode = false;
+            v.find.compose.clear();
+            v.ui.touch();
+            return true;
+        }
+        if (v.edit.active())
+        {
+            v.edit = {};
+            v.ui.touch();
+            return true;
+        }
+        if (v.menu.open)
+        {
+            v.menu.open = false;
+            v.ui.touch();
+            return true;
+        }
+        return false;
+    }
+
+    inline bool cancel_modal() noexcept
+    {
+        auto *s = current_arena();
+        return s != nullptr && cancel_modal(*s);
+    }
+
+    // =====================================================================
+    // 模型 API：数据变更 + view 对齐 + 回调，一站式
+    // =====================================================================
+    inline void notify_model(table_arena &s)
+    {
+        s.changes.model = true;
+        s.view.ui.touch();
+        if (s.cb.on_model_changed)
+            s.cb.on_model_changed();
+    }
+
+    inline ui_table::row_id insert_row(table_arena &s, int at = -1)
+    {
+        const auto id = s.data.insert_row(at);
+        s.view.reconcile(s.data);
+        notify_model(s);
+        return id;
+    }
+    inline bool remove_row(table_arena &s, int at)
+    {
+        if (!s.data.remove_row(at))
+            return false;
+        s.view.reconcile(s.data);
+        notify_model(s);
+        return true;
+    }
+    inline ui_table::column_id insert_column(table_arena &s, int at,
+                                             ui_table::column c)
+    {
+        const auto id = s.data.insert_column(at, std::move(c));
+        s.view.reconcile(s.data);
+        notify_model(s);
+        return id;
+    }
+    inline bool remove_column(table_arena &s, int at)
+    {
+        if (!s.data.remove_column(at))
+            return false;
+        s.view.reconcile(s.data);
+        notify_model(s);
+        return true;
+    }
+    inline void set_cell(table_arena &s, int row, int col, std::string text)
+    {
+        s.data.set_cell(row, col, std::move(text));
+        notify_model(s);
+    }
+    inline void on_pick(table_arena &s, const picking_result &r)
+    {
+        s.pick = r;
+        s.pick_version = s.view.ui.version;
+        if (std::getenv("TABLE_PICKCHECK") == nullptr ||
+            r.key.object_type == 0xFFFFFFFF)
+            return;
+        const auto from_gpu = ui_table::resolve(s.data, r.key.entity_index);
+        const auto from_hit =
+            ui_table::hit_target(s.data, s.geom, s.view, s.mx, s.my, s.id);
+        if (from_gpu.to_zone() != from_hit.to_zone())
+            std::println("[pick] MISMATCH gpu=({}, {}, {}) hit=({}, {}, {})",
+                         ui_table::part_name(from_gpu.kind), from_gpu.row_index,
+                         from_gpu.col_index, ui_table::part_name(from_hit.kind),
+                         from_hit.row_index, from_hit.col_index);
+        else
+            std::println("[pick] ok {} row={} col={} entity={:#x}",
+                         ui_table::part_name(from_gpu.kind), from_gpu.row_index,
+                         from_gpu.col_index, r.key.entity_index);
+    }
+
+    // hover pool callback: hand the GPU readback to the current table
+    inline void on_hover(picking_result r, bool enter, InputCtx &,
+                         ui_new::ScreenWidget *) noexcept
+    {
+        if (auto *st = current_arena())
+            on_pick(*st, r);
+        ui_table::trace("[hover] {} key={:#x}", enter ? "ENTER" : "LEAVE",
+                        r.key.entity_index);
+    }
+    inline std::uint32_t hover_index()
+    {
+        static const std::uint32_t fn = hoverPool().bind(&on_hover);
+        return fn;
+    }
+
+    // =====================================================================
+    // widget adapter: table_arena <-> ui_new tree / glfw_input_translation
+    // Three jobs only: own the state, give the owner box to draw,
+    // hand events to input.
+    // =====================================================================
     inline auto make_table(ui_table::table_data data, ui_table::prefs p,
-                           ui_table::font *f)
+                           ui_table::font f)
     {
         data.finalize();
-        auto t = make_aggregate<"Table">(
-            field<"data">(std::move(data)), field<"id">(ui_table::next_table_id()),
-            field<"view">(ui_table::view{}), field<"geom">(ui_table::geometry{}),
-            field<"frame">(ui_table::frame_data{}), field<"prefs">(p), field<"font">(f),
-            field<"pipe">(ui_table::row_pipeline{}), field<"sys">(ui_table::systems{}),
-            field<"host">(host_t{}),
+        table_arena st;
+        st.data = std::move(data);
+        st.prefs = p;
+        st.font = std::move(f);
+        st.id = ui_table::next_table_id();
+        st.view.reset(st.data);
+        return make_aggregate<"Table">(
+            field<"arena">(std::move(st)),
             field<"input_binding">(glfw_input_translation::scoped_binding{}),
 
-            method<"sync">([](auto &self, float x, float y, float w, float h) {
-                self.host.vw = w;
-                self.host.vh = h;
-                ui_table::sync(self.data, self.view, self.prefs, self.geom, {x, y, w, h},
-                               *self.font, self.sys, self.pipe);
-            }),
-
+            // event entry: single template, straight into the arena
             method<"input_event">([](auto &self, auto e) noexcept {
-                using T = std::remove_cvref_t<decltype(e)>;
-                using namespace mcs::vulkan::event;
-                bool shift = false, ctrl = false;
-                auto picked_any = [&]() -> std::optional<ui_table::target> {
-                    const auto &r = table_glue::last_pick();
-                    if (r.key.object_type == 0xFFFFFFFF ||
-                        r.render_version() != self.view.ui.version)
-                        return std::nullopt;
-                    return ui_table::resolve(self.data, r.key.entity_index);
-                };
-                auto picked = [&]() -> std::optional<ui_table::target> {
-                    auto q = picked_any();
-                    if (!q || q->table.value != self.id.value)
-                        return std::nullopt;
-                    return q;
-                };
-                auto feed = [&](const auto &ev) {
-                    ui_table::system_event(self.data, self.view, self.prefs, self.geom,
-                                           self.sys, *self.font, ev, self.host.fx);
-                    for (auto &e : self.host.fx)
-                    {
-                        if (auto *p = std::get_if<ui_table::fx_set_cell>(&e))
-                            self.data.set_cell(self.data.index_of(p->id), p->col,
-                                               std::move(p->text));
-                        else if (auto *p = std::get_if<ui_table::fx_clipboard>(&e))
-                            if (auto *w = named_resource::frameState().window->data())
-                                table_glue::write_clipboard(w, p->text);
-                    }
-                    self.host.fx.clear();
-                    self.view.ui.touch();
-                };
-
-                if constexpr (requires {
-                                  e.template hasModifiers<ModifierKey::eSHIFT>();
-                              })
-                {
-                    shift = e.template hasModifiers<ModifierKey::eSHIFT>();
-                    ctrl = e.template hasModifiers<ModifierKey::eCONTROL>();
-                }
-                if constexpr (std::same_as<T, position2d_event>)
-                {
-                    self.host.mx = static_cast<float>(e.xpos) * self.host.sx;
-                    self.host.my = static_cast<float>(e.ypos) * self.host.sy;
-                    if (self.view.ui.left)
-                        feed(ui_table::cmd_drag{self.host.mx, self.host.my,
-                                                self.view.ui.drag_target});
-                    else if (auto any = picked_any();
-                             any && any->table.value != self.id.value)
-                        return;
-                    else if (auto pz = picked())
-                        ui_table::system_hover(self.view, *pz);
-                    else
-                        ui_table::system_hover(
-                            self.view,
-                            ui_table::hit_target(self.data, self.geom, self.view,
-                                                 self.host.mx, self.host.my, self.id));
-                }
-                else if constexpr (std::same_as<T, mousebutton_event>)
-                {
-                    if (auto *win = named_resource::frameState().window->data())
-                    {
-                        double cx = 0, cy = 0;
-                        glfwGetCursorPos(win, &cx, &cy);
-                        self.host.mx = static_cast<float>(cx) * self.host.sx;
-                        self.host.my = static_cast<float>(cy) * self.host.sy;
-                    }
-                    if (auto any = picked_any())
-                    {
-                        if (any->table.value != self.id.value)
-                            return;
-                        table_glue::active_table() = self.id;
-                    }
-                    const auto tgt =
-                        picked()
-                            ? *picked()
-                            : ui_table::hit_target(self.data, self.geom, self.view,
-                                                   self.host.mx, self.host.my, self.id);
-                    const auto z = tgt.to_zone();
-                    if (e.button == MouseButtons::eMOUSE_BUTTON_RIGHT && e.press())
-                    {
-                        ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                               self.geom, *self.font, &self.host.fx,
-                                               nullptr};
-                        self.sys.menu.open(tc, z.col, self.host.mx, self.host.my);
-                        return;
-                    }
-                    if (e.button != MouseButtons::eMOUSE_BUTTON_LEFT)
-                        return;
-                    if (e.release())
-                        feed(ui_table::cmd_release{self.host.mx, self.host.my,
-                                                   self.view.ui.drag_target});
-                    else if (e.press())
-                        feed(ui_table::cmd_press{self.host.mx, self.host.my, z, false,
-                                                 shift, ctrl, tgt});
-                }
-                else if constexpr (std::same_as<T, scroll_event>)
-                {
-                    ui_table::system_wheel(self.view, self.prefs,
-                                           static_cast<float>(e.xoffset),
-                                           static_cast<float>(e.yoffset), shift);
-                }
-                else if constexpr (std::same_as<T, window_focus_event>)
-                {
-                    if (!e.focused)
-                    {
-                        self.view.ui.left = false;
-                        self.view.ui.drag = ui_table::drag_mode::none;
-                        self.view.menu.open = false;
-                        self.view.ui.touch();
-                    }
-                }
-                else if constexpr (std::same_as<T, keyboard_event>)
-                {
-                    ui_table::trace("[key] key={} rel={} ctrl={} shift={} active={}",
-                                    (int)e.key, e.release(), ctrl, shift,
-                                    table_glue::active_table().value);
-                    if (e.release())
-                        return;
-                    if (table_glue::active_table().value != 0 &&
-                        table_glue::active_table().value != self.id.value)
-                        return;
-                    if (e.key == Key::eV && ctrl)
-                    {
-                        if (auto *w = named_resource::frameState().window->data())
-                        {
-                            auto s = table_glue::read_clipboard(w);
-                            ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                                   self.geom, *self.font, &self.host.fx,
-                                                   nullptr};
-                            self.sys.edit.paste(tc, std::move(s));
-                        }
-                        return;
-                    }
-                    if (const auto k = map_key(e.key))
-                        feed(ui_table::cmd_key{
-                            *k, shift, ctrl,
-                            ui_table::target_of(
-                                self.data, self.id,
-                                ui_table::zone{ui_table::part::cell, self.view.sel.cur_r,
-                                               self.view.sel.cur_c, self.id})});
-                }
-                else if constexpr (std::same_as<T, char_event>)
-                {
-                    std::string s;
-                    encode_utf8(e.codepoint, s);
-                    {
-                        ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                               self.geom, *self.font, &self.host.fx,
-                                               nullptr};
-                        ui_table::system_text(tc, self.sys, s);
-                    }
-                }
+                self.arena.handle_event(e);
             }),
 
-            method<"tick">([](auto &self, double t) {
-                self.view.ui.now = t;
-                auto picked_any = [&]() -> std::optional<ui_table::target> {
-                    const auto &r = table_glue::last_pick();
-                    if (r.key.object_type == 0xFFFFFFFF ||
-                        r.render_version() != self.view.ui.version)
-                        return std::nullopt;
-                    return ui_table::resolve(self.data, r.key.entity_index);
-                };
-                auto picked = [&]() -> std::optional<ui_table::target> {
-                    auto q = picked_any();
-                    if (!q || q->table.value != self.id.value)
-                        return std::nullopt;
-                    return q;
-                };
-                auto feed = [&](const auto &ev) {
-                    ui_table::system_event(self.data, self.view, self.prefs, self.geom,
-                                           self.sys, *self.font, ev, self.host.fx);
-                    for (auto &e : self.host.fx)
-                    {
-                        if (auto *p = std::get_if<ui_table::fx_set_cell>(&e))
-                            self.data.set_cell(self.data.index_of(p->id), p->col,
-                                               std::move(p->text));
-                        else if (auto *p = std::get_if<ui_table::fx_clipboard>(&e))
-                            if (auto *w = named_resource::frameState().window->data())
-                                table_glue::write_clipboard(w, p->text);
-                    }
-                    self.host.fx.clear();
-                    self.view.ui.touch();
-                };
-                if (std::getenv("TABLE_WHEELTEST") != nullptr)
-                {
-                    static bool once = false;
-                    if (!once)
-                    {
-                        once = true;
-                        mcs::vulkan::event::distribute<
-                            mcs::vulkan::event::scroll_event_dispatcher>(
-                            {.xoffset = 0.0, .yoffset = -5.0});
-                    }
-                }
-                if (std::getenv("TABLE_SORTTEST") != nullptr)
-                {
-                    static bool once = false;
-                    if (!once)
-                    {
-                        once = true;
-                        {
-                            ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                                   self.geom, *self.font, &self.host.fx,
-                                                   nullptr};
-                            self.sys.sort.toggle(tc, 1);
-                        }
-                    }
-                }
-                if (std::getenv("TABLE_SELTEST") != nullptr)
-                {
-                    static bool once = false;
-                    if (!once)
-                    {
-                        once = true;
-                        {
-                            ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                                   self.geom, *self.font, &self.host.fx,
-                                                   nullptr};
-                            self.sys.selection.set(tc, 2, 1);
-                        }
-                        {
-                            ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                                   self.geom, *self.font, &self.host.fx,
-                                                   nullptr};
-                            self.sys.selection.extend(tc, 6, 3);
-                        }
-                        {
-                            ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                                   self.geom, *self.font, &self.host.fx,
-                                                   nullptr};
-                            self.sys.checks.toggle(tc, 0, false);
-                        }
-                        {
-                            ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                                   self.geom, *self.font, &self.host.fx,
-                                                   nullptr};
-                            self.sys.checks.toggle(tc, 1, false);
-                        }
-                    }
-                }
-                if (std::getenv("TABLE_EDITTEST") != nullptr)
-                {
-                    static bool once = false;
-                    if (!once)
-                    {
-                        once = true;
-                        {
-                            ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                                   self.geom, *self.font, &self.host.fx,
-                                                   nullptr};
-                            self.sys.edit.begin(tc, 2, 0);
-                        }
-                        {
-                            ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                                   self.geom, *self.font, &self.host.fx,
-                                                   nullptr};
-                            ui_table::system_text(tc, self.sys, "Z");
-                        }
-                    }
-                }
-                if (std::getenv("TABLE_RESIZETEST") != nullptr)
-                {
-                    static bool once = false;
-                    if (!once)
-                    {
-                        once = true;
-                        ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                               self.geom, *self.font, &self.host.fx,
-                                               nullptr};
-                        self.sys.resize.begin(tc, 0, 0.0F, 220.0F);
-                        self.sys.resize.move(tc, 340.0F);
-                        self.sys.resize.end(tc);
-                    }
-                }
-                if (std::getenv("TABLE_FILTERTEST") != nullptr)
-                {
-                    static bool once = false;
-                    if (!once)
-                    {
-                        once = true;
-                        {
-                            ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                                   self.geom, *self.font, &self.host.fx,
-                                                   nullptr};
-                            self.sys.filter.begin(tc, 1);
-                        }
-                        {
-                            ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                                   self.geom, *self.font, &self.host.fx,
-                                                   nullptr};
-                            ui_table::system_text(tc, self.sys, "err");
-                        }
-                        feed(ui_table::cmd_key{ui_table::key::enter, false, false});
-                    }
-                }
-                if (std::getenv("TABLE_MENUTEST") != nullptr)
-                {
-                    static bool once = false;
-                    if (!once)
-                    {
-                        once = true;
-                        ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                               self.geom, *self.font, &self.host.fx,
-                                               nullptr};
-                        self.sys.menu.open(tc, 0, 320.0F, 90.0F);
-                    }
-                }
-                if (std::getenv("TABLE_FINDINPUT") != nullptr)
-                {
-                    static bool once = false;
-                    if (!once)
-                    {
-                        once = true;
-                        {
-                            ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                                   self.geom, *self.font, &self.host.fx,
-                                                   nullptr};
-                            self.sys.find.toggle(tc);
-                        }
-                        {
-                            ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                                   self.geom, *self.font, &self.host.fx,
-                                                   nullptr};
-                            ui_table::system_text(tc, self.sys, "busy");
-                        }
-                    }
-                }
-                if (std::getenv("TABLE_FILTEREDIT") != nullptr)
-                {
-                    static bool once = false;
-                    if (!once)
-                    {
-                        once = true;
-                        {
-                            ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                                   self.geom, *self.font, &self.host.fx,
-                                                   nullptr};
-                            self.sys.filter.begin(tc, 1);
-                        }
-                        {
-                            ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                                   self.geom, *self.font, &self.host.fx,
-                                                   nullptr};
-                            ui_table::system_text(tc, self.sys, "err");
-                        }
-                    }
-                }
-                if (std::getenv("TABLE_TOOLTIP") != nullptr)
-                {
-                    static bool once = false;
-                    if (!once)
-                    {
-                        once = true;
-                        self.view.ui.hover =
-                            ui_table::make_target(ui_table::part::cell, 2, 1);
-                        self.view.tip.hover_t = self.view.ui.now;
-                        self.view.ui.pointer = {300.0F, 200.0F};
-                    }
-                }
-                if (std::getenv("TABLE_EDITSEL") != nullptr)
-                {
-                    static bool once = false;
-                    if (!once)
-                    {
-                        once = true;
-                        {
-                            ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                                   self.geom, *self.font, &self.host.fx,
-                                                   nullptr};
-                            self.sys.edit.begin(tc, 0, 0);
-                        }
-                        feed(ui_table::cmd_key{ui_table::key::end, false, false});
-                        for (int i = 0; i < 5; ++i)
-                            feed(ui_table::cmd_key{ui_table::key::left, true, false});
-                    }
-                }
-            }),
+            // frame time: arena tick + tooltip / double-click detection
+            method<"tick">([](auto &self, double t) { self.arena.advance(t); }),
 
-            method<"render">([](auto &self, ui_new::ScreenWidget *s,
+            // draw entry: single, straight into the draw chain
+            method<"render">([](auto &self, ui_new::ScreenWidget *screen,
                                 ui_new::Widget *owner, render_context &ctx) {
-                self.host.screen = s;
-                self.host.owner = owner;
-                if (self.view.edit.active())
-                    if (auto *w = named_resource::frameState().window->data())
-                    {
-                        auto pre = table_glue::ime_preedit(w);
-                        if (pre != self.view.edit.compose)
-                        {
-                            ui_table::table_ctx tc{self.data, self.view,  self.prefs,
-                                                   self.geom, *self.font, &self.host.fx,
-                                                   nullptr};
-                            self.sys.edit.compose(tc, std::move(pre));
-                        }
-                    }
-                const float m = 48.0F;
-                const float x = static_cast<float>(owner->offset.x) + m;
-                const float y = static_cast<float>(owner->offset.y) + m;
-                const float w =
-                    std::max(static_cast<float>(owner->size.width) - 2.0F * m, 1.0F);
-                const float h =
-                    std::max(static_cast<float>(owner->size.height) - 2.0F * m, 1.0F);
-                if (auto *win = named_resource::frameState().window->data())
+                auto &s = self.arena;
+                s.screen = screen;
+                s.owner = owner;
+                s.win = named_resource::frameState().window->data();
+                if (s.win != nullptr && owner != nullptr)
                 {
                     int ww = 1, wh = 1;
-                    glfwGetWindowSize(win, &ww, &wh);
+                    glfwGetWindowSize(s.win, &ww, &wh);
                     if (ww > 0 && wh > 0)
                     {
-                        self.host.sx = (w + 2.0F * m) / static_cast<float>(ww);
-                        self.host.sy = (h + 2.0F * m) / static_cast<float>(wh);
+                        s.sx = static_cast<float>(owner->size.width) /
+                               static_cast<float>(ww);
+                        s.sy = static_cast<float>(owner->size.height) /
+                               static_cast<float>(wh);
                     }
-                }
-                self.template invoke<"sync">(x, y, w, h);
-                ui_table::build_frame(self.data, self.view, self.prefs, self.geom,
-                                      *self.font, self.sys, self.frame, self.id);
-                self.frame.table = self.id;
-                if (std::getenv("TABLE_GEOMLOG") != nullptr)
-                {
-                    static bool once = false;
-                    if (!once)
+                    if (std::getenv("TABLE_GEOMLOG") != nullptr)
                     {
-                        once = true;
-                        if (FILE *f = std::fopen(
-                                "E:/0_github_project/mcsvulkan/output/geom.log", "a"))
+                        static double lw = -1, lh = -1, lx = -1, ly = -1;
+                        if (owner->size.width != lw || owner->size.height != lh ||
+                            owner->offset.x != lx || owner->offset.y != ly)
                         {
-                            const auto &g = self.geom;
-                            std::fprintf(
-                                f,
-                                "box=%.1f,%.1f,%.1f,%.1f owner=%d,%d %dx%d "
-                                "vtrack=%.1f,%.1f,%.1f,%.1f vthumb=%.1f,%.1f,%.1f,%.1f "
-                                "ese=%.1f,%.1f,%.1f,%.1f mouse=%.1f,%.1f\n",
-                                g.box.x, g.box.y, g.box.w, g.box.h, owner->offset.x,
-                                owner->offset.y, owner->size.width, owner->size.height,
-                                g.vtrack.x, g.vtrack.y, g.vtrack.w, g.vtrack.h,
-                                g.vthumb.x, g.vthumb.y, g.vthumb.w, g.vthumb.h,
-                                g.edge_se.x, g.edge_se.y, g.edge_se.w, g.edge_se.h,
-                                self.host.mx, self.host.my);
-                            std::fclose(f);
+                            lw = owner->size.width;
+                            lh = owner->size.height;
+                            lx = owner->offset.x;
+                            ly = owner->offset.y;
+                            std::println("[host] owner=({:.0f},{:.0f} @ {:.0f},{:.0f}) "
+                                         "win={}x{} scale=({:.3f},{:.3f})",
+                                         owner->size.width, owner->size.height,
+                                         owner->offset.x, owner->offset.y, ww, wh, s.sx,
+                                         s.sy);
                         }
                     }
                 }
-                table_glue::encode(self.frame, ctx.builder, *self.font,
-                                   self.host.draw_view);
-                if (auto *win = named_resource::frameState().window->data())
-                    table_glue::apply_cursor(
-                        win, ui_table::cursor_for(self.view.ui.hover.to_zone()));
+                const ui_table::rect box{
+                    owner ? static_cast<float>(owner->offset.x) : 0.0F,
+                    owner ? static_cast<float>(owner->offset.y) : 0.0F,
+                    owner ? static_cast<float>(owner->size.width) : 1.0F,
+                    owner ? static_cast<float>(owner->size.height) : 1.0F};
+                table_ui::draw(s, box, ctx.view, ctx.builder);
+                table_glue::apply_cursor(
+                    s.win, ui_table::cursor_for(s.view.ui.hover.to_zone()));
             }));
-        t.view.reset(t.data);
-        return t;
     }
 
     using table_agg = decltype(make_table(std::declval<ui_table::table_data>(),
                                           std::declval<ui_table::prefs>(),
-                                          static_cast<ui_table::font *>(nullptr)));
+                                          std::declval<ui_table::font>()));
 
-    inline table_agg *&current() noexcept
+    inline std::uint32_t version() noexcept
     {
-        static table_agg *p = nullptr;
-        return p;
-    }
-    // 真实窗口的键盘兜底：GLFW key 回调未派发时，用状态边沿驱动 table。
-    inline void poll_keyboard(GLFWwindow *win) noexcept
-    {
-        static std::array<int, GLFW_KEY_LAST + 1> prev{};
-        if (win == nullptr)
-            win = glfwGetCurrentContext();
-        if (win == nullptr)
-            return;
-        auto *t = current();
-        if (t == nullptr)
-            return;
-        const auto ctrl = glfwGetKey(win, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
-                          glfwGetKey(win, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
-        const auto shift = glfwGetKey(win, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
-                           glfwGetKey(win, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
-        const std::uint32_t mods = (ctrl ? 2U : 0U) | (shift ? 1U : 0U);
-        const int keys[] = {
-            GLFW_KEY_ESCAPE,    GLFW_KEY_ENTER, GLFW_KEY_TAB,   GLFW_KEY_BACKSPACE,
-            GLFW_KEY_DELETE,    GLFW_KEY_LEFT,  GLFW_KEY_RIGHT, GLFW_KEY_UP,
-            GLFW_KEY_DOWN,      GLFW_KEY_HOME,  GLFW_KEY_END,   GLFW_KEY_PAGE_UP,
-            GLFW_KEY_PAGE_DOWN, GLFW_KEY_F,     GLFW_KEY_C,     GLFW_KEY_V,
-            GLFW_KEY_X,         GLFW_KEY_Z,     GLFW_KEY_Y,     GLFW_KEY_A};
-        for (const int k : keys)
-        {
-            const bool down = glfwGetKey(win, k) == GLFW_PRESS;
-            if (down == (prev[static_cast<std::size_t>(k)] != 0))
-                continue;
-            prev[static_cast<std::size_t>(k)] = down ? 1 : 0;
-            ui_table::trace("[poll] key={} down={}", k, down);
-            mcs::vulkan::event::keyboard_event ev{
-                .key = static_cast<mcs::vulkan::event::Key>(k),
-                .action = down ? mcs::vulkan::event::Action::ePRESS
-                               : mcs::vulkan::event::Action::eRELEASE,
-                .modifier_key = mcs::vulkan::event::ModifierKey(mods),
-                .scancode = 0};
-            t->invoke<"input_event">(ev);
-        }
+        auto *s = current_arena();
+        return s != nullptr ? s->view.ui.version : 0;
     }
 
     inline ui_new::ScreenWidget make_screen(double w, double h)
     {
-        auto t = make_table(std::move(table_glue::data_ref()), table_glue::prefs_ref(),
-                            &table_glue::font_ref());
+        auto data = ui_table::table_data{};
+        auto prefs = ui_table::prefs{};
+        auto font = ui_table::font{};
+        table_glue::init_font(font);
+        table_glue::init_model(data, prefs);
+        ui_table::hover_fn_ref() = hover_index();
+        auto t = make_table(std::move(data), prefs, std::move(font));
         auto ro = render::asRenderObject(std::move(t));
-        current() = &ro->agg;
+        current_arena() = &ro->agg.arena;
         return ui_new::ScreenWidget{
             ui_new::Size{w, h}, ui_new::Container("panel").renderObject(std::move(ro))};
     }
 
-    // 事件通路 + 数据链路自检（不建窗口）
+    // =====================================================================
+    // TABLE_EVTEST: headless self-test of both chains
+    //   The same draw chain (sync -> build -> encode) and the same input
+    //   chain (cmd -> systems -> visit_owner -> view/data) are asserted.
+    // =====================================================================
     inline int event_probe()
     {
-        ui_table::table_data d;
-        ui_table::column c;
-        c.key = "v";
-        c.title = "V";
-        c.w = 100;
-        d.cols.push_back(c);
-        d.cells.resize(1);
+        int fails = 0;
+        const auto check = [&](bool ok, const char *what) {
+            if (!ok)
+            {
+                ++fails;
+                std::println("[chain] FAIL: {}", what);
+            }
+            else
+                std::println("[chain] ok: {}", what);
+        };
+
+        table_arena s;
+        {
+            ui_table::column c;
+            c.key = "v";
+            c.title = "V";
+            c.w = 200;
+            s.data.cols.push_back(c);
+        }
+        s.data.finalize();
+        s.data.cells.resize(1);
         for (int i = 0; i < 50; ++i)
         {
-            d.cells[0].push_back({std::format("r{}", i), {}});
-            d.ids.push_back(ui_table::row_id{static_cast<std::uint64_t>(i + 1)});
+            s.data.cells[0].push_back({std::format("r{}", i), {}});
+            s.data.ids.push_back(ui_table::row_id{static_cast<std::uint64_t>(i + 1)});
         }
-        ui_table::prefs p;
-        ui_table::font f;
-        auto t = make_table(std::move(d), p, &f);
-        t.template invoke<"sync">(0, 0, 400, 200);
-        auto b = inputTranslation().attach(t);
-        using namespace mcs::vulkan::event;
-        distribute<scroll_event_dispatcher>({.xoffset = 0.0, .yoffset = -3.0});
-        std::println("[evtest] chain sy={} rows={}", t.view.scroll.y,
-                     t.geom.view_rows.size());
-        return t.view.scroll.y > 0.0F ? 0 : 1;
+        s.id = ui_table::next_table_id();
+        s.view.reset(s.data);
+        s.prefs.row_h = 30.0F;
+        s.font.px = 15.0F;
+        ui_table::glyph_metrics gm;
+        gm.advance = 0.5F;
+        for (int c = 32; c < 127; ++c)
+            s.font.put(static_cast<char32_t>(c), gm);
+
+        const ui_table::rect box{0, 0, 500, 220};
+        const ui_dao::view view{500.0F, 220.0F};
+
+        // ---- draw chain: sync -> build -> encode
+        table_ui::draw_sync(s, box);
+        check(s.geom.col_count() == 1 && s.geom.row_count() > 0,
+              "draw.sync: data+view -> geometry");
+        table_ui::draw_build(s);
+        check(s.frame.draw.op_count() > 0, "draw.build: geometry -> frame_data");
+        {
+            std::size_t zero_ops = 0, no_owner = 0;
+            for (const auto &stream_shapes : s.frame.draw.shapes)
+                for (const auto &o : stream_shapes)
+                {
+                    if (o.zone == 0)
+                        ++zero_ops;
+                    else if (std::holds_alternative<ui_table::none_owner>(o.who))
+                        ++no_owner;
+                }
+            for (const auto &stream_texts : s.frame.draw.texts)
+                for (const auto &o : stream_texts)
+                {
+                    if (o.zone == 0)
+                        ++zero_ops;
+                    else if (std::holds_alternative<ui_table::none_owner>(o.who))
+                        ++no_owner;
+                }
+            check(zero_ops == 0, "dl: every op carries target_key");
+            check(no_owner == 0, "dl: every zoned op carries owner");
+        }
+        std::uint32_t instances = 0, zoned = 0, owners = 0;
+        table_ui::draw_encode(s, view, [&](auto &&inst) {
+            ++instances;
+            if (inst.entity_index != 0)
+            {
+                ++zoned;
+                const auto t = ui_table::resolve(s.data, inst.entity_index);
+                owners += t.kind != ui_table::part::none ? 1U : 0U;
+            }
+        });
+        check(instances > 0, "draw.encode: frame_data -> shader instances");
+        check(zoned > 0 && zoned == owners,
+              "draw.encode: every entity_index resolves to a target");
+        {
+            // CPU side of the pixel loop: draw zone and input hit share target_key
+            const int r = s.geom.view_rows.front();
+            const float x = s.geom.col_x_at(0) + 10.0F;
+            const float y = s.geom.row_index.empty()
+                                ? s.geom.body.y + 5.0F
+                                : s.geom.row_y.front() + 5.0F;
+            const auto hit = ui_table::hit_target(s.data, s.geom, s.view, x, y, s.id);
+            const auto key = ui_table::zone_key(hit.to_zone());
+            bool found = false;
+            for (const auto &ops : s.frame.draw.shapes)
+                for (const auto &o : ops)
+                    if (o.zone == key)
+                        found = true;
+            check(found, "merge: frame op.zone == input target_key");
+            check(hit.row_index == r && hit.col_index == 0,
+                  "merge: hit_target gives the same target");
+        }
+
+        // ---- input chain: cmd -> systems/visit_owner -> view/data
+        const std::uint32_t v0 = s.view.ui.version;
+        const int r0 = s.geom.view_rows.front();
+        input_dispatch(
+            s, ui_table::cmd_press{
+                   s.geom.col_x_at(0) + 10.0F, s.geom.row_y.front() + 5.0F,
+                   {ui_table::part::cell, r0, 0, s.id}, false, false, false,
+                   ui_table::make_target(ui_table::part::cell, r0, 0, s.id)});
+        check(s.view.sel.cur_r == r0 && s.view.sel.cur_c == 0,
+              "input: press -> selection");
+        check(s.view.ui.version > v0, "input: press bumps draw version");
+        check(s.changes.selection, "input: selection change is reported");
+        s.changes = {};
+        input_dispatch(s, ui_table::cmd_key{ui_table::key::space, false, false});
+        check(s.changes.checks, "input: row-check change is reported");
+        input_dispatch(s, ui_table::cmd_key{ui_table::key::down, false, false});
+        check(s.view.sel.cur_r > r0, "input: key down -> selection moves");
+
+        // ---- arena 入口：event -> input_frame -> arbiter -> gesture -> on_*
+        {
+            int sel_cb = 0, chk_cb = 0, model_cb = 0;
+            s.cb.on_selection_changed = [&] { ++sel_cb; };
+            s.cb.on_checks_changed = [&] { ++chk_cb; };
+            s.cb.on_model_changed = [&] { ++model_cb; };
+            const float px = s.geom.col_x_at(0) + 10.0F;
+            const float py = s.geom.row_y.front() + 5.0F;
+            const auto press = [&](ev::MouseButtons b) {
+                s.handle_event(ev::mousebutton_event{
+                    .button = b,
+                    .action = ev::Action::ePRESS,
+                    .modifier_key = ev::ModifierKey{}});
+            };
+            const auto release = [&](ev::MouseButtons b) {
+                s.handle_event(ev::mousebutton_event{
+                    .button = b,
+                    .action = ev::Action::eRELEASE,
+                    .modifier_key = ev::ModifierKey{}});
+            };
+
+            s.view.ui.last_click_t = -1.0e9;
+            s.view.edit = {};
+            s.handle_event(ev::position2d_event{.xpos = px, .ypos = py});
+            press(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
+            release(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
+            check(s.view.sel.cur_r == r0, "arena: click event -> selection");
+            check(sel_cb > 0, "callback: selection_changed fires");
+            {
+                const int chk0 = chk_cb;
+                input_dispatch(s, ui_table::cmd_key{ui_table::key::space, false, false});
+                check(chk_cb > chk0, "callback: checks_changed fires");
+            }
+
+            s.view.ui.last_click_t = -1.0e9;
+            s.view.edit = {};
+            s.handle_event(ev::keyboard_event{
+                .key = ev::Key::eDOWN,
+                .action = ev::Action::ePRESS,
+                .modifier_key = ev::ModifierKey{},
+                .scancode = 0});
+            check(s.view.sel.cur_r > r0, "arena: key event -> selection");
+            const int after_press = s.view.sel.cur_r;
+            s.handle_event(ev::keyboard_event{
+                .key = ev::Key::eDOWN,
+                .action = ev::Action::eREPEAT,
+                .modifier_key = ev::ModifierKey{},
+                .scancode = 0});
+            check(s.view.sel.cur_r > after_press,
+                  "arena: key repeat -> selection moves again");
+            s.handle_event(ev::keyboard_event{
+                .key = ev::Key::eDOWN,
+                .action = ev::Action::eRELEASE,
+                .modifier_key = ev::ModifierKey{},
+                .scancode = 0});
+
+            const auto scroll_before = s.view.scroll.y;
+            s.handle_event(ev::scroll_event{.xoffset = 0.0, .yoffset = -1.0});
+            check(s.view.scroll.y > scroll_before, "arena: wheel event -> scroll");
+
+            // 拖拽：press -> move 超过 slop -> release
+            s.view.ui.last_click_t = -1.0e9;
+            s.view.edit = {};
+            s.view.scroll.y = 0.0F;
+            s.handle_event(ev::position2d_event{.xpos = px, .ypos = py});
+            press(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
+            s.handle_event(ev::position2d_event{.xpos = px, .ypos = py + 40.0F});
+            s.handle_event(ev::position2d_event{.xpos = px, .ypos = py + 70.0F});
+            check(s.view.sel.r1 > s.view.sel.r0, "arena: drag event -> extend");
+            release(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
+
+            // 双击：两次 click 落在同一格 -> core 进编辑并选词
+            s.view.ui.last_click_t = -1.0e9;
+            s.view.edit = {};
+            s.handle_event(ev::position2d_event{.xpos = px, .ypos = py});
+            press(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
+            release(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
+            press(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
+            release(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
+            check(s.view.edit.active(), "arena: double click -> edit");
+            s.handle_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+                                              .action = ev::Action::ePRESS,
+                                              .modifier_key = ev::ModifierKey{},
+                                              .scancode = 0});
+            s.handle_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+                                              .action = ev::Action::eRELEASE,
+                                              .modifier_key = ev::ModifierKey{},
+                                              .scancode = 0});
+
+            // 字符：F2 进编辑，char 进 system_text
+            s.view.ui.last_click_t = -1.0e9;
+            s.view.edit = {};
+            s.handle_event(ev::keyboard_event{.key = ev::Key::eF2,
+                                              .action = ev::Action::ePRESS,
+                                              .modifier_key = ev::ModifierKey{},
+                                              .scancode = 0});
+            s.handle_event(ev::keyboard_event{.key = ev::Key::eF2,
+                                              .action = ev::Action::eRELEASE,
+                                              .modifier_key = ev::ModifierKey{},
+                                              .scancode = 0});
+            s.handle_event(ev::char_event{.codepoint = U'Z'});
+            check(s.view.edit.active() && !s.view.edit.buf.empty() &&
+                      s.view.edit.buf.back() == 'Z',
+                  "arena: char event -> edit buffer");
+            s.handle_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+                                              .action = ev::Action::ePRESS,
+                                              .modifier_key = ev::ModifierKey{},
+                                              .scancode = 0});
+            s.handle_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+                                              .action = ev::Action::eRELEASE,
+                                              .modifier_key = ev::ModifierKey{},
+                                              .scancode = 0});
+
+            // 覆盖 overlay 状态：菜单 + tooltip 底色也必须带 owner/zone
+            s.view.edit = {};
+            s.handle_event(ev::position2d_event{
+                .xpos = px, .ypos = s.geom.col_header.y + 10.0F});
+            press(ev::MouseButtons::eMOUSE_BUTTON_RIGHT);
+            release(ev::MouseButtons::eMOUSE_BUTTON_RIGHT);
+            s.view.tip.hover_t = s.view.ui.now - 1.0;
+            s.view.ui.hover = ui_table::make_target(ui_table::part::cell, r0, 0, s.id);
+            table_ui::draw_build(s);
+            {
+                std::size_t zero_ops = 0, no_owner = 0;
+                for (const auto &ss : s.frame.draw.shapes)
+                    for (const auto &o : ss)
+                    {
+                        zero_ops += o.zone == 0;
+                        no_owner += o.zone != 0 &&
+                                    std::holds_alternative<ui_table::none_owner>(o.who);
+                    }
+                for (const auto &tt : s.frame.draw.texts)
+                    for (const auto &o : tt)
+                    {
+                        zero_ops += o.zone == 0;
+                        no_owner += o.zone != 0 &&
+                                    std::holds_alternative<ui_table::none_owner>(o.who);
+                    }
+                check(zero_ops == 0 && no_owner == 0,
+                      "dl: overlay ops also carry target_key + owner");
+            }
+            s.view.menu.open = false;
+
+            // 模型回调 + view 对齐（中间插入：勾选和选区按 row_id 跟着走）
+            {
+                s.view.checks.on.assign(s.data.rows(), 0);
+                s.view.checks.ids = s.data.ids;
+                s.view.checks.on[0] = 1;
+                const auto keep = s.data.ids[0];
+                const auto sel_before = s.view.sel.cur_r;
+                (void)table_ui::insert_row(s, 0);
+                check(s.view.checks.on[1] == 1 &&
+                          s.view.checks.ids[1] == keep,
+                      "model: insert at 0 keeps checks by row_id");
+                check(s.view.sel.cur_r == sel_before + 1,
+                      "model: insert at 0 keeps selection by row_id");
+                (void)table_ui::remove_row(s, 0);
+                check(s.view.checks.on[0] == 1 && s.view.checks.ids[0] == keep,
+                      "model: remove at 0 keeps checks by row_id");
+                check(s.view.sel.cur_r == sel_before,
+                      "model: remove at 0 keeps selection by row_id");
+            }
+            const auto rows_before = s.data.rows();
+            (void)table_ui::insert_row(s, 1);
+            check(s.data.rows() == rows_before + 1 &&
+                      s.view.checks.on.size() == s.data.rows(),
+                  "callback: insert_row reconciles view");
+            check(model_cb > 0, "callback: model_changed fires");
+            (void)table_ui::remove_row(s, 1);
+            check(s.data.rows() == rows_before, "callback: remove_row restores");
+        }
+
+        // redraw after input: the same draw chain sees the new view
+        const std::uint32_t v1 = s.view.ui.version;
+        table_ui::draw_sync(s, box);
+        table_ui::draw_build(s);
+        check(s.geom.version == v1, "loop: input version -> geometry version");
+        check(s.frame.draw.op_count() > 0, "loop: input -> next frame redraw");
+
+        std::println("[chain] done, {} failed", fails);
+        return fails;
     }
+
 } // namespace table_ui
+
 
 int main()
 try
@@ -12170,11 +12847,8 @@ try
         make_aggregate_ref<"mainShaderCtx", "uniformBuffers", "descriptorSets">(
             uniformBuffers, descriptorSets);
 
-    table_glue::init_font(table_glue::font_ref());
-    table_glue::init_model();
     auto screen = table_ui::make_screen(WIDTH, HEIGHT);
     shader_data::hover_manager hoverManager{.screen = &screen};
-    ui_table::hover_fn_ref() = table_glue::index();
     std::println("[table] hover_fn = {}", ui_table::hover_fn_ref());
     // 新的 soaCtx 仅包含 uiRects 和 uiWireRects
     auto soaCtx = make_aggregate_ref<"soaCtx", "screen">(screen);
@@ -12871,19 +13545,16 @@ try
             frame.setCameraIndex(1);
 
             // ══ 表走 UI 树：布局由 Container 给，事件来自 glfw_input_translation ══
-            auto *ro = table_ui::current();
-            ro->host.draw_view = view;
             auto &screen = soaCtx.screen;
             screen.updateSize(W, H);
             screen.layout();
             screen.tick(inputCtx.clock.getElapsed()); // 帧级副作用：从根 DFS
             {
-                // 本帧 GPU 拾取结果（hover 回调里记下的）→ 表直接用
-                render_context ctx{table_glue::last_pick(), frame, inputCtx.input,
-                                   inputCtx.clock, world.fontCtx.fontSelect};
+                render_context ctx{frame, inputCtx.input, inputCtx.clock,
+                                   world.fontCtx.fontSelect, view};
                 screen.render(ctx);
             }
-            renderVersion = ro->view.ui.version;
+            renderVersion = table_ui::version();
             // 外部 API 调用会自动闭合当前 pass
             auto &pickMouse = *fs.pickMouse;
             frame.add_transition(my_render::image_info{
@@ -13167,51 +13838,11 @@ try
             return schedulable_task{
                 .task =
                     {.name = "waitforfences_post_processing",
-                     .function = ^^decltype([](world_type &world, input_type &inputCtx,
-                                               data_type &soaCtx) {
-                         auto &globalCtx = world.globalCtx;
-                         auto &pickCtx = world.pickCtx;
-
-                         auto &frameContext = globalCtx.frameContext;
-
-                         auto &pickMouse = pickCtx.mouse;
-                         auto &pickingFrames = pickCtx.frames;
-
-                         auto &currentFrame = frameContext.currentFrame;
-
-                         // 等待栅栏后，正式获取图像前
-                         // currentFrame == 0 时拾取回读未就绪，不当作"离开"
-                         if (currentFrame > 0)
-                         {
-                             uint32_t readIdx =
-                                 (currentFrame - 1 + MAX_FRAMES_IN_FLIGHT) %
-                                 MAX_FRAMES_IN_FLIGHT;
-                             //diff: [test_dod19] start: 全部逻辑交给 hover_manager（不耦合全局函数）
-                             auto *data = static_cast<picking_result *>(
-                                 pickingFrames[readIdx].mapPtr());
-                             picking_result r = *data;
-                             // ★ 版本不匹配 → 旧世界的 picking，作废悬停状态，丢弃
-                             if (r.render_version() !=
-                                 table_ui::current()->view.ui.version)
-                             {
-                                 world.hoverManager.resetPicking();
-                                 return;
-                             }
-
-                             if (!pickMouse.valid)
-                                 r.key.object_type =
-                                     0xFFFFFFFF; // 光标不在窗口 = 无命中（自动 leave）
-
-                             // [PICKDBG] 定位用：每帧打印 GPU 回读原始值（可删）
-                             std::println("[PICKDBG] frame={} valid={} type={:#x} "
-                                          "entity={} primitive={} ver={} hover_fn={}",
-                                          currentFrame, pickMouse.valid,
-                                          r.key.object_type, r.key.entity_index,
-                                          r.primitive_id(), r.render_version(),
-                                          r.hover_fn);
-                             world.hoverManager.hover(r, world.hoverPool, inputCtx);
-                             //diff: [test_dod19] end
-                         }
+                     .function = ^^decltype([](world_type &world, input_type &,
+                                               data_type &) {
+                         // picking 回读改到 submit 之后、同一帧 fence 之后做，
+                         // 见 drawFrame 里的 TABLE_PICKCHECK 段。
+                         (void)world;
                      })},
                 .befores = {"after_waitForfences_start"},
                 .afters = {"after_waitForfences_end"},
@@ -13324,6 +13955,19 @@ try
             framebufferResized = false;
             recreateSwapChain(world, inputCtx, soaCtx);
         }
+        // 同一帧的 picking 回读：等本帧 fence 后读本帧 buffer。
+        // 只在验证模式启用，避免正常渲染每帧 CPU 等 GPU。
+        if (std::getenv("TABLE_PICKCHECK") != nullptr)
+        {
+            device.waitForFences(1, inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
+            auto *data = static_cast<picking_result *>(
+                pickingFrames[currentFrame].mapPtr());
+            picking_result r = *data;
+            if (!pickMouse.valid)
+                r.key.object_type = 0xFFFFFFFF;
+            if (auto *arena = table_ui::current_arena())
+                table_ui::on_pick(*arena, r);
+        }
         semaphoreIndex = (semaphoreIndex + 1) % presentCompleteSemaphore.size();
         currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     };
@@ -13331,8 +13975,24 @@ try
     while (globalCtx.window.shouldClose() == 0)
     {
         task_graph.invoke_ranges<"input_start", "input_end">(world, inputCtx, soaCtx);
-        table_ui::poll_keyboard(named_resource::frameState().window->data());
+        // Esc 由 on_key 取消 modal 并置 esc_cancelled；这里只负责吞掉关窗。
+        // esc_cancelled=true 说明 modal 已取消，保留窗口；否则保持关窗。
+        if (auto *win = named_resource::frameState().window->data();
+            win != nullptr && glfwWindowShouldClose(win))
+        {
+            bool esc = false;
+            if (auto *arena = table_ui::current_arena())
+            {
+                esc = arena->esc_cancelled;
+                arena->esc_cancelled = false;
+            }
+            if (esc)
+                glfwSetWindowShouldClose(win, GLFW_FALSE);
+        }
+        table_ui::input_ime(*table_ui::current_arena());
         drawFrame(world, inputCtx, soaCtx);
+        if (std::getenv("TABLE_INPUTLOG") != nullptr)
+            std::fflush(stdout);
         // 可选自动退出：只给验证用（DSH_AUTOEXIT 设了就渲染 150 帧后退出），
         // 这样退出路径（含 device 销毁）也能被 validation 覆盖到
         if (std::getenv("DSH_AUTOEXIT") != nullptr && ++autoExitFrames >= 150)

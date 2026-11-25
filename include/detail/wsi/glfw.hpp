@@ -284,9 +284,14 @@ namespace mcs::vulkan::wsi::glfw
             switch (key)
             {
             case GLFW_KEY_ESCAPE:
-                ::glfwSetWindowShouldClose(window, GLFW_TRUE);
-                // std::cout << "按下了 ESC 键，退出程序" << std::endl; //乱码
-                MCSLOG_DEBUG("按下了 ESC 键，退出程序");
+                if (action == GLFW_PRESS)
+                    ::glfwSetWindowShouldClose(window, GLFW_TRUE);
+                // Esc 也进事件分发；关窗/取消 modal 由 app 的 shouldClose 逻辑决定
+                event::distribute<event::keyboard_event_dispatcher>(
+                    {.key = input::mappingKey(key),
+                     .action = input::mappingAction(action),
+                     .modifier_key = event::ModifierKey(mods),
+                     .scancode = scancode});
                 break;
 
             case GLFW_KEY_F1:

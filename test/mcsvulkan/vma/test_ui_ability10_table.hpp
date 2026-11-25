@@ -1,6 +1,6 @@
 #pragma once
 // ============================================================================
-// test_ui_ability9_table.hpp
+// test_ui_ability10_table.hpp
 //
 //   table 不是 widget，是一组数据：
 //
@@ -464,6 +464,40 @@ namespace ui_table
             ++i;
         return i;
     }
+    // 词边界（编辑框用）：字母/数字/下划线/非 ASCII 算词内
+    [[nodiscard]] inline bool is_word_byte(char c) noexcept
+    {
+        const auto u = static_cast<unsigned char>(c);
+        return (u >= '0' && u <= '9') || (u >= 'a' && u <= 'z') ||
+               (u >= 'A' && u <= 'Z') || u == '_' || u >= 0x80;
+    }
+    [[nodiscard]] inline std::size_t utf8_word_left(std::string_view s,
+                                                    std::size_t i) noexcept
+    {
+        if (i == 0)
+            return 0;
+        i = utf8_prev(s, i);
+        while (i > 0 && !is_word_byte(s[i]))
+            i = utf8_prev(s, i);
+        while (i > 0)
+        {
+            const auto prev = utf8_prev(s, i);
+            if (!is_word_byte(s[prev]))
+                break;
+            i = prev;
+        }
+        return i;
+    }
+    [[nodiscard]] inline std::size_t utf8_word_right(std::string_view s,
+                                                     std::size_t i) noexcept
+    {
+        while (i < s.size() && !is_word_byte(s[i]))
+            i = utf8_next(s, i);
+        while (i < s.size() && is_word_byte(s[i]))
+            i = utf8_next(s, i);
+        return i;
+    }
+
     [[nodiscard]] inline float text_width(const font &f, std::string_view s) noexcept
     {
         float w = 0;
@@ -651,8 +685,63 @@ namespace ui_table
         }
         void finalize()
         {
-            for (std::size_t i = 0; i < cols.size(); ++i)
-                cols[i].id = column_id{static_cast<std::uint32_t>(i + 1)};
+            // 只给还没有身份的列补 id：已有 id 永不改（cell_ref / target_key 依赖稳定）
+            std::uint32_t max_id = 0;
+            for (const auto &c : cols)
+                max_id = std::max(max_id, c.id.value);
+            for (auto &c : cols)
+                if (c.id.value == 0)
+                    c.id = column_id{++max_id};
+        }
+        [[nodiscard]] row_id new_row_id() const noexcept
+        {
+            std::uint64_t max_id = 0;
+            for (const auto &id : ids)
+                max_id = std::max(max_id, id.v);
+            return row_id{max_id + 1};
+        }
+        // ── 模型增删：行身份稳定，列身份只补新列 ─────────────────────────
+        row_id insert_row(int at = -1)
+        {
+            if (ids.empty() || at < 0 || at > rows())
+                at = rows();
+            for (auto &col : cells)
+                col.insert(col.begin() + at, cell{});
+            const row_id id = new_row_id();
+            ids.insert(ids.begin() + at, id);
+            return id;
+        }
+        bool remove_row(int at)
+        {
+            if (at < 0 || at >= rows())
+                return false;
+            for (auto &col : cells)
+                if (static_cast<std::size_t>(at) < col.size())
+                    col.erase(col.begin() + at);
+            ids.erase(ids.begin() + at);
+            return true;
+        }
+        column_id insert_column(int at, column c)
+        {
+            if (at < 0 || at > cols_count())
+                at = cols_count();
+            std::uint32_t max_id = 0;
+            for (const auto &x : cols)
+                max_id = std::max(max_id, x.id.value);
+            if (c.id.value == 0)
+                c.id = column_id{max_id + 1};
+            const column_id id = c.id;
+            cols.insert(cols.begin() + at, std::move(c));
+            cells.insert(cells.begin() + at, std::vector<cell>(static_cast<std::size_t>(rows())));
+            return id;
+        }
+        bool remove_column(int at)
+        {
+            if (at < 0 || at >= cols_count())
+                return false;
+            cols.erase(cols.begin() + at);
+            cells.erase(cells.begin() + at);
+            return true;
         }
         [[nodiscard]] column_id column_of(int c) const noexcept
         {
@@ -921,6 +1010,8 @@ namespace ui_table
             std::string compose;
             std::vector<std::string> undo, redo;
             int caret{0}, anchor{0};
+            double last_push_t{-1.0e9};
+            bool last_push_typing{false};
             [[nodiscard]] bool active() const noexcept
             {
                 return row >= 0 && col >= 0;
@@ -978,11 +1069,15 @@ namespace ui_table
             std::vector<std::string> text;
             int edit{-1};
             std::string input;
+            std::string orig;    // 进入编辑时的筛选串：Esc 取消时还原
+            std::string compose; // IME 预编辑（不参与过滤，只用来看）
             void reset(int cols)
             {
                 text.assign(static_cast<std::size_t>(cols), {});
                 edit = -1;
                 input.clear();
+                orig.clear();
+                compose.clear();
             }
         };
         struct selection_state
@@ -1076,11 +1171,13 @@ namespace ui_table
         {
             bool mode{false};
             std::string buf;
+            std::string compose; // IME 预编辑
             int hit{-1};
             void reset() noexcept
             {
                 mode = false;
                 buf.clear();
+                compose.clear();
                 hit = -1;
             }
         };
@@ -1117,6 +1214,7 @@ namespace ui_table
             float drag_base{0}, drag_base2{0}, drag_start_x{0}, drag_start_y{0};
             target drag_target{};
             float trs_x0{0}, trs_y0{0}, trs_w{0}, trs_h{0};
+            part trs_edge{part::none}; // 哪个把手在缩放整表
             double last_click_t{-1.0e9};
             glm::vec2 last_click_pos{0, 0};
             int click_count{0};
@@ -1137,6 +1235,7 @@ namespace ui_table
                 drag_target = {};
 
                 drag_base = drag_base2 = drag_start_x = drag_start_y = 0;
+                trs_edge = part::none;
                 last_click_t = -1.0e9;
                 last_click_pos = {0, 0};
                 click_count = 0;
@@ -1175,6 +1274,112 @@ namespace ui_table
                 ui.reset();
                 tip.reset();
                 edit = {};
+            }
+            // 模型增删后对齐：保留已有 order/宽度/勾选/选择，只补新列新行
+            void reconcile(const table_data &d)
+            {
+                const auto nc = static_cast<std::size_t>(d.cols_count());
+                const auto nr = static_cast<std::size_t>(d.rows());
+                const auto ncols = static_cast<std::size_t>(d.cols_count());
+                std::vector<int> old_order = cols.order;
+                cols.order.clear();
+                cols.order.reserve(ncols);
+                for (const int c : old_order)
+                    if (c >= 0 && static_cast<std::size_t>(c) < ncols &&
+                        std::find(cols.order.begin(), cols.order.end(), c) == cols.order.end())
+                        cols.order.push_back(c);
+                for (std::size_t c = 0; c < ncols; ++c)
+                    if (std::find(cols.order.begin(), cols.order.end(),
+                                  static_cast<int>(c)) == cols.order.end())
+                        cols.order.push_back(static_cast<int>(c));
+                cols.w.resize(ncols);
+                cols.user.resize(ncols);
+                cols.hidden.resize(ncols);
+                for (std::size_t c = 0; c < ncols; ++c)
+                {
+                    if (c >= d.cols.size())
+                        continue;
+                    const auto &def = d.cols[c];
+                    if (cols.w[c] <= 0.0F)
+                    {
+                        cols.w[c] = def.w;
+                        cols.user[c] = static_cast<std::uint8_t>(def.weight > 0 ? 0 : 1);
+                    }
+                }
+                filter.text.resize(ncols);
+                // 勾选按 row_id 重新对齐：中间插入/删除行时，勾选跟着行走
+                {
+                    const auto old_on = checks.on;
+                    const auto old_ids = checks.ids;
+                    checks.on.assign(nr, 0);
+                    checks.ids.assign(nr, {});
+                    for (std::size_t r = 0; r < nr; ++r)
+                    {
+                        if (r >= d.ids.size())
+                            continue;
+                        checks.ids[r] = d.ids[r];
+                        for (std::size_t k = 0; k < old_ids.size(); ++k)
+                            if (old_ids[k] == d.ids[r])
+                            {
+                                checks.on[r] = k < old_on.size() ? old_on[k] : 0;
+                                break;
+                            }
+                    }
+                }
+                const auto old_cur = sel.cur_cell;
+                const auto old_r0 = sel.r0_cell;
+                const auto old_r1 = sel.r1_cell;
+                const auto row_pos = [&](row_id id) {
+                    if (!id.valid())
+                        return -1;
+                    for (std::size_t r = 0; r < d.ids.size(); ++r)
+                        if (d.ids[r] == id)
+                            return static_cast<int>(r);
+                    return -1;
+                };
+                const auto col_pos = [&](column_id id) {
+                    if (id.value == 0)
+                        return -1;
+                    for (std::size_t c = 0; c < d.cols.size(); ++c)
+                        if (d.cols[c].id == id)
+                            return static_cast<int>(c);
+                    return -1;
+                };
+                const auto remap = [&](const cell_ref &ref, int &r, int &c) {
+                    const int rp = row_pos(ref.row);
+                    const int cp = col_pos(ref.col);
+                    if (rp >= 0 && cp >= 0)
+                    {
+                        r = rp;
+                        c = cp;
+                    }
+                };
+                remap(old_cur, sel.cur_r, sel.cur_c);
+                remap(old_r0, sel.r0, sel.c0);
+                remap(old_r1, sel.r1, sel.c1);
+                const auto clamp_rc = [](int &r, int &c, int rows, int cols) {
+                    r = rows <= 0 ? -1 : std::clamp(r < 0 ? 0 : r, 0, rows - 1);
+                    c = cols <= 0 ? -1 : std::clamp(c < 0 ? 0 : c, 0, cols - 1);
+                };
+                const int rows_n = d.rows();
+                const int cols_n = d.cols_count();
+                if (rows_n > 0 && cols_n > 0)
+                {
+                    clamp_rc(sel.cur_r, sel.cur_c, rows_n, cols_n);
+                    if (sel.r0 >= 0)
+                    {
+                        clamp_rc(sel.r0, sel.c0, rows_n, cols_n);
+                        clamp_rc(sel.r1, sel.c1, rows_n, cols_n);
+                    }
+                    sel.cur_cell = d.cell_id(sel.cur_r, sel.cur_c);
+                    sel.r0_cell = d.cell_id(sel.r0, sel.c0);
+                    sel.r1_cell = d.cell_id(sel.r1, sel.c1);
+                }
+                else
+                    sel.reset();
+                if (edit.active() &&
+                    (edit.row >= rows_n || edit.col >= cols_n))
+                    edit = {};
             }
             void touch() noexcept
             {
@@ -1240,6 +1445,7 @@ namespace ui_table
     }
 
     // ═ 输入层 input：事件 → 系统 ═══════════════════════════════════════
+    struct geometry; // 定义在后面；wheel 只需要它的指针做悬停判定
     namespace input
     {
         inline void system_hover(view &v, const target &t)
@@ -1260,12 +1466,17 @@ namespace ui_table
         }
 
         // ── 事件直调系统：wheel ───────────────────────────────────────────────
-        inline void system_wheel(view &v, const prefs &p, float dx, float dy, bool shift)
+        inline void system_wheel(view &v, const prefs &p, float dx, float dy, bool shift,
+                                 const geometry *g = nullptr)
         {
+            if (g != nullptr &&
+                (v.ui.hover.kind == part::hbar_track ||
+                 v.ui.hover.kind == part::hbar_thumb))
+                shift = true;
             if (shift)
-                v.scroll.x += dy;
+                v.scroll.x -= dy * std::max(p.row_h * 2.0F, 10.0F);
             else
-                v.scroll.y -= dy * p.row_h;
+                v.scroll.y -= dy * (p.row_h + p.row_gap);
             v.ui.touch();
         }
 
@@ -1387,6 +1598,13 @@ namespace ui_table
         std::uint16_t order{0};
     };
 
+    // 表头分组带：一段连续的可见列（first/last 是几何位置，first_col/last_col 是数据列）
+    struct group_span
+    {
+        int first_pos{0}, last_pos{0};
+        int first_col{0}, last_col{0};
+    };
+
     struct geometry
     {
         rect box, header, group, col_header, body, frozen_view, scrollv;
@@ -1401,6 +1619,7 @@ namespace ui_table
         std::vector<int> row_index;
         std::vector<float> row_y, row_h, row_off;
         std::vector<float> row_h_data;
+        std::vector<group_span> groups;
         float row_h_key{-1};
         std::uint32_t src_ver{0};
 
@@ -1473,7 +1692,75 @@ namespace ui_table
             }
             return -1;
         }
+        // ── 全量行序（view_rows/row_off）：键盘可见性用 ──
+        [[nodiscard]] int order_pos(int data_row) const noexcept
+        {
+            for (int i = 0; i < static_cast<int>(view_rows.size()); ++i)
+                if (view_rows[static_cast<std::size_t>(i)] == data_row)
+                    return i;
+            return -1;
+        }
+        [[nodiscard]] float order_y(int data_row) const noexcept
+        {
+            const int p = order_pos(data_row);
+            return p < 0 ? -1.0F : row_off[static_cast<std::size_t>(p)];
+        }
+        [[nodiscard]] float order_h(int data_row) const noexcept
+        {
+            return static_cast<std::size_t>(data_row) < row_h_data.size()
+                       ? row_h_data[static_cast<std::size_t>(data_row)]
+                       : 0.0F;
+        }
     };
+
+    // 键盘/查找把活动格滚进视口：只改 scroll，下一次 sync 自然生效
+    inline void ensure_visible(comp::view &v, const geometry &g, const prefs &,
+                               int row, int col) noexcept
+    {
+        if (row >= 0 && g.body.h > 0)
+        {
+            const int pos = g.order_pos(row);
+            if (pos >= 0)
+            {
+                const float y0 = g.row_off[static_cast<std::size_t>(pos)];
+                const float y1 = y0 + g.order_h(row);
+                const float max_sy = std::max(0.0F, g.content_h - g.body.h);
+                float ny = v.scroll.y;
+                if (y0 < ny + 0.5F)
+                    ny = y0;
+                else if (y1 > ny + g.body.h - 0.5F)
+                    ny = y1 - g.body.h;
+                ny = std::clamp(ny, 0.0F, max_sy);
+                if (ny != v.scroll.y)
+                {
+                    v.scroll.y = ny;
+                    v.ui.touch();
+                }
+            }
+        }
+        if (col >= 0)
+        {
+            const int cp = g.pos_of_col(col);
+            if (cp >= 0 && cp >= g.frozen && g.scrollv.w > 0)
+            {
+                const float x0 = g.col_x[static_cast<std::size_t>(cp)];
+                const float x1 = x0 + g.col_w[static_cast<std::size_t>(cp)];
+                const float span = g.scrollv.w;
+                const float max_sx = std::max(0.0F, g.content_w - g.frozen_w - span);
+                float nx = v.scroll.x;
+                if (x0 < nx)
+                    nx = x0;
+                else if (x1 > nx + span)
+                    nx = x1 - span;
+                nx = std::clamp(nx, 0.0F, max_sx);
+                if (nx != v.scroll.x)
+                {
+                    v.scroll.x = nx;
+                    v.ui.touch();
+                }
+            }
+        }
+    }
 
     // ── frame_data：派生 ──────────────────────────────────────────────────
     enum class stream : std::uint8_t
@@ -1595,6 +1882,49 @@ namespace ui_table
     // ═ 系统层 sys：输入/行列/绘制算法 ═══════════════════════════════════
     namespace sys
     {
+        // 列宽自适应：标题与所有单元格里最宽的一行 + 内边距（菜单 Fit 与双击分隔条共用）
+        inline void autofit_column(table_ctx &c, int col) noexcept
+        {
+            auto &v = c.v;
+            if (col < 0 || col >= c.d.cols_count() ||
+                static_cast<std::size_t>(col) >= v.cols.w.size())
+                return;
+            float w = text_width(c.ft, c.d.cols[static_cast<std::size_t>(col)].title);
+            for (int r = 0; r < c.d.rows(); ++r)
+                w = std::max(w, text_width(c.ft, c.d.text(r, col)));
+            const auto &def = c.d.cols[static_cast<std::size_t>(col)];
+            v.cols.w[static_cast<std::size_t>(col)] =
+                std::clamp(w + 2.0F * c.p.cell_pad + 24.0F, def.min_w, def.max_w);
+            v.cols.user[static_cast<std::size_t>(col)] = 1;
+            v.ui.touch();
+        }
+
+        // 列操作：菜单项与（将来的）右键命令共用同一批实现
+        inline void reset_sort(view &v) noexcept
+        {
+            v.sort.col = -1;
+            v.sort.dir = 0;
+        }
+        inline void hide_column(table_ctx &c, int col) noexcept
+        {
+            auto &v = c.v;
+            int visible = 0;
+            for (const auto h : v.cols.hidden)
+                visible += h == 0 ? 1 : 0;
+            if (visible <= 1 || col < 0 ||
+                static_cast<std::size_t>(col) >= v.cols.hidden.size())
+                return;
+            v.cols.hidden[static_cast<std::size_t>(col)] = 1;
+            if (static_cast<std::size_t>(col) < v.filter.text.size())
+                v.filter.text[static_cast<std::size_t>(col)].clear();
+            v.ui.touch();
+        }
+        inline void show_all_columns(table_ctx &c) noexcept
+        {
+            std::fill(c.v.cols.hidden.begin(), c.v.cols.hidden.end(), 0);
+            c.v.ui.touch();
+        }
+
         struct sort_feature
         {
             bool toggle(table_ctx &c, int col)
@@ -1636,7 +1966,7 @@ namespace ui_table
                     return;
                 fr.draw.add_shape(stream::chrome,
                                   {hr.x1() - 12, hr.y + hr.h * 0.5F - 3, 8, 6},
-                                  c.p.header_text, 1, {}, 0, 0);
+                                  c.p.header_text, 1, {}, 0, zone_key({part::header, -1, c.v.sort.col}));
             }
         };
 
@@ -1651,9 +1981,11 @@ namespace ui_table
             {
                 auto &v = c.v;
                 v.filter.edit = col;
+                v.filter.compose.clear();
                 v.filter.input = static_cast<std::size_t>(col) < v.filter.text.size()
                                      ? v.filter.text[static_cast<std::size_t>(col)]
                                      : std::string{};
+                v.filter.orig = v.filter.input;
                 v.ui.touch();
                 return true;
             }
@@ -1677,11 +2009,21 @@ namespace ui_table
                 c.v.ui.touch();
                 return true;
             }
+            static void sync_live(view &v) noexcept
+            {
+                if (v.filter.edit < 0)
+                    return;
+                const auto col = static_cast<std::size_t>(v.filter.edit);
+                if (col < v.filter.text.size())
+                    v.filter.text[col] = v.filter.input;
+            }
             bool text(table_ctx &c, std::string_view s)
             {
                 if (c.v.filter.edit < 0)
                     return false;
                 c.v.filter.input.append(s);
+                c.v.filter.compose.clear();
+                sync_live(c.v); // 边打边过滤，而不是等 Enter
                 c.v.ui.touch();
                 return true;
             }
@@ -1711,6 +2053,7 @@ namespace ui_table
                         v.filter.text[static_cast<std::size_t>(v.filter.edit)] =
                             v.filter.input;
                     v.filter.edit = -1;
+                    v.filter.orig.clear();
                     v.ui.touch();
                 }
                 return false;
@@ -1720,13 +2063,23 @@ namespace ui_table
                 auto &v = c.v;
                 if (v.filter.edit < 0)
                     return false;
+                v.filter.compose.clear();
                 if (k.k == key::esc)
+                {
+                    // 取消：还原进入编辑前的筛选串
+                    if (static_cast<std::size_t>(v.filter.edit) < v.filter.text.size())
+                        v.filter.text[static_cast<std::size_t>(v.filter.edit)] =
+                            v.filter.orig;
+                    v.filter.input = v.filter.orig;
+                    v.filter.orig.clear();
                     v.filter.edit = -1;
-                else if (k.k == key::enter)
+                }
+                else if (k.k == key::enter || k.k == key::tab)
                 {
                     if (static_cast<std::size_t>(v.filter.edit) < v.filter.text.size())
                         v.filter.text[static_cast<std::size_t>(v.filter.edit)] =
                             v.filter.input;
+                    v.filter.orig.clear();
                     v.filter.edit = -1;
                 }
                 else if (k.k == key::backspace && !v.filter.input.empty())
@@ -1734,6 +2087,12 @@ namespace ui_table
                     const std::size_t q = utf8_prev(std::string_view(v.filter.input),
                                                     v.filter.input.size());
                     v.filter.input.erase(q);
+                    sync_live(v);
+                }
+                else if (k.k == key::del)
+                {
+                    v.filter.input.clear();
+                    sync_live(v);
                 }
                 v.ui.touch();
                 return true;
@@ -1771,6 +2130,8 @@ namespace ui_table
                                          c.g.clip_x0(pos), c.g.clip_x1(pos));
                         if (!hr.empty())
                         {
+                            const std::string shown =
+                                c.v.filter.input + c.v.filter.compose;
                             fr.draw.add_shape(
                                 stream::overlay, hr, {0.06F, 0.08F, 0.12F, 1.0F},
                                 c.p.cell_radius, c.p.accent, 1.2F,
@@ -1778,9 +2139,9 @@ namespace ui_table
                             fr.draw.add_text(
                                 stream::overlay,
                                 {hr.x + 6, hr.y, std::max(hr.w - 12, 1.0F), hr.h},
-                                c.p.text, hr.y + hr.h * 0.5F + c.ft.px * 0.30F,
-                                c.v.filter.input, 0);
-                            const float tw = text_width(c.ft, c.v.filter.input);
+                                c.p.text, hr.y + hr.h * 0.5F + c.ft.px * 0.30F, shown,
+                                0);
+                            const float tw = text_width(c.ft, shown);
                             fr.draw.add_shape(stream::overlay,
                                               {hr.x + 6 + tw, hr.y + 6, 1.5F,
                                                std::max(hr.h - 12, 1.0F)},
@@ -1807,11 +2168,12 @@ namespace ui_table
                         active(c.v, dc) ? c.p.accent
                                         : glm::vec4(c.p.header_text.r, c.p.header_text.g,
                                                     c.p.header_text.b, 0.5F);
-                    fr.draw.add_shape(stream::chrome, {x, y, 10, 2}, color, 1, {}, 0, 0);
+                    fr.draw.add_shape(stream::chrome, {x, y, 10, 2}, color, 1, {}, 0,
+                                      zone_key({part::header, -1, dc}));
                     fr.draw.add_shape(stream::chrome, {x + 2, y + 3, 6, 2}, color, 1, {},
-                                      0, 0);
+                                      0, zone_key({part::header, -1, dc}));
                     fr.draw.add_shape(stream::chrome, {x + 4, y + 6, 2, 2}, color, 1, {},
-                                      0, 0);
+                                      0, zone_key({part::header, -1, dc}));
                 }
             }
 
@@ -1875,6 +2237,64 @@ namespace ui_table
                 sync_cells(c.d, c.v);
             }
 
+            // 单击 = anchor；Shift+单击 = 从 anchor 扩到目标（Excel/Finder 语义）
+            void set_or_extend(table_ctx &c, const target &t, bool shift)
+            {
+                if (shift && c.v.sel.r0 >= 0)
+                    extend(c, t.row_index, t.col_index);
+                else
+                    set(c, t);
+            }
+
+            // 拖拽框选：指针出体区时按一行步长自动滚，并把目标夹到首/末可见行列
+            void drag_extend(table_ctx &c, float x, float y)
+            {
+                auto &v = c.v;
+                const auto &g = c.g;
+                const float max_sy = std::max(0.0F, g.content_h - g.body.h);
+                if (y < g.body.y && v.scroll.y > 0.0F)
+                    v.scroll.y = std::max(0.0F, v.scroll.y - g.step);
+                else if (y > g.body.y1())
+                    v.scroll.y = std::min(max_sy, v.scroll.y + g.step);
+                const float max_sx =
+                    std::max(0.0F, g.content_w - g.frozen_w - g.scrollv.w);
+                if (x < g.scrollv.x && v.scroll.x > 0.0F)
+                    v.scroll.x = std::max(0.0F, v.scroll.x - 40.0F);
+                else if (x > g.scrollv.x1())
+                    v.scroll.x = std::min(max_sx, v.scroll.x + 40.0F);
+                int r = g.row_at(y);
+                int cc = g.col_at(x);
+                if (r < 0 && !g.view_rows.empty())
+                    r = y < g.body.y ? g.view_rows.front() : g.view_rows.back();
+                if (cc < 0 && g.col_count() > 0)
+                    cc = x < g.scrollv.x ? g.col_index.front() : g.col_index.back();
+                if (r >= 0 && cc >= 0)
+                    extend(c, r, cc);
+                v.ui.touch();
+            }
+
+            // 点分组头 = 选中这一组的全部行
+            void all_of_group(table_ctx &c, int first_col)
+            {
+                auto &v = c.v;
+                for (const auto &sp : c.g.groups)
+                {
+                    if (sp.first_col != first_col)
+                        continue;
+                    if (c.g.view_rows.empty())
+                        return;
+                    v.sel.r0 = c.g.view_rows.front();
+                    v.sel.r1 = c.g.view_rows.back();
+                    v.sel.c0 = sp.first_col;
+                    v.sel.c1 = sp.last_col;
+                    v.sel.cur_r = v.sel.r1;
+                    v.sel.cur_c = v.sel.c1;
+                    sync_cells(c.d, v);
+                    v.ui.touch();
+                    return;
+                }
+            }
+
             void extend(table_ctx &c, int r, int cc)
             {
                 auto &v = c.v;
@@ -1903,7 +2323,16 @@ namespace ui_table
                 int nr = v.sel.cur_r;
                 int nc = v.sel.cur_c;
                 if (dc != 0)
-                    nc = std::clamp(nc + dc, 0, c.d.cols_count() - 1);
+                {
+                    // 横向只走可见列（隐藏列不参与键盘导航）
+                    int cp = c.g.pos_of_col(nc);
+                    if (cp < 0)
+                        cp = 0;
+                    const int np =
+                        std::clamp(cp + dc, 0, std::max(c.g.col_count() - 1, 0));
+                    if (c.g.col_count() > 0)
+                        nc = c.g.col_index[static_cast<std::size_t>(np)];
+                }
                 else
                 {
                     int pos = 0;
@@ -1928,11 +2357,20 @@ namespace ui_table
                     v.ui.touch();
                 }
                 sync_cells(c.d, v);
+                ensure_visible(v, c.g, c.p, nr, nc);
             }
 
             void to(table_ctx &c, int r, int cc, bool extend_sel)
             {
                 auto &v = c.v;
+                // Home/End 落在可见列的首/末列，而不是可能被隐藏的数据列
+                if (c.g.col_count() > 0)
+                {
+                    if (cc <= 0)
+                        cc = c.g.col_index.front();
+                    else if (cc >= c.d.cols_count() - 1)
+                        cc = c.g.col_index.back();
+                }
                 if (!extend_sel)
                     anchor(v, r, cc);
                 else
@@ -1944,6 +2382,7 @@ namespace ui_table
                     v.ui.touch();
                 }
                 sync_cells(c.d, v);
+                ensure_visible(v, c.g, c.p, r, cc);
             }
 
             void all(table_ctx &c)
@@ -1953,8 +2392,9 @@ namespace ui_table
                     return;
                 v.sel.r0 = c.g.view_rows.front();
                 v.sel.r1 = c.g.view_rows.back();
-                v.sel.c0 = 0;
-                v.sel.c1 = c.d.cols_count() - 1;
+                v.sel.c0 = c.g.col_count() > 0 ? c.g.col_index.front() : 0;
+                v.sel.c1 = c.g.col_count() > 0 ? c.g.col_index.back()
+                                               : c.d.cols_count() - 1;
                 v.sel.cur_r = v.sel.r1;
                 v.sel.cur_c = v.sel.c1;
                 sync_cells(c.d, v);
@@ -2165,7 +2605,7 @@ namespace ui_table
                 auto &v = c.v;
                 if (v.edit.active())
                 {
-                    snapshot(v);
+                    snapshot(v, false);
                     for (char &ch : text)
                         if (ch == '\n' || ch == '\r' || ch == '\t')
                             ch = ' ';
@@ -2247,7 +2687,7 @@ namespace ui_table
                 auto &v = c.v;
                 if (v.edit.active())
                 {
-                    snapshot(v);
+                    snapshot(v, true);
                     replace_sel(v, s);
                 }
                 else if (v.sel.cur_r >= 0 && v.sel.cur_c >= 0)
@@ -2262,13 +2702,50 @@ namespace ui_table
                 return true;
             }
 
-            static void snapshot(view &v)
+            static void snapshot(view &v, bool typing = false)
             {
                 auto &e = v.edit;
+                // 连续输入（0.8s 内）合并成一步 undo，和浏览器的习惯一致
+                if (typing && e.last_push_typing &&
+                    v.ui.now - e.last_push_t < 0.8)
+                {
+                    e.redo.clear();
+                    return;
+                }
                 e.undo.push_back(e.buf);
                 if (e.undo.size() > 64)
                     e.undo.erase(e.undo.begin());
                 e.redo.clear();
+                e.last_push_t = v.ui.now;
+                e.last_push_typing = typing;
+            }
+            static void select_all(view &v) noexcept
+            {
+                v.edit.anchor = 0;
+                v.edit.caret = static_cast<int>(v.edit.buf.size());
+                v.ui.touch();
+            }
+            void select_word(table_ctx &c, float x)
+            {
+                auto &e = c.v.edit;
+                e.caret = caret_at(c, x);
+                const std::string_view sv{e.buf};
+                const auto caret = static_cast<std::size_t>(
+                    std::clamp(e.caret, 0, static_cast<int>(e.buf.size())));
+                std::size_t probe = caret;
+                if (probe >= sv.size() || !is_word_byte(sv[probe]))
+                    probe = probe > 0 ? utf8_prev(sv, probe) : 0;
+                std::size_t lo = probe;
+                while (lo > 0 && is_word_byte(sv[utf8_prev(sv, lo)]))
+                    lo = utf8_prev(sv, lo);
+                std::size_t hi = probe;
+                while (hi < sv.size() && is_word_byte(sv[hi]))
+                    hi = utf8_next(sv, hi);
+                if (hi <= lo)
+                    hi = std::min(sv.size(), utf8_next(sv, lo));
+                e.anchor = static_cast<int>(lo);
+                e.caret = static_cast<int>(hi);
+                c.v.ui.touch();
             }
 
             template <class E>
@@ -2283,10 +2760,21 @@ namespace ui_table
                         if (x.z.kind == part::cell && x.z.row == v.edit.row &&
                             x.z.col == v.edit.col)
                         {
-                            const int caret = caret_at(c, x.x);
-                            v.edit.caret = caret;
-                            v.edit.anchor = caret;
-                            v.ui.touch();
+                            if (v.ui.click_count >= 2)
+                            {
+                                if (v.ui.click_count >= 3)
+                                    select_all(v);
+                                else
+                                    select_word(c, x.x);
+                            }
+                            else
+                            {
+                                const int caret = caret_at(c, x.x);
+                                v.edit.caret = caret;
+                                if (!x.shift)
+                                    v.edit.anchor = caret;
+                                v.ui.touch();
+                            }
                         }
                         else
                             commit(c);
@@ -2343,6 +2831,7 @@ namespace ui_table
                             v.sel.r0 = v.sel.r1 = v.sel.cur_r = nr;
                             v.sel.c0 = v.sel.c1 = v.sel.cur_c = col;
                             v.ui.touch();
+                            ensure_visible(v, c.g, c.p, nr, col);
                         }
                         break;
                     }
@@ -2352,44 +2841,65 @@ namespace ui_table
                                                   c.d.cols_count() - 1);
                         v.sel.cur_c = v.sel.c0 = v.sel.c1 = nc;
                         v.ui.touch();
+                        ensure_visible(v, c.g, c.p, v.sel.cur_r, nc);
                         break;
                     }
                     case key::backspace:
-                        snapshot(v);
+                        snapshot(v, true);
                         if (e.has_sel())
                             replace_sel(v, {});
                         else if (e.caret > 0)
                         {
+                            const auto sv = std::string_view(e.buf);
                             const std::size_t q =
-                                utf8_prev(std::string_view(e.buf), e.caret);
+                                x.ctrl ? utf8_word_left(sv, static_cast<std::size_t>(e.caret))
+                                       : utf8_prev(sv, static_cast<std::size_t>(e.caret));
                             e.buf.erase(q, static_cast<std::size_t>(e.caret) - q);
                             e.caret = static_cast<int>(q);
                             e.anchor = e.caret;
                         }
                         break;
                     case key::del:
-                        snapshot(v);
+                        snapshot(v, true);
                         if (e.has_sel())
                             replace_sel(v, {});
                         else if (e.caret < static_cast<int>(e.buf.size()))
                         {
+                            const auto sv = std::string_view(e.buf);
                             const std::size_t q =
-                                utf8_next(std::string_view(e.buf), e.caret);
+                                x.ctrl ? utf8_word_right(sv, static_cast<std::size_t>(e.caret))
+                                       : utf8_next(sv, static_cast<std::size_t>(e.caret));
                             e.buf.erase(static_cast<std::size_t>(e.caret),
                                         q - static_cast<std::size_t>(e.caret));
                         }
                         break;
                     case key::left:
-                        e.caret = e.has_sel() ? e.sel_lo()
-                                              : static_cast<int>(utf8_prev(
-                                                    std::string_view(e.buf), e.caret));
+                        e.caret = e.has_sel()
+                                      ? e.sel_lo()
+                                      : static_cast<int>(x.ctrl
+                                                             ? utf8_word_left(
+                                                                   std::string_view(e.buf),
+                                                                   static_cast<std::size_t>(
+                                                                       e.caret))
+                                                             : utf8_prev(
+                                                                   std::string_view(e.buf),
+                                                                   static_cast<std::size_t>(
+                                                                       e.caret)));
                         if (!x.shift)
                             e.anchor = e.caret;
                         break;
                     case key::right:
-                        e.caret = e.has_sel() ? e.sel_hi()
-                                              : static_cast<int>(utf8_next(
-                                                    std::string_view(e.buf), e.caret));
+                        e.caret = e.has_sel()
+                                      ? e.sel_hi()
+                                      : static_cast<int>(x.ctrl
+                                                             ? utf8_word_right(
+                                                                   std::string_view(e.buf),
+                                                                   static_cast<std::size_t>(
+                                                                       e.caret))
+                                                             : utf8_next(
+                                                                   std::string_view(e.buf),
+                                                                   static_cast<std::size_t>(
+                                                                       e.caret)));
                         if (!x.shift)
                             e.anchor = e.caret;
                         break;
@@ -2419,6 +2929,19 @@ namespace ui_table
                                                                             e.sel_lo()))
                                     : e.buf});
                         break;
+                    case key::x:
+                        if (x.ctrl)
+                        {
+                            if (e.has_sel() && c.fx)
+                                c.fx->push_back(fx_clipboard{
+                                    e.buf.substr(static_cast<std::size_t>(e.sel_lo()),
+                                                 static_cast<std::size_t>(e.sel_hi() -
+                                                                          e.sel_lo()))});
+                            snapshot(v, true);
+                            if (e.has_sel())
+                                replace_sel(v, {});
+                        }
+                        break;
                     case key::z:
                         if (x.ctrl && !e.undo.empty())
                         {
@@ -2427,6 +2950,7 @@ namespace ui_table
                             e.undo.pop_back();
                             e.caret = static_cast<int>(e.buf.size());
                             e.anchor = e.caret;
+                            e.last_push_typing = false;
                         }
                         break;
                     case key::y:
@@ -2437,6 +2961,7 @@ namespace ui_table
                             e.redo.pop_back();
                             e.caret = static_cast<int>(e.buf.size());
                             e.anchor = e.caret;
+                            e.last_push_typing = false;
                         }
                         break;
                     default:
@@ -2693,13 +3218,26 @@ namespace ui_table
                 const bool on = v.checks.on[static_cast<std::size_t>(row)] == 0;
                 if (shift && v.checks.last >= 0)
                 {
-                    const int lo = std::min(v.checks.last, row);
-                    const int hi = std::max(v.checks.last, row);
-                    for (int i = lo; i <= hi; ++i)
+                    // 区间按“可见顺序”走：排序/筛选后也只勾选当前看得到的行
+                    const int pl = c.g.order_pos(v.checks.last);
+                    const int pr = c.g.order_pos(row);
+                    if (pl >= 0 && pr >= 0)
                     {
-                        v.checks.on[static_cast<std::size_t>(i)] = on ? 1 : 0;
-                        v.checks.ids[static_cast<std::size_t>(i)] =
-                            c.d.ids[static_cast<std::size_t>(i)];
+                        const int lo = std::min(pl, pr);
+                        const int hi = std::max(pl, pr);
+                        for (int i = lo; i <= hi; ++i)
+                        {
+                            const int r = c.g.view_rows[static_cast<std::size_t>(i)];
+                            v.checks.on[static_cast<std::size_t>(r)] = on ? 1 : 0;
+                            v.checks.ids[static_cast<std::size_t>(r)] =
+                                c.d.ids[static_cast<std::size_t>(r)];
+                        }
+                    }
+                    else
+                    {
+                        v.checks.on[static_cast<std::size_t>(row)] = on ? 1 : 0;
+                        v.checks.ids[static_cast<std::size_t>(row)] =
+                            c.d.ids[static_cast<std::size_t>(row)];
                     }
                 }
                 else
@@ -2872,8 +3410,24 @@ namespace ui_table
             bool move(table_ctx &c, float x, float y)
             {
                 auto &v = c.v;
-                v.cols.user_w = std::max(v.ui.trs_w + (x - v.ui.trs_x0), c.p.min_w);
-                v.cols.user_h = std::max(v.ui.trs_h + (y - v.ui.trs_y0), c.p.min_h);
+                // 左/上把手：往左/上拖是放大，所以位移取反
+                const part e = v.ui.trs_edge;
+                const bool left = e == part::edge_w || e == part::edge_nw ||
+                                  e == part::edge_sw;
+                const bool top = e == part::edge_n || e == part::edge_ne ||
+                                 e == part::edge_nw;
+                const bool use_x = e != part::edge_n;
+                const bool use_y = e != part::edge_w;
+                float dx = x - v.ui.trs_x0;
+                float dy = y - v.ui.trs_y0;
+                if (left)
+                    dx = -dx;
+                if (top)
+                    dy = -dy;
+                v.cols.user_w =
+                    std::max(v.ui.trs_w + (use_x ? dx : 0.0F), c.p.min_w);
+                v.cols.user_h =
+                    std::max(v.ui.trs_h + (use_y ? dy : 0.0F), c.p.min_h);
                 v.ui.touch();
                 return true;
             }
@@ -3016,7 +3570,10 @@ namespace ui_table
                 if (!c.v.find.mode)
                     return false;
                 c.v.find.buf.append(s);
+                c.v.find.compose.clear();
                 c.v.find.hit = first_hit(c.d, c.g, c.v);
+                if (c.v.find.hit >= 0)
+                    ensure_visible(c.v, c.g, c.p, c.v.find.hit, 0);
                 c.v.ui.touch();
                 return true;
             }
@@ -3064,6 +3621,15 @@ namespace ui_table
             {
                 if constexpr (std::is_same_v<E, cmd_key>)
                     return key(c, x);
+                else if constexpr (std::is_same_v<E, cmd_press>)
+                {
+                    // 点别处 = 退出查找（让这次点击继续走正常的表内分派）
+                    if (c.v.find.mode)
+                    {
+                        c.v.find.mode = false;
+                        c.v.ui.touch();
+                    }
+                }
                 return false;
             }
             bool key(table_ctx &c, const cmd_key &k)
@@ -3071,6 +3637,7 @@ namespace ui_table
                 auto &v = c.v;
                 if (!v.find.mode)
                     return false;
+                v.find.compose.clear();
                 if (k.k == key::esc)
                     v.find.mode = false;
                 else if (k.k == key::backspace && !v.find.buf.empty())
@@ -3079,6 +3646,8 @@ namespace ui_table
                         utf8_prev(std::string_view(v.find.buf), v.find.buf.size());
                     v.find.buf.erase(q);
                     v.find.hit = first_hit(c.d, c.g, v);
+                    if (v.find.hit >= 0)
+                        ensure_visible(v, c.g, c.p, v.find.hit, 0);
                 }
                 else if (k.k == key::enter)
                 {
@@ -3087,6 +3656,7 @@ namespace ui_table
                     {
                         v.sel.r0 = v.sel.r1 = v.sel.cur_r = v.find.hit;
                         v.sel.c0 = v.sel.c1 = v.sel.cur_c = 0;
+                        ensure_visible(v, c.g, c.p, v.find.hit, 0);
                         v.ui.touch();
                     }
                 }
@@ -3103,11 +3673,12 @@ namespace ui_table
                     const rect bar{c.g.box.x + 8, fy, c.g.box.w - 16, 22};
                     fr.draw.add_shape(stream::overlay, bar, {0.06F, 0.08F, 0.12F, 0.95F},
                                       4, c.p.accent, 1.0F, 0);
+                    const std::string shown = c.v.find.buf + c.v.find.compose;
                     fr.draw.add_text(
                         stream::overlay, {bar.x + 8, bar.y, bar.w - 16, bar.h}, c.p.text,
                         bar.y + bar.h * 0.5F + c.ft.px * 0.30F,
-                        c.v.find.buf.empty() ? std::string_view{"Find..."}
-                                             : std::string_view{c.v.find.buf},
+                        shown.empty() ? std::string_view{"Find..."}
+                                      : std::string_view{shown},
                         0);
                 }
                 if (c.v.find.buf.empty())
@@ -3230,40 +3801,18 @@ namespace ui_table
                     switch (index)
                     {
                     case 0: {
-                        const int col = v.menu.col;
-                        if (col >= 0 && col < c.d.cols_count())
-                        {
-                            float w = text_width(
-                                c.ft, c.d.cols[static_cast<std::size_t>(col)].title);
-                            for (int r = 0; r < c.d.rows(); ++r)
-                                w = std::max(w, text_width(c.ft, c.d.text(r, col)));
-                            const auto &def = c.d.cols[static_cast<std::size_t>(col)];
-                            v.cols.w[static_cast<std::size_t>(col)] = std::clamp(
-                                w + 2.0F * c.p.cell_pad + 24.0F, def.min_w, def.max_w);
-                            v.cols.user[static_cast<std::size_t>(col)] = 1;
-                        }
+                        autofit_column(c, v.menu.col);
                         break;
                     }
                     case 1:
-                        v.sort.col = -1;
-                        v.sort.dir = 0;
+                        reset_sort(v);
                         break;
                     case 2: {
-                        int visible = 0;
-                        for (const auto h : v.cols.hidden)
-                            visible += h == 0 ? 1 : 0;
-                        const int col = v.menu.col;
-                        if (visible > 1 && col >= 0 &&
-                            static_cast<std::size_t>(col) < v.cols.hidden.size())
-                        {
-                            v.cols.hidden[static_cast<std::size_t>(col)] = 1;
-                            if (static_cast<std::size_t>(col) < v.filter.text.size())
-                                v.filter.text[static_cast<std::size_t>(col)].clear();
-                        }
+                        hide_column(c, v.menu.col);
                         break;
                     }
                     case 3:
-                        std::fill(v.cols.hidden.begin(), v.cols.hidden.end(), 0);
+                        show_all_columns(c);
                         break;
                     default:
                         break;
@@ -3325,18 +3874,6 @@ namespace ui_table
             }
         };
 
-        // 列操作：hide / show all / autofit / reset sort
-        struct column_ops_feature
-        {
-            template <class E>
-            bool on_command(table_ctx &, const E &)
-            {
-                return false;
-            }
-            void rows(table_ctx &, std::vector<row_idx> &) {}
-            void paint(const frame_ctx &, frame_data &) const {}
-        };
-
         struct systems
         {
             filter_feature filter;
@@ -3345,7 +3882,6 @@ namespace ui_table
             resize_feature resize;
             reorder_feature reorder;
             freeze_feature freeze;
-            column_ops_feature column_ops;
             checks_feature checks;
             scroll_feature scroll;
             table_resize_feature table_resize;
@@ -3370,8 +3906,6 @@ namespace ui_table
                 if (reorder.on_command(c, cmd))
                     return true;
                 if (freeze.on_command(c, cmd))
-                    return true;
-                if (column_ops.on_command(c, cmd))
                     return true;
                 if (checks.on_command(c, cmd))
                     return true;
@@ -3406,7 +3940,6 @@ namespace ui_table
                 resize.paint(c, fr);
                 reorder.paint(c, fr);
                 freeze.paint(c, fr);
-                column_ops.paint(c, fr);
                 checks.paint(c, fr);
                 scroll.paint(c, fr);
                 table_resize.paint(c, fr);
@@ -3546,7 +4079,7 @@ namespace ui_table
         {
             if (v.cols.order.size() != static_cast<std::size_t>(d.cols_count()) ||
                 v.checks.on.size() != static_cast<std::size_t>(d.rows()))
-                v.reset(d);
+                v.reconcile(d);
             g = geometry{};
             g.version = v.ui.version;
 
@@ -3577,6 +4110,38 @@ namespace ui_table
             g.gutter_body = {g.body.x, g.body.y, g.gutter_w, g.body.h};
 
             solve_columns(d, v, p, std::max(g.body.w - g.gutter_w, 1.0F), g);
+            // 分组带：连续、同名 group 的可见列算一段；命中/整组选择都读这张表
+            g.groups.clear();
+            {
+                int start = -1;
+                std::string_view cur;
+                const auto flush = [&](int end) {
+                    if (start >= 0 && end >= start)
+                        g.groups.push_back({start, end,
+                                            g.col_index[static_cast<std::size_t>(start)],
+                                            g.col_index[static_cast<std::size_t>(end)]});
+                };
+                for (int i = 0; i < g.col_count(); ++i)
+                {
+                    const auto &name =
+                        d.cols[static_cast<std::size_t>(g.col_index[static_cast<std::size_t>(i)])]
+                            .group;
+                    if (name.empty())
+                    {
+                        flush(i - 1);
+                        start = -1;
+                        cur = {};
+                        continue;
+                    }
+                    if (start < 0 || name != cur)
+                    {
+                        flush(i - 1);
+                        start = i;
+                        cur = name;
+                    }
+                }
+                flush(g.col_count() - 1);
+            }
             g.content_w = g.col_count() > 0
                               ? g.col_x.back() + g.col_w.back() - g.col_x.front()
                               : 0.0F;
@@ -3589,6 +4154,14 @@ namespace ui_table
                 sy.rows(ctx, pipe.buf);
             }
             g.view_rows.assign(pipe.buf.begin(), pipe.buf.end());
+            // 当前格被筛掉：清选区（ability7 语义），避免编辑/勾选落到不可见行
+            if (v.sel.cur_r >= 0 &&
+                std::find(g.view_rows.begin(), g.view_rows.end(), v.sel.cur_r) ==
+                    g.view_rows.end())
+            {
+                v.sel = {};
+                v.ui.touch();
+            }
             g.row_off.assign(g.view_rows.size() + 1, 0.0F);
             float acc = 0;
             for (std::size_t i = 0; i < g.view_rows.size(); ++i)
@@ -3785,6 +4358,21 @@ namespace ui_table
 
     namespace input
     {
+        // 连击计数：press 的分派顺序要求它在 systems 之前更新（edit 会先读它）
+        inline void note_click(view &v, const cmd_press &c) noexcept
+        {
+            const bool near_last =
+                !c.shift && v.ui.now - v.ui.last_click_t < 0.40 &&
+                (c.x - v.ui.last_click_pos.x) * (c.x - v.ui.last_click_pos.x) +
+                        (c.y - v.ui.last_click_pos.y) *
+                            (c.y - v.ui.last_click_pos.y) <
+                    25.0F;
+            v.ui.click_count =
+                near_last ? std::min(std::max(v.ui.click_count, 1) + 1, 3) : 1;
+            v.ui.last_click_t = v.ui.now;
+            v.ui.last_click_pos = {c.x, c.y};
+        }
+
         template <class E>
         inline void system_gesture(table_data &d, view &v, const prefs &p,
                                    const geometry &g, systems &sy, const font &ft,
@@ -3804,15 +4392,7 @@ namespace ui_table
                     v.ui.drag_start_x = c.x;
                     v.ui.drag_start_y = c.y;
                     v.ui.header_moved = false;
-                    bool dbl = c.dbl;
-                    if (!dbl && v.ui.now - v.ui.last_click_t < 0.40 &&
-                        (c.x - v.ui.last_click_pos.x) * (c.x - v.ui.last_click_pos.x) +
-                                (c.y - v.ui.last_click_pos.y) *
-                                    (c.y - v.ui.last_click_pos.y) <
-                            25.0F)
-                        dbl = true;
-                    v.ui.last_click_t = v.ui.now;
-                    v.ui.last_click_pos = {c.x, c.y};
+                    const bool dbl = c.dbl || v.ui.click_count >= 2;
                     if (v.edit.active() && z.kind == part::cell && v.edit.row == z.row &&
                         v.edit.col == z.col)
                         return;
@@ -3822,10 +4402,16 @@ namespace ui_table
                         to_owner(tgt),
                         overloaded{
                             [&](const cell_owner &) {
-                                sy.selection.set(tc, tgt);
+                                sy.selection.set_or_extend(tc, tgt, c.shift);
                                 v.ui.drag = drag_mode::select;
                                 if (dbl)
+                                {
                                     sy.edit.begin(tc, tgt);
+                                    if (v.ui.click_count >= 3)
+                                        sys::edit_feature::select_all(v);
+                                    else
+                                        sy.edit.select_word(tc, c.x);
+                                }
                             },
                             [&](const check_owner &) {
                                 sy.checks.toggle(tc, tgt, c.shift);
@@ -3840,6 +4426,11 @@ namespace ui_table
                             [&](const sep_owner &h) {
                                 if (h.col_index < 0)
                                     return;
+                                if (v.ui.click_count >= 2)
+                                {
+                                    sys::autofit_column(tc, h.col_index);
+                                    return;
+                                }
                                 v.ui.drag = drag_mode::col_w;
                                 sy.resize.begin(tc, tgt, c.x);
                             },
@@ -3858,9 +4449,33 @@ namespace ui_table
                                     v.ui.drag = drag_mode::hthumb;
                                     sy.scroll.begin(tc, 1, v.scroll.x, c.x);
                                 }
+                                else if (b.kind == part::vbar_track)
+                                {
+                                    // 点轨道 = 翻一页（点在滑块上方往上，下方往下）
+                                    const float page = std::max(g.body.h * 0.9F, g.step);
+                                    const float max_sy =
+                                        std::max(0.0F, g.content_h - g.body.h);
+                                    v.scroll.y = std::clamp(
+                                        v.scroll.y +
+                                            (c.y < g.vthumb.y ? -page : page),
+                                        0.0F, max_sy);
+                                    v.ui.touch();
+                                }
+                                else if (b.kind == part::hbar_track)
+                                {
+                                    const float page = std::max(g.scrollv.w * 0.9F, 10.0F);
+                                    const float max_sx = std::max(
+                                        0.0F, g.content_w - g.frozen_w - g.scrollv.w);
+                                    v.scroll.x = std::clamp(
+                                        v.scroll.x +
+                                            (c.x < g.hthumb.x ? -page : page),
+                                        0.0F, max_sx);
+                                    v.ui.touch();
+                                }
                             },
-                            [&](const edge_owner &) {
+                            [&](const edge_owner &eo) {
                                 v.ui.drag = drag_mode::table_size;
+                                v.ui.trs_edge = eo.kind;
                                 sy.table_resize.begin(
                                     tc, c.x, c.y,
                                     v.cols.user_w > 0 ? v.cols.user_w : g.box.w,
@@ -3868,7 +4483,11 @@ namespace ui_table
                             },
                             [&](const menu_owner &) { sy.menu.item(tc, tgt); },
                             [&](const frame_owner &) { sy.selection.clear(tc); },
-                            [&](const group_owner &) {}, [&](const none_owner &) {}});
+                            [&](const group_owner &o) {
+                                sy.selection.all_of_group(tc, o.col_index);
+                                v.ui.drag = drag_mode::none;
+                            },
+                            [&](const none_owner &) { sy.selection.clear(tc); }});
                     v.ui.touch();
                 }
                 else if constexpr (std::is_same_v<T, cmd_drag>)
@@ -3878,10 +4497,7 @@ namespace ui_table
                     visit_drag(
                         v.ui.drag,
                         overloaded{[&](const drag_select &) {
-                                       const int r = g.row_at(c.y);
-                                       const int cc = g.col_at(c.x);
-                                       if (r >= 0 && cc >= 0)
-                                           sy.selection.extend(tc, r, cc);
+                                       sy.selection.drag_extend(tc, c.x, c.y);
                                    },
                                    [&](const drag_col_w &) { sy.resize.move(tc, c.x); },
                                    [&](const drag_vthumb &) { sy.scroll.move(tc, c.y); },
@@ -3902,6 +4518,7 @@ namespace ui_table
                         if (sc >= 0)
                         {
                             v.sort.toggle(sc);
+                            sy.selection.clear(tc); // 排序后行位置变了，选区语义失效
                             v.ui.touch();
                         }
                     }
@@ -3931,18 +4548,65 @@ namespace ui_table
                         sy.selection.move(tc, 0, 1, c.shift);
                         break;
                     case key::home:
-                        sy.selection.to(tc, v.sel.cur_r, 0, c.shift);
+                        if (c.ctrl)
+                            sy.selection.to(tc, g.view_rows.empty() ? 0
+                                                                    : g.view_rows.front(),
+                                            0, c.shift);
+                        else
+                            sy.selection.to(tc, v.sel.cur_r, 0, c.shift);
                         break;
                     case key::end:
-                        sy.selection.to(tc, v.sel.cur_r, d.cols_count() - 1, c.shift);
+                        if (c.ctrl)
+                            sy.selection.to(
+                                tc,
+                                g.view_rows.empty() ? d.rows() - 1 : g.view_rows.back(),
+                                d.cols_count() - 1, c.shift);
+                        else
+                            sy.selection.to(tc, v.sel.cur_r, d.cols_count() - 1,
+                                            c.shift);
                         break;
+                    case key::pgup:
+                    case key::pgdn: {
+                        const int page = std::max(
+                            1, static_cast<int>(g.body.h / std::max(g.step, 1.0F)) - 1);
+                        sy.selection.move(tc, c.k == key::pgup ? -page : page, 0,
+                                          c.shift);
+                        break;
+                    }
                     case key::enter:
+                        sy.selection.move(tc, c.shift ? -1 : 1, 0, false);
+                        break;
                     case key::f2:
                         sy.edit.begin(tc, v.sel.cur_r, v.sel.cur_c);
                         break;
-                    case key::tab:
-                        sy.selection.move(tc, 0, c.shift ? -1 : 1, false);
+                    case key::tab: {
+                        // 浏览器式 tab 顺序：行末换到下一行行首，行首 Shift+Tab 回上一行行末
+                        const int ncol = g.col_count();
+                        if (ncol <= 0)
+                            break;
+                        const int pos = std::max(0, g.order_pos(v.sel.cur_r));
+                        int cp = g.pos_of_col(v.sel.cur_c);
+                        if (cp < 0)
+                            cp = 0;
+                        cp += c.shift ? -1 : 1;
+                        int rp = pos;
+                        if (cp >= ncol)
+                        {
+                            cp = 0;
+                            rp = std::min(rp + 1, static_cast<int>(g.view_rows.size()) - 1);
+                        }
+                        else if (cp < 0)
+                        {
+                            cp = ncol - 1;
+                            rp = std::max(rp - 1, 0);
+                        }
+                        if (!g.view_rows.empty())
+                            sy.selection.to(tc,
+                                            g.view_rows[static_cast<std::size_t>(rp)],
+                                            g.col_index[static_cast<std::size_t>(cp)],
+                                            false);
                         break;
+                    }
                     case key::del:
                     case key::backspace:
                         sy.clipboard.remove(tc);
@@ -3990,7 +4654,19 @@ namespace ui_table
             };
             test(g.box, {part::frame});
             if (g.group_h > 0)
-                test(g.group, {part::header_group});
+            {
+                for (const auto &sp : g.groups)
+                {
+                    const float x0 =
+                        std::max(g.col_x_at(sp.first_pos), g.clip_x0(sp.first_pos));
+                    const float x1 =
+                        std::min(g.col_x_at(sp.last_pos) +
+                                     g.col_w[static_cast<std::size_t>(sp.last_pos)],
+                                 g.clip_x1(sp.last_pos));
+                    if (x >= x0 && x < x1 && y >= g.group.y && y < g.group.y1())
+                        best = {part::header_group, -1, sp.first_col};
+                }
+            }
             for (int i = 0; i < g.col_count(); ++i)
             {
                 const int dc = g.col_index[static_cast<std::size_t>(i)];
@@ -4075,7 +4751,8 @@ namespace ui_table
                            g.clip_x0(i), g.clip_x1(i));
                 if (hr.w <= 24)
                     continue;
-                const rect btn{hr.x1() - 18, hr.y, 18, hr.h};
+                // 漏斗的可点区域比图标大一圈，但停在分隔条热区之前（否则列宽拖不动）
+                const rect btn{hr.x1() - 24, hr.y, 19, hr.h};
                 if (x >= btn.x && x < btn.x1() && y >= btn.y && y < btn.y1())
                     return {part::filter_btn, -1, dc, tid};
             }
@@ -4087,6 +4764,8 @@ namespace ui_table
                                  const geometry &g, systems &sy, const font &ft,
                                  const E &ev, std::vector<effect> &fx)
         {
+            if constexpr (std::is_same_v<E, cmd_press>)
+                note_click(v, ev);
             table_ctx tc{d, v, p, g, ft, &fx, nullptr};
             if (!sy.handle(tc, ev))
                 system_gesture(d, v, p, g, sy, ft, ev, fx);
@@ -4221,7 +4900,7 @@ namespace ui_table
                 if (v.ui.band_col == dc)
                     bg = glm::vec4(glm::vec3(bg) + glm::vec3(0.06F), bg.a);
                 dl.add_shape(stream::chrome, hr, bg, p.cell_radius, {}, 0,
-                             zk({part::header, -1, dc}));
+                             zone_key({part::header, -1, dc}));
                 const auto &def = d.cols[static_cast<std::size_t>(dc)];
                 const float inner = std::max(
                     hr.w - 2 * p.cell_pad - (def.filterable ? 18.0F : 0.0F), 1.0F);
@@ -4234,7 +4913,7 @@ namespace ui_table
                 dl.add_text(stream::chrome,
                             {hr.x + p.cell_pad + dx, hr.y, inner - dx, hr.h},
                             p.header_text, hr.y + hr.h * 0.5F + ft.px * 0.30F, def.title,
-                            zk({part::header, -1, dc}));
+                            zone_key({part::header, -1, dc}));
             }
 
             // 沟槽
@@ -4349,16 +5028,44 @@ namespace ui_table
                     }
                     else
                     {
-                        const auto s = fit_text(ft, text, inner, dl.ar, scratch);
-                        const float tw = text_width(ft, s);
-                        float dx = 0;
-                        if (def.a == align::center)
-                            dx = std::max((inner - tw) * 0.5F, 0.0F);
-                        else if (def.a == align::right)
-                            dx = std::max(inner - tw, 0.0F);
-                        dl.add_text(stream::content,
-                                    {cr.x + p.cell_pad + dx, cr.y, inner - dx, cr.h},
-                                    p.text, baseline, s, z);
+                        if (def.wrap || p.wrap)
+                        {
+                            // 折行：行高在 sync 里按 wrap_lines 算过，这里逐行画
+                            std::vector<std::string_view> lines;
+                            wrap_lines(ft, text, inner, lines);
+                            const float lh = ft.px * ft.line_h;
+                            float ty = cr.y + 4.0F;
+                            for (const auto ln : lines)
+                            {
+                                if (ty >= cr.y1())
+                                    break;
+                                const float tw = text_width(ft, ln);
+                                float dx = 0;
+                                if (def.a == align::center)
+                                    dx = std::max((inner - tw) * 0.5F, 0.0F);
+                                else if (def.a == align::right)
+                                    dx = std::max(inner - tw, 0.0F);
+                                dl.add_text(stream::content,
+                                            {cr.x + p.cell_pad + dx, ty,
+                                             std::max(inner - dx, 1.0F),
+                                             std::min(lh, cr.y1() - ty)},
+                                            p.text, ty + ft.px * 0.85F, ln, z);
+                                ty += lh;
+                            }
+                        }
+                        else
+                        {
+                            const auto s = fit_text(ft, text, inner, dl.ar, scratch);
+                            const float tw = text_width(ft, s);
+                            float dx = 0;
+                            if (def.a == align::center)
+                                dx = std::max((inner - tw) * 0.5F, 0.0F);
+                            else if (def.a == align::right)
+                                dx = std::max(inner - tw, 0.0F);
+                            dl.add_text(stream::content,
+                                        {cr.x + p.cell_pad + dx, cr.y, inner - dx, cr.h},
+                                        p.text, baseline, s, z);
+                        }
                     }
                 }
             }
@@ -4391,7 +5098,17 @@ namespace ui_table
             };
             add_zone(g.box, {part::frame});
             if (g.group_h > 0)
-                add_zone(g.group, {part::header_group});
+                for (const auto &sp : g.groups)
+                {
+                    const float x0 =
+                        std::max(g.col_x_at(sp.first_pos), g.clip_x0(sp.first_pos));
+                    const float x1 =
+                        std::min(g.col_x_at(sp.last_pos) +
+                                     g.col_w[static_cast<std::size_t>(sp.last_pos)],
+                                 g.clip_x1(sp.last_pos));
+                    add_zone({x0, g.group.y, x1 - x0, g.group.h},
+                             {part::header_group, -1, sp.first_col});
+                }
             for (int i = 0; i < g.col_count(); ++i)
             {
                 const rect hz =
@@ -4402,7 +5119,7 @@ namespace ui_table
                 add_zone(hz, {part::header, -1, dc});
                 if (dc >= 0 && dc < d.cols_count() &&
                     d.cols[static_cast<std::size_t>(dc)].filterable && hz.w > 24)
-                    add_zone({hz.x1() - 18, hz.y, 18, hz.h}, {part::filter_btn, -1, dc});
+                    add_zone({hz.x1() - 24, hz.y, 19, hz.h}, {part::filter_btn, -1, dc});
             }
             add_zone(g.gutter_head, {part::check_head});
             for (int ri = 0; ri < g.row_count(); ++ri)
@@ -4449,6 +5166,17 @@ namespace ui_table
                 frame_ctx fc{d, v, p, g, ft};
                 sy.paint(fc, out);
             }
+            // 装饰性 op（背景/外框/tooltip 底）也必须有主：默认归 table frame。
+            // 更具体的 zone 在 emit 时已经给了，不会被覆盖。
+            const std::uint32_t frame_zone = zk({part::frame});
+            for (auto &ss : out.draw.shapes)
+                for (auto &o : ss)
+                    if (o.zone == 0)
+                        o.zone = frame_zone;
+            for (auto &tt : out.draw.texts)
+                for (auto &o : tt)
+                    if (o.zone == 0)
+                        o.zone = frame_zone;
             const std::uint32_t tbits = (tid.value & bits::kTableMask)
                                         << bits::kTableShift;
             if (tbits != 0)
@@ -4464,6 +5192,10 @@ namespace ui_table
             }
             for (auto &zr : out.zones)
                 zr.z.table = tid;
+            for (const auto &z : out.zones)
+                dl.add_shape(stream::proxy, z.r, {0, 0, 0, 0}, 0, {}, 0, zk(z.z));
+            // every op（含 proxy）都必须带 owner：新增 part 时 to_owner 会先返回
+            // none_owner，selftest 的 “no owner” 断言会当场失败。
             if (tid.value != 0)
             {
                 const auto assign_who = [&](auto &ops) {
@@ -4476,8 +5208,6 @@ namespace ui_table
                 for (auto &tt : out.draw.texts)
                     assign_who(tt);
             }
-            for (const auto &z : out.zones)
-                dl.add_shape(stream::proxy, z.r, {0, 0, 0, 0}, 0, {}, 0, zk(z.z));
         }
 
         // ── 自测 ──────────────────────────────────────────────────────────────
@@ -4496,12 +5226,15 @@ namespace ui_table
     inline int selftest()
     {
         int fails = 0;
+        const bool verbose = std::getenv("TABLE_SELFTEST_VERBOSE") != nullptr;
         const auto check = [&](bool ok, const char *what) {
             if (!ok)
             {
                 ++fails;
                 std::println("[table-selftest] FAIL: {}", what);
             }
+            else if (verbose)
+                std::println("[table-selftest] ok: {}", what);
         };
 
         table_data d;
@@ -4554,12 +5287,8 @@ namespace ui_table
             ft.put(static_cast<char32_t>(c), gm);
 
         std::vector<effect> fx;
-        // 和 submit 相同的分发：语义命令 → feature，没人认领 → apply
-        auto send = [&]<class E>(const E &c) {
-            table_ctx tc{d, v, p, g, ft, &fx, nullptr};
-            if (!sy.handle(tc, c))
-                system_gesture(d, v, p, g, sy, ft, c, fx);
-        };
+        // 和 submit 完全相同的分发：语义命令 → feature，没人认领 → apply
+        auto send = [&]<class E>(const E &c) { system_event(d, v, p, g, sy, ft, c, fx); };
         auto send_text = [&](std::string_view s) {
             table_ctx tc{d, v, p, g, ft, &fx, nullptr};
             system_text(tc, sy, s);
@@ -4580,8 +5309,83 @@ namespace ui_table
               "selection carries cell_ref");
         sync(d, v, p, g, vp, ft, sy, pipe);
 
+        // G1：Shift+单击 = 从 anchor 扩选；点非格区域 = 清选区
+        v.ui.last_click_t = -1.0e9;
+        send(cmd_press{10, 10, {part::cell, 2, 1}, false, true, false});
+        check(v.sel.r0 == 1 && v.sel.c0 == 0 && v.sel.r1 == 2 && v.sel.c1 == 1,
+              "shift+click extends from anchor");
+        send(cmd_press{10, 10, {part::none}, false, false, false});
+        check(v.sel.r0 < 0, "click on non-cell area clears selection");
+        send(cmd_release{10, 10});
+        v.ui.last_click_t = -1.0e9;
+
+        // G3：点分组带 = 选中整组（用一张带 group 的独立小表）
+        {
+            table_data dg;
+            column gc;
+            for (int i = 0; i < 4; ++i)
+            {
+                gc = {};
+                gc.key = std::format("c{}", i);
+                gc.title = gc.key;
+                gc.w = 120;
+                gc.group = i < 2 ? "G1" : "G2";
+                dg.cols.push_back(gc);
+            }
+            dg.finalize();
+            dg.cells.resize(4);
+            for (int i = 0; i < 4; ++i)
+            {
+                dg.cells[static_cast<std::size_t>(i)].push_back(
+                    {"v", {}});
+                dg.cells[static_cast<std::size_t>(i)].push_back(
+                    {"w", {}});
+            }
+            dg.ids.push_back(row_id{1});
+            dg.ids.push_back(row_id{2});
+            view vg;
+            vg.reset(dg);
+            geometry gg;
+            row_pipeline pg;
+            sync(dg, vg, p, gg, vp, ft, sy, pg);
+            const auto gz = hit_test(dg, gg, vg, gg.col_x_at(1) + 5.0F,
+                                     gg.group.y + 5.0F);
+            check(gz.to_zone().kind == part::header_group &&
+                      gz.to_zone().col >= 0,
+                  "group hit test carries first column");
+            {
+                const cmd_press press{gg.col_x_at(1) + 5.0F, gg.group.y + 5.0F,
+                                      {part::header_group, -1, gz.to_zone().col},
+                                      false, false, false};
+                system_event(dg, vg, p, gg, sy, ft, press, fx);
+            }
+            check(vg.sel.c0 == 0 && vg.sel.c1 == 1 && vg.sel.r0 == 0 &&
+                      vg.sel.r1 == dg.rows() - 1,
+                  "group header click selects whole group");
+        }
+
+        // G5：键盘导航把活动格滚进视口（短视口）
+        {
+            sync(d, v, p, g, {0, 0, 800, 120}, ft, sy, pipe);
+            v.scroll.y = 0;
+            v.ui.last_click_t = -1.0e9;
+            send(cmd_press{g.scrollv.x + 20, g.row_y.empty() ? g.body.y + 5
+                                                            : g.row_y.front() + 5,
+                           {part::cell, g.view_rows.front(), 0}, false, false, false});
+            for (int i = 0; i < 4; ++i)
+                send(cmd_key{key::down, false, false});
+            check(v.sel.cur_r == g.view_rows.back(), "keyboard down reaches last row");
+            check(v.scroll.y > 0.0F, "keyboard navigation auto-scrolls");
+            sync(d, v, p, g, {0, 0, 800, 120}, ft, sy, pipe);
+            check(g.row_index.back() == v.sel.cur_r,
+                  "active row is inside the viewport after scroll");
+            send(cmd_release{g.scrollv.x + 20, g.body.y + 5});
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            v.scroll.y = 0;
+        }
+
         frame_data f;
-        build_frame(d, v, p, g, ft, sy, f);
+        build_frame(d, v, p, g, ft, sy, f, table_id{7});
         check(f.draw.op_count() > 0, "frame has ops");
         check(!f.zones.empty(), "zones");
         {
@@ -4597,13 +5401,16 @@ namespace ui_table
                     }
             check(owned, "DL op carries typed owner");
         }
-        build_frame(d, v, p, g, ft, sy, f);
-        build_frame(d, v, p, g, ft, sy, f);
+        build_frame(d, v, p, g, ft, sy, f, table_id{7});
+        build_frame(d, v, p, g, ft, sy, f, table_id{7});
         check(f.draw.op_count() > 0, "frame reusable (arena reset)");
 
         fx.clear();
-        send(cmd_key{key::enter, false, false});
-        check(v.edit.active(), "enter begins edit");
+        v.ui.last_click_t = -1.0e9;
+        send(cmd_press{10, 10, {part::cell, 1, 0}, false, false, false});
+        sync(d, v, p, g, vp, ft, sy, pipe);
+        send(cmd_key{key::f2, false, false});
+        check(v.edit.active(), "F2 begins edit");
         send_text("X");
         send(cmd_key{key::enter, false, false});
         check(!v.edit.active(), "enter commits");
@@ -4624,6 +5431,56 @@ namespace ui_table
               "sort ascending");
         check(d.ids[static_cast<std::size_t>(g.view_rows.front())] == row_id{2},
               "row_id stable under sort");
+        // 三态：再点两次 = 降序、取消
+        send(cmd_press{10, 70, {part::header, -1, 0}, false, false, false});
+        send(cmd_release{10, 70});
+        sync(d, v, p, g, vp, ft, sy, pipe);
+        check(v.sort.dir == 2 && !g.view_rows.empty() &&
+                  d.text(g.view_rows.front(), 0) == "gamma.dat",
+              "sort: second click descending");
+        send(cmd_press{10, 70, {part::header, -1, 0}, false, false, false});
+        send(cmd_release{10, 70});
+        sync(d, v, p, g, vp, ft, sy, pipe);
+        check(v.sort.dir == 0 && !g.view_rows.empty() &&
+                  d.text(g.view_rows.front(), 0) == "beta.dat",
+              "sort: third click restores original order");
+
+        // G6：模型增删 + 身份稳定 + view 增量对齐（不是整份 reset）
+        {
+            const auto keep_col_id = d.cols[0].id;
+            d.finalize();
+            check(d.cols[0].id == keep_col_id,
+                  "finalize keeps existing column ids");
+            const auto id_new = d.insert_row(1);
+            check(d.rows() == 4 && d.ids[1].v == id_new.v,
+                  "insert row gives a fresh stable id");
+            check(d.ids[2] == row_id{2} && d.ids[3] == row_id{3},
+                  "insert row keeps neighbour ids");
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            check(g.row_count() == 4 && v.checks.on.size() == 4,
+                  "sync reconciles a new row without reset");
+            check(v.sel.cur_r >= 0 && v.sel.cur_r < 4,
+                  "selection survives a model change");
+            check(d.remove_row(1) && d.rows() == 3 && d.ids[1] == row_id{2},
+                  "remove row keeps neighbour ids");
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            check(g.row_count() == 3, "sync reconciles a removed row");
+            ui_table::column extra;
+            extra.key = "extra";
+            extra.title = "Extra";
+            extra.w = 80;
+            const auto cid = d.insert_column(1, extra);
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            check(d.cols_count() == 4 && g.col_count() == 4,
+                  "insert column reconciled");
+            check(d.column_of(1) == cid && d.column_of(0) == keep_col_id &&
+                      d.column_of(2) == column_id{2},
+                  "insert column keeps existing column ids");
+            check(d.remove_column(1) && d.cols_count() == 3,
+                  "remove column");
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            check(g.col_count() == 3, "sync reconciles a removed column");
+        }
 
         sync(d, v, p, g, {0, 0, 800, 120}, ft, sy, pipe);
         ui_table::system_wheel(v, p, 0.0F, -3.0F, false);
@@ -4681,6 +5538,26 @@ namespace ui_table
         }
         check(v.checks.on[0] == 1 && v.checks.ids[0] == d.ids[0],
               "checks carries row_id");
+        v.checks.reset(d.rows());
+        v.ui.last_click_t = -1.0e9;
+        send(cmd_press{10, 10, {part::check, 0, -1}, false, false, false,
+                       make_target(part::check, 0, -1)});
+        send(cmd_press{10, 10, {part::check, 2, -1}, false, true, false,
+                       make_target(part::check, 2, -1)});
+        {
+            int on = 0;
+            for (const auto x : v.checks.on)
+                on += x != 0;
+            check(on == d.rows(), "checks: shift range selects visible range");
+        }
+        send(cmd_press{10, 10, {part::check_head, -1, -1}, false, false, false,
+                       make_target(part::check_head, -1, -1)});
+        {
+            int on = 0;
+            for (const auto x : v.checks.on)
+                on += x != 0;
+            check(on == 0, "checks: header clears all");
+        }
         {
             table_ctx tc{d, v, p, g, ft, &fx, nullptr};
             sy.selection.set(tc, 1, 0);
@@ -4738,6 +5615,24 @@ namespace ui_table
             check(!g.view_rows.empty() && all, "filter UI applies");
         }
         {
+            // 大小写不敏感 + 两列 AND
+            v.filter.text[0] = "ALPHA";
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            check(!g.view_rows.empty() &&
+                      filter_feature::contains(d.text(g.view_rows.front(), 0), "ALPHA"),
+                  "filter: case-insensitive");
+            v.filter.text[1] = "10 KB";
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            bool both = !g.view_rows.empty();
+            for (const int r : g.view_rows)
+                both = both && filter_feature::contains(d.text(r, 0), "alpha") &&
+                       filter_feature::contains(d.text(r, 1), "10 KB");
+            check(both, "filter: two columns AND");
+            v.filter.text[0].clear();
+            v.filter.text[1].clear();
+            sync(d, v, p, g, vp, ft, sy, pipe);
+        }
+        {
             table_ctx tc{d, v, p, g, ft, &fx, nullptr};
             sy.filter.clear(tc, 0);
         }
@@ -4749,6 +5644,26 @@ namespace ui_table
         }
         send_text("alpha");
         check(v.find.mode && v.find.hit >= 0, "find locates rows");
+        {
+            // 命中在视口外：Enter 必须把命中行滚进来
+            sync(d, v, p, g, {0, 0, 800, 120}, ft, sy, pipe);
+            v.scroll.y = 0;
+            {
+                table_ctx tc{d, v, p, g, ft, &fx, nullptr};
+                sy.find.close(tc);
+                sy.find.toggle(tc);
+            }
+            send_text("gamma");
+            send(cmd_key{key::enter, false, false});
+            check(v.find.hit == 2, "find: hit is the off-screen row");
+            check(v.scroll.y > 0.0F, "find: enter scrolls to the hit");
+            sync(d, v, p, g, {0, 0, 800, 120}, ft, sy, pipe);
+            check(std::find(g.row_index.begin(), g.row_index.end(), v.find.hit) !=
+                      g.row_index.end(),
+                  "find: hit row is visible after scroll");
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            v.scroll.y = 0;
+        }
         {
             table_ctx tc{d, v, p, g, ft, &fx, nullptr};
             sy.find.close(tc);
@@ -4766,6 +5681,18 @@ namespace ui_table
         check(v.cols.hidden[0] == 1, "hide column");
         sync(d, v, p, g, vp, ft, sy, pipe);
         check(g.col_count() == 2, "hidden column excluded from geometry");
+        {
+            // 键盘左右只走可见列：隐藏 col0 后从 col1 往右到 col2，再往右停住
+            table_ctx tc{d, v, p, g, ft, &fx, nullptr};
+            sy.selection.set(tc, g.view_rows.front(), g.col_index.front());
+        }
+        send(cmd_key{key::right, false, false});
+        sync(d, v, p, g, vp, ft, sy, pipe);
+        check(v.sel.cur_c == g.col_index.back(), "hidden: keyboard moves over visible columns");
+        send(cmd_key{key::right, false, false});
+        sync(d, v, p, g, vp, ft, sy, pipe);
+        check(v.sel.cur_c == g.col_index.back(), "hidden: keyboard stops at last visible");
+        check(v.sel.cur_c != 0, "hidden: never lands on hidden column");
         {
             ui_table::table_ctx tc{d, v, p, g, ft, &fx, nullptr};
             sy.menu.open(tc, 1, 10.0F, 10.0F);
@@ -4854,7 +5781,7 @@ namespace ui_table
         check(cursor_for({part::edge_se}) == cursor::resize_nwse,
               "resize cursor mapping");
         {
-            build_frame(d, v, p, g, ft, sy, f);
+            build_frame(d, v, p, g, ft, sy, f, table_id{7});
             bool thumb = false, sep = false, edge = false;
             for (const auto &zr : f.zones)
             {
@@ -4882,6 +5809,166 @@ namespace ui_table
             check(fz.kind == part::filter_btn && fz.col == dc0, "filter button hit test");
         }
 
+        // G2：拖拽框选出体区 = 自动滚动 + 目标夹到末行
+        {
+            sync(d, v, p, g, {0, 0, 800, 120}, ft, sy, pipe);
+            v.scroll.y = 0;
+            v.ui.last_click_t = -1.0e9;
+            send(cmd_press{g.scrollv.x + 20, g.row_y.front() + 5,
+                           {part::cell, g.view_rows.front(), 0}, false, false, false});
+            send(cmd_drag{g.scrollv.x + 20, g.body.y1() + 20});
+            check(v.scroll.y > 0.0F, "drag past bottom edge auto-scrolls");
+            check(v.sel.r1 == g.view_rows.back(), "drag extends to last row");
+            send(cmd_release{g.scrollv.x + 20, g.body.y1() + 20});
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            v.scroll.y = 0;
+        }
+
+        // G4：编辑框词级操作（双击选词 / 三击全选 / Ctrl+← / Ctrl+Backspace）
+        {
+            const std::string keep = d.cells[0][0].text;
+            d.cells[0][0].text = "alpha beta gamma";
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            send_begin(0, 0);
+            send(cmd_key{key::end, false, false});
+            send(cmd_key{key::left, false, true});
+            check(v.edit.caret == 11, "edit: Ctrl+Left jumps to word start");
+            send(cmd_key{key::backspace, false, true});
+            check(v.edit.buf == "alpha gamma", "edit: Ctrl+Backspace deletes a word");
+            send(cmd_key{key::esc, false, false});
+            {
+                const float origin =
+                    g.col_x_at(g.pos_of_col(0)) + p.cell_pad + text_width(ft, "alpha be");
+                v.ui.last_click_t = -1.0e9;
+                send(cmd_press{origin, g.row_y.front() + 5,
+                               {part::cell, 0, 0}, false, false, false});
+                send(cmd_press{origin, g.row_y.front() + 5,
+                               {part::cell, 0, 0}, false, false, false});
+                check(v.edit.active() && v.edit.sel_lo() == 6 &&
+                          v.edit.sel_hi() == 10,
+                      "edit: double-click selects the word");
+                send(cmd_press{origin, g.row_y.front() + 5,
+                               {part::cell, 0, 0}, false, false, false});
+                check(v.edit.sel_lo() == 0 &&
+                          v.edit.sel_hi() == static_cast<int>(v.edit.buf.size()),
+                      "edit: triple-click selects all");
+            }
+            send(cmd_key{key::esc, false, false});
+            send(cmd_release{0, 0});
+            d.cells[0][0].text = keep;
+            sync(d, v, p, g, vp, ft, sy, pipe);
+        }
+
+        // 13) 筛选实时生效 / 查找点别处关闭 / 双击分隔条自适应
+        {
+            const std::string keep = d.cells[0][0].text;
+            d.cells[0][0].text = "livefilter";
+            v.ui.last_click_t = -1.0e9;
+            send(cmd_press{10, 10, {part::filter_btn, -1, 0}, false, false, false,
+                           make_target(part::filter_btn, -1, 0)});
+            send_text("livef");
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            check(v.filter.edit == 0 && g.view_rows.size() == 1 &&
+                      d.text(g.view_rows.front(), 0) == "livefilter",
+                  "filter: live while typing");
+            send(cmd_key{key::enter, false, false});
+            check(v.filter.edit < 0 && v.filter.text[0] == "livef",
+                  "filter: enter keeps filter");
+            v.ui.last_click_t = -1.0e9;
+            send(cmd_press{10, 10, {part::filter_btn, -1, 0}, false, false, false,
+                           make_target(part::filter_btn, -1, 0)});
+            send(cmd_key{key::del, false, false});
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            check(v.filter.text[0].empty() && g.view_rows.size() == 3,
+                  "filter: Delete clears live");
+            send(cmd_key{key::enter, false, false});
+            d.cells[0][0].text = keep;
+            sync(d, v, p, g, vp, ft, sy, pipe);
+        }
+        {
+            send(cmd_key{key::f, false, true});
+            check(v.find.mode, "find: Ctrl+F opens");
+            v.ui.last_click_t = -1.0e9;
+            send(cmd_press{10, 10, {part::cell, 1, 0}, false, false, false,
+                           make_target(part::cell, 1, 0)});
+            check(!v.find.mode, "find: click elsewhere closes");
+        }
+        {
+            v.ui.last_click_t = -1.0e9;
+            v.cols.user[0] = 0;
+            v.cols.w[0] = 60; // 明显偏离自适应宽度，双击后应被改回来
+            const float before = v.cols.w[0];
+            send(cmd_press{10, 10, {part::col_sep, -1, 0}, false, false, false,
+                           make_target(part::col_sep, -1, 0)});
+            send(cmd_release{10, 10});
+            send(cmd_press{10, 10, {part::col_sep, -1, 0}, false, false, false,
+                           make_target(part::col_sep, -1, 0)});
+            send(cmd_release{10, 10});
+            check(v.cols.user[0] == 1 && v.cols.w[0] != before,
+                  "resize: double-click separator autofits");
+            sync(d, v, p, g, vp, ft, sy, pipe);
+        }
+
+        // 14) wrap：行高按行数增长，且 build_frame 真的画出多行
+        {
+            const std::string keep = d.cells[0][1].text;
+            d.cells[0][1].text = "alpha beta gamma delta epsilon zeta";
+            d.cols[0].wrap = true;
+            sync(d, v, p, g, {0, 0, 800, 600}, ft, sy, pipe);
+            check(g.row_h_data[1] > p.row_h, "wrap: row height grows");
+            frame_data fw;
+            build_frame(d, v, p, g, ft, sy, fw, table_id{});
+            const auto wrap_zone = zone_key({part::cell, 1, 0});
+            int lines = 0;
+            for (const auto &t : fw.draw.texts[static_cast<std::size_t>(stream::content)])
+                lines += t.zone == wrap_zone ? 1 : 0;
+            check(lines > 1, "wrap: multiple text lines emitted");
+            d.cols[0].wrap = false;
+            d.cells[0][1].text = keep;
+            sync(d, v, p, g, vp, ft, sy, pipe);
+        }
+
+        // 15) 滚动条轨道翻页 / 上边把手缩放（方向要正确）
+        {
+            sync(d, v, p, g, {0, 0, 800, 120}, ft, sy, pipe);
+            v.scroll.y = 0;
+            v.ui.last_click_t = -1.0e9;
+            send(cmd_press{g.vtrack.x + 2, g.vtrack.y1() - 2,
+                           {part::vbar_track, -1, -1}, false, false, false,
+                           make_target(part::vbar_track, -1, -1)});
+            check(v.scroll.y > 0.0F, "scroll: track click pages down");
+            send(cmd_release{g.vtrack.x + 2, g.vtrack.y1() - 2});
+
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            v.cols.user_w = 500;
+            v.cols.user_h = 300;
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            const float h0 = g.box.h;
+            v.ui.last_click_t = -1.0e9;
+            const ui_table::rect en = g.edge_n;
+            send(cmd_press{en.x + en.w * 0.5F, en.y + en.h * 0.5F,
+                           {part::edge_n}, false, false, false,
+                           make_target(part::edge_n, -1, -1)});
+            send(cmd_drag{en.x + en.w * 0.5F, en.y + en.h * 0.5F - 40.0F});
+            send(cmd_release{en.x + en.w * 0.5F, en.y + en.h * 0.5F - 40.0F});
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            check(v.cols.user_h > h0, "table resize: top handle grows height");
+            v.cols.user_h = -1;
+            v.cols.user_w = -1;
+            sync(d, v, p, g, vp, ft, sy, pipe);
+        }
+
+        // 16) undo 合并：同一段连续输入只占一步
+        {
+            send_begin(0, 0);
+            const std::string keep = v.edit.buf;
+            send_text("abc");
+            check(v.edit.undo.size() == 1, "undo: typing burst coalesced");
+            send(cmd_key{key::z, false, true});
+            check(v.edit.buf == keep, "undo: coalesced burst undone in one step");
+            send(cmd_key{key::esc, false, false});
+        }
+
         // 12) tooltip：悬停 0.6s 后才多出图元
         sync(d, v, p, g, vp, ft, sy, pipe);
         v.ui.hover = make_target(part::cell, 0, 0);
@@ -4892,6 +5979,294 @@ namespace ui_table
         v.ui.now = 1.0;
         build_frame(d, v, p, g, ft, sy, t1);
         check(t1.draw.op_count() > t0.draw.op_count(), "tooltip shows after dwell");
+
+        // 13) zone/owner/cursor 全 part 往返，几何不变量
+        {
+            const std::array<std::tuple<part, int, int>, 19> parts{{
+                {part::cell, 1, 0},
+                {part::check, 1, -1},
+                {part::check_head, -1, -1},
+                {part::header, -1, 0},
+                {part::col_sep, -1, 0},
+                {part::filter_btn, -1, 0},
+                {part::header_group, -1, 0},
+                {part::menu_item, -1, 1},
+                {part::frame, -1, -1},
+                {part::vbar_track, -1, -1},
+                {part::vbar_thumb, -1, -1},
+                {part::hbar_track, -1, -1},
+                {part::hbar_thumb, -1, -1},
+                {part::edge_n, -1, -1},
+                {part::edge_w, -1, -1},
+                {part::edge_ne, -1, -1},
+                {part::edge_nw, -1, -1},
+                {part::edge_se, -1, -1},
+                {part::edge_sw, -1, -1},
+            }};
+            for (const auto &[k, r, c] : parts)
+            {
+                const zone z{k, r, c, table_id{3}};
+                const zone back = zone_from(zone_key(z));
+                check(back.kind == k && back.row == r && back.col == c &&
+                          back.table == z.table,
+                      std::format("zone roundtrip {}", part_name(k)).c_str());
+            }
+            const std::array<std::pair<part, cursor>, 12> cursors{{
+                {part::header, cursor::hand},
+                {part::header_group, cursor::hand},
+                {part::check, cursor::hand},
+                {part::check_head, cursor::hand},
+                {part::vbar_thumb, cursor::hand},
+                {part::hbar_thumb, cursor::hand},
+                {part::col_sep, cursor::resize_ew},
+                {part::edge_n, cursor::resize_ns},
+                {part::edge_w, cursor::resize_ew},
+                {part::edge_ne, cursor::resize_nesw},
+                {part::edge_sw, cursor::resize_nesw},
+                {part::edge_nw, cursor::resize_nwse},
+            }};
+            for (const auto &[k, want] : cursors)
+                check(cursor_for({k}) == want,
+                      std::format("cursor {}", part_name(k)).c_str());
+        }
+        {
+            bool xs = true, ys = true, ws = true, hs = true;
+            for (int i = 1; i < g.col_count(); ++i)
+                xs = xs && g.col_x_at(i) >= g.col_x_at(i - 1);
+            for (int i = 1; i < g.row_count(); ++i)
+                ys = ys && g.row_y[static_cast<std::size_t>(i)] >=
+                               g.row_y[static_cast<std::size_t>(i - 1)];
+            for (int i = 0; i < g.col_count(); ++i)
+                ws = ws && g.col_w[static_cast<std::size_t>(i)] >=
+                               d.cols[static_cast<std::size_t>(g.col_index[static_cast<std::size_t>(i)])].min_w;
+            for (int i = 0; i < g.row_count(); ++i)
+                hs = hs && g.row_h[static_cast<std::size_t>(i)] >= p.row_h;
+            check(xs, "geometry: column x monotonic");
+            check(ys, "geometry: row y monotonic");
+            check(ws, "geometry: column width >= min");
+            check(hs, "geometry: row height >= row_h");
+            check(g.col_count() == 3 && g.row_count() == 3, "geometry: 3x3 visible");
+            check(g.body.w > 0 && g.body.h > 0, "geometry: body non-empty");
+        }
+
+        // 14) 键盘 End / Ctrl+Home、reorder 拖拽、ne 缩放、横条拖拽
+        {
+            v.edit = {};
+            v.filter.edit = -1;
+            v.find.mode = false;
+            v.menu.open = false;
+            v.cols.hidden.assign(d.cols_count(), 0);
+            v.cols.order = {0, 1, 2};
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            v.sel.reset();
+            v.ui.last_click_t = -1.0e9;
+            send(cmd_press{10, 10, {part::cell, g.view_rows.front(), g.col_index.front()},
+                           false, false, false,
+                           make_target(part::cell, g.view_rows.front(), g.col_index.front())});
+            const int col0 = v.sel.cur_c;
+            send(cmd_key{key::right, false, false});
+            check(v.sel.cur_c != col0, "keyboard: right moves column");
+            send(cmd_key{key::left, false, false});
+            check(v.sel.cur_c == col0, "keyboard: left moves column");
+            const float hx = g.col_x_at(0) + g.col_w[0] * 0.5F;
+            const float hy = g.col_header.y + g.col_header.h * 0.5F;
+            const auto ht = make_target(part::header, -1, 0);
+            send(cmd_press{hx, hy, {part::header, -1, 0}, false, false, false, ht});
+            send(cmd_drag{g.col_x_at(1) + 20.0F, hy});
+            send(cmd_release{g.col_x_at(1) + 20.0F, hy});
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            check(v.cols.order[0] != 0, "reorder drag: order changed");
+            check(v.cols.order[0] == 1 && v.cols.order[1] == 0,
+                  "reorder drag: col0 moved to col1");
+            check(d.cols[0].id.value != 0, "reorder drag: column id stable");
+            v.cols.order = {0, 1, 2};
+            sync(d, v, p, g, vp, ft, sy, pipe);
+
+            v.cols.user_w = 500;
+            v.cols.user_h = 300;
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            const auto ne = g.edge_ne;
+            send(cmd_press{ne.x + ne.w * 0.5F, ne.y + ne.h * 0.5F,
+                           {part::edge_ne}, false, false, false,
+                           make_target(part::edge_ne, -1, -1)});
+            send(cmd_drag{ne.x + ne.w * 0.5F - 40.0F, ne.y + ne.h * 0.5F - 30.0F});
+            send(cmd_release{ne.x + ne.w * 0.5F - 40.0F, ne.y + ne.h * 0.5F - 30.0F});
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            check(v.cols.user_w < 500, "table resize ne: width shrinks from left");
+            check(v.cols.user_h > 300, "table resize ne: height grows upward");
+            v.cols.user_w = -1;
+            v.cols.user_h = -1;
+            sync(d, v, p, g, vp, ft, sy, pipe);
+
+            const auto save_w = v.cols.w;
+            v.cols.w = {400, 400, 400};
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            check(g.hbar, "hbar appears when columns overflow");
+            const float sx0 = v.scroll.x;
+            const auto hb = g.hthumb;
+            send(cmd_press{hb.x + hb.w * 0.5F, hb.y + hb.h * 0.5F,
+                           {part::hbar_thumb}, false, false, false,
+                           make_target(part::hbar_thumb, -1, -1)});
+            send(cmd_drag{hb.x + hb.w * 0.5F + 60.0F, hb.y + hb.h * 0.5F});
+            send(cmd_release{hb.x + hb.w * 0.5F + 60.0F, hb.y + hb.h * 0.5F});
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            check(v.scroll.x > sx0, "hbar thumb drag scrolls x");
+            v.cols.w = save_w;
+            v.scroll.x = 0;
+            sync(d, v, p, g, vp, ft, sy, pipe);
+        }
+
+        // 15) 编辑写回、undo/redo、勾选三态、wrap 换行、动态行
+        {
+            fx.clear();
+            send_begin(0, 0);
+            const auto before_edit = d.text(0, 0);
+            send_text("Q");
+            send(cmd_key{key::enter, false, false});
+            check(!v.edit.active(), "edit: Enter closes editor");
+            bool wrote = false;
+            for (auto &e : fx)
+                if (auto *q = std::get_if<fx_set_cell>(&e))
+                {
+                    wrote = true;
+                    d.set_cell(d.index_of(q->id), q->col, q->text);
+                }
+            check(wrote && d.text(0, 0).find('Q') != std::string::npos,
+                  "edit: commit writes data");
+            (void)before_edit;
+            fx.clear();
+
+            send_begin(0, 1);
+            const auto keep2 = v.edit.buf;
+            send_text("xy");
+            send(cmd_key{key::z, false, true});
+            check(v.edit.buf == keep2, "undo: single step restores");
+            send(cmd_key{key::y, false, true});
+            check(v.edit.buf.ends_with("xy"), "redo: restores edit text");
+            send(cmd_key{key::esc, false, false});
+            check(!v.edit.active(), "edit: Esc cancels");
+
+            v.checks.reset(d.rows());
+            check(v.checks.on.size() == static_cast<std::size_t>(d.rows()),
+                  "checks: array grows with rows");
+            v.checks.on[0] = 1;
+            table_ctx tc{d, v, p, g, ft, &fx, nullptr};
+            sy.checks.toggle_all(tc);
+            int on = 0;
+            for (auto x : v.checks.on)
+                on += x != 0;
+            check(on == d.rows(), "checks: toggle_all from partial -> all");
+            sy.checks.toggle_all(tc);
+            on = 0;
+            for (auto x : v.checks.on)
+                on += x != 0;
+            check(on == 0, "checks: toggle_all from all -> none");
+
+            d.set_cell(0, 0, "a\nb");
+            p.wrap = true;
+            v.cols.user[0] = 0;
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            check(g.row_h_data[0] > p.row_h, "wrap: explicit newline grows row");
+            p.wrap = false;
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            check(g.row_h_data[0] <= p.row_h, "wrap: toggle off restores row height");
+
+            const auto n0 = d.rows();
+            const auto id0 = d.insert_row(1);
+            const auto id1 = d.insert_row(2);
+            d.finalize();
+            v.reset(d);
+            sync(d, v, p, g, vp, ft, sy, pipe);
+            check(d.rows() == n0 + 2, "dynamic: insert two rows");
+            check(id0 != id1 && d.ids[1] != d.ids[2], "dynamic: fresh row ids");
+            check(v.checks.on.size() == static_cast<std::size_t>(d.rows()),
+                  "dynamic: checks size follows insert");
+            check(d.remove_row(2) && d.remove_row(1), "dynamic: remove two rows");
+            d.finalize();
+            v.reset(d);
+            sync(d, v, p, g, vp, ft, sy, pipe);
+
+            bool cells_hit = true;
+            for (int ri = 0; ri < g.row_count(); ++ri)
+                for (int ci = 0; ci < g.col_count(); ++ci)
+                {
+                    const auto t = ui_table::hit_test(
+                        d, g, v, g.col_x_at(ci) + 4.0F,
+                        g.row_y[static_cast<std::size_t>(ri)] + 4.0F);
+                    cells_hit = cells_hit && t.kind == part::cell &&
+                                t.row_index == g.row_index[static_cast<std::size_t>(ri)] &&
+                                t.col_index == g.col_index[static_cast<std::size_t>(ci)];
+                }
+            check(cells_hit, "hit_test: every visible cell center resolves");
+            frame_data f;
+            build_frame(d, v, p, g, ft, sy, f, table_id{7});
+            bool owner_ok = true, zone_ok = true;
+            for (const auto &ss : f.draw.shapes)
+                for (const auto &o : ss)
+                {
+                    zone_ok = zone_ok && o.zone != 0;
+                    owner_ok = owner_ok && !std::holds_alternative<none_owner>(o.who);
+                }
+            for (const auto &tt : f.draw.texts)
+                for (const auto &o : tt)
+                {
+                    zone_ok = zone_ok && o.zone != 0;
+                    owner_ok = owner_ok && !std::holds_alternative<none_owner>(o.who);
+                }
+            check(zone_ok, "selftest: every op has zone");
+            check(owner_ok, "selftest: every op has owner");
+        }
+
+        // 17) 导航/勾选/选中扩展/身份往返的补充断言
+        {
+            v.edit = {};
+            v.sel.reset();
+            v.ui.last_click_t = -1.0e9;
+            const int rr = g.view_rows.front();
+            const int cc = g.col_index.front();
+            send(cmd_press{10, 10, {part::cell, rr, cc}, false, false, false,
+                           make_target(part::cell, rr, cc)});
+            send(cmd_key{key::space, false, false});
+            check(v.checks.on[static_cast<std::size_t>(rr)] != 0,
+                  "space toggles current row check");
+            send(cmd_key{key::space, false, false});
+            check(v.checks.on[static_cast<std::size_t>(rr)] == 0,
+                  "space toggles current row check off");
+
+            send(cmd_key{key::pgdn, false, false});
+            check(v.sel.cur_r != rr, "keyboard: PageDown moves selection");
+            send(cmd_key{key::pgup, false, false});
+            check(v.sel.cur_r == rr, "keyboard: PageUp returns");
+
+            const int last = g.view_rows.back();
+            send(cmd_press{10, 10, {part::cell, last, cc}, false, true, false,
+                           make_target(part::cell, last, cc)});
+            check(v.sel.r1 == last && v.sel.r0 == rr,
+                  "shift+click extends selection to last row");
+            send(cmd_press{1, 1, {part::none, -1, -1}, false, false, false,
+                           make_target(part::none, -1, -1)});
+            check(!v.sel.has_sel(), "click non-cell clears selection");
+
+            check(d.cell_id(0, 0).row == d.ids[0] &&
+                      d.cell_id(0, 0).col == d.column_of(0),
+                  "cell_id roundtrip row/col");
+            check(d.index_of(d.ids[0]) == 0, "index_of row_id");
+            check(d.cols[0].id == d.column_of(0), "column id stable");
+            check(d.cols[1].id == d.column_of(1), "column id stable 2");
+
+            const zone zt{part::cell, 1, 2, table_id{7}};
+            const auto backt = zone_from(zone_key(zt));
+            check(backt.kind == part::cell && backt.row == 1 && backt.col == 2 &&
+                      backt.table == table_id{7},
+                  "zone roundtrip with table bits");
+            check(zone_key(zt) != zone_key({part::cell, 1, 2, table_id{8}}),
+                  "zone table bits participate in key");
+
+            check(cursor_for({part::cell, 0, 0}) == cursor::arrow,
+                  "cursor cell arrow");
+            check(cursor_for({part::menu_item}) == cursor::arrow,
+                  "cursor menu arrow");
+        }
 
         std::println("[table-selftest] done, {} failed", fails);
         return fails;
