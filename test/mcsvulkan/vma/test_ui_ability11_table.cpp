@@ -1,0 +1,14016 @@
+#include <any>
+#include <array>
+#include <bit>
+#include <cassert>
+#include <concepts>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <deque>
+#include <format>
+#include <functional>
+#include <exception>
+#include <flat_map>
+#include <iostream>
+#include <memory>
+#include <optional>
+#include <print>
+#include <chrono>
+#include <random>
+#include <span>
+#include <stdexcept>
+#include <string_view>
+#include <stdint.h>
+#include <thread>
+#include <type_traits>
+#include <typeindex>
+#include <unordered_map>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include <memory_resource> // pmr 内存资源
+
+#include "../head.hpp"
+
+// IME 预编辑需要真正的 Win32 HWND（GLFWwindow* 不是 HWND）
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
+
+using mcs::vulkan::Instance;
+using mcs::vulkan::tool::create_instance;
+using mcs::vulkan::tool::create_debugger;
+using mcs::vulkan::tool::create_physical_device_selector;
+using mcs::vulkan::vkMakeVersion;
+using mcs::vulkan::vkApiVersion;
+
+using mcs::vulkan::tool::enable_intance_build;
+using mcs::vulkan::tool::structure_chain;
+using mcs::vulkan::tool::create_queue_family_index_selector;
+using mcs::vulkan::tool::create_logical_device;
+using mcs::vulkan::tool::create_swapchain;
+using mcs::vulkan::tool::create_pipeline_layout;
+using mcs::vulkan::tool::create_graphics_pipeline;
+using mcs::vulkan::tool::create_command_pool;
+using mcs::vulkan::tool::frame_context;
+using mcs::vulkan::tool::sType;
+using mcs::vulkan::tool::create_descriptor_set_layout;
+using mcs::vulkan::tool::create_descriptor_pool;
+
+using mcs::vulkan::camera::camera_interface;
+using mcs::vulkan::input::glfw_input;
+
+using mcs::vulkan::raii_vulkan;
+using mcs::vulkan::PhysicalDevice;
+using mcs::vulkan::Debugger;
+using mcs::vulkan::surface_impl;
+using mcs::vulkan::wsi::glfw::Window;
+using mcs::vulkan::Queue;
+
+using mcs::vulkan::LogicalDevice;
+
+using mcs::vulkan::tool::make_pNext;
+using mcs::vulkan::tool::pNext;
+using mcs::vulkan::tool::Flags;
+
+using mcs::vulkan::CommandPool;
+using mcs::vulkan::CommandBuffers;
+using mcs::vulkan::CommandBuffer;
+using mcs::vulkan::CommandBufferView;
+using mcs::vulkan::Fence;
+
+using mcs::vulkan::DescriptorSetLayout;
+using mcs::vulkan::DescriptorPool;
+using mcs::vulkan::DescriptorSets;
+using mcs::vulkan::DescriptorSetLayout;
+
+using raii_vma = mcs::vulkan::raii_vma;
+
+using mcs::vulkan::tool::simple_copy_buffer;
+
+using mcs::vulkan::meta::make_aggregate_ref;
+using mcs::vulkan::meta::make_aggregate;
+using mcs::vulkan::meta::field;
+using mcs::vulkan::meta::method;
+using mcs::vulkan::meta::static_string;
+
+using mcs::vulkan::ecs::gen_soa_aggregate;
+using mcs::vulkan::ecs::gen_soa_struct;
+using mcs::vulkan::ecs::soa_vector;
+using mcs::vulkan::ecs::proxy_value;
+
+using mcs::vulkan::task::make_task;
+using mcs::vulkan::task::init_task;
+using mcs::vulkan::task::schedulable_task;
+
+using mcs::vulkan::match;
+
+using mcs::vulkan::fatal_error;
+
+constexpr uint32_t WIDTH = 1536;
+constexpr uint32_t HEIGHT = 1000; // 给底部能力条留空间
+
+// 3D 占用的屏幕区域（UI 不覆盖这里）
+constexpr float k3dAreaW = 300.0F;
+constexpr float k3dAreaH = 240.0F;
+
+// 底部能力条的 tile 网格
+constexpr float kTileW = 100.0F;
+constexpr float kTileH = 65.0F;
+constexpr float kTileGap = 8.0F;
+constexpr float kTileX = 20.0F;
+constexpr float kTileY = 664.0F;
+
+// 共用的混合/写掩码常量，避免每个 demo 块重复定义
+constexpr VkColorComponentFlags kColorWriteRGBA =
+    VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+    VK_COLOR_COMPONENT_A_BIT;
+constexpr VkColorBlendEquationEXT kBlendNone{VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO,
+                                             VK_BLEND_OP_ADD,      VK_BLEND_FACTOR_ZERO,
+                                             VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD};
+constexpr auto TITLE = "test_my_triangle";
+
+static constexpr auto MAX_FRAMES_IN_FLIGHT = 2;
+
+namespace camera
+{
+    using mcs::vulkan::camera::composeTRS;
+    using mcs::vulkan::camera::extractTranslationScale;
+    using mcs::vulkan::camera::VulkanNDCConfig;
+    using mcs::vulkan::camera::transform;
+    using mcs::vulkan::camera::computeAnchorOffset;
+    using mcs::vulkan::camera::transformPointToWorld;
+    using mcs::vulkan::camera::RightHandedView;
+    using mcs::vulkan::camera::LeftHandedView;
+    using mcs::vulkan::camera::VulkanPerspectiveProjection;
+    using mcs::vulkan::camera::VulkanOrthographicProjection;
+    using mcs::vulkan::camera::VulkanUIOrthographicProjection;
+    using mcs::vulkan::camera::GenCamera;
+}; // namespace camera
+
+namespace mesh
+{
+    using mcs::vulkan::memory::buffer_base;
+    using mcs::vulkan::memory::auto_map_buffer;
+    using mcs::vulkan::memory::create_simple_buffer;
+    using mcs::vulkan::memory::create_staging_buffer;
+
+    using index_type = uint32_t;
+
+    using position_3d = glm::vec3;
+
+}; // namespace mesh
+
+namespace font
+{
+    // 2. Library Initialization
+    using freetype_loader = mcs::vulkan::font::freetype::loader;
+
+    using mcs::vulkan::font::FontType;
+
+    using mcs::vulkan::font::texture_info;
+    using mcs::vulkan::font::FontInfo;
+    using mcs::vulkan::font::font_register;
+
+    using mcs::vulkan::font::font_registration;
+
+    using mcs::vulkan::font::GenFontContext;
+    using mcs::vulkan::font::GenFontFactory;
+    using mcs::vulkan::font::GenFontSelector;
+    using mcs::vulkan::font::make_font_factory;
+
+}; // namespace font
+
+struct FrameClock
+{
+    using Clock = std::chrono::steady_clock;    // 单调时钟，适合测时间间隔
+    Clock::time_point startTime = Clock::now(); // 程序启动时自动记录
+    Clock::time_point lastTime = startTime;
+    float deltaTime = 0.016f;
+
+    // 返回从 startTime 到现在的秒数（float）
+    float getElapsed() const noexcept
+    {
+        return std::chrono::duration<float>(Clock::now() - startTime).count();
+    }
+};
+
+struct my_render
+{
+
+    struct image_info
+    {
+        struct trans
+        {
+            VkImageLayout layout;
+            VkAccessFlags2 access_mask;
+            VkPipelineStageFlags2 stage_mask;
+        };
+        VkImage image;
+        VkImageAspectFlags aspect_mask;
+        trans src;
+        trans dst;
+    };
+    constexpr static VkImageMemoryBarrier2 to_barrier(const image_info &info) noexcept
+    {
+        return VkImageMemoryBarrier2{
+            .sType = sType<VkImageMemoryBarrier2>(),
+            // Specify the pipeline stages and access masks for the barrier
+            .srcStageMask = info.src.stage_mask,
+            .srcAccessMask = info.src.access_mask,
+            .dstStageMask = info.dst.stage_mask,
+            .dstAccessMask = info.dst.access_mask,
+            // Specify the old and new layouts of the image
+            .oldLayout = info.src.layout,
+            .newLayout = info.dst.layout,
+            // We are not changing the ownership between queues
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            // Specify the image to be affected by this barrier
+            .image = info.image,
+            // Define the subresource range (which parts of the image are affected)
+            .subresourceRange = {.aspectMask = info.aspect_mask,
+                                 .baseMipLevel = 0,
+                                 .levelCount = VK_REMAINING_MIP_LEVELS,
+                                 .baseArrayLayer = 0,
+                                 .layerCount = VK_REMAINING_ARRAY_LAYERS}};
+    }
+
+    constexpr static void transition_image_layout(
+        const CommandBufferView &commandBuffer,
+        std::span<const VkImageMemoryBarrier2> barriers) noexcept
+    {
+        commandBuffer.pipelineBarrier2(VkDependencyInfo{
+            .sType = sType<VkDependencyInfo>(),
+            .pNext = nullptr,
+            .dependencyFlags = 0,
+            .memoryBarrierCount = 0,
+            .pMemoryBarriers = nullptr,
+            .bufferMemoryBarrierCount = 0,
+            .pBufferMemoryBarriers = nullptr,
+            .imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size()),
+            .pImageMemoryBarriers = barriers.data()});
+    }
+    template <std::same_as<image_info>... T>
+    constexpr static void transition_image_layout(const CommandBufferView &commandBuffer,
+                                                  T... info) noexcept
+    {
+        std::array<VkImageMemoryBarrier2, sizeof...(T)> barriers{to_barrier(info)...};
+        transition_image_layout(commandBuffer, barriers);
+    }
+
+    // VkDependencyInfo 的数据头：完整表达 flags + 三类 barrier 数组
+    struct barrier2_header
+    {
+        VkDependencyFlags flags;
+        std::uint32_t memory_count;
+        std::uint32_t buffer_count;
+        std::uint32_t image_count;
+    };
+
+    static constexpr std::uint32_t align_up(std::uint32_t value,
+                                            std::uint32_t alignment) noexcept
+    {
+        return (value + alignment - 1) / alignment * alignment;
+    }
+
+    // 解析函数版本：数据 = [header][memory][buffer][image] → vkCmdPipelineBarrier2
+    static void parse_transition(std::span<const std::byte> data,
+                                 const CommandBufferView &commandBuffer)
+    {
+        const auto *base = data.data();
+        const auto *head = reinterpret_cast<const barrier2_header *>(base);
+        std::uint32_t offset = static_cast<std::uint32_t>(sizeof(barrier2_header));
+
+        offset = align_up(offset, alignof(VkMemoryBarrier2));
+        const auto *memory = reinterpret_cast<const VkMemoryBarrier2 *>(base + offset);
+        offset +=
+            head->memory_count * static_cast<std::uint32_t>(sizeof(VkMemoryBarrier2));
+
+        offset = align_up(offset, alignof(VkBufferMemoryBarrier2));
+        const auto *buffer =
+            reinterpret_cast<const VkBufferMemoryBarrier2 *>(base + offset);
+        offset += head->buffer_count *
+                  static_cast<std::uint32_t>(sizeof(VkBufferMemoryBarrier2));
+
+        offset = align_up(offset, alignof(VkImageMemoryBarrier2));
+        const auto *image =
+            reinterpret_cast<const VkImageMemoryBarrier2 *>(base + offset);
+
+        VkDependencyInfo info{};
+        info.sType = sType<VkDependencyInfo>();
+        info.dependencyFlags = head->flags;
+        info.memoryBarrierCount = head->memory_count;
+        info.pMemoryBarriers = memory;
+        info.bufferMemoryBarrierCount = head->buffer_count;
+        info.pBufferMemoryBarriers = buffer;
+        info.imageMemoryBarrierCount = head->image_count;
+        info.pImageMemoryBarriers = image;
+        commandBuffer.pipelineBarrier2(info);
+    }
+
+    // copyImageToBuffer 的数据头
+    struct copy_image_to_buffer_info
+    {
+        VkImage src;
+        VkImageLayout layout;
+        VkBuffer dst;
+    };
+
+    // 解析函数版本：数据 = [info][count][VkBufferImageCopy × count] → 发射。
+    static void parse_copy_image_to_buffer(std::span<const std::byte> data,
+                                           const CommandBufferView &commandBuffer)
+    {
+        const auto *info =
+            reinterpret_cast<const copy_image_to_buffer_info *>(data.data());
+        const auto *count = reinterpret_cast<const std::uint32_t *>(
+            data.data() + sizeof(copy_image_to_buffer_info));
+        constexpr auto align = static_cast<std::uint32_t>(alignof(VkBufferImageCopy));
+        const auto header = static_cast<std::uint32_t>(sizeof(copy_image_to_buffer_info) +
+                                                       sizeof(std::uint32_t));
+        const auto offset = (header + align - 1) / align * align;
+        const auto *regions =
+            reinterpret_cast<const VkBufferImageCopy *>(data.data() + offset);
+
+        commandBuffer.copyImageToBuffer(
+            info->src, info->layout, info->dst,
+            std::span<const VkBufferImageCopy>{regions, *count});
+    }
+
+    // blitImage 的数据头（pass 外：layer/主图之间的拷贝+缩放+格式转换）
+    struct blit_image_header
+    {
+        VkImage src;
+        VkImageLayout src_layout;
+        VkImage dst;
+        VkImageLayout dst_layout;
+        VkFilter filter;
+    };
+
+    // 解析函数版本：数据 = [header][count][VkImageBlit × count] → 发射。
+    static void parse_blit_image(std::span<const std::byte> data,
+                                 const CommandBufferView &commandBuffer)
+    {
+        const auto *head = reinterpret_cast<const blit_image_header *>(data.data());
+        const auto *count = reinterpret_cast<const std::uint32_t *>(
+            data.data() + sizeof(blit_image_header));
+        constexpr auto align = static_cast<std::uint32_t>(alignof(VkImageBlit));
+        const auto header =
+            static_cast<std::uint32_t>(sizeof(blit_image_header) + sizeof(std::uint32_t));
+        const auto offset = (header + align - 1) / align * align;
+        const auto *regions = reinterpret_cast<const VkImageBlit *>(data.data() + offset);
+
+        commandBuffer.blitImage(head->src, head->src_layout, head->dst, head->dst_layout,
+                                std::span<const VkImageBlit>{regions, *count},
+                                head->filter);
+    }
+};
+
+struct Vertex // NOLINT
+{
+    glm::vec3 pos;
+    glm::vec2 texCoord;
+    glm::vec3 normal{0.0F, 0.0F, 1.0F};
+};
+struct VertexAttribute
+{
+    glm::vec3 color; // 仅颜色
+};
+
+// diff: [test_dod14] start: 让3D和UI各自一份。推送常量切换
+// 相机/灯光 UBO 定义在 test_ui_ability7_shader_abi.hpp
+// diff: [test_dod14] end
+
+// diff: [texture] start
+
+void generateCheckerboardTexture(uint8_t *pixels, int width, int height,
+                                 uint8_t color1[4], uint8_t color2[4],
+                                 int checkerSize = 32)
+{
+    for (int y = 0; y < height; ++y)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            int tileX = x / checkerSize;
+            int tileY = y / checkerSize;
+            bool isEven = ((tileX + tileY) % 2) == 0;
+
+            uint8_t *pixel = &pixels[(y * width + x) * 4];
+            if (isEven)
+            {
+                pixel[0] = color1[0];
+                pixel[1] = color1[1];
+                pixel[2] = color1[2];
+                pixel[3] = color1[3];
+            }
+            else
+            {
+                pixel[0] = color2[0];
+                pixel[1] = color2[1];
+                pixel[2] = color2[2];
+                pixel[3] = color2[3];
+            }
+        }
+    }
+}
+
+void generateGradientTexture(uint8_t *pixels, int width, int height, uint8_t topColor[4],
+                             uint8_t bottomColor[4])
+{
+    for (int y = 0; y < height; ++y)
+    {
+        float t = static_cast<float>(y) / (height - 1);
+        for (int x = 0; x < width; ++x)
+        {
+            uint8_t *pixel = &pixels[(y * width + x) * 4];
+
+            pixel[0] = static_cast<uint8_t>(topColor[0] * (1 - t) + bottomColor[0] * t);
+            pixel[1] = static_cast<uint8_t>(topColor[1] * (1 - t) + bottomColor[1] * t);
+            pixel[2] = static_cast<uint8_t>(topColor[2] * (1 - t) + bottomColor[2] * t);
+            pixel[3] = 255;
+        }
+    }
+}
+
+// diff: [camera_perspective] end
+//diff: [test_dod8] start
+struct object_data
+{
+    glm::mat4 matrix;
+};
+struct VertexTransform
+{
+    glm::mat4 matrix = glm::mat4(1.0f);
+};
+struct UvTransform
+{
+    glm::vec2 scale{1.0f, 1.0f};
+    glm::vec2 offset{0.0f, 0.0f};
+
+    // 默认：完整纹理
+    constexpr static UvTransform identity() noexcept
+    {
+        return {};
+    }
+
+    // 从目标矩形的四个纹理坐标构造
+    static UvTransform from_target_verts(std::span<const glm::vec2> target)
+    {
+        // 对轴对齐矩形直接取边界
+        float l = std::min({target[0].x, target[1].x, target[2].x, target[3].x});
+        float r = std::max({target[0].x, target[1].x, target[2].x, target[3].x});
+        float b = std::min({target[0].y, target[1].y, target[2].y, target[3].y});
+        float t = std::max({target[0].y, target[1].y, target[2].y, target[3].y});
+        return {.scale = {r - l, t - b}, .offset = {l, b}};
+    }
+
+    // 也可以接受 origin（默认为标准 [0,1]²）和目标，用于完整仿射
+    static UvTransform from_verts(std::span<const glm::vec2> origin,
+                                  std::span<const glm::vec2> target)
+    {
+        // 与 from_target_verts 类似，但考虑 origin 缩放
+        float ol = std::min({origin[0].x, origin[1].x, origin[2].x, origin[3].x});
+        float or_ = std::max({origin[0].x, origin[1].x, origin[2].x, origin[3].x});
+        float ob = std::min({origin[0].y, origin[1].y, origin[2].y, origin[3].y});
+        float ot = std::max({origin[0].y, origin[1].y, origin[2].y, origin[3].y});
+
+        float tl = std::min({target[0].x, target[1].x, target[2].x, target[3].x});
+        float tr = std::max({target[0].x, target[1].x, target[2].x, target[3].x});
+        float tb = std::min({target[0].y, target[1].y, target[2].y, target[3].y});
+        float tt = std::max({target[0].y, target[1].y, target[2].y, target[3].y});
+
+        glm::vec2 originSize{or_ - ol, ot - ob};
+        glm::vec2 targetSize{tr - tl, tt - tb};
+        glm::vec2 originBase{ol, ob};
+        glm::vec2 targetBase{tl, tb};
+
+        glm::vec2 scale = targetSize / originSize;
+        glm::vec2 offset = targetBase - originBase * scale;
+
+        return {scale, offset};
+    }
+};
+
+//diff: [test_dod16] start
+struct object_key
+{
+    uint32_t object_type{};
+    uint32_t entity_index{};
+    auto operator<=>(const object_key &) const = default;
+};
+namespace std
+{
+    template <>
+    struct hash<object_key>
+    {
+        constexpr size_t operator()(const object_key &k) const noexcept
+        {
+            size_t h1 = hash<uint32_t>{}(k.object_type);
+            size_t h2 = hash<uint32_t>{}(k.entity_index);
+            return h1 ^ (h2 << 1);
+        }
+    };
+}; // namespace std
+static_assert(sizeof(object_key) == 2 * sizeof(uint32_t));
+
+template <std::size_t Bits>
+class render_version
+{
+    static_assert(Bits >= 1 && Bits <= 32,
+                  "render_version: bit width must be in [1, 32]");
+
+  public:
+    // ── 最佳底层 uint 类型 ────────────────────────────────
+    //   Bits <=  8 → uint8_t
+    //   Bits <= 16 → uint16_t
+    //   Bits <= 32 → uint32_t
+    template <std::size_t B>
+    using best_uint_t =
+        std::conditional_t<(B <= 8), std::uint8_t,
+                           std::conditional_t<(B <= 16), std::uint16_t, std::uint32_t>>;
+
+    using underlying_t = best_uint_t<Bits>;
+
+    static constexpr std::size_t bit_width = Bits;
+
+    // ── 掩码：全 1 ────────────────────────────────────────
+    //   用 lambda + if constexpr 避开 `1u << 32` 的 UB
+    static constexpr underlying_t mask = [] {
+        if constexpr (Bits >= 32)
+            return static_cast<underlying_t>(~std::uint32_t{0});
+        else
+            return static_cast<underlying_t>((std::uint32_t{1} << Bits) - 1u);
+    }();
+
+    // ── 构造 ─────────────────────────────────────────────
+    constexpr render_version() noexcept = default;
+
+    // 从外部整数导入：自动按 mask 截断
+    constexpr explicit render_version(std::uint32_t v) noexcept
+        : value_{static_cast<underlying_t>(v & mask)}
+    {
+    }
+
+    // ── 自增：到 mask 后回绕到 0，永不越界 ────────────────
+    constexpr render_version &operator++() noexcept
+    {
+        value_ = static_cast<underlying_t>((value_ + 1u) & mask);
+        return *this;
+    }
+    constexpr render_version operator++(int) noexcept
+    {
+        auto old = *this;
+        ++*this;
+        return old;
+    }
+
+    // ── 隐式转换到最佳 uint 类型 ──────────────────────────
+    [[nodiscard]] constexpr operator underlying_t() const noexcept
+    {
+        return value_;
+    }
+
+    // 显式取 uint32（打包用）
+    [[nodiscard]] constexpr std::uint32_t to_u32() const noexcept
+    {
+        return static_cast<std::uint32_t>(value_);
+    }
+
+    [[nodiscard]] constexpr bool operator==(const render_version &) const noexcept =
+        default;
+
+  private:
+    underlying_t value_ = 0;
+};
+using render_version_t = render_version<16>; // 16 位版本号
+// picking_result：与 R32G32B32A32_UINT 附件 + frag 的 uvec4 输出严格对齐（16B）
+// xy = object_key(type_id, entity_index) 外键；z = primitive_id；w = hover_fn（池实体下标，0xFFFFFFFF = 未绑定）
+struct picking_result
+{
+    // ── 位分配：由 version_t 的 bit_width 推导出 primitive 位宽 ──
+    using version_t = render_version_t; // 例如 render_version<16>
+    static constexpr std::size_t version_bits = version_t::bit_width;
+    static constexpr std::size_t total_bits = 32;
+    static constexpr std::size_t primitive_bits = total_bits - version_bits;
+
+    static_assert(primitive_bits >= 1 && primitive_bits < total_bits,
+                  "picking_result: version_t leaves no room for primitive_id");
+
+    // ── primitive_id 的返回类型同样按位宽选 ─────────────────
+    using primitive_t = version_t::template best_uint_t<primitive_bits>;
+
+    // ── 掩码 ────────────────────────────────────────────────
+    static constexpr std::uint32_t primitive_mask =
+        (std::uint32_t{1} << primitive_bits) - 1u;
+
+    // ── 数据 ────────────────────────────────────────────────
+    object_key key; // outPicking.xy
+    std::uint32_t
+        packed; // outPicking.z：高 version_bits=版本，低 primitive_bits=primitive_id
+    std::uint32_t hover_fn; // outPicking.w
+
+    // ── 读取 ────────────────────────────────────────────────
+    [[nodiscard]] constexpr primitive_t primitive_id() const noexcept
+    {
+        return static_cast<primitive_t>(packed & primitive_mask);
+    }
+    [[nodiscard]] constexpr version_t::underlying_t render_version() const noexcept
+    {
+        return version_t{packed >> version_bits}; // 构造时内部会再 mask 一次
+    }
+
+    // ── 写入（shader 侧对应同一个 pack 逻辑）────────────────
+    static constexpr std::uint32_t pack(version_t v, primitive_t p) noexcept
+    {
+        return (v.to_u32() << version_bits) |
+               (static_cast<std::uint32_t>(p) & primitive_mask);
+    }
+};
+static_assert(sizeof(picking_result) == 16);
+//diff: [test_dod16] end
+struct mesh_data
+{
+    uint32_t vertexCount;  // 网格的顶点数量
+    uint32_t vertexOffset; // 在全局顶点池中的偏移
+    uint32_t indexOffset;  // 在全局索引池中的偏移
+    uint32_t indexCount;   // 索引数量
+
+    [[nodiscard]] VkDrawIndexedIndirectCommand getDrawCommand(
+        uint32_t instanceCount, uint32_t firstInstance = 0) const noexcept
+    {
+        return {.indexCount = indexCount,
+                .instanceCount = instanceCount,
+                .firstIndex = indexOffset,
+                .vertexOffset = static_cast<int32_t>(vertexOffset),
+                .firstInstance = firstInstance};
+    }
+    bool operator==(const mesh_data &o) const noexcept = default;
+    constexpr bool valid() const noexcept
+    {
+        return vertexCount != 0 && indexCount != 0;
+    }
+};
+inline constexpr mesh_data kQuadMesh{4, 0, 0, 6};
+
+#include "test_ui_ability7_dao.hpp"
+#include "test_ui_ability7_shader_buffers.hpp"
+#include "test_ui_ability11_table.hpp"
+
+using shader_data::UniformBufferObject;
+
+struct record_info
+{
+    uint32_t current_frame{};
+    uint32_t image_index{};
+};
+
+struct pick_mouse
+{
+    glm::ivec2 pos{0, 0};
+    bool valid = false;
+};
+
+// ─────────────────────────────────────────────────────────────────────────
+// 全局具名资源表：名字 -> 对象指针；同类型多个的，一个类型一张 map<名字, T*>。
+//
+//   * 存对象指针，不是句柄值：拿到的就是能调用成员的那个对象；
+//   * 全局：函数内 static + namespace 里的 resources()，任何函数都能取
+//     （和 uiPipelines()/uiTextures()/hoverPool() 同款），不再受 main 限制；
+//   * 不拥有资源：不析构、不 free、不转移所有权；
+//   * 地址在 init 后不变：recreateSwapChain 换的是对象里的值，不是对象地址。
+//
+//   分三层，和“init 后对象不变 / per-frame 槽位 / recreateSwapChain 必须重建”
+//   对齐；第二层逐项标注依赖 swapchain 的哪个属性。
+// ─────────────────────────────────────────────────────────────────────────
+namespace named_resource
+{
+    template <class T>
+    using resource_map = std::flat_map<static_string, T *>;
+
+    // Vulkan 侧：资源（Buffer/Image/...）+ 对象（Device/Queue/Swapchain/...）。
+    //   spec 的“资源”是窄义（Resource Creation / Resource Descriptors 两章：
+    //   Buffer、Image、ImageView、BufferView、Sampler、DescriptorSet*）。
+    //   Device/Queue/Swapchain/Pipeline/CommandBuffer/同步对象属于 Object Model，
+    //   严格说不叫资源；但 recreateSwapChain 和 draw 都要用，放同一张表。
+    struct resource_table
+    {
+        // ══ 一、init 后对象不变：recreateSwapChain 完全不动 ══
+        // Vulkan 对象
+        LogicalDevice *device{};
+        surface_impl<Window> *surface{};
+        Queue *queue{};
+        CommandPool *commandPool{};
+        CommandBuffers *commandBuffers{}; // per-frame：reset + record
+        mcs::vulkan::PipelineLayout *pipelineLayout{};
+        // 资源描述符
+        DescriptorSetLayout *descriptorSetLayout{};
+        DescriptorPool *descriptorPool{};
+        DescriptorSets *descriptorSets{}; // per-frame：只 update
+        // 资源（Buffer）
+        std::array<mcs::vulkan::memory::auto_map_buffer, MAX_FRAMES_IN_FLIGHT>
+            *uniformBuffers{}; // per-frame：CPU 写
+        std::array<mcs::vulkan::memory::auto_map_buffer, MAX_FRAMES_IN_FLIGHT>
+            *pickingFrames{}; // per-frame：GPU copy 进、CPU 读
+        std::array<shader_data::ShaderBuffers, MAX_FRAMES_IN_FLIGHT> *shaderBuffers{};
+
+        // ══ 二、recreateSwapChain 必须处理（括注 = 依赖的 swapchain 属性）══
+        mcs::vulkan::Swapchain *swapchain{};              // extent + format + imageCount
+        mcs::vulkan::memory::resource *depthResource{};   // extent
+        mcs::vulkan::memory::resource *msaaResource{};    // extent + format
+        mcs::vulkan::memory::resource *pickResource{};    // 不依赖（WIDTH*HEIGHT 常量）
+        mcs::vulkan::memory::resource *resolveResource{}; // 同上
+        resource_map<mcs::vulkan::Pipeline> pipelines;    // format
+        frame_context<MAX_FRAMES_IN_FLIGHT> *frameContext{}; // imageCount
+    };
+
+    // 宿主侧：不是资源，也不在 Vulkan 里创建 —— 每帧状态、窗口、建造配置。
+    struct frame_state
+    {
+        Window *window{};
+        record_info *frameInfo{};
+        pick_mouse *pickMouse{};
+        mcs::vulkan::memory::create_resources *depthResourcesBuild{};
+        mcs::vulkan::memory::create_resources *msaaResourcesBuild{};
+        mcs::vulkan::memory::create_resources *pickResourcesBuild{};
+        mcs::vulkan::memory::create_resources *resolveResourcesBuild{};
+    };
+
+    // 全局唯一实例
+    constexpr resource_table &resources() noexcept
+    {
+        static resource_table value{};
+        return value;
+    }
+    constexpr frame_state &frameState() noexcept
+    {
+        static frame_state value{};
+        return value;
+    }
+
+    // 名字 -> 对象指针（找不到返回 nullptr）
+    template <class T>
+    [[nodiscard]] constexpr T *find(resource_map<T> &map, std::string_view name)
+    {
+        for (auto &&[key, value] : map)
+            if (key.view() == name)
+                return value;
+        return nullptr;
+    }
+}; // namespace named_resource
+
+using PushData = shader_data::PushData;
+namespace command
+{
+    using PushData = shader_data::PushData;
+
+    struct command_context_data
+    {
+        // 录制过程需要的API,关联的全部类型+数据
+    };
+
+    // 比较两个 VkViewport 是否相等
+    constexpr bool viewportEqual(const VkViewport &a, const VkViewport &b) noexcept
+    {
+        return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height &&
+               a.minDepth == b.minDepth && a.maxDepth == b.maxDepth;
+    }
+
+    // 比较两个 VkRect2D 是否相等
+    constexpr bool rect2DEqual(const VkRect2D &a, const VkRect2D &b) noexcept
+    {
+        return a.offset.x == b.offset.x && a.offset.y == b.offset.y &&
+               a.extent.width == b.extent.width && a.extent.height == b.extent.height;
+    }
+
+    // PushData 里只有 cameraIndex 是 per-draw；
+    // renderVersion 是帧级 picking 版本（和 hover 回读有关），不参与合批。
+    // vertexAddress / instanceAddress / commandConstantsAddress 由 recorder
+    // 在 solve 时按当前 frame 的 buffer 自动算。
+    // 创建期与录制期共用的常量：从句柄创建到 draw 只写一份。
+    struct recorder_config
+    {
+        static constexpr VkIndexType index_type = VK_INDEX_TYPE_UINT32;
+        static constexpr std::uint32_t index_count = 6;
+        static constexpr VkShaderStageFlags push_stages =
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    };
+
+    constexpr bool blend_equation_equal(const VkColorBlendEquationEXT &a,
+                                        const VkColorBlendEquationEXT &b) noexcept
+    {
+        return a.srcColorBlendFactor == b.srcColorBlendFactor &&
+               a.dstColorBlendFactor == b.dstColorBlendFactor &&
+               a.colorBlendOp == b.colorBlendOp &&
+               a.srcAlphaBlendFactor == b.srcAlphaBlendFactor &&
+               a.dstAlphaBlendFactor == b.dstAlphaBlendFactor &&
+               a.alphaBlendOp == b.alphaBlendOp;
+    }
+    constexpr bool stencil_op_equal(const VkStencilOpState &a,
+                                    const VkStencilOpState &b) noexcept
+    {
+        return a.failOp == b.failOp && a.passOp == b.passOp &&
+               a.depthFailOp == b.depthFailOp && a.compareOp == b.compareOp &&
+               a.compareMask == b.compareMask && a.writeMask == b.writeMask;
+    }
+
+    struct draw_state
+    {
+        VkPipeline pipeline{};
+        VkPipelineLayout pipelineLayout{};
+        VkDescriptorSet descriptorSet{};
+
+        VkViewport viewport{};
+        VkRect2D scissor{};
+        std::uint32_t cameraIndex{};
+        std::optional<std::uint32_t> stencilRef;
+
+        // ── ext_dynamic_state2/3：blend / A2C / stencil（sticky）───────────
+        bool dynamic_ui = false; // 该 pipeline 是否声明了这些动态状态
+        std::array<VkBool32, 2> color_blend_enable{VK_TRUE, VK_FALSE};
+        std::array<VkColorBlendEquationEXT, 2> color_blend_equation{
+            VkColorBlendEquationEXT{VK_BLEND_FACTOR_ONE,
+                                    VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD,
+                                    VK_BLEND_FACTOR_ONE,
+                                    VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA, VK_BLEND_OP_ADD},
+            VkColorBlendEquationEXT{VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ZERO,
+                                    VK_BLEND_OP_ADD, VK_BLEND_FACTOR_ZERO,
+                                    VK_BLEND_FACTOR_ZERO, VK_BLEND_OP_ADD}};
+        std::array<VkColorComponentFlags, 2> color_write_mask{
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT};
+        VkBool32 alpha_to_coverage = VK_FALSE;
+        VkBool32 stencil_test_enable = VK_FALSE;
+        VkStencilOpState stencil_op{};
+
+        constexpr bool dynamic_equal(const draw_state &o) const noexcept
+        {
+            return color_blend_enable == o.color_blend_enable &&
+                   blend_equation_equal(color_blend_equation[0],
+                                        o.color_blend_equation[0]) &&
+                   blend_equation_equal(color_blend_equation[1],
+                                        o.color_blend_equation[1]) &&
+                   color_write_mask == o.color_write_mask &&
+                   alpha_to_coverage == o.alpha_to_coverage &&
+                   stencil_test_enable == o.stencil_test_enable &&
+                   stencil_op_equal(stencil_op, o.stencil_op);
+        }
+        constexpr bool valid() const noexcept
+        {
+            return pipeline != nullptr && descriptorSet != nullptr &&
+                   pipelineLayout != nullptr && (viewport.width > 0);
+        }
+        constexpr bool operator==(const draw_state &o) const noexcept
+        {
+            return pipeline == o.pipeline && pipelineLayout == o.pipelineLayout &&
+                   descriptorSet == o.descriptorSet &&
+                   viewportEqual(viewport, o.viewport) &&
+                   rect2DEqual(scissor, o.scissor) && cameraIndex == o.cameraIndex &&
+                   stencilRef == o.stencilRef && dynamic_ui == o.dynamic_ui &&
+                   (!dynamic_ui || dynamic_equal(o));
+        }
+    };
+
+    enum class stream_state : std::uint8_t
+    {
+        close,
+        open,
+        pending
+    };
+
+    enum class scope_state : std::uint8_t
+    {
+        PipelineBarrier2,
+        BeginRendering, //NOTE: BeginRendering 之前不保证都能写一个PipelineBarrier2.参考 [19]
+        EndRendering,
+    };
+
+    // 在 beginRendering 之前或 endRendering 之后记录.避免块内同步。块内需要额外扩展
+    struct transition_image
+    {
+        using image_info = my_render::image_info;
+        std::vector<VkImageMemoryBarrier2> data;
+        constexpr auto apply(const CommandBufferView &commandBuffer) const noexcept
+        {
+            if (data.size() > 0)
+                my_render::transition_image_layout(commandBuffer, data);
+        }
+    };
+
+    /*
+    typedef struct VkRenderingInfo {
+        VkStructureType                     sType;
+        const void*                         pNext;
+        VkRenderingFlags                    flags;
+        VkRect2D                            renderArea;
+        uint32_t                            layerCount;
+        uint32_t                            viewMask;
+        uint32_t                            colorAttachmentCount;
+        const VkRenderingAttachmentInfo*    pColorAttachments;
+        const VkRenderingAttachmentInfo*    pDepthAttachment;
+        const VkRenderingAttachmentInfo*    pStencilAttachment;
+    } VkRenderingInfo;
+    */
+    struct rendering_info
+    {
+        struct rendering_info_submit
+        {
+            std::vector<VkRenderingAttachmentInfo> colorAttachments;
+            std::optional<VkRenderingAttachmentInfo> depthAttachment;
+            std::optional<VkRenderingAttachmentInfo> stencilAttachment;
+
+            constexpr void apply(const rendering_info &info)
+            {
+                colorAttachments.resize(info.colorAttachments.size());
+                for (size_t i = 0; i < info.colorAttachments.size(); ++i)
+                    colorAttachments[i] = info.colorAttachments[i];
+
+                depthAttachment = info.depthAttachment
+                                      ? *info.depthAttachment
+                                      : std::optional<VkRenderingAttachmentInfo>{};
+                stencilAttachment = info.stencilAttachment
+                                        ? *info.stencilAttachment
+                                        : std::optional<VkRenderingAttachmentInfo>{};
+            }
+
+            [[nodiscard]] constexpr VkRenderingInfo operator()(
+                const rendering_info &info) const noexcept
+            {
+                return {.sType = sType<VkRenderingInfo>(),
+                        .pNext = *info.pNext,
+                        .flags = info.flags,
+                        .renderArea = info.renderArea,
+                        .layerCount = info.layerCount,
+                        .viewMask = info.viewMask,
+                        .colorAttachmentCount =
+                            static_cast<uint32_t>(colorAttachments.size()),
+                        .pColorAttachments = colorAttachments.data(),
+                        .pDepthAttachment =
+                            depthAttachment ? &(*depthAttachment) : nullptr,
+                        .pStencilAttachment =
+                            stencilAttachment ? &(*stencilAttachment) : nullptr};
+            }
+        };
+
+        /*
+        typedef struct VkRenderingAttachmentInfo {
+            VkStructureType          sType;
+            const void*              pNext;
+            VkImageView              imageView;
+            VkImageLayout            imageLayout;
+            VkResolveModeFlagBits    resolveMode;
+            VkImageView              resolveImageView;
+            VkImageLayout            resolveImageLayout;
+            VkAttachmentLoadOp       loadOp;
+            VkAttachmentStoreOp      storeOp;
+            VkClearValue             clearValue;
+        } VkRenderingAttachmentInfo;
+        */
+        struct rendering_attachment // NOLINTBEGIN
+        {
+            [[nodiscard]] operator VkRenderingAttachmentInfo() const noexcept
+            {
+                return {.sType = sType<VkRenderingAttachmentInfo>(),
+                        .pNext = *pNext,
+                        .imageView = imageView,
+                        .imageLayout = imageLayout,
+                        .resolveMode = resolveMode,
+                        .resolveImageView = resolveImageView,
+                        .resolveImageLayout = resolveImageLayout,
+                        .loadOp = loadOp,
+                        .storeOp = storeOp,
+                        .clearValue = clearValue};
+            }
+            pNext pNext{};
+            VkImageView imageView{};
+            VkImageLayout imageLayout{};
+            VkResolveModeFlagBits resolveMode{};
+            VkImageView resolveImageView{};
+            VkImageLayout resolveImageLayout{};
+            VkAttachmentLoadOp loadOp{};
+            VkAttachmentStoreOp storeOp{};
+            VkClearValue clearValue{};
+        }; // NOLINTEND
+        // NOLINTBEGIN
+        pNext pNext{};
+        Flags<VkRenderingFlagBits> flags{};
+        VkRect2D renderArea{};
+        uint32_t layerCount{};
+        uint32_t viewMask{};
+        std::vector<rendering_attachment> colorAttachments;
+        std::optional<rendering_attachment> depthAttachment;
+        std::optional<rendering_attachment> stencilAttachment;
+    }; // NOLINTEND
+
+    class ByteBuffer
+    {
+      public:
+        ByteBuffer() = default;
+        explicit ByteBuffer(std::size_t cap)
+            : data_(cap ? std::make_unique_for_overwrite<uint8_t[]>(cap) : nullptr),
+              capacity_(cap)
+        {
+        }
+
+        // 写入任意 trivially copyable 的 T
+        template <class T>
+        constexpr void write(const T &v)
+        {
+            static_assert(std::is_trivially_copyable_v<T>,
+                          "ByteBuffer 只接受 trivially copyable 的类型");
+            write_bytes(&v, sizeof(T));
+        }
+
+        // 写入 T 的数组
+        template <class T>
+        constexpr void write_array(const T *p, std::size_t n)
+        {
+            static_assert(std::is_trivially_copyable_v<T>);
+            write_bytes(p, n * sizeof(T));
+        }
+
+        // 原始字节写入（内部统一走这里）
+        constexpr void write_bytes(const void *src, std::size_t n)
+        {
+            reserve(size_ + n);
+            std::memcpy(data_.get() + size_, src, n);
+            size_ += n;
+        }
+
+        // 按偏移读出 T
+        template <class T>
+        constexpr T read(std::size_t off) const
+        {
+            static_assert(std::is_trivially_copyable_v<T>);
+            if (off + sizeof(T) > size_)
+                throw std::out_of_range("ByteBuffer::read out of range");
+            T v;
+            std::memcpy(&v, data_.get() + off, sizeof(T));
+            return v;
+        }
+
+        constexpr uint8_t *data() noexcept
+        {
+            return data_.get();
+        }
+        constexpr const uint8_t *data() const noexcept
+        {
+            return data_.get();
+        }
+        constexpr std::size_t size() const noexcept
+        {
+            return size_;
+        }
+        constexpr std::size_t capacity() const noexcept
+        {
+            return capacity_;
+        }
+        constexpr void clear() noexcept
+        {
+            size_ = 0;
+        }
+
+      private:
+        // 自动扩容：容量不足时按 2 倍增长，只搬运 size_ 个有效字节
+        void reserve(std::size_t need)
+        {
+            if (need <= capacity_)
+                return;
+
+            const std::size_t max = std::numeric_limits<std::size_t>::max();
+            std::size_t newcap = capacity_ ? capacity_ : 64;
+            while (newcap < need)
+            {
+                if (newcap > max / 2)
+                {
+                    newcap = need;
+                    break;
+                } // 防溢出
+                newcap *= 2;
+            }
+
+            // 注意：make_unique_for_overwrite 不初始化内存
+            auto nd = std::make_unique_for_overwrite<uint8_t[]>(newcap);
+            if (size_)
+                std::memcpy(nd.get(), data_.get(), size_);
+            data_ = std::move(nd);
+            capacity_ = newcap;
+        }
+
+        std::unique_ptr<uint8_t[]> data_;
+        std::size_t size_ = 0;
+        std::size_t capacity_ = 0;
+    };
+
+    // 一个 scope 在 GPU 上的落地地址。只能由 record_builder::resolveStorage 产出；
+    // command_recorder::record 必须拿到它才能录 vkCmd* —— 用类型把“先定地址、后录命令”
+    // 固化成调用约束，避免先录命令、后扩容导致的地址失效。
+    struct scope_binding
+    {
+        VkDeviceAddress vertex{};
+        VkDeviceAddress heap{};
+        VkDeviceAddress constants{};
+        VkBuffer index_buffer{};
+        VkBuffer indirect_buffer{};
+        VkDeviceSize indirect_offset{};
+
+        // 仅用于断言 / 回溯
+        std::uint32_t heap_base{};
+        std::uint32_t heap_bytes{};
+        std::uint32_t constants_base{};
+        std::uint32_t constants_bytes{};
+        std::uint32_t indirect_base{};
+        std::uint32_t indirect_bytes{};
+    };
+
+    struct command_recorder
+    {
+        named_resource::resource_table *resources{};
+        std::vector<shader_data::CommandConstant> constants;
+        std::vector<VkDrawIndexedIndirectCommand> commands;
+        // 与 commands 一一对应的几何范围（CPU 侧，不上传）
+        std::vector<mesh_data> command_meshes;
+        mesh_data current_mesh{kQuadMesh};
+
+        // 共享堆：由 record_builder 提供；本段只占 [heap_begin, heap_end)。
+        ByteBuffer *heap = nullptr;
+        std::uint32_t heap_begin = 0;
+        std::uint32_t heap_end = 0;
+
+        constexpr void attach(ByteBuffer &shared) noexcept
+        {
+            heap = &shared;
+            heap_begin = static_cast<std::uint32_t>(shared.size());
+            heap_end = heap_begin;
+        }
+
+        struct draw_data_range
+        {
+            struct span_info
+            {
+                std::uint32_t offset;
+                std::uint32_t size;
+            };
+            span_info data_span;
+            constexpr std::uint32_t draw_count() const noexcept
+            {
+                return data_span.size;
+            }
+            constexpr bool empty() const noexcept
+            {
+                return data_span.size == 0;
+            }
+            constexpr bool valid() const noexcept
+            {
+                return not empty();
+            }
+            template <class T>
+            constexpr static auto to_span(std::span<T> v, span_info si) noexcept
+            {
+                return v.subspan(si.offset, si.size);
+            }
+            constexpr auto to_span(std::vector<shader_data::CommandConstant> &v) noexcept
+            {
+                return to_span(std::span{v}, data_span);
+            }
+            constexpr auto to_span(std::vector<VkDrawIndexedIndirectCommand> &v) noexcept
+            {
+                return to_span(std::span{v}, data_span);
+            }
+        };
+        struct draw_item
+        {
+            draw_data_range data_ranges;
+            draw_state draw_state;
+        };
+
+        std::vector<draw_item> draws;
+        draw_data_range pendingData;
+        draw_state draw_state;
+
+        constexpr bool canSubmit() const noexcept
+        {
+            return draw_state.valid() && pendingData.valid();
+        }
+        void submitPending()
+        {
+            assert(canSubmit());
+            draws.emplace_back(pendingData, draw_state);
+            pendingData = {};
+        }
+        void trySubmit()
+        {
+            if (canSubmit()) //  submit by change state
+                submitPending();
+        }
+        constexpr void setViewport(VkViewport viewport) noexcept
+        {
+            if (viewportEqual(draw_state.viewport, viewport)) //  skip
+                return;
+            trySubmit();
+            draw_state.viewport = viewport; //new state
+        }
+        constexpr void setScissor(VkRect2D scissor) noexcept
+        {
+            if (rect2DEqual(draw_state.scissor, scissor))
+                return;
+            trySubmit();
+            draw_state.scissor = scissor;
+        }
+        constexpr void setCameraIndex(std::uint32_t cameraIndex) noexcept
+        {
+            if (draw_state.cameraIndex == cameraIndex)
+                return;
+            trySubmit();
+            draw_state.cameraIndex = cameraIndex;
+        }
+        constexpr void setStencilRef(std::optional<std::uint32_t> stencilRef) noexcept
+        {
+            if (draw_state.stencilRef == stencilRef)
+                return;
+            trySubmit();
+            draw_state.stencilRef = stencilRef;
+        }
+        // ── ext_dynamic_state2/3：不新建管线，直接改状态 ──────────────────
+        constexpr void setDynamicUI(bool enabled) noexcept
+        {
+            if (draw_state.dynamic_ui == enabled)
+                return;
+            trySubmit();
+            draw_state.dynamic_ui = enabled;
+        }
+        constexpr void setBlendState(std::array<VkBool32, 2> enable,
+                                     std::array<VkColorBlendEquationEXT, 2> equation,
+                                     std::array<VkColorComponentFlags, 2> mask) noexcept
+        {
+            if (draw_state.color_blend_enable == enable &&
+                draw_state.color_write_mask == mask &&
+                blend_equation_equal(draw_state.color_blend_equation[0], equation[0]) &&
+                blend_equation_equal(draw_state.color_blend_equation[1], equation[1]))
+                return;
+            trySubmit();
+            draw_state.color_blend_enable = enable;
+            draw_state.color_blend_equation = equation;
+            draw_state.color_write_mask = mask;
+        }
+        constexpr void setAlphaToCoverage(VkBool32 enabled) noexcept
+        {
+            if (draw_state.alpha_to_coverage == enabled)
+                return;
+            trySubmit();
+            draw_state.alpha_to_coverage = enabled;
+        }
+        constexpr void setStencilTest(VkBool32 enabled) noexcept
+        {
+            if (draw_state.stencil_test_enable == enabled)
+                return;
+            trySubmit();
+            draw_state.stencil_test_enable = enabled;
+        }
+        constexpr void setStencilOp(VkStencilOpState op) noexcept
+        {
+            if (stencil_op_equal(draw_state.stencil_op, op))
+                return;
+            trySubmit();
+            draw_state.stencil_op = op;
+        }
+        constexpr void setPipeline(VkPipeline pipeline) noexcept
+        {
+            if (draw_state.pipeline == pipeline)
+                return;
+            trySubmit();
+            draw_state.pipeline = pipeline;
+        }
+        constexpr void setDescriptorSet(VkDescriptorSet descriptorSet) noexcept
+        {
+            if (draw_state.descriptorSet == descriptorSet)
+                return;
+            trySubmit();
+            draw_state.descriptorSet = descriptorSet;
+        }
+        constexpr void setPipelineLayout(VkPipelineLayout pipelineLayout) noexcept
+        {
+            if (draw_state.pipelineLayout == pipelineLayout)
+                return;
+            trySubmit();
+            draw_state.pipelineLayout = pipelineLayout;
+        }
+
+        // ── [beginRendering, endRendering] 段先录后放 ──────────────────────
+        // 直接持有完整 rendering_info（pNext 链、任意颜色附件数都在里面），
+        // 回放时由 rendering_info_submit 拼 VkRenderingInfo。
+        std::optional<rendering_info> begin_info;
+
+        void begin_rendering(rendering_info info)
+        {
+            begin_info = std::move(info);
+            heap_end = static_cast<std::uint32_t>(heap->size());
+        }
+
+        // 段闭合：钉住本段的 heap 切片；endRendering 由 scope 的 closed 决定。
+        void close()
+        {
+            if (heap)
+                heap_end = static_cast<std::uint32_t>(heap->size());
+        }
+
+        void emit_begin_rendering(const CommandBufferView &commandBuffer) const
+        {
+            if (!begin_info)
+                return;
+            rendering_info::rendering_info_submit submit;
+            submit.apply(*begin_info);
+            commandBuffer.beginRendering(submit(*begin_info));
+        }
+
+        // renderVersion 只是 picking 回读的过滤标签，不属于 draw 录制状态；
+        // 在发射时统一盖章，不参与 draw_state / 合批。
+        // ── 阶段 2：只录 vkCmd*，地址全部来自 scope_binding ────────────────
+        //   binding 由 record_builder::resolveStorage 产出；数据在阶段 1
+        //   已全部写进 GPU buffer，这里不再扩容、不再写 heap。
+        void record(const CommandBufferView &commandBuffer, const scope_binding &binding,
+                    std::uint32_t renderVersion, bool closed)
+        {
+            trySubmit();
+
+            const auto size = draws.size();
+            if (size == 0)
+            {
+                emit_begin_rendering(commandBuffer);
+                if (closed)
+                    commandBuffer.endRendering();
+                return;
+            }
+
+            assert(binding.vertex != 0);
+            assert(binding.heap != 0);
+            assert(binding.constants != 0);
+            assert(binding.index_buffer != VK_NULL_HANDLE);
+            assert(binding.indirect_buffer != VK_NULL_HANDLE);
+
+            emit_begin_rendering(commandBuffer);
+
+            // 数据已由 record_builder::resolveStorage 在阶段 1 写好；
+            // 这里只录命令。绝不再重建 buffer —— 重建会让先录的地址失效。
+
+            // 关键：gl_DrawIDARB 在每次 drawIndexedIndirect 内从 0 开始。
+            // 每个 draw_item 的 push 必须指向它自己的 CommandConstant 区间，
+            // 同时把绝对地址重新解析到当前 frame 的 buffer 槽。
+            const auto resolvePush = [&](const draw_item &item) {
+                PushData push{};
+                push.vertexAddress = binding.vertex;
+                push.instanceAddress = binding.heap;
+                push.commandConstantsAddress =
+                    binding.constants + item.data_ranges.data_span.offset *
+                                            sizeof(shader_data::CommandConstant);
+                push.cameraIndex = item.draw_state.cameraIndex;
+                push.renderVersion = renderVersion;
+                return push;
+            };
+
+            // ext_dynamic_state2/3：blend / A2C / stencil 一律走动态状态
+            const auto emit_dynamic = [&](const command::draw_state &s) {
+                const auto &vk = commandBuffer.functions();
+                vk.vkCmdSetColorBlendEnableEXT(*commandBuffer, 0, 2,
+                                               s.color_blend_enable.data());
+                vk.vkCmdSetColorBlendEquationEXT(*commandBuffer, 0, 2,
+                                                 s.color_blend_equation.data());
+                vk.vkCmdSetColorWriteMaskEXT(*commandBuffer, 0, 2,
+                                             s.color_write_mask.data());
+                vk.vkCmdSetAlphaToCoverageEnableEXT(*commandBuffer, s.alpha_to_coverage);
+                commandBuffer.setStencilTestEnable(s.stencil_test_enable);
+                commandBuffer.setStencilOp(VK_STENCIL_FACE_FRONT_AND_BACK,
+                                           s.stencil_op.failOp, s.stencil_op.passOp,
+                                           s.stencil_op.depthFailOp,
+                                           s.stencil_op.compareOp);
+                commandBuffer.setStencilCompareMask(VK_STENCIL_FACE_FRONT_AND_BACK,
+                                                    s.stencil_op.compareMask);
+                commandBuffer.setStencilWriteMask(VK_STENCIL_FACE_FRONT_AND_BACK,
+                                                  s.stencil_op.writeMask);
+            };
+
+            auto &first = draws[0];
+            auto pre = first.draw_state;
+            auto prePush = resolvePush(first);
+
+            commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pre.pipeline);
+            commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                             pre.pipelineLayout, 0, 1, &pre.descriptorSet,
+                                             0, nullptr);
+            commandBuffer.setViewport(0, std::span<const VkViewport>{&pre.viewport, 1});
+            commandBuffer.setScissor(0, std::span<const VkRect2D>{&pre.scissor, 1});
+            commandBuffer.bindIndexBuffer(binding.index_buffer, 0,
+                                          recorder_config::index_type);
+            if (pre.stencilRef)
+                commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK,
+                                                  *pre.stencilRef);
+            commandBuffer.pushConstants(pre.pipelineLayout, recorder_config::push_stages,
+                                        0, sizeof(PushData), &prePush);
+            if (pre.dynamic_ui)
+                emit_dynamic(pre);
+
+            auto offset =
+                binding.indirect_offset +
+                first.data_ranges.data_span.offset * sizeof(VkDrawIndexedIndirectCommand);
+            auto count = first.data_ranges.draw_count();
+            commandBuffer.drawIndexedIndirect(binding.indirect_buffer, offset, count,
+                                              sizeof(VkDrawIndexedIndirectCommand));
+
+            for (std::size_t i = 1; i < size; ++i)
+            {
+                auto &item = draws[i];
+                auto &cur = item.draw_state;
+                auto curPush = resolvePush(item);
+
+                if (cur.pipeline != pre.pipeline)
+                    commandBuffer.bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                               cur.pipeline);
+
+                if (cur.pipelineLayout != pre.pipelineLayout ||
+                    cur.descriptorSet != pre.descriptorSet)
+                    commandBuffer.bindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                     cur.pipelineLayout, 0, 1,
+                                                     &cur.descriptorSet, 0, nullptr);
+                if (not viewportEqual(cur.viewport, pre.viewport))
+                    commandBuffer.setViewport(
+                        0, std::span<const VkViewport>{&cur.viewport, 1});
+
+                if (not rect2DEqual(cur.scissor, pre.scissor))
+                    commandBuffer.setScissor(0,
+                                             std::span<const VkRect2D>{&cur.scissor, 1});
+
+                if (cur.stencilRef != pre.stencilRef && cur.stencilRef)
+                    commandBuffer.setStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK,
+                                                      *cur.stencilRef);
+
+                if (cur.pipelineLayout != pre.pipelineLayout || curPush != prePush)
+                    commandBuffer.pushConstants(cur.pipelineLayout,
+                                                recorder_config::push_stages, 0,
+                                                sizeof(PushData), &curPush);
+
+                if (cur.dynamic_ui &&
+                    (cur.pipeline != pre.pipeline || !cur.dynamic_equal(pre)))
+                    emit_dynamic(cur);
+
+                offset =
+                    binding.indirect_offset + item.data_ranges.data_span.offset *
+                                                  sizeof(VkDrawIndexedIndirectCommand);
+                count = item.data_ranges.draw_count();
+                commandBuffer.drawIndexedIndirect(binding.indirect_buffer, offset, count,
+                                                  sizeof(VkDrawIndexedIndirectCommand));
+                pre = cur;
+                prePush = curPush;
+            }
+
+            if (closed)
+                commandBuffer.endRendering();
+        }
+
+        // NOTE: [13] 确定了,state 不变 随便合批. 不同的 T 增加命令缓冲区即可. 不需要新增 drawIndexedIndirect
+        template <class T>
+        constexpr void addInsteance(T data)
+        {
+            assert(draw_state.valid());
+            constexpr auto program_value = shader_data::program_value<T>();
+            const auto initcmd = VkDrawIndexedIndirectCommand{
+                .indexCount = current_mesh.indexCount,
+                .instanceCount = 1,
+                .firstIndex = current_mesh.indexOffset,
+                .vertexOffset = static_cast<std::int32_t>(current_mesh.vertexOffset),
+                .firstInstance = 0};
+            const auto address_offset =
+                static_cast<std::uint32_t>(heap->size() - heap_begin);
+            heap->write(data);
+            // CommandConstant.address_offset 相对 pc.dataAddress（本帧的实例堆起点）。
+            const auto init_cc = shader_data::CommandConstant{
+                .program = program_value, .address_offset = address_offset};
+            if (pendingData.empty())
+            {
+                // new realy memory
+                constants.emplace_back(init_cc);
+                commands.emplace_back(initcmd);
+                command_meshes.emplace_back(current_mesh);
+                pendingData =
+                    draw_data_range{.data_span = {.offset = static_cast<std::uint32_t>(
+                                                      constants.size() - 1),
+                                                  .size = 1}};
+                return;
+            }
+
+            assert(pendingData.valid());
+            if (auto &back_constant = pendingData.to_span(constants).back();
+                program_value == back_constant.program &&
+                command_meshes.back() == current_mesh)
+            {
+                // NOTE: 同一类型 + 同一 mesh,在多实例绘制支持下,不需要增加命令
+                auto &back_command = pendingData.to_span(commands).back();
+                back_command.instanceCount++; // 注意 gl_InstanceIndex = [0,instanceCount)
+            }
+            else
+            {
+                // NOTE: 需要增加命令.多实例只需要增加命令数据,无法合批. 才需要新 draw. state又不变
+                constants.emplace_back(init_cc);
+                commands.emplace_back(initcmd);
+                command_meshes.emplace_back(current_mesh);
+                pendingData.data_span.size++; //drawIndexedIndirect 命令参数的 count ++
+            }
+        }
+        constexpr void setMesh(mesh_data mesh) noexcept
+        {
+            current_mesh = mesh;
+        }
+        void clear() noexcept
+        {
+            draws.clear();
+            constants.clear();
+            commands.clear();
+            command_meshes.clear();
+            current_mesh = kQuadMesh;
+            if (heap)
+            {
+                heap_begin = static_cast<std::uint32_t>(heap->size());
+                heap_end = heap_begin;
+            }
+            pendingData = {};
+            draw_state = {};
+        }
+
+        // ── 阶段 1：把本段的 heap / constants / indirect 写进 GPU buffer ──
+        //   b 的 base 由 record_builder 统一分配，保证各 scope 的区间不重叠。
+        void writeStorage(shader_data::ShaderBuffers &sb, const scope_binding &b) const
+        {
+            if (b.heap_bytes != 0)
+                sb.globalHeapBuffer.write(b.heap_base, heap->data() + heap_begin,
+                                          b.heap_bytes);
+            if (b.constants_bytes != 0)
+                sb.commandConstantsBuffer.write(b.constants_base, constants.data(),
+                                                b.constants_bytes);
+            if (b.indirect_bytes != 0)
+                sb.indirectDrawBuffer.write(b.indirect_base, commands.data(),
+                                            b.indirect_bytes);
+        }
+    };
+
+    // 单线程录制：一个 recorder 顺序录每帧；GPU 侧按 frame 槽隔离。
+    inline command_recorder &globalRecorder() noexcept
+    {
+        static command_recorder value{};
+        return value;
+    }
+
+    // ── 外部段：与 command_recorder 同级的“记录 → 回放”对象 ──────────────
+    enum class outer_opcode : std::uint16_t
+    {
+        transition,
+        copy_image_to_buffer,
+        blit_image,
+        Count
+    };
+
+    using parse_fn = void (*)(std::span<const std::byte> data,
+                              const CommandBufferView &commandBuffer);
+
+    struct outer_op
+    {
+        outer_opcode type; // 数据 → 类型（回溯）
+        parse_fn parse;    // 数据 → Vulkan 调用（回放）
+    };
+
+    // API → 解析函数：由 tag 自动决定，调用方不手填。
+    struct transition_cmd_tag
+    {
+    };
+    struct copy_image_cmd_tag
+    {
+    };
+    struct blit_cmd_tag
+    {
+    };
+
+    template <class Tag>
+    struct outer_codec;
+
+    template <>
+    struct outer_codec<transition_cmd_tag>
+    {
+        static constexpr outer_opcode type = outer_opcode::transition;
+        static constexpr parse_fn parse = my_render::parse_transition;
+    };
+
+    template <>
+    struct outer_codec<copy_image_cmd_tag>
+    {
+        static constexpr outer_opcode type = outer_opcode::copy_image_to_buffer;
+        static constexpr parse_fn parse = my_render::parse_copy_image_to_buffer;
+    };
+
+    template <>
+    struct outer_codec<blit_cmd_tag>
+    {
+        static constexpr outer_opcode type = outer_opcode::blit_image;
+        static constexpr parse_fn parse = my_render::parse_blit_image;
+    };
+
+    template <class Tag>
+    inline constexpr outer_op op_v{outer_codec<Tag>::type, outer_codec<Tag>::parse};
+
+    struct command_recorder_outer
+    {
+        struct item
+        {
+            outer_op op;
+            std::uint32_t offset;
+            std::uint32_t size;
+        };
+
+        ByteBuffer *bytes = nullptr; // record_builder 的共享堆
+        std::vector<item> items;
+
+        void attach(ByteBuffer &shared) noexcept
+        {
+            bytes = &shared;
+        }
+
+        // 和 addInsteance 一样直接：录一个 barrier 段
+        template <class... T>
+            requires(std::same_as<T, my_render::image_info> && ...)
+        void add_transition(T... infos)
+        {
+            const std::array barriers{my_render::to_barrier(infos)...};
+            push_barrier2(0, {}, {}, barriers);
+        }
+
+        // 完整 vkCmdPipelineBarrier2：flags + memory/buffer/image 三类 barrier
+        void add_pipeline_barrier2(const VkDependencyInfo &info)
+        {
+            assert(info.pNext == nullptr);
+            push_barrier2(info.dependencyFlags,
+                          {info.pMemoryBarriers, info.memoryBarrierCount},
+                          {info.pBufferMemoryBarriers, info.bufferMemoryBarrierCount},
+                          {info.pImageMemoryBarriers, info.imageMemoryBarrierCount});
+        }
+
+        void add_copy_image_to_buffer(VkImage src, VkImageLayout layout, VkBuffer dst,
+                                      std::span<const VkBufferImageCopy> regions)
+        {
+            push<copy_image_cmd_tag>(
+                my_render::copy_image_to_buffer_info{src, layout, dst}, regions);
+        }
+
+        // pass 外：layer/主图之间的 blit（拷贝 + 缩放 + 格式转换）
+        void add_blit_image(VkImage src, VkImageLayout src_layout, VkImage dst,
+                            VkImageLayout dst_layout,
+                            std::span<const VkImageBlit> regions, VkFilter filter)
+        {
+            push<blit_cmd_tag>(
+                my_render::blit_image_header{src, src_layout, dst, dst_layout, filter},
+                regions);
+        }
+
+        // 手工组合：把还没发射的按顺序发射，cursor 前进；items 保留用于回溯。
+        void flush(const CommandBufferView &commandBuffer)
+        {
+            for (; cursor_ < items.size(); ++cursor_)
+            {
+                const auto &it = items[cursor_];
+                it.op.parse(
+                    std::span<const std::byte>{
+                        reinterpret_cast<const std::byte *>(bytes->data()) + it.offset,
+                        it.size},
+                    commandBuffer);
+            }
+        }
+
+        [[nodiscard]] static constexpr std::string_view name(outer_opcode type) noexcept
+        {
+            switch (type)
+            {
+            case outer_opcode::transition:
+                return "transition";
+            case outer_opcode::copy_image_to_buffer:
+                return "copy_image_to_buffer";
+            case outer_opcode::blit_image:
+                return "blit_image";
+            case outer_opcode::Count:
+                break;
+            }
+            return "?";
+        }
+
+        void clear() noexcept
+        {
+            items.clear();
+            cursor_ = 0;
+        }
+
+        // 外部回溯：目录 + 原始数据（按 item.op.type 自行解释）
+        [[nodiscard]] std::span<const item> entries() const noexcept
+        {
+            return items;
+        }
+        [[nodiscard]] std::span<const std::byte> payload(const item &it) const noexcept
+        {
+            return {reinterpret_cast<const std::byte *>(bytes->data()) + it.offset,
+                    it.size};
+        }
+
+      private:
+        void push_barrier2(VkDependencyFlags flags,
+                           std::span<const VkMemoryBarrier2> memory,
+                           std::span<const VkBufferMemoryBarrier2> buffer,
+                           std::span<const VkImageMemoryBarrier2> image)
+        {
+            constexpr auto op = op_v<transition_cmd_tag>;
+            const auto offset = align_to(16);
+            write_value(my_render::barrier2_header{
+                flags, static_cast<std::uint32_t>(memory.size()),
+                static_cast<std::uint32_t>(buffer.size()),
+                static_cast<std::uint32_t>(image.size())});
+            align_to(alignof(VkMemoryBarrier2));
+            if (!memory.empty())
+                write_bytes(memory.data(), memory.size_bytes());
+            align_to(alignof(VkBufferMemoryBarrier2));
+            if (!buffer.empty())
+                write_bytes(buffer.data(), buffer.size_bytes());
+            align_to(alignof(VkImageMemoryBarrier2));
+            if (!image.empty())
+                write_bytes(image.data(), image.size_bytes());
+            items.push_back(
+                {op, offset, static_cast<std::uint32_t>(bytes->size() - offset)});
+        }
+
+        template <class Tag, class T>
+        void push(std::span<const T> values)
+        {
+            static_assert(std::is_trivially_copyable_v<T>);
+            constexpr auto op = op_v<Tag>;
+            const auto offset = align_to(16);
+            write_value(static_cast<std::uint32_t>(values.size()));
+            align_to(alignof(T));
+            if (!values.empty())
+                write_bytes(values.data(), values.size() * sizeof(T));
+            items.push_back(
+                {op, offset, static_cast<std::uint32_t>(bytes->size() - offset)});
+        }
+
+        template <class Tag, class Header, class T>
+        void push(const Header &header, std::span<const T> values)
+        {
+            static_assert(std::is_trivially_copyable_v<Header>);
+            constexpr auto op = op_v<Tag>;
+            const auto offset = align_to(16);
+            write_value(header);
+            write_value(static_cast<std::uint32_t>(values.size()));
+            align_to(alignof(T));
+            if (!values.empty())
+                write_bytes(values.data(), values.size() * sizeof(T));
+            items.push_back(
+                {op, offset, static_cast<std::uint32_t>(bytes->size() - offset)});
+        }
+
+        std::uint32_t align_to(std::size_t alignment)
+        {
+            static constexpr std::byte zero{0};
+            while (bytes->size() % alignment != 0)
+                bytes->write_bytes(&zero, 1);
+            return static_cast<std::uint32_t>(bytes->size());
+        }
+        void write_bytes(const void *src, std::size_t count)
+        {
+            if (count != 0)
+                bytes->write_bytes(src, count);
+        }
+        template <class T>
+        void write_value(const T &value)
+        {
+            static_assert(std::is_trivially_copyable_v<T>);
+            write_bytes(&value, sizeof(T));
+        }
+
+        std::size_t cursor_ = 0;
+    };
+
+    // ── 帧级：[beginRendering, endRendering] 及 outer 记录 ──────────────────
+    inline constexpr std::uint32_t no_scope = 0xFFFFFFFFu;
+
+    struct scope_info
+    {
+        std::uint32_t outer = no_scope;
+        std::uint32_t inter = no_scope;
+        bool opened = false;     // beginRendering 已录
+        bool closed = false;     // endRendering 已录（显式或自动）
+        scope_binding binding{}; // 阶段 1 产出的 GPU 落地地址
+    };
+
+    struct record_builder
+    {
+        ByteBuffer heap;
+        named_resource::resource_table *resources{};
+        std::deque<command_recorder_outer> outers;
+        std::deque<command_recorder> inters;
+        std::vector<scope_info> scopes; // 顺序即 C API 走向
+
+        // ── 外部代理：自动闭合当前 pass，落到当前/新建的 outer 段 ──
+        template <class... T>
+            requires(std::same_as<T, my_render::image_info> && ...)
+        void add_transition(T... infos)
+        {
+            outer_segment().add_transition(infos...);
+        }
+
+        void add_copy_image_to_buffer(VkImage src, VkImageLayout layout, VkBuffer dst,
+                                      std::span<const VkBufferImageCopy> regions)
+        {
+            outer_segment().add_copy_image_to_buffer(src, layout, dst, regions);
+        }
+
+        void add_blit_image(VkImage src, VkImageLayout src_layout, VkImage dst,
+                            VkImageLayout dst_layout,
+                            std::span<const VkImageBlit> regions, VkFilter filter)
+        {
+            outer_segment().add_blit_image(src, src_layout, dst, dst_layout, regions,
+                                           filter);
+        }
+
+        void add_pipeline_barrier2(const VkDependencyInfo &info)
+        {
+            outer_segment().add_pipeline_barrier2(info);
+        }
+
+        // ── 内部代理：builder 持有并代理“激活未关闭”的 command_recorder ──
+        void begin_rendering(rendering_info info)
+        {
+            end_rendering();
+            if (scopes.empty() || scopes.back().inter != no_scope)
+                scopes.push_back({});
+            auto &scope = scopes.back();
+            assert(scope.inter == no_scope && !scope.opened);
+
+            scope.inter = static_cast<std::uint32_t>(inters.size());
+            inters.emplace_back();
+            auto &recorder = inters.back();
+            recorder.attach(heap);
+            recorder.clear();
+            recorder.resources = resources;
+            recorder.begin_rendering(std::move(info));
+            scope.opened = true;
+        }
+
+        [[nodiscard]] command_recorder &active_inter()
+        {
+            assert(pending());
+            return inters[scopes.back().inter];
+        }
+
+        template <class... A>
+        void setPipeline(A &&...a)
+        {
+            active_inter().setPipeline(std::forward<A>(a)...);
+        }
+        template <class... A>
+        void setPipelineLayout(A &&...a)
+        {
+            active_inter().setPipelineLayout(std::forward<A>(a)...);
+        }
+        template <class... A>
+        void setDescriptorSet(A &&...a)
+        {
+            active_inter().setDescriptorSet(std::forward<A>(a)...);
+        }
+        template <class... A>
+        void setViewport(A &&...a)
+        {
+            active_inter().setViewport(std::forward<A>(a)...);
+        }
+        template <class... A>
+        void setScissor(A &&...a)
+        {
+            active_inter().setScissor(std::forward<A>(a)...);
+        }
+        template <class... A>
+        void setCameraIndex(A &&...a)
+        {
+            active_inter().setCameraIndex(std::forward<A>(a)...);
+        }
+        template <class... A>
+        void setMesh(A &&...a)
+        {
+            active_inter().setMesh(std::forward<A>(a)...);
+        }
+        template <class... A>
+        void setStencilRef(A &&...a)
+        {
+            active_inter().setStencilRef(std::forward<A>(a)...);
+        }
+        // ext_dynamic_state2/3 代理
+        void setDynamicUI(bool enabled)
+        {
+            active_inter().setDynamicUI(enabled);
+        }
+        void setBlendState(std::array<VkBool32, 2> enable,
+                           std::array<VkColorBlendEquationEXT, 2> equation,
+                           std::array<VkColorComponentFlags, 2> mask)
+        {
+            active_inter().setBlendState(enable, equation, mask);
+        }
+        void setAlphaToCoverage(VkBool32 enabled)
+        {
+            active_inter().setAlphaToCoverage(enabled);
+        }
+        void setStencilTest(VkBool32 enabled)
+        {
+            active_inter().setStencilTest(enabled);
+        }
+        void setStencilOp(VkStencilOpState op)
+        {
+            active_inter().setStencilOp(op);
+        }
+        template <class T>
+        void addInsteance(T data)
+        {
+            active_inter().addInsteance(std::move(data));
+        }
+
+        // 幂等：没有开着的段就什么也不做。
+        void end_rendering()
+        {
+            if (!pending())
+                return;
+            auto &scope = scopes.back();
+            inters[scope.inter].close();
+            scope.closed = true;
+        }
+
+        [[nodiscard]] bool pending() const noexcept
+        {
+            return !scopes.empty() && scopes.back().opened && !scopes.back().closed;
+        }
+
+        // 外部回溯（无回调）：段表 + 某段的 outer 记录
+        [[nodiscard]] std::span<const scope_info> scopes_view() const noexcept
+        {
+            return scopes;
+        }
+        [[nodiscard]] const command_recorder_outer &outer_of(
+            std::uint32_t scope_index) const
+        {
+            assert(scope_index < scopes.size() && scopes[scope_index].outer != no_scope);
+            return outers[scopes[scope_index].outer];
+        }
+
+        // ── 阶段 1：定地址 + 推数据（不录任何 vkCmd*）────────────────────
+        //   1. 统计所有 scope 的 heap / constants / indirect 总量
+        //   2. 每个 scope 分配互不重叠、16 B 对齐的区间
+        //   3. 一次性扩容；此后 realloc 不会再发生
+        //   4. 全部写入 GPU buffer
+        //   5. 产出 scope_binding，阶段 2 只读它
+        static constexpr std::uint32_t kScopeGpuAlign = 16;
+        static constexpr std::uint32_t alignScopeBase(std::uint32_t value) noexcept
+        {
+            return (value + kScopeGpuAlign - 1) / kScopeGpuAlign * kScopeGpuAlign;
+        }
+
+        void resolveStorage(std::size_t frame)
+        {
+            assert(resources != nullptr);
+            auto &sb = (*resources->shaderBuffers)[frame];
+
+            std::uint32_t heap_total = 0;
+            std::uint32_t constants_total = 0;
+            std::uint32_t indirect_total = 0;
+
+            for (auto &scope : scopes)
+            {
+                if (scope.inter == no_scope)
+                    continue;
+                const auto &recorder = inters[scope.inter];
+                auto &b = scope.binding;
+
+                b.heap_base = heap_total;
+                b.heap_bytes = recorder.heap_end - recorder.heap_begin;
+                heap_total = alignScopeBase(heap_total + b.heap_bytes);
+
+                b.constants_base = constants_total;
+                b.constants_bytes = static_cast<std::uint32_t>(
+                    recorder.constants.size() * sizeof(shader_data::CommandConstant));
+                constants_total = alignScopeBase(constants_total + b.constants_bytes);
+
+                b.indirect_base = indirect_total;
+                b.indirect_bytes = static_cast<std::uint32_t>(
+                    recorder.commands.size() * sizeof(VkDrawIndexedIndirectCommand));
+                indirect_total = alignScopeBase(indirect_total + b.indirect_bytes);
+            }
+
+            if (std::getenv("MCS_DUMP_SCOPES") != nullptr)
+            {
+                static bool dumped = false;
+                if (!dumped)
+                {
+                    dumped = true;
+                    std::println("[scope-bind] scopes={} heap={} constants={} "
+                                 "indirect={}",
+                                 scopes.size(), heap_total, constants_total,
+                                 indirect_total);
+                    for (const auto &scope : scopes)
+                        if (scope.inter != no_scope)
+                            std::println("[scope-bind] inter={} heap[{},{}) "
+                                         "const[{},{}) indirect[{},{})",
+                                         scope.inter, scope.binding.heap_base,
+                                         scope.binding.heap_base +
+                                             scope.binding.heap_bytes,
+                                         scope.binding.constants_base,
+                                         scope.binding.constants_base +
+                                             scope.binding.constants_bytes,
+                                         scope.binding.indirect_base,
+                                         scope.binding.indirect_base +
+                                             scope.binding.indirect_bytes);
+                }
+            }
+
+            const auto heap_need = heap_total == 0 ? 1u : heap_total;
+            if (sb.globalHeapBuffer.capacity < heap_need)
+                sb.globalHeapBuffer = shader_data::ShaderBuffers::newHeapBuffer(
+                    *sb.globalHeapBuffer.buffer.device(), std::bit_ceil(heap_need));
+
+            const auto constants_need = constants_total == 0 ? 1u : constants_total;
+            if (sb.commandConstantsBuffer.capacity < constants_need)
+                sb.commandConstantsBuffer = shader_data::ShaderBuffers::newConstantBuffer(
+                    *sb.commandConstantsBuffer.buffer.device(),
+                    std::bit_ceil(constants_need));
+
+            const auto indirect_need = indirect_total == 0 ? 1u : indirect_total;
+            if (sb.indirectDrawBuffer.capacity < indirect_need)
+                sb.indirectDrawBuffer = shader_data::ShaderBuffers::newIndirectBuffer(
+                    *sb.indirectDrawBuffer.buffer.device(), std::bit_ceil(indirect_need));
+
+            assert(sb.globalHeapBuffer.capacity >= heap_total);
+            assert(sb.commandConstantsBuffer.capacity >= constants_total);
+            assert(sb.indirectDrawBuffer.capacity >= indirect_total);
+
+            // 地址从此固定：阶段 2 不再扩容、不再写 heap。
+            for (auto &scope : scopes)
+            {
+                if (scope.inter == no_scope)
+                    continue;
+                auto &recorder = inters[scope.inter];
+                auto &b = scope.binding;
+
+                recorder.writeStorage(sb, b);
+                b.vertex = sb.globalVertexBuffer.address;
+                b.heap = sb.globalHeapBuffer.address + b.heap_base;
+                b.constants = sb.commandConstantsBuffer.address + b.constants_base;
+                b.index_buffer = sb.globalIndexBuffer.buffer.buffer();
+                b.indirect_buffer = sb.indirectDrawBuffer.buffer.buffer();
+                b.indirect_offset = b.indirect_base;
+            }
+        }
+
+        void replay(const CommandBufferView &commandBuffer, std::size_t frame,
+                    std::uint32_t renderVersion)
+        {
+            end_rendering(); // 尾段未闭合时自动闭合
+
+            resolveStorage(frame); // 阶段 1：地址稳定 + 数据就位
+
+            // 阶段 2：只按顺序录 vkCmd*；binding 已经在阶段 1 定死。
+            for (const auto &scope : scopes)
+            {
+                if (scope.outer != no_scope)
+                    outers[scope.outer].flush(commandBuffer);
+                if (scope.inter != no_scope)
+                    inters[scope.inter].record(commandBuffer, scope.binding,
+                                               renderVersion, scope.closed);
+            }
+        }
+
+      private:
+        command_recorder_outer &outer_segment()
+        {
+            end_rendering(); // outer API 自动闭合当前 pass
+
+            if (scopes.empty() || scopes.back().inter != no_scope)
+                scopes.push_back({});
+
+            auto &scope = scopes.back();
+            if (scope.outer == no_scope)
+            {
+                scope.outer = static_cast<std::uint32_t>(outers.size());
+                outers.emplace_back();
+                outers.back().attach(heap);
+            }
+            return outers[scope.outer];
+        }
+    };
+
+}; // namespace command
+//
+// ═══════════════════════════════════════════════════════════════════════
+// 离屏层（offscreen render target）
+//
+//   blur / backdrop blur / group opacity 的真实做法：先把内容画到离屏图像上，
+//   再模糊 / 按组不透明度合成回主通道。这里的离屏图像同时具备两种身份：
+//     · 渲染目标（COLOR_ATTACHMENT）
+//     · 可被 bindless 数组采样的纹理（SAMPLED）
+//   每 frame-in-flight 一套，尺寸固定成图块大小（比全屏省得多）。
+// ═══════════════════════════════════════════════════════════════════════
+struct ui_layer_ctx
+{
+    static constexpr uint32_t kPerFrame = 4; // A=模糊结果 B=糊的临时 C=组 D=背景
+    static constexpr VkExtent2D kExtent{320, 192};
+    struct layer
+    {
+        VkImage image{};
+        VkImageView view{};
+        uint32_t texture{};
+        uint32_t sampler{};
+    };
+    std::array<std::array<layer, kPerFrame>, MAX_FRAMES_IN_FLIGHT> layers{};
+};
+ui_layer_ctx &uiLayers()
+{
+    static ui_layer_ctx ctx;
+    return ctx;
+}
+
+// 建离屏层：用 create_texture 建（能生成视图、能进 bindless 数组），
+// 初始内容是一张全透明图，之后每帧都会被 clear，所以内容无所谓。
+constexpr auto initUiLayers(const LogicalDevice &device, const CommandPool &pool,
+                            const Queue &queue, VkFormat format, uint32_t sampler_index,
+                            auto &textureManager, auto &descriptorSetManager)
+{
+    auto &ctx = uiLayers();
+
+    std::vector<uint8_t> zeros(static_cast<std::size_t>(ui_layer_ctx::kExtent.width) *
+                                   ui_layer_ctx::kExtent.height * 4u,
+                               0u);
+
+    for (uint32_t frame = 0; frame < MAX_FRAMES_IN_FLIGHT; ++frame)
+        for (uint32_t slot = 0; slot < ui_layer_ctx::kPerFrame; ++slot)
+        {
+            uint32_t texture_index = 0;
+            for (auto i : textureManager.view_free_indexes())
+            {
+                texture_index = static_cast<uint32_t>(i);
+                break;
+            }
+
+            mcs::vulkan::memory::create_texture builder{
+                [format](mcs::vulkan::memory::create_texture::image_info imageInfo)
+                    -> mcs::vulkan::memory::create_texture::create_info {
+                    return {.imageType = VK_IMAGE_TYPE_2D,
+                            .format = format,
+                            .extent = {.width = imageInfo.extent.width,
+                                       .height = imageInfo.extent.height,
+                                       .depth = 1},
+                            .mipLevels = 1,
+                            .arrayLayers = 1,
+                            .samples = VK_SAMPLE_COUNT_1_BIT,
+                            .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                     VK_IMAGE_USAGE_SAMPLED_BIT |
+                                     VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+                },
+                mcs::vulkan::memory::gen_memory_allocate_info(
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+                [](VkImageCreateInfo imageCreateInfo, VkImage image)
+                    -> mcs::vulkan::memory::create_texture::view_create_info {
+                    return {.image = image,
+                            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                            .format = imageCreateInfo.format,
+                            .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                                 .baseMipLevel = 0,
+                                                 .levelCount = 1,
+                                                 .baseArrayLayer = 0,
+                                                 .layerCount = 1}};
+                }};
+
+            auto resource = builder.build(
+                device, pool, queue,
+                mcs::vulkan::memory::create_texture::image_info{
+                    .extent = ui_layer_ctx::kExtent,
+                    .pixels = std::span<const uint8_t>{zeros.data(), zeros.size()},
+                    .mipLevels = 1});
+
+            ctx.layers[frame][slot] = ui_layer_ctx::layer{.image = resource.image(),
+                                                          .view = resource.imageView(),
+                                                          .texture = texture_index,
+                                                          .sampler = sampler_index};
+
+            textureManager.use_slot(texture_index, std::move(resource), "ui.layer");
+        }
+
+    descriptorSetManager.update_texture(textureManager.view_used_indexes());
+}
+
+constexpr auto inputInit(float aspect)
+{
+    auto camera = [&]() {
+        using namespace camera; // 你的 camera 命名空间
+        // 视图：从 eye/center/up 构建 ViewMatrixObject
+        glm::vec3 eye(0.0f, 0.0f, 2.0f);
+        glm::vec3 center(0.0f, 0.0f, 0.0f);
+        glm::vec3 up(0.0f, 1.0f, 0.0f);
+        glm::vec3 forward = glm::normalize(center - eye);
+        RightHandedView view;
+        view.setPosition(eye).setOrientation(glm::quatLookAt(forward, up)); // 右手系
+
+        // 投影：注意原 fovy 是弧度，这里要转成度数，因为构造函数接收度数
+        float fovDeg = glm::degrees(glm::radians(45.0f)); // 就是 45.0f
+        VulkanPerspectiveProjection proj(fovDeg, aspect, 0.1f, 10.0f);
+        return GenCamera(RightHandedView::lookAt(glm::vec3(0, 0, 2), glm::vec3(0, 0, 0),
+                                                 glm::vec3(0, 1, 0)),
+                         std::move(proj));
+    }();
+    // 在创建 camera 之后，创建 uiCamera.与i开始是单位矩阵
+    auto uiCamera = []() {
+        using namespace camera;
+        // 视图：相机位于原点，无旋转 → 视图矩阵 = I
+        auto uiView = camera::RightHandedView{
+            glm::vec3(0.0f, 0.0f, 0.0f), // 位置为原点
+            glm::identity<glm::quat>()   // 无旋转
+        };
+        // 投影：正交范围 [-1,1] 且 near=0, far=1 → 投影矩阵 = I //NOTE: -10.0f, 10.0f 避免绕 Y X 被裁剪
+        auto uiProj = camera::VulkanUIOrthographicProjection{-1.0f, 1.0f,   -1.0f,
+                                                             1.0f,  -10.0f, 10.0f};
+        return camera::GenCamera(uiView, uiProj);
+    }();
+    auto input = std::make_unique<glfw_input>();
+    return make_aggregate<"inputDataCtx", "input", "camera", "uiCamera", "clock">(
+        std::move(input), std::move(camera), std::move(uiCamera), FrameClock{});
+}
+template <class InitInput>
+struct genInputCtx
+{
+    using InputRef = decltype(*(std::declval<InitInput &>().input.get()));
+    using CameraRef =
+        std::add_lvalue_reference_t<decltype(std::declval<InitInput &>().camera)>;
+    using UICameraRef =
+        std::add_lvalue_reference_t<decltype(std::declval<InitInput &>().uiCamera)>;
+    using ClockRef =
+        std::add_lvalue_reference_t<decltype(std::declval<InitInput &>().clock)>;
+    InputRef input;
+    CameraRef camera;
+    UICameraRef uiCamera;
+    ClockRef clock;
+
+    explicit constexpr genInputCtx(InitInput &initInput) noexcept
+        : input{*initInput.input.get()}, camera{initInput.camera},
+          uiCamera{initInput.uiCamera}, clock{initInput.clock}
+    {
+    }
+};
+using InputCtx = genInputCtx<decltype(inputInit(0))>;
+namespace ui_new
+{
+    struct ScreenWidget; //NOTE: 指针用途前向声明
+}
+
+//
+
+//diff: [test_dod8] end
+
+//diff: [test_indirectdraw2] start
+// NOLINTBEGIN
+
+using mcs::vulkan::load::raw_stbi_image;
+
+using Sampler = mcs::vulkan::Sampler;
+using create_sampler = mcs::vulkan::tool::create_sampler;
+
+auto generateGradientTexture(const LogicalDevice &device, const CommandPool &pool,
+                             const Queue &queue, int textureType = 0, bool mipmap = true)
+{
+    auto texWidth_ = 256;
+    auto texHeight_ = 256;
+
+    mcs::vulkan::memory::create_texture create_texture{
+        [](mcs::vulkan::memory::create_texture::image_info imageInfo)
+            -> mcs::vulkan::memory::create_texture::create_info {
+            return {.imageType = VK_IMAGE_TYPE_2D,
+                    .format = VK_FORMAT_R8G8B8A8_SRGB,
+                    .extent = {.width = imageInfo.extent.width,
+                               .height = imageInfo.extent.height,
+                               .depth = 1},
+                    .mipLevels = imageInfo.mipLevels,
+                    .arrayLayers = 1,
+                    .samples = VK_SAMPLE_COUNT_1_BIT,
+                    .tiling = VK_IMAGE_TILING_OPTIMAL,
+                    .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+        },
+        mcs::vulkan::memory::gen_memory_allocate_info(
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+        [](VkImageCreateInfo imageCreateInfo,
+           VkImage image) -> mcs::vulkan::memory::create_texture::view_create_info {
+            return {.image = image,
+                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                    .format = imageCreateInfo.format,
+                    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                         .baseMipLevel = 0,
+                                         .levelCount = imageCreateInfo.mipLevels,
+                                         .baseArrayLayer = 0,
+                                         .layerCount = 1}};
+        }};
+
+    auto imageSize = texWidth_ * texHeight_ * STBI_rgb_alpha;
+    auto pixels = std::make_unique_for_overwrite<uint8_t[]>(imageSize);
+    if (textureType == 1)
+    {
+        // 生成红蓝棋盘纹理
+        uint8_t color1[4] = {255, 0, 0, 255}; // 红色
+        uint8_t color2[4] = {0, 0, 255, 255}; // 蓝色
+        generateCheckerboardTexture(pixels.get(), texWidth_, texHeight_, color1, color2);
+    }
+    else if (textureType == 2)
+    {
+        // 生成绿色到黄色渐变纹理
+        uint8_t topColor[4] = {0, 255, 0, 255};      // 绿色
+        uint8_t bottomColor[4] = {255, 255, 0, 255}; // 黄色
+        generateGradientTexture(pixels.get(), texWidth_, texHeight_, topColor,
+                                bottomColor);
+    }
+    return create_texture.build(
+        device, pool, queue,
+        mcs::vulkan::memory::create_texture::image_info{
+            .extent = {.width = static_cast<uint32_t>(texWidth_),
+                       .height = static_cast<uint32_t>(texHeight_)},
+            .pixels =
+                std::span<const uint8_t>{pixels.get(), static_cast<uint64_t>(imageSize)},
+            .mipLevels = mipmap ? mcs::vulkan::memory::create_texture::getMipLevels(
+                                      texWidth_, texHeight_)
+                                : 1});
+}
+// NOLINTEND
+//diff: [test_indirectdraw2] end
+
+// 删除了 UI 命名空间及其所有依赖（Container/Row/Column/Expanded/Text Trait, UIBuilder, FlatLayoutTree 等）
+
+constexpr auto init()
+{
+    //NOTE: make_unique 保证地址稳定
+    auto ctx = std::make_unique<raii_vulkan>();
+    auto window = std::make_unique<Window>();
+    window->setup({.width = WIDTH, .height = HEIGHT}, TITLE); // NOLINT
+
+    auto enables = enable_intance_build{}
+                       .enableDebugExtension()
+                       .enableValidationLayer()
+                       .enableSurfaceExtension<Window>();
+
+    constexpr auto APIVERSION = VK_API_VERSION_1_4;
+    enables.check();
+    enables.print();
+    auto instance = std::make_unique<Instance>(
+        create_instance{}
+            .setCreateInfo(
+                {.applicationInfo = {.pApplicationName = "Hello Triangle",
+                                     .applicationVersion = vkMakeVersion(1, 0, 0),
+                                     .pEngineName = "No Engine",
+                                     .engineVersion = vkMakeVersion(1, 0, 0),
+                                     .apiVersion = APIVERSION},
+                 .enabledLayers = enables.enabledLayers(),
+                 .enabledExtensions = enables.enabledExtensions()})
+            .build());
+    auto debuger = std::make_unique<Debugger>(
+        create_debugger{}
+            .setCreateInfo(create_debugger::defaultCreateInfo())
+            .build(*instance.get()));
+    std::vector<const char *> requiredDeviceExtension = {
+        VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_SPIRV_1_4_EXTENSION_NAME,
+        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
+        VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME}; // NOLINTEND
+    requiredDeviceExtension.emplace_back(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+    requiredDeviceExtension.emplace_back(VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
+    requiredDeviceExtension.emplace_back(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
+    structure_chain<VkPhysicalDeviceFeatures2, VkPhysicalDeviceVulkan13Features,
+                    VkPhysicalDeviceVulkan12Features, VkPhysicalDeviceVulkan11Features,
+                    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT,
+                    VkPhysicalDeviceExtendedDynamicState2FeaturesEXT,
+                    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT>
+        enablefeatureChain = {
+            {.features =
+                 {
+                     /*
+                    当不同附件的混合状态（包括 colorWriteMask）不同时，即使所有附件的 blendEnable 都是 VK_FALSE，也必须启用 independentBlend 特性，否则就是非法。
+                    你的两个附件 colorWriteMask 不同（一个包含 A，一个只有 R|G），因此需要该特性
+                    */
+                     //diff: [test_indirectdraw_no_pick] start
+                     .independentBlend = VK_TRUE, // 新增
+                     //diff: [test_indirectdraw_no_pick] end
+                     // NOTE: test_ui_ability7.frag 用 gl_PrimitiveID，SPIR-V 会声明 Geometry
+                     // capability；必须在 device 上打开 geometryShader。
+                     .geometryShader = VK_TRUE,
+                     //NOTE: gcc 要求。严格的初始化顺序。 multiDrawIndirect 要在前面
+                     .multiDrawIndirect = VK_TRUE, //diff: [test_indirectdraw]
+                     .samplerAnisotropy = VK_TRUE,
+                     .shaderInt64 = VK_TRUE,
+
+                 }},
+            {.shaderDemoteToHelperInvocation = VK_TRUE,
+             .synchronization2 = VK_TRUE,
+             .dynamicRendering = VK_TRUE},
+            {
+                .descriptorIndexing = VK_TRUE,
+                .shaderSampledImageArrayNonUniformIndexing = VK_TRUE,
+                .descriptorBindingSampledImageUpdateAfterBind = VK_TRUE,
+                .descriptorBindingStorageImageUpdateAfterBind = VK_TRUE,
+                .descriptorBindingPartiallyBound = VK_TRUE,
+                .descriptorBindingVariableDescriptorCount = VK_TRUE,
+
+                .runtimeDescriptorArray = VK_TRUE,
+
+                .scalarBlockLayout = VK_TRUE,
+                .bufferDeviceAddress = VK_TRUE,
+
+            },
+            {
+                .shaderDrawParameters = VK_TRUE //diff: [test_indirectdraw]
+            },
+            {.extendedDynamicState = VK_TRUE},
+            {.extendedDynamicState2 = VK_TRUE},
+            {}};
+
+    // ext3 的字段太多，按需在链上就地打开（不用逐个写进聚合初始化）。
+    {
+        auto &ext3 =
+            enablefeatureChain
+                .template get<VkPhysicalDeviceExtendedDynamicState3FeaturesEXT>();
+        ext3.extendedDynamicState3ColorBlendEnable = VK_TRUE;
+        ext3.extendedDynamicState3ColorBlendEquation = VK_TRUE;
+        ext3.extendedDynamicState3ColorWriteMask = VK_TRUE;
+        ext3.extendedDynamicState3AlphaToCoverageEnable = VK_TRUE;
+        ext3.extendedDynamicState3SampleMask = VK_TRUE;
+    }
+
+    auto [id [[maybe_unused]], physical_device [[maybe_unused]]] =
+        create_physical_device_selector{}
+            .requiredDeviceExtension(requiredDeviceExtension)
+            .requiredProperties([](const VkPhysicalDeviceProperties
+                                       &device_properties) constexpr noexcept {
+                return device_properties.apiVersion >= VK_API_VERSION_1_3;
+            })
+            .requiredQueueFamily(
+                [](const VkQueueFamilyProperties &qfp) constexpr noexcept {
+                    return !!(qfp.queueFlags & VK_QUEUE_GRAPHICS_BIT);
+                })
+            .requiredFeatures([](const PhysicalDevice &physicalDevice) constexpr noexcept
+                                  -> bool {
+                auto query = structure_chain<
+                    VkPhysicalDeviceFeatures2, VkPhysicalDeviceVulkan13Features,
+                    VkPhysicalDeviceVulkan12Features, VkPhysicalDeviceVulkan11Features,
+                    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT,
+                    VkPhysicalDeviceExtendedDynamicState2FeaturesEXT,
+                    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT>{{}, {}, {}, {},
+                                                                      {}, {}, {}};
+                physicalDevice.getFeatures2(&query.head());
+                auto &features2 = query.template get<VkPhysicalDeviceFeatures2>();
+                auto &query_vulkan13_features =
+                    query.template get<VkPhysicalDeviceVulkan13Features>();
+                auto &query_vulkan12_features =
+                    query.template get<VkPhysicalDeviceVulkan12Features>();
+                auto &query_vulkan11_features =
+                    query.template get<VkPhysicalDeviceVulkan11Features>();
+                auto &query_extended_dynamic_state_features =
+                    query.template get<VkPhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+                auto &query_ext2 =
+                    query
+                        .template get<VkPhysicalDeviceExtendedDynamicState2FeaturesEXT>();
+                auto &query_ext3 =
+                    query
+                        .template get<VkPhysicalDeviceExtendedDynamicState3FeaturesEXT>();
+                return features2.features.samplerAnisotropy &&
+                       features2.features.shaderInt64 &&
+                       features2.features.geometryShader &&
+                       features2.features.multiDrawIndirect && //diff: [test_indirectdraw]
+                       features2.features
+                           .independentBlend && //diff: [test_indirectdraw_no_pick]
+                       query_vulkan13_features.dynamicRendering &&
+                       query_vulkan13_features.synchronization2 &&
+                       query_vulkan12_features.bufferDeviceAddress &&
+                       query_vulkan12_features.scalarBlockLayout &&
+                       query_vulkan12_features.runtimeDescriptorArray &&
+                       query_vulkan12_features.descriptorBindingPartiallyBound &&
+                       query_vulkan12_features.descriptorBindingVariableDescriptorCount &&
+                       query_vulkan12_features.descriptorIndexing &&
+                       query_vulkan12_features
+                           .shaderSampledImageArrayNonUniformIndexing &&
+                       query_vulkan11_features
+                           .shaderDrawParameters && //diff: [test_indirectdraw]
+                       query_extended_dynamic_state_features.extendedDynamicState &&
+                       query_ext2.extendedDynamicState2 &&
+                       query_ext3.extendedDynamicState3ColorBlendEnable &&
+                       query_ext3.extendedDynamicState3ColorBlendEquation &&
+                       query_ext3.extendedDynamicState3ColorWriteMask &&
+                       query_ext3.extendedDynamicState3AlphaToCoverageEnable &&
+                       query_ext3.extendedDynamicState3SampleMask;
+            })
+            .select(*instance.get())[0];
+    auto physical = std::make_unique<PhysicalDevice>(std::move(physical_device));
+    auto surface = std::make_unique<surface_impl<Window>>(*physical.get(), *window.get());
+    const uint32_t GRAPHICS_QUEUE_FAMILY_IDX =
+        create_queue_family_index_selector{}
+            .requiredQueueFamily([&](const VkQueueFamilyProperties &qfp,
+                                     uint32_t queueFamilyIndex) -> bool {
+                return (qfp.queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+                       physical->getSurfaceSupportKHR(queueFamilyIndex, **surface);
+            })
+            .select(*physical.get())[0];
+    auto device = std::make_unique<LogicalDevice>(
+        create_logical_device{}
+            .setCreateInfo({
+                .pNext = make_pNext(enablefeatureChain),
+                .queueCreateInfos = create_logical_device::makeQueueCreateInfos(
+                    create_logical_device::queue_create_info{
+                        .queueFamilyIndex = GRAPHICS_QUEUE_FAMILY_IDX,
+                        .queueCount = 1,
+                        .queuePrioritie = 1.0}),
+                .enabledExtensions = requiredDeviceExtension,
+            })
+            .build(*physical.get()));
+    auto GRAPHICS_AND_PRESENT = std::make_unique<Queue>(
+        Queue{*device.get(),
+              {.queue_family_index = GRAPHICS_QUEUE_FAMILY_IDX, .queue_index = 0}});
+    auto commandPool = std::make_unique<CommandPool>(
+        create_command_pool{}
+            .setCreateInfo({.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+                            .queueFamilyIndex = GRAPHICS_QUEUE_FAMILY_IDX})
+            .build(*device.get()));
+    auto commandBuffers =
+        std::make_unique<CommandBuffers>(commandPool->allocateCommandBuffers(
+            {.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+             .commandBufferCount = MAX_FRAMES_IN_FLIGHT}));
+
+    auto swapchainBuild =
+        create_swapchain{}
+            .setCreateInfo(
+                {.changeMinImageCount =
+                     [](uint32_t minImageCount) noexcept { return minImageCount + 1; },
+                 .candidateSurfaceFormats = {{.format = VK_FORMAT_B8G8R8A8_SRGB,
+                                              .colorSpace =
+                                                  VK_COLOR_SPACE_SRGB_NONLINEAR_KHR}},
+                 .imageArrayLayers = 1,
+                 .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                 .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                 .queueFamilyIndices = {},
+                 .preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+                 .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+                 .candidatePresentModes = {VK_PRESENT_MODE_MAILBOX_KHR,
+                                           VK_PRESENT_MODE_IMMEDIATE_KHR},
+                 .clipped = VK_TRUE})
+            .setViewCreateInfo(
+                {.viewType = VK_IMAGE_VIEW_TYPE_2D,
+                 .components = {.r = VK_COMPONENT_SWIZZLE_IDENTITY,
+                                .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+                                .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+                                .a = VK_COMPONENT_SWIZZLE_IDENTITY},
+                 .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                      .baseMipLevel = 0,
+                                      .levelCount = 1,
+                                      .baseArrayLayer = 0,
+                                      .layerCount = 1}});
+    auto swapchain = swapchainBuild.build(*device.get(), *surface.get());
+
+    frame_context<MAX_FRAMES_IN_FLIGHT> frameContext{*device.get(),
+                                                     swapchain.imagesSize()};
+    // hardware
+    return make_aggregate<"hardwareCtx", "vulkan", "window", "instance", "debuger",
+                          "physicalDevice", "surface", "device", "queue", "commandPool",
+                          "commandBuffers", "swapchainBuild", "swapchain",
+                          "frameContext">(
+        std::move(ctx), std::move(window), std::move(instance), std::move(debuger),
+        std::move(physical), std::move(surface), std::move(device),
+        std::move(GRAPHICS_AND_PRESENT), std::move(commandPool),
+        std::move(commandBuffers), std::move(swapchainBuild), std::move(swapchain),
+        std::move(frameContext));
+}
+
+using mcs::vulkan::tool::resource_manager;
+
+constexpr static auto font_linear_sampler_key = "font_linear_sampler";
+// UI 纹理用：线性过滤 + clamp + 完整 mip 链（九宫格不能 repeat，否则边缘会串色）
+constexpr static auto ui_clamp_sampler_key = "ui_clamp_linear_sampler";
+constexpr static auto font_nearest_neighbor_sampler_key = "font_nearest_neighbor_sampler";
+constexpr static auto texture_ui_key = "white";
+constexpr auto descriptorInit(auto &hardwareCtx)
+{
+    auto &physical_device = *hardwareCtx.physicalDevice.get();
+    auto &surface = *hardwareCtx.surface.get();
+    auto &device = *hardwareCtx.device.get();
+    auto &GRAPHICS_AND_PRESENT = *hardwareCtx.queue.get();
+    auto &commandPool = *hardwareCtx.commandPool.get();
+
+    constexpr int MAX_TEXTURES = 64; // 预分配最大纹理槽位数（足够大）
+    constexpr int SAMPLER_COUNT = 5; // 4 个原有 + 1 个 UI 用的 clamp 线性采样器
+
+    std::array<VkDescriptorBindingFlags, 4> bindingFlags = {
+        // 绑定0：Uniform Buffer - 通常不需要绑定后更新
+        0,
+        VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+            VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT, //允许不连续占用纹理槽（如 1、3、5、33）
+        0,
+        0, // 对应 binding 3（Storage Buffer）
+    };
+
+    auto descriptorSetLayoutPtr = std::make_unique<DescriptorSetLayout>(
+        create_descriptor_set_layout{}
+            .setCreateInfo(
+                {.pNext = make_pNext(
+                     structure_chain<VkDescriptorSetLayoutBindingFlagsCreateInfo>{
+                         {.bindingCount = static_cast<uint32_t>(bindingFlags.size()),
+                          .pBindingFlags = bindingFlags.data()}}),
+                 .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,
+                 .bindings =
+                     {
+                         VkDescriptorSetLayoutBinding{
+                             .binding = 0,
+                             .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                             .descriptorCount = 1,
+                             .stageFlags = command::recorder_config::push_stages},
+                         VkDescriptorSetLayoutBinding{
+                             .binding = 1,
+                             .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                             .descriptorCount = MAX_TEXTURES,
+                             .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                             .pImmutableSamplers = nullptr,
+                         },
+                         VkDescriptorSetLayoutBinding{
+                             .binding = 2,
+                             .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
+                             .descriptorCount = SAMPLER_COUNT,
+                             .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                             .pImmutableSamplers = nullptr,
+                         }, //diff: [test_indirectdraw] end
+                         VkDescriptorSetLayoutBinding{
+                             .binding = 3,
+                             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                             .descriptorCount = 1,
+                             // 顶点阶段读段数据、片元阶段读端点
+                             .stageFlags = VK_SHADER_STAGE_VERTEX_BIT |
+                                           VK_SHADER_STAGE_FRAGMENT_BIT,
+                         }, //diff: [test_indirectdraw] end
+                     }})
+            .build(device));
+    auto &descriptorSetLayout = *descriptorSetLayoutPtr.get();
+
+    auto descriptorPoolPtr = std::make_unique<DescriptorPool>(
+        create_descriptor_pool{}
+            .setCreateInfo(
+                {.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT |
+                          VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT,
+                 .maxSets = MAX_FRAMES_IN_FLIGHT,
+                 .poolSizes =
+                     {
+                         VkDescriptorPoolSize{.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                              .descriptorCount = MAX_FRAMES_IN_FLIGHT},
+                         VkDescriptorPoolSize{
+                             .type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                             .descriptorCount = MAX_TEXTURES * static_cast<uint32_t>(
+                                                                   MAX_FRAMES_IN_FLIGHT),
+                         },
+                         VkDescriptorPoolSize{
+                             .type = VK_DESCRIPTOR_TYPE_SAMPLER,
+                             .descriptorCount =
+                                 (SAMPLER_COUNT) *
+                                 static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT),
+                         }, //diff: [test_indirectdraw] start
+                         VkDescriptorPoolSize{
+                             .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                             .descriptorCount =
+                                 MAX_FRAMES_IN_FLIGHT}, //diff: [test_indirectdraw] end
+                     }})
+            .build(device));
+    using descriptorSetsType = decltype(descriptorPoolPtr->allocateDescriptorSets(
+        {.descriptorSets = std::vector<VkDescriptorSetLayout>{MAX_FRAMES_IN_FLIGHT,
+                                                              *descriptorSetLayout}}));
+    auto descriptorSetsPtr =
+        std::make_unique<descriptorSetsType>(descriptorPoolPtr->allocateDescriptorSets(
+            {.descriptorSets = std::vector<VkDescriptorSetLayout>{
+                 MAX_FRAMES_IN_FLIGHT, *descriptorSetLayout}}));
+    auto &descriptorSets = *descriptorSetsPtr.get();
+
+    // diff: [test_dod7] start: 不再是 vma 的内存
+    auto uniformBuffersPtr = std::make_unique<
+        std::array<mcs::vulkan::memory::auto_map_buffer, MAX_FRAMES_IN_FLIGHT>>();
+    auto &uniformBuffers = *uniformBuffersPtr.get();
+    {
+        constexpr VkDeviceSize BUFFER_SIZE = sizeof(UniformBufferObject);
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+        {
+            uniformBuffers[i] = mcs::vulkan::memory::auto_map_buffer(
+                mcs::vulkan::memory::create_simple_buffer(
+                    device,
+                    {.size = BUFFER_SIZE,
+                     .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                     .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+                BUFFER_SIZE);
+        }
+    }
+    // diff: [test_dod7] end
+    uint32_t create_texture_mipLevels = 1;
+    mcs::vulkan::memory::create_texture create_texture{
+        [&](mcs::vulkan::memory::create_texture::image_info imageInfo)
+            -> mcs::vulkan::memory::create_texture::create_info {
+            create_texture_mipLevels = imageInfo.mipLevels;
+            return {.imageType = VK_IMAGE_TYPE_2D,
+                    .format = VK_FORMAT_R8G8B8A8_SRGB,
+                    .extent = {.width = imageInfo.extent.width,
+                               .height = imageInfo.extent.height,
+                               .depth = 1},
+                    .mipLevels = imageInfo.mipLevels,
+                    .arrayLayers = 1,
+                    .samples = VK_SAMPLE_COUNT_1_BIT,
+                    .tiling = VK_IMAGE_TILING_OPTIMAL,
+                    .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+        },
+        mcs::vulkan::memory::gen_memory_allocate_info(
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+        [](VkImageCreateInfo imageCreateInfo,
+           VkImage image) -> mcs::vulkan::memory::create_texture::view_create_info {
+            return {.image = image,
+                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                    .format = imageCreateInfo.format,
+                    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                         .baseMipLevel = 0,
+                                         .levelCount = imageCreateInfo.mipLevels,
+                                         .baseArrayLayer = 0,
+                                         .layerCount = 1}};
+        }};
+    auto textureManagerPtr =
+        std::make_unique<resource_manager<mcs::vulkan::memory::resource, MAX_TEXTURES>>();
+    auto &textureManager = *textureManagerPtr.get();
+    {
+
+        std::vector<mcs::vulkan::memory::resource> upload;
+        std::vector<std::string> upload_keys;
+        upload.reserve(4);
+        upload.push_back(create_texture.templateForImage2d(
+            device, commandPool, GRAPHICS_AND_PRESENT,
+            raw_stbi_image{"textures/texture.jpg", STBI_rgb_alpha}, true));
+        upload_keys.emplace_back("texture");
+        uint32_t white = 0xFFFFFFFF;
+        upload.push_back(
+            create_texture.build(device, commandPool, GRAPHICS_AND_PRESENT,
+                                 mcs::vulkan::memory::create_texture::image_info{
+                                     .extent = {.width = 1, .height = 1},
+                                     .pixels = std::span<const uint8_t>(
+                                         reinterpret_cast<const uint8_t *>(&white), 4),
+                                     .mipLevels = 1})); //创建纯白纹理
+        upload_keys.emplace_back("white");
+
+        upload.push_back(generateGradientTexture(device, commandPool,
+                                                 GRAPHICS_AND_PRESENT, 2)); // 渐变
+        upload_keys.emplace_back("gradient");
+        upload.push_back(generateGradientTexture(device, commandPool,
+                                                 GRAPHICS_AND_PRESENT, 1)); // 棋盘
+        upload_keys.emplace_back("chessboard");
+
+        for (auto [resource, index, key] :
+             std::views::zip(upload, textureManager.view_free_indexes(), upload_keys))
+        {
+            textureManager.use_slot(index, std::move(resource), std::move(key));
+        }
+    }
+    auto samplerManagerPtr = std::make_unique<resource_manager<Sampler, SAMPLER_COUNT>>();
+    auto &samplerManager = *samplerManagerPtr.get();
+    {
+        std::vector<Sampler> samplers;
+        std::vector<std::string> upload_keys;
+
+        samplers.reserve(SAMPLER_COUNT);
+        samplers.emplace_back(
+            create_sampler{}
+                .setCreateInfo(create_sampler::templateLinear())
+                .enableAnisotropy(
+                    device.physicalDevice()->getProperties().limits.maxSamplerAnisotropy)
+                .updateMaxLodByMipmap(create_texture_mipLevels)
+                .build(device)); // 线性采样器
+        upload_keys.emplace_back("linear_sampler");
+        samplers.emplace_back(create_sampler{}
+                                  .setCreateInfo(create_sampler::templateNearest())
+                                  .build(device)); // 最近邻采样器
+        upload_keys.emplace_back("nearest_neighbor_sampler");
+
+        // 采样器类型2：线性过滤，重复寻址，各向异性
+        samplers.emplace_back(
+            create_sampler{}
+                .setCreateInfo(
+                    {.pNext = {},
+                     .flags = {},
+                     .magFilter = VK_FILTER_LINEAR,
+                     .minFilter = VK_FILTER_LINEAR,
+                     .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+                     .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                     .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                     .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                     .mipLodBias = 0,
+                     .anisotropyEnable = VK_TRUE, // NOTE: 各向异性器件特性启用
+                     .maxAnisotropy =
+                         physical_device.getProperties().limits.maxSamplerAnisotropy,
+                     .compareEnable = VK_FALSE,
+                     .compareOp = VK_COMPARE_OP_ALWAYS,
+                     .minLod = 0,
+                     .maxLod =
+                         VK_LOD_CLAMP_NONE, // NOTE: vulkan 内置最大值，就能适配一切mip
+                     .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+                     .unnormalizedCoordinates = VK_FALSE})
+                .build(device));
+        upload_keys.emplace_back(font_linear_sampler_key);
+
+        // 采样器类型1：最近邻过滤，钳位到边缘
+        samplers.emplace_back(
+            create_sampler{}
+                .setCreateInfo({.pNext = {},
+                                .flags = {},
+                                .magFilter = VK_FILTER_NEAREST,
+                                .minFilter = VK_FILTER_NEAREST,
+                                .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+                                .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                .mipLodBias = 0,
+                                .anisotropyEnable = VK_FALSE, // NOTE: 无各向异性器
+                                .maxAnisotropy = 1,
+                                .compareEnable = VK_FALSE,
+                                .compareOp = VK_COMPARE_OP_ALWAYS,
+                                .minLod = 0,
+                                .maxLod = VK_LOD_CLAMP_NONE,
+                                .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+                                .unnormalizedCoordinates = VK_FALSE})
+                .build(device));
+        upload_keys.emplace_back(font_nearest_neighbor_sampler_key);
+
+        // UI 专用：线性 + CLAMP_TO_EDGE + mipmap 线性（九宫格 / alpha mask / mipmap）
+        samplers.emplace_back(
+            create_sampler{}
+                .setCreateInfo({.pNext = {},
+                                .flags = {},
+                                .magFilter = VK_FILTER_LINEAR,
+                                .minFilter = VK_FILTER_LINEAR,
+                                .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+                                .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                .mipLodBias = 0,
+                                .anisotropyEnable = VK_FALSE,
+                                .maxAnisotropy = 1.0F,
+                                .compareEnable = VK_FALSE,
+                                .compareOp = VK_COMPARE_OP_ALWAYS,
+                                .minLod = 0,
+                                .maxLod = VK_LOD_CLAMP_NONE,
+                                .borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK,
+                                .unnormalizedCoordinates = VK_FALSE})
+                .build(device));
+        upload_keys.emplace_back(ui_clamp_sampler_key);
+
+        for (auto [resource, index, key] :
+             std::views::zip(samplers, samplerManager.view_free_indexes(), upload_keys))
+        {
+            samplerManager.use_slot(index, std::move(resource), std::move(key));
+        }
+    }
+    auto descriptorSetManager = make_aggregate<"descriptorSetManager",
+                                               "update_uniform_buffer", "update_texture",
+                                               "update_sampler">(
+        [&device, &uniformBuffers, &descriptorSets]() {
+            constexpr auto dstBinding = 0;
+            for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+            {
+                VkDescriptorBufferInfo uniformInfo{.buffer = uniformBuffers[i].buffer(),
+                                                   .offset = 0,
+                                                   .range = sizeof(UniformBufferObject)};
+                VkWriteDescriptorSet writes{
+                    .sType = sType<VkWriteDescriptorSet>(),
+                    .dstSet = descriptorSets[i],
+                    .dstBinding = dstBinding,
+                    .dstArrayElement = 0,
+                    .descriptorCount = 1,
+                    .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                    .pBufferInfo = &uniformInfo,
+                };
+                device.updateDescriptorSets(1, &writes, 0, nullptr);
+            }
+        },
+        [&device, &textureManager, &descriptorSets](auto used_indexes) {
+            constexpr auto dstBinding = 1;
+            std::vector<VkDescriptorImageInfo> imageInfos(MAX_TEXTURES);
+            for (auto index : used_indexes)
+            {
+                auto &image = textureManager.resources[index];
+                imageInfos[index] = VkDescriptorImageInfo{
+                    .sampler = nullptr,
+                    .imageView = image.imageView(),
+                    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            }
+            for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+            {
+                std::vector<VkWriteDescriptorSet> writes;
+                for (uint32_t slot : used_indexes)
+                {
+                    writes.push_back({
+                        .sType = sType<VkWriteDescriptorSet>(),
+                        .dstSet = descriptorSets[i],
+                        .dstBinding = dstBinding,
+                        .dstArrayElement = slot,
+                        .descriptorCount = 1,
+                        .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                        .pImageInfo =
+                            &imageInfos[slot], // 安全：imageInfos 生命周期远长于此处
+                    });
+                }
+                device.updateDescriptorSets(static_cast<uint32_t>(writes.size()),
+                                            writes.data(), 0, nullptr);
+            }
+        },
+        [&device, &samplerManager, &descriptorSets](auto used_indexes) {
+            constexpr auto dstBinding = 2;
+            std::vector<VkDescriptorImageInfo> samplerInfos(SAMPLER_COUNT);
+            for (auto index : used_indexes)
+            {
+                auto &sampler = samplerManager.resources[index];
+                samplerInfos[index] =
+                    VkDescriptorImageInfo{.sampler = sampler.data(),
+                                          .imageView = nullptr,
+                                          .imageLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+            }
+            for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++)
+            {
+                std::vector<VkWriteDescriptorSet> writes;
+                for (uint32_t slot : used_indexes)
+                {
+                    writes.push_back({
+                        .sType = sType<VkWriteDescriptorSet>(),
+                        .dstSet = descriptorSets[i],
+                        .dstBinding = dstBinding,
+                        .dstArrayElement = static_cast<uint32_t>(slot),
+                        // NOTE: 上面是 shader的信息。下面是传输的信息
+                        .descriptorCount = 1,
+                        .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
+                        .pImageInfo =
+                            &samplerInfos[slot], // 安全：imageInfos 生命周期远长于此处
+                    });
+                }
+                device.updateDescriptorSets(static_cast<uint32_t>(writes.size()),
+                                            writes.data(), 0, nullptr);
+            }
+        });
+
+    return make_aggregate<"descriptorCtx", "descriptorSetLayout", "descriptorPool",
+                          "descriptorSets", "uniformBuffers", "textureManager",
+                          "samplerManager", "descriptorSetManager">(
+        std::move(descriptorSetLayoutPtr), std::move(descriptorPoolPtr),
+        std::move(descriptorSetsPtr), std::move(uniformBuffersPtr),
+        std::move(textureManagerPtr), std::move(samplerManagerPtr),
+        std::move(descriptorSetManager));
+}
+constexpr auto initFont(auto &hardwareCtx, auto &descriptorCtx)
+{
+    auto &device = *hardwareCtx.device.get();
+    auto &GRAPHICS_AND_PRESENT = *hardwareCtx.queue.get();
+    auto &commandPool = *hardwareCtx.commandPool.get();
+
+    auto &textureManager = *descriptorCtx.textureManager.get();
+    auto &samplerManager = *descriptorCtx.samplerManager.get();
+
+    //diff: [test_dod12] start: 加载字符纹理
+    auto pre = std::string{MSDF_OUTPUT_DIR};
+    const std::string TEXTURE_PATH_0 = pre + "/english_atlas.png";
+    const std::string JSON_PATH_0 = pre + "/english_atlas.json";
+    const std::string FONT_PATH_0 = pre + "/english_atlas.ttf";
+
+    const std::string TEXTURE_PATH_1 = pre + "/msyh_chinese.png";
+    const std::string JSON_PATH_1 = pre + "/msyh_chinese.json";
+    const std::string FONT_PATH_1 = pre + "/msyh_chinese.ttc";
+
+    const std::string TEXTURE_PATH_2 = pre + "/emoji.png";
+    const std::string JSON_PATH_2 = pre + "/emoji.json";
+    const std::string FONT_PATH_2 = pre + "/emoji.ttf";
+
+    const std::string TEXTURE_PATH_3 = pre + "/arial_all.png";
+    const std::string JSON_PATH_3 = pre + "/arial_all.json";
+    const std::string FONT_PATH_3 = pre + "/arial_all.ttf";
+
+    const std::string TEXTURE_PATH_4 = pre + "/missing_char.png";
+    const std::string JSON_PATH_4 = pre + "/missing_char.json";
+    const std::string FONT_PATH_4 = pre + "/missing_char.ttf";
+
+    // 添加字体
+    auto loaderPtr = std::make_unique<font::freetype_loader>();
+    auto &loader = *loaderPtr.get();
+    auto factory = font::make_font_factory(
+        [&device, &commandPool, &GRAPHICS_AND_PRESENT, &textureManager,
+         &samplerManager](font::FontInfo &info) {
+            mcs::vulkan::memory::create_texture create_font_texture{
+                [](mcs::vulkan::memory::create_texture::image_info imageInfo)
+                    -> mcs::vulkan::memory::create_texture::create_info {
+                    return {
+                        .imageType = VK_IMAGE_TYPE_2D,
+                        .format =
+                            VK_FORMAT_R8G8B8A8_UNORM, //diff: [test_dod14] msdf是距离场。这个格式更好
+                        .extent = {.width = imageInfo.extent.width,
+                                   .height = imageInfo.extent.height,
+                                   .depth = 1},
+                        .mipLevels = imageInfo.mipLevels,
+                        .arrayLayers = 1,
+                        .samples = VK_SAMPLE_COUNT_1_BIT,
+                        .tiling = VK_IMAGE_TILING_OPTIMAL,
+                        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                 VK_IMAGE_USAGE_SAMPLED_BIT,
+                        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+                },
+                mcs::vulkan::memory::gen_memory_allocate_info(
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+                [](VkImageCreateInfo imageCreateInfo, VkImage image)
+                    -> mcs::vulkan::memory::create_texture::view_create_info {
+                    return {.image = image,
+                            .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                            .format = imageCreateInfo.format,
+                            .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                                 .baseMipLevel = 0,
+                                                 .levelCount = imageCreateInfo.mipLevels,
+                                                 .baseArrayLayer = 0,
+                                                 .layerCount = 1}};
+                }};
+
+            using stbi_image_type = mcs::vulkan::font::texture_info::stbi_image_type;
+            using texture_bind_sampler = mcs::vulkan::font::texture_bind_sampler;
+            const auto &registration = info.registration;
+            if (std::holds_alternative<stbi_image_type>(
+                    registration.texture_info.image_variant))
+            {
+                auto sampler_index = samplerManager.find_slot_by_name(
+                    info.registration.type == font::FontType::eMSDF
+                        ? font_linear_sampler_key
+                        : font_nearest_neighbor_sampler_key);
+                if (not sampler_index)
+                    throw std::logic_error{"couldn't find a suitable sampler_index"};
+
+                using image_type = stbi_image_type::type;
+                const auto &imageInfo =
+                    std::get<stbi_image_type>(registration.texture_info.image_variant);
+                auto image =
+                    image_type{imageInfo.image_path.data(), imageInfo.image_format};
+                auto texWidth = image.width();
+                auto texHeight = image.height();
+                auto imageSize = image.size();
+
+                for (auto texture_index :
+                     textureManager.view_free_indexes() | std::views::take(1))
+                {
+                    // NOTE: update: bind
+                    info.registration.texture_info.bind = texture_bind_sampler{
+                        .texture_index = static_cast<uint32_t>(texture_index),
+                        .sampler_index = static_cast<uint32_t>(*sampler_index)};
+
+                    textureManager.use_slot(
+                        texture_index,
+                        create_font_texture.build(
+                            device, commandPool, GRAPHICS_AND_PRESENT,
+                            mcs::vulkan::memory::create_texture::image_info{
+                                .extent = {.width = static_cast<uint32_t>(texWidth),
+                                           .height = static_cast<uint32_t>(texHeight)},
+                                .pixels =
+                                    std::span<const uint8_t>{
+                                        image.data(), static_cast<uint64_t>(imageSize)},
+                                .mipLevels = 1}),
+                        imageInfo.image_path);
+                    using ManagerType = std::remove_cvref_t<decltype(textureManager)>;
+                    using auto_free_slot_type = typename ManagerType::auto_free_slot_type;
+                    return auto_free_slot_type{textureManager, texture_index};
+                }
+                throw std::logic_error{"couldn't find a suitable texture_index"};
+            }
+            throw std::logic_error{"check image_variant"};
+        },
+        *loader);
+
+    using factoryType = decltype(factory);
+    auto font_factoryPtr = std::make_unique<factoryType>(std::move(factory));
+    auto &fontFactory = *font_factoryPtr.get();
+    auto fontSelect = font::GenFontSelector{&fontFactory, "zh-CN"}.load(
+        font::font_register::makeFontInfos(
+            loader, //
+            {
+                font::font_registration{
+                    .font_path = FONT_PATH_0,
+                    .json_path = JSON_PATH_0,
+                    .type = font::FontType::eMSDF,
+                    .texture_info = {.bind = {}, //NOTE: lazy_bind
+                                     .image_variant =
+                                         font::texture_info::stbi_image_type{
+                                             .image_format = STBI_rgb_alpha,
+                                             .image_path = TEXTURE_PATH_0}}},
+                font::font_registration{
+                    .font_path = FONT_PATH_1,
+                    .json_path = JSON_PATH_1,
+                    .type = font::FontType::eMSDF,
+                    .texture_info = {.bind = {},
+                                     .image_variant =
+                                         font::texture_info::stbi_image_type{
+                                             .image_format = STBI_rgb_alpha,
+                                             .image_path = TEXTURE_PATH_1}}},
+                font::font_registration{
+                    .font_path = FONT_PATH_2,
+                    .json_path = JSON_PATH_2,
+                    .type = font::FontType::eBITMAP,
+                    .texture_info = {.bind = {},
+                                     .image_variant =
+                                         font::texture_info::stbi_image_type{
+                                             .image_format = STBI_rgb_alpha,
+                                             .image_path = TEXTURE_PATH_2}}},
+                font::font_registration{
+                    .font_path = FONT_PATH_3,
+                    .json_path = JSON_PATH_3,
+                    .type = font::FontType::eMSDF,
+                    .texture_info = {.bind = {},
+                                     .image_variant =
+                                         font::texture_info::stbi_image_type{
+                                             .image_format = STBI_rgb_alpha,
+                                             .image_path = TEXTURE_PATH_3}}},
+                font::font_registration{
+                    .font_path = FONT_PATH_4,
+                    .json_path = JSON_PATH_4,
+                    .type = font::FontType::eMSDF,
+                    .texture_info = {.bind = {},
+                                     .image_variant =
+                                         font::texture_info::stbi_image_type{
+                                             .image_format = STBI_rgb_alpha,
+                                             .image_path = TEXTURE_PATH_4}}},
+            }));
+    fontSelect.initNotdefFont();
+    assert(fontSelect.notdefFont() != nullptr);
+
+    return make_aggregate<"fontCtx", "loader", "fontFactory", "fontSelect">(
+        std::move(loaderPtr), std::move(font_factoryPtr), std::move(fontSelect));
+}
+using HardwareCtx = decltype(init());
+using DescriptorCtx = decltype(descriptorInit(std::declval<HardwareCtx &>()));
+using FontCtx =
+    decltype(initFont(std::declval<HardwareCtx &>(), std::declval<DescriptorCtx &>()));
+using FontSelect = std::remove_cvref_t<decltype(std::declval<FontCtx>().fontSelect)>;
+
+// ═══════════════════════════════════════════════════════════════════════
+// 真实纹理：九宫格 / alpha mask / mipmap
+//
+//   和前两轮的“程序化近似”不同，这里真的建了纹理：
+//     · 真的像素数据（3x3 九宫格图、径向 alpha 遮罩、高频棋盘）
+//     · 真的 mip 链（create_texture 会用 vkCmdBlitImage 逐级生成）
+//     · 真的注册进 bindless 数组 + 更新描述符
+//   着色器只负责 UV 分区 / 采样 / textureLod。
+// ═══════════════════════════════════════════════════════════════════════
+// 特殊管线池：混合模式与模板裁剪都要真的换 VkPipeline
+//   0=UI(over) 1=add 2=multiply 3=erase 4=maskA 5=maskB 6=clipped
+struct ui_pipeline_ctx
+{
+    // 存 Pipeline（RAII 对象）而不是裸 VkPipeline：临时对象析构会销毁管线
+    std::array<std::optional<mcs::vulkan::Pipeline>, 12> pipes{};
+    // 必须在 device 销毁前显式清理：函数内 static 的析构晚于 device，
+    // 否则退出时会报 N 条 "VkPipeline ... has not been destroyed"
+    void reset() noexcept
+    {
+        for (auto &p : pipes)
+            p.reset();
+    }
+};
+// ═══════════════════════════════════════════════════════════════════════
+// 文本 Unicode：一行 = HarfBuzz shape 出来的字形序列（视觉顺序）
+//   drawFrame 是无捕获 lambda，数据只能走文件作用域静态
+// ═══════════════════════════════════════════════════════════════════════
+struct text_glyph
+{
+    glm::vec4 uv;    // uv_bounds
+    glm::vec4 plane; // plane_bounds（1em 归一化）
+    float advance{0.0F};
+    uint32_t tex{0};
+    uint32_t samp{0};
+    uint32_t shaderFont{4}; // FONT_*：2=SDF 3=PSDF 4=MSDF 5=MTSDF 6=BITMAP
+    float pxRange{0.0F};
+    bool yDown{false}; // atlas yOrigin == "top"
+};
+struct text_line
+{
+    std::vector<text_glyph> glyphs;
+};
+inline std::unordered_map<char32_t, text_glyph> &uiAsciiGlyphs() noexcept
+{
+    static std::unordered_map<char32_t, text_glyph> glyphs;
+    return glyphs;
+}
+
+inline std::array<text_line, 4> &uiUnicodeLines() noexcept
+{
+    static std::array<text_line, 4> lines;
+    return lines;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// path 输入接口：PathId + 注册表
+//   消费者（even-odd 填充 / path 描边）只拿 PathId，不再内联构造轮廓；
+//   注册表每帧 reset()，PathId 在同一帧内稳定。
+// ═══════════════════════════════════════════════════════════════════════
+namespace ui_path
+{
+    struct contour
+    {
+        std::vector<glm::vec2> pts; // 已展平（像素坐标）
+        bool closed{true};
+    };
+    using path = std::vector<contour>;
+
+    struct registry
+    {
+        std::vector<path> paths;
+        uint32_t generation{0}; // 每次 reset 自增：PathId 只在同一代内有效
+        void reset() noexcept
+        {
+            paths.clear();
+            ++generation;
+        }
+        uint32_t add(path p)
+        {
+            paths.push_back(std::move(p));
+            return static_cast<uint32_t>(paths.size() - 1);
+        }
+        [[nodiscard]] bool valid(uint32_t id) const noexcept
+        {
+            return id < paths.size(); // bounds check：坏命令不能越界
+        }
+        [[nodiscard]] const path &get(uint32_t id) const
+        {
+            static const path empty; // 越界兜底，返回空 path 而不是 UB
+            return valid(id) ? paths[id] : empty;
+        }
+        [[nodiscard]] static constexpr uint32_t invalid() noexcept
+        {
+            return 0xFFFFFFFFu;
+        }
+    };
+    inline registry &get() noexcept
+    {
+        static registry r;
+        return r;
+    }
+} // namespace ui_path
+
+// 几何路径用的顶点缓冲（CPU 侧 tessellation 结果）
+ui_pipeline_ctx &uiPipelines()
+{
+    static ui_pipeline_ctx ctx;
+    return ctx;
+}
+
+struct ui_texture_ctx
+{
+    uint32_t nineSlice{};
+    uint32_t alphaMask{};
+    uint32_t checker{};
+    uint32_t photo{~0u}; // descriptorInit 里已加载的 "texture" 槽（槽 0 合法）
+    uint32_t white{~0u}; // descriptorInit 里已加载的 1x1 白纹理
+    uint32_t sampler{};
+    VkExtent2D nineSliceExtent{};
+    VkExtent2D alphaMaskExtent{};
+};
+ui_texture_ctx &uiTextures()
+{
+    static ui_texture_ctx ctx;
+    return ctx;
+}
+
+// 3D 演示用的 mesh range（draw lambda 不能捕获局部变量，和 uiTextures 同款访问器）
+struct ui_mesh_ctx
+{
+    mesh_data cube{};
+    mesh_data sphere{};
+};
+ui_mesh_ctx &uiMeshes()
+{
+    static ui_mesh_ctx ctx;
+    return ctx;
+}
+
+constexpr auto initUiTextures(const LogicalDevice &device, const CommandPool &pool,
+                              const Queue &queue, uint32_t sampler_index,
+                              auto &textureManager, auto &descriptorSetManager)
+{
+    auto &ctx = uiTextures();
+    ctx.sampler = sampler_index;
+
+    // 通用的“像素 → 纹理”构造：RGBA8、可采样、可生成 mip
+    auto create_ui_texture = [&](VkExtent2D extent, uint32_t mipLevels,
+                                 const std::vector<uint8_t> &pixels) -> uint32_t {
+        mcs::vulkan::memory::create_texture builder{
+            [](mcs::vulkan::memory::create_texture::image_info imageInfo)
+                -> mcs::vulkan::memory::create_texture::create_info {
+                return {.imageType = VK_IMAGE_TYPE_2D,
+                        .format = VK_FORMAT_R8G8B8A8_UNORM,
+                        .extent = {.width = imageInfo.extent.width,
+                                   .height = imageInfo.extent.height,
+                                   .depth = 1},
+                        .mipLevels = imageInfo.mipLevels,
+                        .arrayLayers = 1,
+                        .samples = VK_SAMPLE_COUNT_1_BIT,
+                        .tiling = VK_IMAGE_TILING_OPTIMAL,
+                        .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                 VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                 VK_IMAGE_USAGE_SAMPLED_BIT,
+                        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+            },
+            mcs::vulkan::memory::gen_memory_allocate_info(
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+            [](VkImageCreateInfo imageCreateInfo,
+               VkImage image) -> mcs::vulkan::memory::create_texture::view_create_info {
+                return {.image = image,
+                        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                        .format = imageCreateInfo.format,
+                        .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                             .baseMipLevel = 0,
+                                             .levelCount = imageCreateInfo.mipLevels,
+                                             .baseArrayLayer = 0,
+                                             .layerCount = 1}};
+            }};
+
+        auto resource = builder.build(
+            device, pool, queue,
+            mcs::vulkan::memory::create_texture::image_info{
+                .extent = extent,
+                .pixels = std::span<const uint8_t>{pixels.data(), pixels.size()},
+                .mipLevels = mipLevels});
+
+        uint32_t texture_index = 0;
+        for (auto i : textureManager.view_free_indexes())
+        {
+            texture_index = static_cast<uint32_t>(i);
+            break;
+        }
+        textureManager.use_slot(texture_index, std::move(resource), "ui.texture");
+        return texture_index;
+    };
+
+    // ── 1. 九宫格源图：96x96，3x3 分区 + 6px 边框 + 1px 分区线 ──────────
+    {
+        constexpr uint32_t S = 96;
+        constexpr uint32_t CELL = S / 3;
+        constexpr uint32_t BORDER = 6;
+        static const uint8_t palette[9][3] = {
+            {230, 60, 60},  {60, 200, 80},   {60, 110, 230},
+            {230, 200, 60}, {240, 240, 240}, {60, 210, 210},
+            {200, 80, 210}, {240, 140, 60},  {140, 140, 140}};
+        std::vector<uint8_t> px(static_cast<std::size_t>(S) * S * 4u);
+        for (uint32_t y = 0; y < S; ++y)
+            for (uint32_t x = 0; x < S; ++x)
+            {
+                const uint32_t cell = (y / CELL) * 3u + (x / CELL);
+                uint8_t r = palette[cell][0];
+                uint8_t g = palette[cell][1];
+                uint8_t b = palette[cell][2];
+                // 外框 + 分区线：这两类像素在拉伸时必须保持原宽度
+                const bool frame =
+                    x < BORDER || y < BORDER || x + BORDER >= S || y + BORDER >= S;
+                const bool line = (x % CELL) < 1u || (y % CELL) < 1u;
+                if (frame)
+                {
+                    r = static_cast<uint8_t>(r / 3);
+                    g = static_cast<uint8_t>(g / 3);
+                    b = static_cast<uint8_t>(b / 3);
+                }
+                else if (line)
+                {
+                    r = static_cast<uint8_t>(r / 2 + 60);
+                    g = static_cast<uint8_t>(g / 2 + 60);
+                    b = static_cast<uint8_t>(b / 2 + 60);
+                }
+                const std::size_t o = (static_cast<std::size_t>(y) * S + x) * 4u;
+                px[o + 0] = r;
+                px[o + 1] = g;
+                px[o + 2] = b;
+                px[o + 3] = 255;
+            }
+        ctx.nineSliceExtent = {S, S};
+        ctx.nineSlice = create_ui_texture({S, S}, 1, px);
+    }
+
+    // ── 2. alpha 遮罩：128x128，径向渐变 + 一圈环 ──────────────────────
+    {
+        constexpr uint32_t S = 128;
+        std::vector<uint8_t> px(static_cast<std::size_t>(S) * S * 4u);
+        for (uint32_t y = 0; y < S; ++y)
+            for (uint32_t x = 0; x < S; ++x)
+            {
+                const float fx = (static_cast<float>(x) + 0.5F) / S * 2.0F - 1.0F;
+                const float fy = (static_cast<float>(y) + 0.5F) / S * 2.0F - 1.0F;
+                const float r = std::sqrt(fx * fx + fy * fy);
+                const float disc = glm::clamp((0.85F - r) / 0.12F, 0.0F, 1.0F);
+                const float ring =
+                    glm::clamp(1.0F - std::abs(r - 0.62F) / 0.05F, 0.0F, 1.0F);
+                const float a = std::max(disc, ring * 0.9F);
+                const std::size_t o = (static_cast<std::size_t>(y) * S + x) * 4u;
+                px[o + 0] = 255;
+                px[o + 1] = 255;
+                px[o + 2] = 255;
+                px[o + 3] = static_cast<uint8_t>(a * 255.0F);
+            }
+        ctx.alphaMaskExtent = {S, S};
+        ctx.alphaMask = create_ui_texture({S, S}, 1, px);
+    }
+
+    // ── 3. 棋盘：256x256、8px 格，带完整 mip 链（8 级）─────────────────
+    {
+        constexpr uint32_t S = 256;
+        constexpr uint32_t CELL = 8;
+        constexpr uint32_t MIPS = 8; // 256 -> 1
+        std::vector<uint8_t> px(static_cast<std::size_t>(S) * S * 4u);
+        for (uint32_t y = 0; y < S; ++y)
+            for (uint32_t x = 0; x < S; ++x)
+            {
+                const bool on = ((x / CELL) + (y / CELL)) % 2u == 0u;
+                const uint8_t v = on ? 235 : 40;
+                const std::size_t o = (static_cast<std::size_t>(y) * S + x) * 4u;
+                px[o + 0] = v;
+                px[o + 1] = v;
+                px[o + 2] = v;
+                px[o + 3] = 255;
+            }
+        ctx.checker = create_ui_texture({S, S}, MIPS, px);
+    }
+
+    // ── 4. 复用 descriptorInit 已加载的 "texture"（textures/texture.jpg，带 mip）
+    if (auto slot = textureManager.find_slot_by_name("texture"))
+        ctx.photo = *slot;
+    if (auto slot = textureManager.find_slot_by_name("white"))
+        ctx.white = *slot;
+
+    descriptorSetManager.update_texture(textureManager.view_used_indexes());
+}
+
+struct mesh_manager
+{
+    std::vector<Vertex> allVertices;
+    std::vector<uint32_t> allIndices;
+    std::unordered_map<std::string, mesh_data> meshMap;
+
+    constexpr void addMesh(const std::string &name, const std::span<const Vertex> &verts,
+                           const std::span<const uint32_t> &indices)
+    {
+        assert(not name.empty());
+        assert(not verts.empty());
+        assert(not indices.empty());
+        assert(not meshMap.contains(name));
+        uint32_t vOff = static_cast<uint32_t>(allVertices.size());
+        uint32_t iOff = static_cast<uint32_t>(allIndices.size());
+        allVertices.insert(allVertices.end(), verts.begin(), verts.end());
+        allIndices.insert(allIndices.end(), indices.begin(), indices.end());
+        meshMap[name] = {static_cast<uint32_t>(verts.size()), vOff, iOff,
+                         static_cast<uint32_t>(indices.size())};
+    }
+};
+
+// NOTE: 考虑放到一个命名空间或等区域统一处理
+constexpr std::array<Vertex, 4> quadVerts = {
+    Vertex{{-0.5f, -0.5f, 0.0f}, {0.0f, 0.0f}}, // 左上
+    Vertex{{0.5f, -0.5f, 0.0f}, {1.0f, 0.0f}},  // 右上
+    Vertex{{0.5f, 0.5f, 0.0f}, {1.0f, 1.0f}},   // 右下
+    Vertex{{-0.5f, 0.5f, 0.0f}, {0.0f, 1.0f}}   // 左下
+};
+constexpr auto quadIdx =
+    std::array<uint32_t, command::recorder_config::index_count>{0, 1, 2, 0, 2, 3};
+constexpr auto initMeshManager()
+{
+    mesh_manager m;
+    m.addMesh("quad", std::span{quadVerts}, std::span{quadIdx});
+
+    // 单位立方体：6 面 × 4 顶点，pos + uv；验证“任意 mesh + 相机槽”的最小几何
+    std::array<Vertex, 24> cubeVerts = {
+        // +Z
+        Vertex{{-0.5F, -0.5F, 0.5F}, {0.0F, 1.0F}},
+        Vertex{{0.5F, -0.5F, 0.5F}, {1.0F, 1.0F}},
+        Vertex{{0.5F, 0.5F, 0.5F}, {1.0F, 0.0F}},
+        Vertex{{-0.5F, 0.5F, 0.5F}, {0.0F, 0.0F}},
+        // -Z
+        Vertex{{0.5F, -0.5F, -0.5F}, {0.0F, 1.0F}},
+        Vertex{{-0.5F, -0.5F, -0.5F}, {1.0F, 1.0F}},
+        Vertex{{-0.5F, 0.5F, -0.5F}, {1.0F, 0.0F}},
+        Vertex{{0.5F, 0.5F, -0.5F}, {0.0F, 0.0F}},
+        // +X
+        Vertex{{0.5F, -0.5F, 0.5F}, {0.0F, 1.0F}},
+        Vertex{{0.5F, -0.5F, -0.5F}, {1.0F, 1.0F}},
+        Vertex{{0.5F, 0.5F, -0.5F}, {1.0F, 0.0F}},
+        Vertex{{0.5F, 0.5F, 0.5F}, {0.0F, 0.0F}},
+        // -X
+        Vertex{{-0.5F, -0.5F, -0.5F}, {0.0F, 1.0F}},
+        Vertex{{-0.5F, -0.5F, 0.5F}, {1.0F, 1.0F}},
+        Vertex{{-0.5F, 0.5F, 0.5F}, {1.0F, 0.0F}},
+        Vertex{{-0.5F, 0.5F, -0.5F}, {0.0F, 0.0F}},
+        // +Y
+        Vertex{{-0.5F, 0.5F, 0.5F}, {0.0F, 0.0F}},
+        Vertex{{0.5F, 0.5F, 0.5F}, {1.0F, 0.0F}},
+        Vertex{{0.5F, 0.5F, -0.5F}, {1.0F, 1.0F}},
+        Vertex{{-0.5F, 0.5F, -0.5F}, {0.0F, 1.0F}},
+        // -Y
+        Vertex{{-0.5F, -0.5F, -0.5F}, {0.0F, 0.0F}},
+        Vertex{{0.5F, -0.5F, -0.5F}, {1.0F, 0.0F}},
+        Vertex{{0.5F, -0.5F, 0.5F}, {1.0F, 1.0F}},
+        Vertex{{-0.5F, -0.5F, 0.5F}, {0.0F, 1.0F}},
+    };
+    const std::array<glm::vec3, 6> faceNormals = {
+        glm::vec3{0, 0, 1},  glm::vec3{0, 0, -1}, glm::vec3{1, 0, 0},
+        glm::vec3{-1, 0, 0}, glm::vec3{0, 1, 0},  glm::vec3{0, -1, 0}};
+    for (std::size_t i = 0; i < cubeVerts.size(); ++i)
+        cubeVerts[i].normal = faceNormals[i / 4];
+    std::array<uint32_t, 36> cubeIdx{};
+    for (uint32_t f = 0; f < 6; ++f)
+    {
+        const uint32_t b = f * 4;
+        cubeIdx[f * 6 + 0] = b;
+        cubeIdx[f * 6 + 1] = b + 1;
+        cubeIdx[f * 6 + 2] = b + 2;
+        cubeIdx[f * 6 + 3] = b;
+        cubeIdx[f * 6 + 4] = b + 2;
+        cubeIdx[f * 6 + 5] = b + 3;
+    }
+    m.addMesh("cube", std::span{cubeVerts}, std::span{cubeIdx});
+
+    // 程序化 UV 球：光源 gizmo 用
+    constexpr int kStacks = 8;
+    constexpr int kSlices = 16;
+    std::vector<Vertex> sphereVerts;
+    std::vector<uint32_t> sphereIdx;
+    for (int i = 0; i <= kStacks; ++i)
+    {
+        const float phi = 3.14159265F * static_cast<float>(i) / kStacks;
+        for (int j = 0; j <= kSlices; ++j)
+        {
+            const float theta = 6.2831853F * static_cast<float>(j) / kSlices;
+            const glm::vec3 n{glm::sin(phi) * glm::cos(theta), glm::cos(phi),
+                              glm::sin(phi) * glm::sin(theta)};
+            sphereVerts.push_back(
+                Vertex{n * 0.5F,
+                       {static_cast<float>(j) / kSlices, static_cast<float>(i) / kStacks},
+                       n});
+        }
+    }
+    for (int i = 0; i < kStacks; ++i)
+        for (int j = 0; j < kSlices; ++j)
+        {
+            const uint32_t a = static_cast<uint32_t>(i * (kSlices + 1) + j);
+            const uint32_t b = a + static_cast<uint32_t>(kSlices + 1);
+            sphereIdx.insert(sphereIdx.end(), {a, b, a + 1, a + 1, b, b + 1});
+        }
+    m.addMesh("sphere", std::span{sphereVerts}, std::span{sphereIdx});
+    return m;
+}
+
+constexpr auto run_text_pipeline(auto &fontSelect, const auto *rawText,
+                                 std::string_view langBcp47, bool ltr = true)
+{
+    constexpr auto ltr_value = 0; // NOLINT
+    constexpr auto rtl_value = 1; // NOLINT
+    namespace font_ns = mcs::vulkan::font;
+
+    auto norm = font_ns::utf8proc::normalize(rawText);
+    const std::vector<uint32_t> &codepoints = norm.codepoints;
+    font_ns::utf8proc::print_normalized(norm, rawText);
+
+    auto analyze_result = font_ns::bidi::analyze(codepoints, ltr ? ltr_value : rtl_value);
+    font_ns::bidi::print_bidi_result(codepoints, analyze_result);
+
+    auto test_text_runs = font_ns::assign_fonts(analyze_result, fontSelect);
+    font_ns::print_text_runs(test_text_runs);
+
+    auto test_shape_result = font_ns::harfbuzz::shape(
+        analyze_result.mirrored_codepoints, test_text_runs, fontSelect.notdefFont());
+    font_ns::harfbuzz::print_shape_result(analyze_result.mirrored_codepoints,
+                                          test_shape_result);
+
+    auto break_result = font_ns::libunibreak::analyze_line_breaks(
+        analyze_result.mirrored_codepoints, langBcp47);
+    font_ns::libunibreak::print_break_result(break_result,
+                                             analyze_result.mirrored_codepoints);
+    return make_aggregate<"text_pipeline_result", "codepoints", "shape_result",
+                          "break_result">(std::move(analyze_result.mirrored_codepoints),
+                                          std::move(test_shape_result),
+                                          std::move(break_result));
+}
+
+constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
+{
+    auto &physical_device = *hardwareCtx.physicalDevice.get();
+    auto &device = *hardwareCtx.device.get();
+
+    auto &swapchainBuild = hardwareCtx.swapchainBuild;
+    auto &swapchain = hardwareCtx.swapchain;
+
+    auto &descriptorSetLayout = *descriptorCtx.descriptorSetLayout.get();
+
+    auto depthResourcesBuild = mcs::vulkan::memory::build_simple_resource(
+        {.imageType = VK_IMAGE_TYPE_2D,
+         .format = mcs::vulkan::memory::create_resources::findSupportedFormat(
+             physical_device,
+             std::array<VkFormat, 3>{VkFormat::VK_FORMAT_D32_SFLOAT_S8_UINT,
+                                     VkFormat::VK_FORMAT_D24_UNORM_S8_UINT,
+                                     VkFormat::VK_FORMAT_D32_SFLOAT},
+             VkImageTiling::VK_IMAGE_TILING_OPTIMAL,
+             VkFormatFeatureFlagBits::VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT),
+         .extent = {.width = swapchain.refImageExtent().width,
+                    .height = swapchain.refImageExtent().height,
+                    .depth = 1},
+         .mipLevels = 1,
+         .arrayLayers = 1,
+         .samples = physical_device.getMaxUsableSampleCount(),
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VkImageUsageFlagBits::VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+         .sharingMode = VkSharingMode::VK_SHARING_MODE_EXCLUSIVE,
+         .initialLayout = VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED},
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        [](VkImageCreateInfo imageCreateInfo, VkImage image) noexcept
+            -> mcs::vulkan::memory::create_image::view_create_info {
+            // 纯深度格式没有模板分量，aspectMask 只能是 DEPTH
+            const bool stencil = imageCreateInfo.format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+                                 imageCreateInfo.format == VK_FORMAT_D24_UNORM_S8_UINT ||
+                                 imageCreateInfo.format == VK_FORMAT_D16_UNORM_S8_UINT ||
+                                 imageCreateInfo.format == VK_FORMAT_S8_UINT;
+            return {.image = image,
+                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                    .format = imageCreateInfo.format,
+                    .subresourceRange = {.aspectMask = static_cast<VkImageAspectFlags>(
+                                             stencil ? (VK_IMAGE_ASPECT_DEPTH_BIT |
+                                                        VK_IMAGE_ASPECT_STENCIL_BIT)
+                                                     : VK_IMAGE_ASPECT_DEPTH_BIT),
+                                         .baseMipLevel = 0,
+                                         .levelCount = 1,
+                                         .baseArrayLayer = 0,
+                                         .layerCount = 1}};
+        });
+    auto depthResource = depthResourcesBuild.build(device);
+    const auto &depthFormat_ref = depthResourcesBuild.refCreateInfoFormat();
+    std::cout << "depthResource hasStencilComponent: "
+              << depthResourcesBuild.hasStencilComponent() << '\n';
+
+    auto msaaResourcesBuild = mcs::vulkan::memory::build_simple_resource(
+        {.imageType = VK_IMAGE_TYPE_2D,
+         .format = swapchainBuild.refImageFormat(),
+         .extent = {.width = swapchain.refImageExtent().width,
+                    .height = swapchain.refImageExtent().height,
+                    .depth = 1},
+         .mipLevels = 1,
+         .arrayLayers = 1,
+         .samples = physical_device.getMaxUsableSampleCount(),
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT |
+                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED},
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        [](VkImageCreateInfo imageCreateInfo, VkImage image) noexcept
+            -> mcs::vulkan::memory::create_image::view_create_info {
+            return {.image = image,
+                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                    .format = imageCreateInfo.format,
+                    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                         .baseMipLevel = 0,
+                                         .levelCount = 1,
+                                         .baseArrayLayer = 0,
+                                         .layerCount = 1}};
+        });
+    auto msaaResource = msaaResourcesBuild.build(device);
+    auto swapchainAttachments =
+        make_aggregate<"swapchainAttachments", "depthResourcesBuild", "depthResource",
+                       "msaaResourcesBuild", "msaaResource">(
+            std::move(depthResourcesBuild), std::move(depthResource),
+            std::move(msaaResourcesBuild), std::move(msaaResource));
+
+    // ========== 拾取资源 =========
+    auto pickResourcesBuild = mcs::vulkan::memory::build_simple_resource(
+        {.imageType = VK_IMAGE_TYPE_2D,
+         .format = VK_FORMAT_R32G32B32A32_UINT, // 128位：外键 + primitive_id + hover_fn
+         .extent = {.width = WIDTH, .height = HEIGHT, .depth = 1},
+         .mipLevels = 1,
+         .arrayLayers = 1,
+         .samples = physical_device.getMaxUsableSampleCount(), //NOTE: 和主管线一样
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage =
+             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT //diff: [test_indirectdraw_no_pick] 没有任何代码从 pickingImage 进行拷贝或读取，因此 TRANSFER_SRC_BIT 完全没有必要
+         // | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+         ,
+         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED},
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        [](VkImageCreateInfo imageCreateInfo, VkImage image) noexcept
+            -> mcs::vulkan::memory::create_image::view_create_info {
+            return {.image = image,
+                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                    .format = imageCreateInfo.format,
+                    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                         .baseMipLevel = 0,
+                                         .levelCount = 1,
+                                         .baseArrayLayer = 0,
+                                         .layerCount = 1}};
+        });
+    auto pickResource = pickResourcesBuild.build(device);
+
+    auto resolveResourcesBuild = mcs::vulkan::memory::build_simple_resource(
+        {.imageType = pickResourcesBuild.refCreateInfo().imageType,
+         .format = pickResourcesBuild.refCreateInfo().format,
+         .extent = pickResourcesBuild.refCreateInfo().extent,
+         .mipLevels = pickResourcesBuild.refCreateInfo().mipLevels,
+         .arrayLayers = pickResourcesBuild.refCreateInfo().arrayLayers,
+         .samples = VK_SAMPLE_COUNT_1_BIT,
+         .tiling = pickResourcesBuild.refCreateInfo().tiling,
+         .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |   // 作为 resolve 目标
+                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT |   // 用于复制像素到缓冲区
+                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT // ← 必须！
+         ,
+         .sharingMode = pickResourcesBuild.refCreateInfo().sharingMode,
+         .initialLayout = pickResourcesBuild.refCreateInfo().initialLayout},
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+        [](VkImageCreateInfo imageCreateInfo, VkImage image) noexcept
+            -> mcs::vulkan::memory::create_image::view_create_info {
+            return {.image = image,
+                    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                    .format = imageCreateInfo.format,
+                    .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                         .baseMipLevel = 0,
+                                         .levelCount = 1,
+                                         .baseArrayLayer = 0,
+                                         .layerCount = 1}};
+        });
+    auto resolveResource = resolveResourcesBuild.build(device);
+    std::array<mcs::vulkan::memory::auto_map_buffer, MAX_FRAMES_IN_FLIGHT> pickingFrames;
+    for (auto &pf : pickingFrames)
+    {
+        constexpr auto BUFFER_SIZE = sizeof(picking_result); // 16B = 一个 4×u32 texel
+        pf = mcs::vulkan::memory::auto_map_buffer(
+            mcs::vulkan::memory::create_simple_buffer(
+                device,
+                {.size = BUFFER_SIZE,
+                 .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                 .sharingMode = VK_SHARING_MODE_EXCLUSIVE},
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+            BUFFER_SIZE);
+    }
+    pick_mouse pickMouse;
+    auto pickingAttachments =
+        make_aggregate<"pickingAttachments", "pickResourcesBuild", "pickResource",
+                       "resolveResourcesBuild", "resolveResource", "pickingFrames",
+                       "pickMouse">(
+            std::move(pickResourcesBuild), std::move(pickResource),
+            std::move(resolveResourcesBuild), std::move(resolveResource),
+            std::move(pickingFrames), std::move(pickMouse));
+
+    auto pipelineLayout =
+        create_pipeline_layout{}
+            .setCreateInfo(
+                {.setLayouts = {*descriptorSetLayout},
+                 // diff: [test_dod8] 推送常量传说地址更快，没有绑定的开销？
+                 .pushConstantRanges = {{.stageFlags =
+                                             command::recorder_config::push_stages,
+                                         .offset = 0,
+                                         .size = sizeof(PushData)}}})
+            .build(device);
+
+    using stage_info = create_graphics_pipeline::stage_info;
+    // 定义两个颜色附件格式
+    std::array<VkFormat, 2> mainColorFormats = {
+        swapchainBuild.refImageFormat(), // location 0 (swapchain)
+        VK_FORMAT_R32G32B32A32_UINT      // location 1 (picking)
+    };
+
+    /*
+    管线名	                深度测试	    深度写入	混合(att0)	        典型用途
+    pipelineOpaque3D	    ON (LESS)	    ON	        OFF	            不透明3D物体
+    pipelineTransparent3D	ON (LESS)	    OFF	        ON	            半透明3D物体
+    pipelineOpaqueUI	    OFF	            OFF	        OFF	            不透明UI（矩形、文字）
+    pipelineTransparentUI	OFF	            OFF	        ON	            半透明UI（毛玻璃、淡入淡出）
+    */
+    auto makePipeline = [&](const VkBool32 depthTest, const VkBool32 depthWrite,
+                            VkBool32 blendEnable) {
+        return create_graphics_pipeline{}
+            .setCreateInfo(
+                {.pNext = make_pNext(structure_chain<VkPipelineRenderingCreateInfo>{
+                     {//diff: [test_indirectdraw_no_pick] start
+                      .colorAttachmentCount =
+                          static_cast<uint32_t>(mainColorFormats.size()),
+                      .pColorAttachmentFormats = mainColorFormats.data(),
+                      //diff: [test_indirectdraw_no_pick] end
+                      .depthAttachmentFormat = depthFormat_ref,
+                      // 深度格式带模板分量时，管线必须同时声明 stencil 格式，
+                      // 否则 VkRenderingInfo::pStencilAttachment 会触发 VUID-08917
+                      .stencilAttachmentFormat = depthResourcesBuild.hasStencilComponent()
+                                                     ? depthFormat_ref
+                                                     : VK_FORMAT_UNDEFINED}}),
+                 .stages = create_graphics_pipeline::makeStages(
+                     stage_info{.stage = VK_SHADER_STAGE_VERTEX_BIT,
+                                .filePath = VERT_SHADER_PATH,
+                                .pName = "main"},
+                     stage_info{.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                                .filePath = FRAG_SHADER_PATH,
+                                .pName = "main"}),
+                 .vertexInputState = {},
+                 .inputAssemblyState = {.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                                        .primitiveRestartEnable = VK_FALSE},
+                 .tessellationState = {},
+                 .viewportState = {.viewports = {VkViewport{}}, .scissors = {VkRect2D{}}},
+                 .rasterizationState = {.depthClampEnable = VK_FALSE,
+                                        .rasterizerDiscardEnable = VK_FALSE,
+                                        .polygonMode = VK_POLYGON_MODE_FILL,
+                                        .cullMode = VK_CULL_MODE_NONE,
+                                        .frontFace = VK_FRONT_FACE_CLOCKWISE,
+                                        .depthBiasEnable = VK_FALSE,
+                                        .lineWidth = 1.0F},
+                 .multisampleState =
+                     {
+                         .rasterizationSamples =
+                             physical_device.getMaxUsableSampleCount(),
+                         .sampleShadingEnable = VK_FALSE,
+                         .minSampleShading = 1.0F,
+                         .sampleMask = {},
+                         .alphaToCoverageEnable = VK_FALSE,
+                         .alphaToOneEnable = VK_FALSE,
+                     },
+                 // 深度/模板状态: 片段着色器之后的固定操作. 控制丢弃片元
+                 .depthStencilState = {.depthTestEnable = depthTest,
+                                       .depthWriteEnable = depthWrite,
+                                       .depthCompareOp = VK_COMPARE_OP_LESS,
+                                       .depthBoundsTestEnable = VK_FALSE,
+                                       .stencilTestEnable = VK_FALSE,
+                                       .front = {},
+                                       .back = {},
+                                       .minDepthBounds = 0.0F,
+                                       .maxDepthBounds = 1.0F},
+                 // 颜色混合: 片段着色器之后的固定操作,控制画面颜色
+                 .colorBlendState =
+                     {.logicOpEnable = VK_FALSE,
+                      .logicOp = VkLogicOp::VK_LOGIC_OP_COPY,
+                      .attachments =
+                          {
+                              //附件0
+                              {
+                                  //diff: [test_dod12] start: 附件 0 – 开启混合，支持 MSDF 与普通纹理混合
+                                  .blendEnable = blendEnable,
+                                  .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+                                  .dstColorBlendFactor =
+                                      VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                                  .colorBlendOp = VK_BLEND_OP_ADD,
+                                  .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+                                  .dstAlphaBlendFactor =
+                                      VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                                  .alphaBlendOp = VK_BLEND_OP_ADD,
+                                  .colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
+                                                    VK_COLOR_COMPONENT_G_BIT |
+                                                    VK_COLOR_COMPONENT_B_BIT |
+                                                    VK_COLOR_COMPONENT_A_BIT,
+                                  //diff: [test_dod12] end
+                              },
+                              //diff: [test_indirectdraw_no_pick] start
+                              {
+                                  // location 1 (拾取：4 通道全写，zw = primitive_id + hover_fn)
+                                  .blendEnable = VK_FALSE,
+                                  .colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
+                                                    VK_COLOR_COMPONENT_G_BIT |
+                                                    VK_COLOR_COMPONENT_B_BIT |
+                                                    VK_COLOR_COMPONENT_A_BIT,
+                              },
+                              //diff: [test_indirectdraw_no_pick] end
+                          }},
+                 .dynamicState = {.dynamicStates =
+                                      {
+                                          VK_DYNAMIC_STATE_VIEWPORT,
+                                          VK_DYNAMIC_STATE_SCISSOR,
+                                          // ext 动态状态：blend / A2C / stencil
+                                          VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+                                          VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+                                          VK_DYNAMIC_STATE_STENCIL_OP,
+                                          VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+                                          VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                                          VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT,
+                                          VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
+                                          VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT,
+                                          VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT,
+                                      }},
+                 .layout = *pipelineLayout})
+            .build(device);
+    };
+    // 离屏层管线：只有一张颜色附件（离屏图像），无深度/无拾取
+    auto makeLayerPipeline = [&]() {
+        std::array<VkFormat, 1> layerColorFormats = {swapchainBuild.refImageFormat()};
+        return create_graphics_pipeline{}
+            .setCreateInfo(
+                {.pNext = make_pNext(structure_chain<VkPipelineRenderingCreateInfo>{
+                     {.colorAttachmentCount = 1,
+                      .pColorAttachmentFormats = layerColorFormats.data(),
+                      .depthAttachmentFormat = VK_FORMAT_UNDEFINED,
+                      .stencilAttachmentFormat = VK_FORMAT_UNDEFINED}}),
+                 .stages = create_graphics_pipeline::makeStages(
+                     stage_info{.stage = VK_SHADER_STAGE_VERTEX_BIT,
+                                .filePath = VERT_SHADER_PATH,
+                                .pName = "main"},
+                     stage_info{.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                                .filePath = FRAG_SHADER_PATH,
+                                .pName = "main"}),
+                 .vertexInputState = {},
+                 .inputAssemblyState = {.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                                        .primitiveRestartEnable = VK_FALSE},
+                 .tessellationState = {},
+                 .viewportState = {.viewports = {VkViewport{}}, .scissors = {VkRect2D{}}},
+                 .rasterizationState = {.depthClampEnable = VK_FALSE,
+                                        .rasterizerDiscardEnable = VK_FALSE,
+                                        .polygonMode = VK_POLYGON_MODE_FILL,
+                                        .cullMode = VK_CULL_MODE_NONE,
+                                        .frontFace = VK_FRONT_FACE_CLOCKWISE,
+                                        .depthBiasEnable = VK_FALSE,
+                                        .lineWidth = 1.0F},
+                 .multisampleState = {.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+                                      .sampleShadingEnable = VK_FALSE,
+                                      .minSampleShading = 1.0F,
+                                      .sampleMask = {},
+                                      .alphaToCoverageEnable = VK_FALSE,
+                                      .alphaToOneEnable = VK_FALSE},
+                 .depthStencilState = {.depthTestEnable = VK_FALSE,
+                                       .depthWriteEnable = VK_FALSE,
+                                       .depthCompareOp = VK_COMPARE_OP_ALWAYS,
+                                       .depthBoundsTestEnable = VK_FALSE,
+                                       .stencilTestEnable = VK_FALSE,
+                                       .front = {},
+                                       .back = {},
+                                       .minDepthBounds = 0.0F,
+                                       .maxDepthBounds = 1.0F},
+                 .colorBlendState =
+                     {.logicOpEnable = VK_FALSE,
+                      .logicOp = VkLogicOp::VK_LOGIC_OP_COPY,
+                      .attachments =
+                          {{.blendEnable = VK_TRUE,
+                            .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+                            .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                            .colorBlendOp = VK_BLEND_OP_ADD,
+                            .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+                            .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+                            .alphaBlendOp = VK_BLEND_OP_ADD,
+                            .colorWriteMask =
+                                VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT}}},
+                 .dynamicState = {.dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT,
+                                                    VK_DYNAMIC_STATE_SCISSOR}},
+                 .layout = *pipelineLayout})
+            .build(device);
+    };
+    auto pipelineUILayer = makeLayerPipeline();
+
+    // 通用管线工厂：混合 / 模板 / 颜色写掩码 都可配
+    auto makePipelineEx = [&](VkPipelineColorBlendAttachmentState blendAttachment,
+                              VkBool32 stencilEnable, VkStencilOpState stencilOp,
+                              VkColorComponentFlags colorWrite,
+                              const char *vsEntry = "main") {
+        const VkPipelineColorBlendAttachmentState pickAttachmentState{
+            .blendEnable = VK_FALSE,
+            .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT};
+        return create_graphics_pipeline{}
+            .setCreateInfo(
+                {.pNext = make_pNext(structure_chain<VkPipelineRenderingCreateInfo>{
+                     {.colorAttachmentCount =
+                          static_cast<uint32_t>(mainColorFormats.size()),
+                      .pColorAttachmentFormats = mainColorFormats.data(),
+                      .depthAttachmentFormat = depthFormat_ref,
+                      .stencilAttachmentFormat = depthResourcesBuild.hasStencilComponent()
+                                                     ? depthFormat_ref
+                                                     : VK_FORMAT_UNDEFINED}}),
+                 .stages = create_graphics_pipeline::makeStages(
+                     stage_info{.stage = VK_SHADER_STAGE_VERTEX_BIT,
+                                .filePath = VERT_SHADER_PATH,
+                                .pName = vsEntry},
+                     stage_info{.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+                                .filePath = FRAG_SHADER_PATH,
+                                .pName = "main"}),
+                 .vertexInputState = {},
+                 .inputAssemblyState = {.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                                        .primitiveRestartEnable = VK_FALSE},
+                 .tessellationState = {},
+                 .viewportState = {.viewports = {VkViewport{}}, .scissors = {VkRect2D{}}},
+                 .rasterizationState = {.depthClampEnable = VK_FALSE,
+                                        .rasterizerDiscardEnable = VK_FALSE,
+                                        .polygonMode = VK_POLYGON_MODE_FILL,
+                                        .cullMode = VK_CULL_MODE_NONE,
+                                        .frontFace = VK_FRONT_FACE_CLOCKWISE,
+                                        .depthBiasEnable = VK_FALSE,
+                                        .lineWidth = 1.0F},
+                 .multisampleState = {.rasterizationSamples =
+                                          physical_device.getMaxUsableSampleCount(),
+                                      .sampleShadingEnable = VK_FALSE,
+                                      .minSampleShading = 1.0F,
+                                      .sampleMask = {},
+                                      .alphaToCoverageEnable = VK_FALSE,
+                                      .alphaToOneEnable = VK_FALSE},
+                 .depthStencilState = {.depthTestEnable = VK_FALSE,
+                                       .depthWriteEnable = VK_FALSE,
+                                       .depthCompareOp = VK_COMPARE_OP_ALWAYS,
+                                       .depthBoundsTestEnable = VK_FALSE,
+                                       .stencilTestEnable = stencilEnable,
+                                       .front = stencilOp,
+                                       .back = stencilOp,
+                                       .minDepthBounds = 0.0F,
+                                       .maxDepthBounds = 1.0F},
+                 .colorBlendState = {.logicOpEnable = VK_FALSE,
+                                     .logicOp = VkLogicOp::VK_LOGIC_OP_COPY,
+                                     .attachments = {blendAttachment,
+                                                     pickAttachmentState}},
+                 .dynamicState = {.dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT,
+                                                    VK_DYNAMIC_STATE_SCISSOR,
+                                                    VK_DYNAMIC_STATE_STENCIL_REFERENCE}},
+                 .layout = *pipelineLayout})
+            .build(device);
+    };
+
+    const auto blendOver = VkPipelineColorBlendAttachmentState{
+        .blendEnable = VK_TRUE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .alphaBlendOp = VK_BLEND_OP_ADD,
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT};
+    auto blendWith = [&](VkBlendFactor src, VkBlendFactor dst) {
+        auto a = blendOver;
+        a.srcColorBlendFactor = src;
+        a.dstColorBlendFactor = dst;
+        return a;
+    };
+    const auto noColorWrite =
+        VkPipelineColorBlendAttachmentState{.blendEnable = VK_FALSE, .colorWriteMask = 0};
+    const auto stencilAlwaysIncr =
+        VkStencilOpState{.failOp = VK_STENCIL_OP_KEEP,
+                         .passOp = VK_STENCIL_OP_INCREMENT_AND_CLAMP,
+                         .depthFailOp = VK_STENCIL_OP_KEEP,
+                         .compareOp = VK_COMPARE_OP_ALWAYS,
+                         .compareMask = 0xFF,
+                         .writeMask = 0xFF,
+                         .reference = 0};
+    auto stencilEqualIncr = stencilAlwaysIncr;
+    stencilEqualIncr.compareOp = VK_COMPARE_OP_EQUAL;
+    auto stencilEqualKeep = stencilAlwaysIncr;
+    stencilEqualKeep.compareOp = VK_COMPARE_OP_EQUAL;
+    stencilEqualKeep.passOp = VK_STENCIL_OP_KEEP;
+    stencilEqualKeep.writeMask = 0x00;
+
+    uiPipelines().pipes[1] =
+        makePipelineEx(blendWith(VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ONE), VK_FALSE,
+                       stencilAlwaysIncr, 0);
+    uiPipelines().pipes[2] =
+        makePipelineEx(blendWith(VK_BLEND_FACTOR_DST_COLOR, VK_BLEND_FACTOR_ZERO),
+                       VK_FALSE, stencilAlwaysIncr, 0);
+    uiPipelines().pipes[3] = makePipelineEx(
+        blendWith(VK_BLEND_FACTOR_ZERO, VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA), VK_FALSE,
+        stencilAlwaysIncr, 0);
+    uiPipelines().pipes[4] = makePipelineEx(noColorWrite, VK_TRUE, stencilAlwaysIncr, 0);
+    uiPipelines().pipes[5] = makePipelineEx(noColorWrite, VK_TRUE, stencilEqualIncr, 0);
+    // 几何管线：模板 INVERT（even-odd 奇偶计数）；多边形顶点由推送常量传入
+    {
+        auto stencilInvert = stencilAlwaysIncr;
+        stencilInvert.passOp = VK_STENCIL_OP_INVERT;
+        uiPipelines().pipes[7] = makePipelineEx(noColorWrite, VK_TRUE, stencilInvert, 0);
+        // 8 = 路径描边：写颜色、不测模板（覆盖率由片元解析算）
+        uiPipelines().pipes[8] =
+            makePipelineEx(blendOver, VK_FALSE, stencilAlwaysIncr, 0);
+    }
+
+    uiPipelines().pipes[6] =
+        makePipelineEx(blendOver, VK_TRUE, stencilEqualKeep,
+                       VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
+
+    // [08-4] 专用：blend OFF + 只写 R/G，B/A 保留 dst；用来观察 colorWriteMask。
+    auto maskRG = blendOver;
+    maskRG.blendEnable = VK_FALSE;
+    maskRG.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;
+    uiPipelines().pipes[9] = makePipelineEx(maskRG, VK_FALSE, stencilAlwaysIncr, 0);
+
+    // [08-7] 专用：blend ON + 只写 R/G（和 pipes[9] 只差 blendEnable）。
+    auto maskRGBlend = maskRG;
+    maskRGBlend.blendEnable = VK_TRUE;
+    uiPipelines().pipes[10] = makePipelineEx(maskRGBlend, VK_FALSE, stencilAlwaysIncr, 0);
+
+    // [08-3/4] 专用：stencil EQUAL + blend OFF。stencil pass 只决定“留/丢”，
+    // 不会顺带发生 blend；source 通过后是直接写红色，不是混合。
+    const auto noBlendAll = VkPipelineColorBlendAttachmentState{
+        .blendEnable = VK_FALSE,
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT};
+    uiPipelines().pipes[11] =
+        makePipelineEx(noBlendAll, VK_TRUE, stencilEqualKeep,
+                       VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT);
+
+    // 创建4个管线
+    auto pipelineOpaque3D = makePipeline(VK_TRUE, VK_TRUE, VK_FALSE);
+    auto pipelineTransparent3D = makePipeline(VK_TRUE, VK_FALSE, VK_TRUE);
+    auto pipelineOpaqueUI = makePipeline(VK_FALSE, VK_FALSE, VK_FALSE);
+    auto pipelineTransparentUI = makePipeline(VK_FALSE, VK_FALSE, VK_TRUE);
+    return make_aggregate<"mainPipelineCtx", "pipelineLayout", "pipelineOpaque3D",
+                          "pipelineTransparent3D", "pipelineOpaqueUI",
+                          "pipelineTransparentUI", "pipelineUILayer",
+                          "swapchainAttachments", "pickingAttachments">(
+        std::move(pipelineLayout), std::move(pipelineOpaque3D),
+        std::move(pipelineTransparent3D), std::move(pipelineOpaqueUI),
+        std::move(pipelineTransparentUI), std::move(pipelineUILayer),
+        std::move(swapchainAttachments), std::move(pickingAttachments));
+}
+
+//diff: [test_dod22] start
+
+namespace shader_data
+{
+
+    // NOTE:    ?
+    // NOTE:  ?shader ?
+
+    // ===================== hover  ?+   =====================
+    //  ? ?  =  ?hover  ?
+    //  ?hover_fn over_fn = 0xFFFFFFFF  ?
+    struct hover_pool
+    {
+        using hover_callback_t = void (*)(picking_result, bool, InputCtx &,
+                                          ui_new::ScreenWidget *) noexcept;
+        std::vector<hover_callback_t> hover_fns;
+
+        //  ?hover  ?  ?
+        uint32_t bind(hover_callback_t fn)
+        {
+            hover_fns.push_back(std::move(fn));
+            return hover_fns.size() - 1;
+        }
+        //  0xFFFFFFFF =  ?=
+        void call(uint32_t entity, const picking_result &r, bool enter,
+                  InputCtx &inputCtx, ui_new::ScreenWidget *screen) noexcept
+        {
+            if (entity == ~0U)
+                return;
+            // 没有注册任何 hover 回调时（例如 ability3 的最小矩形），
+            // picking 里回读到的 hover_fn 可能是 0；这里直接忽略，不 assert。
+            if (entity >= hover_fns.size())
+                return;
+            hover_fns[entity](r, enter, inputCtx, screen);
+        }
+    };
+
+    //  ?cur ?cur   pre  leave ?
+    struct hover_manager
+    {
+        static constexpr auto hover_leave = false;
+        static constexpr auto hover_enter = true;
+        ui_new::ScreenWidget *screen = nullptr;
+        picking_result cur{object_key{0xFFFFFFFF, 0}, 0, 0}; //  ey   =
+
+        constexpr void resetPicking() noexcept
+        {
+            cur = {object_key{0xFFFFFFFF, 0}, 0, 0};
+        }
+
+        constexpr void hover(const picking_result &r, hover_pool &pool,
+                             InputCtx &inputCtx) noexcept
+        {
+            static_assert(0xFFFFFFFF == uint32_t{~0U});
+            if (cur.key == r.key)
+                return; //
+            if (cur.key.object_type != 0xFFFFFFFF && cur.hover_fn != ~0U)
+                pool.call(cur.hover_fn, cur, hover_leave, inputCtx, screen);
+            cur = r;
+            if (r.key.object_type != 0xFFFFFFFF && r.hover_fn != ~0U)
+                pool.call(r.hover_fn, r, hover_enter, inputCtx, screen);
+        }
+    };
+
+}; // namespace shader_data
+
+constexpr auto &hoverPool() noexcept
+{
+    static shader_data::hover_pool hoverPool{};
+    return hoverPool;
+}
+struct render_context
+{
+    command::record_builder &builder; // 表直接往 builder 里录 UI 实例
+    glfw_input &input;
+    FrameClock &clock;
+    FontSelect &fontSelect;
+    ui_dao::view view; // 绘制目标尺寸（像素坐标 → NDC）
+};
+
+//diff: [test_dod24.cpp] start
+namespace ui_new
+{
+    template <typename T>
+    concept constraints = requires(const T &t) {
+        { t.isTight() } noexcept -> std::same_as<bool>;
+        { t.isNormalized() } noexcept -> std::same_as<bool>;
+    };
+
+    // NOLINTBEGIN
+    // clang-format off
+    struct Size
+    {
+        double width, height;
+    };
+    struct Offset
+    {
+        double x, y;
+    };
+    enum class Axis               : std::uint8_t { horizontal, vertical };
+    enum class FlexFit            : std::uint8_t { tight, loose };
+    enum class MainAxisSize       : std::uint8_t { min, max };
+    enum class MainAxisAlignment  : std::uint8_t { start, end, center, spaceBetween, spaceAround, spaceEvenly };
+    enum class CrossAxisAlignment : std::uint8_t { start, end, center, stretch, baseline };
+    enum class TextDirection      : std::uint8_t { rtl, ltr };
+    enum class VerticalDirection  : std::uint8_t { up, down };
+    enum class TextBaseline       : std::uint8_t { alphabetic, ideographic };
+
+    struct EdgeInsetsGeometry
+    {
+        static constexpr auto inf = std::numeric_limits<double>::infinity();
+        double left,right,top,bottom,start,end;
+        
+        static constexpr auto fromLRSETB(double left,double right,double start,double end,double top,double bottom) noexcept
+        { return EdgeInsetsGeometry{.left=left,.right=right,.top=top,.bottom=bottom,.start=start,.end=end}; }
+        static constexpr auto fromLTRB(double left,double top,double right,double bottom) noexcept 
+        { return EdgeInsetsGeometry{.left=left,.right=right,.top=top,.bottom=bottom,.start=0,.end=0}; }
+        static constexpr auto fromSTEB(double start,double top,double end,double bottom)noexcept
+        { return EdgeInsetsGeometry{.left=0,.right=0,.top=top,.bottom=bottom,.start=start,.end=end}; }
+
+        // api
+        [[nodiscard]] constexpr auto horizontal()const noexcept { return left + right + start + end; }
+        [[nodiscard]] constexpr auto vertical()const noexcept { return top + bottom; }
+        // The total offset in the given direction.
+        [[nodiscard]] constexpr double along(Axis axis) const noexcept
+        {
+            switch (axis) 
+            {
+                case  Axis::horizontal : return horizontal();
+                case  Axis::vertical   : return vertical();
+            };
+        }
+        [[nodiscard]] constexpr Size collapsedSize() const noexcept { return {horizontal(), vertical()}; }
+        [[nodiscard]] constexpr bool isNonNegative() const noexcept { return left >= 0 && right >= 0 && top >= 0 && bottom >= 0 && start>=0 && end >= 0; }
+    };
+    struct EdgeInsets : EdgeInsetsGeometry
+    {
+        static constexpr auto all(double value) noexcept
+        {
+            return EdgeInsetsGeometry::fromLTRB(value,value,value,value);
+        }
+    };
+
+
+    struct Alignment
+    {
+        double x, y;
+        struct _Initializer{float x, y; constexpr operator Alignment() const noexcept { return {x, y};}};
+        constexpr static _Initializer topLeft{-1, -1}, topCenter{0, -1}, topRight{1, -1};
+        constexpr static _Initializer centerLeft{-1, 0}, center{0, 0}, centerRight{1, 0};
+        constexpr static _Initializer bottomLeft{-1, 1}, bottomCenter{0, 1}, bottomRight{1, 1};
+    };
+
+
+    class BoxConstraints
+    {
+    public:
+        static constexpr auto inf = std::numeric_limits<double>::infinity();
+        constexpr explicit BoxConstraints(double minWidth = 0, double maxWidth = inf,
+                                        double minHeight = 0, double maxHeight = inf)
+            : minWidth_{minWidth}, maxWidth_{maxWidth}, minHeight_{minHeight},
+            maxHeight_{maxHeight}
+        {
+        }
+
+        [[nodiscard]] constexpr double minWidth() const noexcept { return minWidth_; }
+        [[nodiscard]] constexpr double maxWidth() const noexcept { return maxWidth_; }
+        [[nodiscard]] constexpr double minHeight() const noexcept { return minHeight_; }
+        [[nodiscard]] constexpr double maxHeight() const noexcept { return maxHeight_; }
+
+        // constraints  concept
+        [[nodiscard]] constexpr bool hasTightWidth() const noexcept { return minWidth_ >= maxWidth_; }
+        [[nodiscard]] constexpr bool hasTightHeight() const noexcept { return minHeight_ >= maxHeight_; }
+        [[nodiscard]] constexpr bool isTight() const noexcept { return hasTightWidth() && hasTightHeight(); }
+        [[nodiscard]] constexpr bool isNormalized() const noexcept
+        { return minWidth_ >= 0.0 && minWidth_ <= maxWidth_ && minHeight_ >= 0.0 && minHeight_ <= maxHeight_; }
+        [[nodiscard]] constexpr bool hasBoundedWidth() const noexcept { return maxWidth_ < inf; }
+        [[nodiscard]] constexpr bool hasBoundedHeight() const noexcept { return maxHeight_ < inf; }
+        [[nodiscard]] constexpr bool hasInfiniteWidth() const noexcept { return minWidth_ >= inf; }
+        [[nodiscard]] constexpr bool hasInfiniteHeight() const noexcept { return minHeight_ >= inf; }
+
+        [[nodiscard]] constexpr bool isSatisfiedBy(Size size) const noexcept 
+        {     
+            return  (minWidth_ <= size.width) && (size.width <= maxWidth_) &&
+                    (minHeight_ <= size.height) && (size.height <= maxHeight_);
+        }
+        [[nodiscard]] constexpr auto normalize()const noexcept  
+        {
+            if (isNormalized())
+                return *this;
+            auto minWidth = minWidth_ >= 0.0 ? minWidth_ : 0.0;
+            auto minHeight = minHeight_ >= 0.0 ? minHeight_ : 0.0;
+            return BoxConstraints(
+                    minWidth,
+                    minWidth > maxWidth_ ? minWidth : maxWidth_,
+                    minHeight,
+                    minHeight > maxHeight_ ? minHeight : maxHeight_);
+        }
+
+        // 语义相关 API
+        static constexpr auto tight(Size size) noexcept
+        { return BoxConstraints{size.width,size.width,size.height,size.height}; }
+        struct Optional {std::optional<double> width,height;};
+        // null → 宽松;非 null 值 -> 紧
+        static constexpr auto tightFor(Optional op) noexcept
+        {
+            auto [width,height] = op;
+            return BoxConstraints{width.value_or(0.0),width.value_or(inf),height.value_or(0.0),height.value_or(inf)};
+        }
+        struct Finite {double width = inf, height = inf;};
+        // infinity → 宽松; 有限数值 → 紧
+        static constexpr auto tightForFinite(Finite op) noexcept
+        {
+            auto [width,height] = op;
+            return BoxConstraints{width != inf ? width : 0.0,width != inf ? width : inf,height != inf ? height : 0.0,height != inf ? height : inf};
+        }
+
+        static constexpr auto loose(Size size) noexcept
+        { return BoxConstraints{0,size.width,0,size.height}; }
+        // expand 默认是无限大紧约束; 不设置维度，则该维度无限大
+        static constexpr auto expand(Optional op = {}) noexcept
+        {
+            auto [width,height] = op;
+            return BoxConstraints{width.value_or(inf),width.value_or(inf),height.value_or(inf),height.value_or(inf)};
+        }
+
+        // 成员API
+        struct OptionalConstraints {std::optional<double> minWidth,maxWidth,minHeight,maxHeight;};
+        // 无维度定义，则复制当前维度
+        constexpr auto copyWith(OptionalConstraints c) const noexcept
+        {
+            auto [minWidth,maxWidth,minHeight,maxHeight] =c;
+            return BoxConstraints{minWidth.value_or(minWidth_),maxWidth.value_or(maxWidth_),minHeight.value_or(minHeight_),maxHeight.value_or(maxHeight_)};
+        }
+        // 根据给定的边距（内边距）缩小当前的盒子约束，返回一个更紧的新约束，表示在扣除这些边距后，子组件可用的空间范围
+        constexpr auto deflate(EdgeInsetsGeometry edges) const noexcept
+        {
+            double horizontal = edges.horizontal();
+            double vertical = edges.vertical();
+            double deflatedMinWidth = std::max(0.0, minWidth_ - horizontal);
+            double deflatedMinHeight =  std::max(0.0, minHeight_ - vertical);
+            return BoxConstraints{
+            deflatedMinWidth,
+            std::max(deflatedMinWidth, maxWidth_ - horizontal),
+            deflatedMinHeight,
+            std::max(deflatedMinHeight, maxHeight_ - vertical)};
+        }
+        constexpr auto enforce(BoxConstraints constraints) const noexcept
+        {
+            return BoxConstraints{
+                std::clamp(minWidth_, constraints.minWidth_, constraints.maxWidth_),
+                std::clamp(maxWidth_, constraints.minWidth_, constraints.maxWidth_),
+                std::clamp(minHeight_, constraints.minHeight_, constraints.maxHeight_),
+                std::clamp(maxHeight_, constraints.minHeight_, constraints.maxHeight_)};
+        }
+        constexpr auto tighten(Optional op) const noexcept
+        {
+            auto [ width,height] = op;
+            return BoxConstraints{
+                !width.has_value() ? minWidth_ : std::clamp(*width, minWidth_, maxWidth_),
+                !width.has_value() ? maxWidth_ : std::clamp(*width, minWidth_, maxWidth_),
+                !height.has_value() ? minHeight_ : std::clamp(*height, minHeight_, maxHeight_),
+                !height.has_value() ? maxHeight_ : std::clamp(*height, minHeight_, maxHeight_)};
+        }
+
+        [[nodiscard]] constexpr auto loosen() const noexcept
+        { return BoxConstraints{0.0, maxWidth_, 0.0, maxHeight_}; }
+
+        [[nodiscard]] constexpr auto flipped() const noexcept
+        { return BoxConstraints{minHeight_, maxHeight_, minWidth_, maxWidth_}; }
+        
+        constexpr auto constrainWidth(double width = inf ) const noexcept { return std::clamp(width, minWidth_, maxWidth_); } 
+        constexpr auto constrainHeight(double height = inf ) const noexcept { return std::clamp(height, minHeight_, maxHeight_); } 
+        constexpr Size constrain(Size size) const noexcept { return {constrainWidth(size.width), constrainHeight(size.height)}; }
+        constexpr Size constrainDimensions(double width, double height) const noexcept { return constrain(Size{width,height}); }
+
+        // The biggest size that satisfies the constraints.
+        constexpr Size biggest() const noexcept { return Size(constrainWidth(), constrainHeight());}
+        // The smallest size that satisfies the constraints.
+        constexpr Size smallest() const noexcept { return Size(constrainWidth(0), constrainHeight(0));}
+
+        [[nodiscard]] constexpr bool operator==(const BoxConstraints &) const noexcept = default;
+
+        [[nodiscard]] std::string toString() const
+        {
+            auto fmt1 = [](double v) {
+                if (std::isinf(v)) return std::string("inf");
+                return std::to_string(v);
+            };
+            return "BoxConstraints(w=[" + fmt1(minWidth_) + "," + fmt1(maxWidth_) + "]"
+                ", h=[" + fmt1(minHeight_) + "," + fmt1(maxHeight_) + "])";
+        }
+    private:
+        double minWidth_;
+        double maxWidth_;
+        double minHeight_;
+        double maxHeight_;
+    };
+
+    static_assert(constraints<BoxConstraints>, "should satisfy");
+
+
+    // 在 Flutter 中，尺寸（w, h）先计算，位置（x, y）后设置
+    struct ScreenWidget;
+    struct Widget;
+    struct RenderObject
+    {
+        virtual constexpr void render(ScreenWidget *screen, Widget *owner,
+                                      render_context &context) = 0;
+        // 每帧一次，从树根往下传（ScreenWidget::tick → DFS）
+        virtual void tick(double /*now*/) {}
+        virtual ~RenderObject() = default;
+    };
+
+    // 自上而下传递约束（Constraints）
+    // 自下而上汇报尺寸（Size）
+    struct Widget
+    { 
+        std::string key{};
+        Size size{};
+        Offset offset{};
+        std::unique_ptr<RenderObject> renderObject;
+
+        virtual constexpr void layout(BoxConstraints c) = 0;
+        virtual constexpr void updateOffset(Offset offset) noexcept = 0;
+        [[nodiscard]] virtual std::span<const std::unique_ptr<Widget>> children() const noexcept = 0;
+        virtual ~Widget() = default;
+        constexpr auto& Self() noexcept { return *this; }
+
+
+        // 前序遍历：先自己，再按顺序遍历每个子节点
+        template <typename Fn>
+        constexpr void visit(Fn &&fn)
+        {
+            fn(*this);
+            for (auto &child : children())
+                if (child) child->visit(std::forward<Fn>(fn));
+        }
+
+        // 前序查找第一个满足谓词的节点，找不到返回 nullptr
+        template <typename Pred>
+        constexpr Widget *findIf(Pred &&pred)
+        {
+            if (pred(*this)) return this;
+            for (auto &child : children())
+                if (child)
+                    if (auto *found = child->findIf(std::forward<Pred>(pred)))
+                        return found;
+            return nullptr;
+        }
+
+        // 按 key 查找
+        [[nodiscard]] constexpr Widget *findByKey(std::string_view k)
+        {
+            return findIf([k](const Widget &w) { return w.key == k; });
+        }
+
+      protected:
+        Widget() noexcept = default;
+        constexpr explicit Widget(std::string k,
+                                  std::unique_ptr<RenderObject> ro = nullptr) noexcept
+            : key(std::move(k)), renderObject(std::move(ro)) {}
+    };
+
+    template <typename B>
+    concept WidgetBuild = requires(B &&b) {
+        static_cast<std::unique_ptr<Widget>>(std::forward<B>(b));
+    };
+    struct ScreenWidget
+    {
+        constexpr render_version_t::underlying_t renderVersion() const noexcept { return renderVersion_ + static_cast<uint8_t>(versionDirty_);}
+
+        constexpr void makeLayoutDirty(uint32_t frame) noexcept
+        { layoutDirty_[frame] = true; makeVersionDirty(); }
+        constexpr void clearLayoutDirty(uint32_t frame) noexcept
+        { layoutDirty_[frame] = false; }
+        constexpr bool isLayoutDirty(uint32_t frame) const noexcept
+        { return layoutDirty_[frame]; }
+
+        constexpr void makeRenderDirty(uint32_t frame) noexcept
+        { renderDirty_[frame] = true; makeVersionDirty();}
+        constexpr void clearRenderDirty(uint32_t frame) noexcept
+        { renderDirty_[frame] = false; }
+        constexpr bool isRenderDirty(uint32_t frame) const noexcept
+        { return renderDirty_[frame]; }
+        constexpr bool hasDirty(uint32_t frame) const noexcept {return isLayoutDirty(frame) || isRenderDirty(frame); }
+
+        constexpr void layout()
+        {
+            if(auto *ptr = root_.get())
+            {
+                ptr->layout(BoxConstraints{0,size_.width,0,size_.height});
+                ptr->updateOffset({0,0});
+            }
+        }
+        // 每帧一次：从根 DFS，把 now 传给每个 renderObject
+        void tick(double now)
+        {
+            if (auto *p = root_.get())
+                p->visit([now](Widget &w) {
+                    if (w.renderObject)
+                        w.renderObject->tick(now);
+                });
+        }
+        constexpr void updateSize(double width, double height) noexcept
+        {
+            if (size_.width == width && size_.height == height)
+                return;
+            size_ = {width, height};
+            for (std::size_t f = 0; f < MAX_FRAMES_IN_FLIGHT; ++f)
+                makeLayoutDirty(f);
+        }
+
+        void render(render_context &context) 
+        {
+            Widget* root = root_.get();
+            if (root == nullptr) return;
+
+            const auto dfs = [&, screen = this](this auto &self, Widget *node) {
+                if (!node) return;
+
+                // 命中就提交渲染；没命中就"路过"这个节点
+                if (node->renderObject)
+                    node->renderObject->render(screen, node, context);
+
+                // 无论有没有 renderObject，都继续下探子节点
+                for (auto& child : node->children())
+                    self(child.get());
+            };
+            dfs(root);
+        }
+        void recorderCmd(uint32_t frame, render_context &context)
+        {
+            if(isLayoutDirty(frame))
+            {
+                layout();
+                render(context);
+
+
+                clearLayoutDirty(frame);
+                clearRenderDirty(frame);
+                toNextRenderVersion();
+                return;
+            }
+            if(isRenderDirty(frame))
+            {
+                render(context); //NOTE: 布局不变，仅仅是数据渲染更新
+                clearRenderDirty(frame);
+                toNextRenderVersion();
+                return;
+            }
+        }
+
+
+        ScreenWidget()=default;
+        constexpr ScreenWidget(Size size,std::unique_ptr<Widget> root) noexcept : size_(size) , root_(std::move(root)) { layoutDirty_.fill(true);renderDirty_.fill(true);}
+        template <WidgetBuild Build>
+        constexpr ScreenWidget(Size size,Build &&b) noexcept : ScreenWidget(size,static_cast<std::unique_ptr<Widget>>(std::forward<Build>(b))) {}
+        
+        constexpr auto& size(Size size) noexcept 
+        {
+            size_ = size;
+            return *this;
+        }
+        constexpr auto& size(double width, double height) noexcept { return size({width,height});}
+        
+        template <WidgetBuild Build>
+        constexpr auto &root(Build &&b) noexcept 
+        { 
+            root_ = static_cast<std::unique_ptr<Widget>>(std::forward<Build>(b));
+            return *this;
+        }
+
+        // root 访问器：给外部拿根节点（需要时可加 const 重载）
+        [[nodiscard]] constexpr Widget *root() noexcept { return root_.get(); }
+        // 从根节点开始转发
+        template <typename Fn>
+        constexpr void visit(Fn &&fn) { if (root_) root_->visit(std::forward<Fn>(fn)); }
+
+        template <typename Pred>
+        constexpr Widget *findIf(Pred &&pred)
+        { return root_ ? root_->findIf(std::forward<Pred>(pred)) : nullptr; }
+
+        [[nodiscard]] constexpr Widget *findByKey(std::string_view k)
+        { return root_ ? root_->findByKey(k) : nullptr; }
+
+    private:
+        std::array<bool, MAX_FRAMES_IN_FLIGHT> layoutDirty_;   // 默认全 false，构造时填 true
+        std::array<bool, MAX_FRAMES_IN_FLIGHT> renderDirty_;
+        Size size_;
+        std::unique_ptr<Widget> root_;
+        render_version_t renderVersion_{};   // 默认 0
+        bool versionDirty_ = false;
+        constexpr void makeVersionDirty() noexcept { versionDirty_ = true; }
+        constexpr void clearVersionDirty() noexcept { versionDirty_ = false; }
+        constexpr void toNextRenderVersion() noexcept { renderVersion_ = render_version_t{renderVersion()};clearVersionDirty(); }
+    };
+
+    // clang-format on
+    // NOLINTEND
+
+    struct ContainerWidget : Widget
+    {
+
+        ContainerWidget() = default; // NOLINTBEGIN
+        constexpr ContainerWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                                  std::optional<BoxConstraints> constraints,
+                                  std::optional<Alignment> alignment,
+                                  std::optional<EdgeInsetsGeometry> margin,
+                                  std::optional<EdgeInsetsGeometry> border,
+                                  std::optional<EdgeInsetsGeometry> padding,
+                                  std::unique_ptr<Widget> child) noexcept
+            : Widget(std::move(key), std::move(ro)), constraints_{constraints},
+              alignment_{alignment}, margin_{margin}, border_{border}, padding_{padding},
+              child_{std::move(child)} // NOLINTEND
+        {
+            assert(not constraints_.has_value() || (*constraints_).isNormalized());
+            assert(not margin_.has_value() || (*margin_).isNonNegative());
+            assert(not border_.has_value() || (*border_).isNonNegative());
+            assert(not padding_.has_value() || (*padding_).isNonNegative());
+        }
+
+        [[nodiscard]] constexpr auto additionalWidth() const noexcept
+        {
+            return margin_.value_or({}).horizontal() + border_.value_or({}).horizontal() +
+                   padding_.value_or({}).horizontal();
+        }
+        [[nodiscard]] constexpr auto additionalHeight() const noexcept
+        {
+            return margin_.value_or({}).vertical() + border_.value_or({}).vertical() +
+                   padding_.value_or({}).vertical();
+        }
+        constexpr void layout(BoxConstraints c) override
+        {
+            const auto margin = margin_.value_or({});
+            const auto border = border_.value_or({});
+            const auto padding = padding_.value_or({});
+
+            // ── 1. 先扣 margin，得到 ConstrainedBox 的可用区
+            BoxConstraints afterMargin = c.deflate(margin);
+
+            // ── 2. 应用用户 constraints_（若没有就是继承父约束）
+            BoxConstraints inner = constraints_.has_value()
+                                       ? (*constraints_).enforce(afterMargin)
+                                       : afterMargin;
+
+            // ── 3. 再扣 padding + border，得到 child 真正的可用区
+            const EdgeInsetsGeometry inset = EdgeInsetsGeometry::fromLTRB(
+                border.left + padding.left, border.top + padding.top,
+                border.right + padding.right, border.bottom + padding.bottom);
+            BoxConstraints childConstraints = inner.deflate(inset);
+
+            if (child_)
+            {
+                Widget &childRef = *child_;
+
+                // ── 4. 有 alignment → 给孩子松约束，让它算自己的尺寸
+                //      无 alignment → 直接把 childConstraints 丢给它
+                if (alignment_.has_value())
+                {
+                    childRef.layout(BoxConstraints{0.0, childConstraints.maxWidth(), 0.0,
+                                                   childConstraints.maxHeight()});
+                }
+                else
+                {
+                    childRef.layout(childConstraints);
+                }
+
+                // ── 5. 内容区尺寸：
+                //      有 alignment：Align 展开到内容区的 max（tight 时即 tight 值）
+                //      无 alignment：就是孩子尺寸
+                Size contentSize =
+                    alignment_.has_value() ? childConstraints.biggest() : childRef.size;
+
+                // Padding(padding).size = inner.constrain(child.size + padding + border)
+                Size paddingBoxSize = inner.constrain(Size{
+                    .width = contentSize.width + inset.horizontal(),
+                    .height = contentSize.height + inset.vertical(),
+                });
+
+                // ── 6. 父自身 = 内容 + padding + border + margin
+                // Padding(margin).size = c.constrain(paddingBox.size + margin)
+                Self().size = c.constrain(Size{
+                    .width = paddingBoxSize.width + margin.horizontal(),
+                    .height = paddingBoxSize.height + margin.vertical(),
+                });
+            }
+            else
+            {
+                // 无 child：只有 margin 计入自身尺寸，padding/border 不计
+                BoxConstraints effective = constraints_.has_value()
+                                               ? (*constraints_).enforce(afterMargin)
+                                               : afterMargin;
+
+                double w = 0.0, h = 0.0;
+                if (constraints_.has_value() && constraints_->isTight())
+                {
+                    w = effective.maxWidth();
+                    h = effective.maxHeight();
+                }
+                else
+                {
+                    w = effective.hasBoundedWidth() ? effective.maxWidth() : 0.0;
+                    h = effective.hasBoundedHeight() ? effective.maxHeight() : 0.0;
+                }
+                Self().size = {
+                    .width = w + margin.horizontal(),
+                    .height = h + margin.vertical(),
+                };
+            }
+        }
+
+        constexpr void updateOffset(Offset offset) noexcept override
+        {
+            Self().offset = offset;
+            if (!child_)
+                return;
+
+            Widget &childRef = *child_;
+
+            const auto margin = margin_.value_or({});
+            const auto border = border_.value_or({});
+            const auto padding = padding_.value_or({});
+
+            // 孩子左边缘 = 父偏移 + margin + border + padding
+            double dx = offset.x + margin.left + border.left + padding.left;
+            double dy = offset.y + margin.top + border.top + padding.top;
+
+            // 有 alignment：再叠加内容区内的对齐偏移
+            if (alignment_.has_value())
+            {
+                // 内容区尺寸 = 父自身 - padding - border - margin
+                // 但更简单：直接用 layout 里算过的内容区尺寸反推
+                // 这里从对齐公式出发，需要 free = contentSize - child.size
+                // 而 contentSize = Self().size - inset - margin
+                double contentW = Self().size.width - margin.horizontal() -
+                                  border.horizontal() - padding.horizontal();
+                double contentH = Self().size.height - margin.vertical() -
+                                  border.vertical() - padding.vertical();
+
+                double freeW = contentW - childRef.size.width;
+                double freeH = contentH - childRef.size.height;
+
+                dx += freeW * (alignment_->x + 1.0) * 0.5;
+                dy += freeH * (alignment_->y + 1.0) * 0.5;
+            }
+
+            childRef.updateOffset({dx, dy});
+        }
+        [[nodiscard]] constexpr std::span<const std::unique_ptr<Widget>> children()
+            const noexcept override
+        {
+            if (!child_)
+                return {};
+            return std::span<const std::unique_ptr<Widget>>{&child_, 1};
+        }
+
+      private:
+        std::optional<BoxConstraints> constraints_;
+        std::optional<Alignment> alignment_;
+        std::optional<EdgeInsetsGeometry> margin_;
+        std::optional<EdgeInsetsGeometry> border_;
+        std::optional<EdgeInsetsGeometry> padding_;
+        std::unique_ptr<Widget> child_;
+    };
+    struct ContainerBuild
+    {
+        constexpr explicit ContainerBuild(std::string key) noexcept : key_(std::move(key))
+        {
+        }
+        constexpr explicit operator std::unique_ptr<Widget>()
+        {
+            return std::make_unique<ContainerWidget>(
+                std::move(key_), std::move(renderObject_),
+                width_.has_value() || height_.has_value()
+                    ? std::optional<BoxConstraints>{BoxConstraints::tightFor(
+                          {.width = width_, .height = height_})}
+                    : std::nullopt,
+                alignment_, margin_, border_, padding_, std::move(child_));
+        }
+        constexpr auto &key(std::string key) noexcept
+        {
+            key_ = std::move(key);
+            return *this;
+        }
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+        constexpr auto &width(double width) noexcept
+        {
+            width_ = width;
+            return *this;
+        }
+        constexpr auto &height(double height) noexcept
+        {
+            height_ = height;
+            return *this;
+        }
+        constexpr auto &margin(EdgeInsetsGeometry margin) noexcept
+        {
+            margin_ = margin;
+            return *this;
+        }
+        constexpr auto &alignment(Alignment alignment) noexcept
+        {
+            alignment_ = alignment;
+            return *this;
+        }
+        constexpr auto &border(EdgeInsetsGeometry border) noexcept
+        {
+            border_ = border;
+            return *this;
+        }
+        constexpr auto &padding(EdgeInsetsGeometry padding) noexcept
+        {
+            padding_ = padding;
+            return *this;
+        }
+        constexpr auto &child(std::unique_ptr<Widget> child) noexcept
+        {
+            child_ = std::move(child);
+            return *this;
+        }
+        constexpr auto &child(WidgetBuild auto &&b) noexcept
+        {
+            return child(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+
+      private:
+        std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
+        std::optional<double> width_;
+        std::optional<double> height_;
+        std::optional<Alignment> alignment_;
+        std::optional<EdgeInsetsGeometry> margin_;
+        std::optional<EdgeInsetsGeometry> border_;
+        std::optional<EdgeInsetsGeometry> padding_;
+        std::unique_ptr<Widget> child_;
+    };
+    static constexpr auto Container(std::string key = {}) noexcept // NOLINT
+    {
+        return ContainerBuild{std::move(key)};
+    }
+
+    struct AlignWidget : Widget
+    {
+        // NOLINTBEGIN
+        AlignWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                    Alignment alignment, std::optional<double> widthFactor,
+                    std::optional<double> heightFactor,
+                    std::unique_ptr<Widget> child) noexcept // NOLINTEND
+            : Widget(std::move(key), std::move(ro)), alignment_{alignment},
+              widthFactor_{widthFactor}, heightFactor_{heightFactor},
+              child_{std::move(child)}
+        {
+            assert(not widthFactor_.has_value() || *widthFactor_ >= 0);
+            assert(not heightFactor_.has_value() || *heightFactor_ >= 0);
+        }
+        void layout(BoxConstraints c) override
+        {
+            const BoxConstraints constraints = c.normalize();
+
+            if (child_)
+            {
+                Widget &childRef = *child_;
+
+                // Align 给孩子松约束：最小值为 0，最大值保持不变。
+                const BoxConstraints childConstraints = constraints.loosen();
+
+                childRef.layout(childConstraints);
+
+                const Size childSize = childRef.size;
+
+                const double width = widthFactor_.has_value()
+                                         ? childSize.width * (*widthFactor_)
+                                         : constraints.maxWidth();
+
+                const double height = heightFactor_.has_value()
+                                          ? childSize.height * (*heightFactor_)
+                                          : constraints.maxHeight();
+
+                Self().size = constraints.constrain(Size{width, height});
+            }
+            else
+            {
+                const double width = widthFactor_.has_value()
+                                         ? constraints.minWidth() * (*widthFactor_)
+                                         : constraints.maxWidth();
+
+                const double height = heightFactor_.has_value()
+                                          ? constraints.minHeight() * (*heightFactor_)
+                                          : constraints.maxHeight();
+
+                Self().size = constraints.constrain(Size{width, height});
+            }
+        }
+
+        void updateOffset(Offset offset) noexcept override
+        {
+            Self().offset = offset;
+
+            if (!child_)
+                return;
+
+            Widget &childRef = *child_;
+
+            double freeWidth = Self().size.width - childRef.size.width;
+            double freeHeight = Self().size.height - childRef.size.height;
+
+            // Alignment:
+            // (-1, -1) => 左上
+            // ( 0,  0) => 居中
+            // ( 1,  1) => 右下
+            double dx = freeWidth * (alignment_.x + 1.0) * 0.5;
+            double dy = freeHeight * (alignment_.y + 1.0) * 0.5;
+
+            childRef.updateOffset(Offset{.x = offset.x + dx, .y = offset.y + dy});
+        }
+
+        [[nodiscard]] constexpr std::span<const std::unique_ptr<Widget>> children()
+            const noexcept override
+        {
+            if (!child_)
+                return {};
+            return std::span<const std::unique_ptr<Widget>>{&child_, 1};
+        }
+
+      private:
+        Alignment alignment_;
+        std::optional<double> widthFactor_;
+        std::optional<double> heightFactor_;
+        std::unique_ptr<Widget> child_;
+    };
+    struct AlignBuild
+    {
+        explicit AlignBuild(std::string key) noexcept : key_(std::move(key)) {}
+        explicit operator std::unique_ptr<Widget>()
+        {
+            return std::make_unique<AlignWidget>(
+                std::move(key_), std::move(renderObject_), alignment_, widthFactor_,
+                heightFactor_, std::move(child_));
+        }
+        constexpr auto &key(std::string key) noexcept
+        {
+            key_ = std::move(key);
+            return *this;
+        }
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+        constexpr AlignBuild &alignment(Alignment alignment) noexcept
+        {
+            alignment_ = alignment;
+            return *this;
+        }
+        constexpr auto &widthFactor(double widthFactor) noexcept
+        {
+            widthFactor_ = widthFactor;
+            return *this;
+        }
+        constexpr auto &heightFactor(double heightFactor) noexcept
+        {
+            heightFactor_ = heightFactor;
+            return *this;
+        }
+        constexpr auto &child(std::unique_ptr<Widget> child) noexcept
+        {
+            child_ = std::move(child);
+            return *this;
+        }
+        constexpr auto &child(WidgetBuild auto &&b) noexcept
+        {
+            return child(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+
+      private:
+        std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
+        Alignment alignment_ = Alignment::center;
+        std::optional<double> widthFactor_;
+        std::optional<double> heightFactor_;
+        std::unique_ptr<Widget> child_;
+    };
+    static constexpr auto Align(std::string key = {}) noexcept // NOLINT
+    {
+        return AlignBuild{std::move(key)};
+    }
+
+    struct CenterWidget : AlignWidget
+    {
+    };
+    struct CenterBuild : AlignBuild
+    {
+        using AlignBuild::AlignBuild;
+        constexpr AlignBuild &alignment(Alignment alignment) noexcept = delete;
+    };
+    static constexpr auto Center(std::string key = {}) noexcept // NOLINT
+    {
+        return CenterBuild{std::move(key)};
+    }
+
+    struct SizedBoxWidget : Widget
+    {
+        // NOLINTBEGIN
+        constexpr SizedBoxWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                                 std::optional<double> width,
+                                 std::optional<double> height,
+                                 std::unique_ptr<Widget> child) noexcept
+            : Widget(std::move(key), std::move(ro)), width_{width}, height_{height},
+              child_{std::move(child)} // NOLINTEND
+        {
+            assert(not width_.has_value() || *width_ >= 0);
+            assert(not height_.has_value() || *height_ >= 0);
+        }
+        constexpr void layout(BoxConstraints c) override
+        {
+            // Flutter: RenderConstrainedBox(additionalConstraints: tightFor(width, height))
+            BoxConstraints effective =
+                BoxConstraints::tightFor({.width = width_, .height = height_}).enforce(c);
+
+            if (child_)
+            {
+                Widget &childRef = *child_;
+                childRef.layout(effective);
+                // 自身尺寸 = 孩子的尺寸
+                Self().size = childRef.size;
+            }
+            else
+            {
+                // Flutter: size = effective.constrain(Size.zero)
+                Self().size = effective.smallest();
+            }
+        }
+        constexpr void updateOffset(Offset offset) noexcept override
+        {
+            Self().offset = offset;
+            if (child_)
+            {
+                // SizedBox 无 margin/padding，孩子与自身同原点
+                Widget &childRef = *child_;
+                childRef.updateOffset(offset);
+            }
+        }
+        [[nodiscard]] constexpr std::span<const std::unique_ptr<Widget>> children()
+            const noexcept override
+        {
+            if (!child_)
+                return {};
+            return std::span<const std::unique_ptr<Widget>>{&child_, 1};
+        }
+
+      private:
+        std::optional<double> width_;
+        std::optional<double> height_;
+        std::unique_ptr<Widget> child_;
+    };
+    struct SizedBoxBuild
+    {
+        explicit SizedBoxBuild(std::string key) noexcept : key_(std::move(key)) {}
+
+        explicit operator std::unique_ptr<Widget>()
+        {
+            return std::make_unique<SizedBoxWidget>(std::move(key_),
+                                                    std::move(renderObject_), width_,
+                                                    height_, std::move(child_));
+        }
+
+        constexpr auto &key(std::string key) noexcept
+        {
+            key_ = std::move(key);
+            return *this;
+        }
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+        constexpr auto &width(double width) noexcept
+        {
+            width_ = width;
+            return *this;
+        }
+        constexpr auto &height(double height) noexcept
+        {
+            height_ = height;
+            return *this;
+        }
+        constexpr auto &child(std::unique_ptr<Widget> child) noexcept
+        {
+            child_ = std::move(child);
+            return *this;
+        }
+        constexpr auto &child(WidgetBuild auto &&b) noexcept
+        {
+            return child(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+
+      private:
+        std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
+        std::optional<double> width_;
+        std::optional<double> height_;
+        std::unique_ptr<Widget> child_;
+    };
+    static constexpr auto SizedBox(std::string key = {}) noexcept // NOLINT
+    {
+        return SizedBoxBuild{std::move(key)};
+    }
+
+    struct PaddingWidget : Widget
+    {
+        constexpr PaddingWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                                EdgeInsetsGeometry padding,
+                                std::unique_ptr<Widget> child) noexcept
+            : Widget(std::move(key), std::move(ro)), padding_{padding},
+              child_{std::move(child)}
+        {
+            assert(padding_.isNonNegative());
+        }
+
+        constexpr void layout(BoxConstraints c) override
+        {
+            if (child_)
+            {
+                Widget &childRef = *child_;
+
+                // 1. 缩水约束：c.deflate(padding) 给孩子
+                childRef.layout(c.deflate(padding_));
+
+                // 2. 自身尺寸 = 孩子尺寸 + padding，再被父约束夹住
+                Self().size = c.constrain(Size{
+                    .width = childRef.size.width + padding_.horizontal(),
+                    .height = childRef.size.height + padding_.vertical(),
+                });
+            }
+            else
+            {
+                Self().size = c.constrain(Size{
+                    .width = padding_.horizontal(),
+                    .height = padding_.vertical(),
+                });
+            }
+        }
+
+        constexpr void updateOffset(Offset offset) noexcept override
+        {
+            Self().offset = offset;
+            if (child_)
+            {
+                Widget &childRef = *child_;
+                // padding 就是孩子的内缩量（LTR 情况下 start=left, end=right）
+                childRef.updateOffset(Offset{
+                    .x = offset.x + padding_.left,
+                    .y = offset.y + padding_.top,
+                });
+            }
+        }
+
+        [[nodiscard]] constexpr std::span<const std::unique_ptr<Widget>> children()
+            const noexcept override
+        {
+            if (!child_)
+                return {};
+            return std::span<const std::unique_ptr<Widget>>{&child_, 1};
+        }
+
+      private:
+        EdgeInsetsGeometry padding_;
+        std::unique_ptr<Widget> child_;
+    };
+    struct PaddingBuild
+    {
+        constexpr explicit PaddingBuild(std::string key) noexcept : key_(std::move(key))
+        {
+        }
+
+        explicit operator std::unique_ptr<Widget>()
+        {
+            if (not padding_.has_value())
+                throw std::logic_error{"PaddingBuild required padding value"};
+            return std::make_unique<PaddingWidget>(
+                std::move(key_), std::move(renderObject_), *padding_, std::move(child_));
+        }
+
+        constexpr auto &key(std::string key) noexcept
+        {
+            key_ = std::move(key);
+            return *this;
+        }
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+        constexpr auto &padding(EdgeInsetsGeometry padding) noexcept
+        {
+            padding_ = padding;
+            return *this;
+        }
+        constexpr auto &child(std::unique_ptr<Widget> child) noexcept
+        {
+            child_ = std::move(child);
+            return *this;
+        }
+        constexpr auto &child(WidgetBuild auto &&b) noexcept
+        {
+            return child(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+
+      private:
+        std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
+        std::optional<EdgeInsetsGeometry> padding_;
+        std::unique_ptr<Widget> child_;
+    };
+    static constexpr auto Padding(std::string key = {}) noexcept // NOLINT
+    {
+        return PaddingBuild{std::move(key)};
+    }
+
+    struct ConstrainedBoxWidget : Widget
+    {
+        constexpr ConstrainedBoxWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                                       BoxConstraints constraints,
+                                       std::unique_ptr<Widget> child) noexcept
+            : Widget(std::move(key), std::move(ro)), constraints_{constraints},
+              child_{std::move(child)}
+        {
+            assert(constraints_.isNormalized());
+        }
+
+        constexpr void layout(BoxConstraints c) override
+        {
+            // Flutter: RenderConstrainedBox(additionalConstraints: constraints_)
+            BoxConstraints effective = constraints_.enforce(c);
+
+            if (child_)
+            {
+                Widget &childRef = *child_;
+                childRef.layout(effective);
+                // 自身尺寸 = 孩子的尺寸
+                Self().size = childRef.size;
+            }
+            else
+            {
+                // Flutter: size = effective.constrain(Size.zero)
+                Self().size = effective.smallest();
+            }
+        }
+
+        constexpr void updateOffset(Offset offset) noexcept override
+        {
+            Self().offset = offset;
+            if (child_)
+            {
+                // 无 margin/padding，孩子与自身同原点
+                child_->updateOffset(offset);
+            }
+        }
+
+        [[nodiscard]] constexpr std::span<const std::unique_ptr<Widget>> children()
+            const noexcept override
+        {
+            if (!child_)
+                return {};
+            return std::span<const std::unique_ptr<Widget>>{&child_, 1};
+        }
+
+      private:
+        BoxConstraints constraints_; // The additional constraints to impose on the child.
+        std::unique_ptr<Widget> child_;
+    };
+    struct ConstrainedBoxBuild
+    {
+        constexpr explicit ConstrainedBoxBuild(std::string key) noexcept
+            : key_(std::move(key))
+        {
+        }
+
+        explicit operator std::unique_ptr<Widget>()
+        {
+            if (not constraints_.has_value())
+                throw std::logic_error{"ConstrainedBoxWidget required constraints value"};
+            return std::make_unique<ConstrainedBoxWidget>(
+                std::move(key_), std::move(renderObject_), *constraints_,
+                std::move(child_));
+        }
+
+        constexpr auto &key(std::string key) noexcept
+        {
+            key_ = std::move(key);
+            return *this;
+        }
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+        constexpr auto &constraints(BoxConstraints constraints) noexcept
+        {
+            constraints_ = constraints;
+            return *this;
+        }
+        constexpr auto &child(std::unique_ptr<Widget> child) noexcept
+        {
+            child_ = std::move(child);
+            return *this;
+        }
+        constexpr auto &child(WidgetBuild auto &&b) noexcept
+        {
+            return child(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+
+      private:
+        std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
+        std::optional<BoxConstraints> constraints_;
+        std::unique_ptr<Widget> child_;
+    };
+    static constexpr auto ConstrainedBox(std::string key = {}) noexcept // NOLINT
+    {
+        return ConstrainedBoxBuild{std::move(key)};
+    }
+
+    enum class OverflowBoxFit : std::uint8_t
+    {
+        max,          // 自身 = 父约束允许的最大尺寸（默认）
+        deferToChild, // 自身 = 父约束对 child.size 夹取后的尺寸
+    };
+    struct OverflowBoxWidget : Widget
+    {
+        // NOLINTBEGIN
+        constexpr OverflowBoxWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                                    Alignment alignment, std::optional<double> minWidth,
+                                    std::optional<double> maxWidth,
+                                    std::optional<double> minHeight,
+                                    std::optional<double> maxHeight, OverflowBoxFit fit,
+                                    std::unique_ptr<Widget> child) noexcept // NOLINTEND
+            : Widget(std::move(key), std::move(ro)), alignment_{alignment},
+              minWidth_{minWidth}, maxWidth_{maxWidth}, minHeight_{minHeight},
+              maxHeight_{maxHeight}, fit_{fit}, child_{std::move(child)}
+        {
+        }
+
+        constexpr void layout(BoxConstraints c) override
+        {
+            // 1) 用「显式覆盖值 + 从父约束继承」组合出 child 的约束
+            const BoxConstraints inner = innerConstraints(c);
+
+            if (child_)
+            {
+                Widget &childRef = *child_;
+
+                // 2) child 用 inner 布局（可能溢出父约束，这正是 OverflowBox 的用意）
+                childRef.layout(inner);
+
+                // 3) 自身尺寸：deferToChild → 夹取 child.size；max → 父允许的最大
+                Self().size = (fit_ == OverflowBoxFit::deferToChild)
+                                  ? c.constrain(childRef.size)
+                                  : c.biggest();
+            }
+            else
+            {
+                // 无 child：仍按 fit 决定自身尺寸
+                Self().size = (fit_ == OverflowBoxFit::deferToChild)
+                                  ? c.constrain(inner.smallest())
+                                  : c.biggest();
+            }
+        }
+
+        constexpr void updateOffset(Offset offset) noexcept override
+        {
+            Self().offset = offset;
+            if (!child_)
+                return;
+
+            Widget &childRef = *child_;
+
+            // child 可以大于 / 小于自身，因此 freeW / freeH 可能为负（溢出时）
+            const double freeW = Self().size.width - childRef.size.width;
+            const double freeH = Self().size.height - childRef.size.height;
+
+            const double dx = offset.x + freeW * (alignment_.x + 1.0) * 0.5;
+            const double dy = offset.y + freeH * (alignment_.y + 1.0) * 0.5;
+
+            childRef.updateOffset({dx, dy});
+        }
+
+        [[nodiscard]] constexpr std::span<const std::unique_ptr<Widget>> children()
+            const noexcept override
+        {
+            if (!child_)
+                return {};
+            return std::span<const std::unique_ptr<Widget>>{&child_, 1};
+        }
+
+      private:
+        [[nodiscard]] constexpr BoxConstraints innerConstraints(
+            BoxConstraints c) const noexcept
+        {
+            // 未提供的分量 → 沿用父约束；提供的分量 → 覆盖
+            return BoxConstraints{
+                minWidth_.value_or(c.minWidth()),
+                maxWidth_.value_or(c.maxWidth()),
+                minHeight_.value_or(c.minHeight()),
+                maxHeight_.value_or(c.maxHeight()),
+            };
+        }
+
+        Alignment alignment_;
+        std::optional<double> minWidth_;
+        std::optional<double> maxWidth_;
+        std::optional<double> minHeight_;
+        std::optional<double> maxHeight_;
+        OverflowBoxFit fit_;
+        std::unique_ptr<Widget> child_;
+    };
+    struct OverflowBoxBuild
+    {
+        constexpr explicit OverflowBoxBuild(std::string key) noexcept
+            : key_(std::move(key))
+        {
+        }
+
+        explicit operator std::unique_ptr<Widget>()
+        {
+            return std::make_unique<OverflowBoxWidget>(
+                std::move(key_), std::move(renderObject_), alignment_, minWidth_,
+                maxWidth_, minHeight_, maxHeight_, fit_, std::move(child_));
+        }
+
+        constexpr auto &key(std::string key) noexcept
+        {
+            key_ = std::move(key);
+            return *this;
+        }
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+        constexpr auto &alignment(Alignment alignment) noexcept
+        {
+            alignment_ = alignment;
+            return *this;
+        }
+        constexpr auto &minWidth(double v) noexcept
+        {
+            minWidth_ = v;
+            return *this;
+        }
+        constexpr auto &maxWidth(double v) noexcept
+        {
+            maxWidth_ = v;
+            return *this;
+        }
+        constexpr auto &minHeight(double v) noexcept
+        {
+            minHeight_ = v;
+            return *this;
+        }
+        constexpr auto &maxHeight(double v) noexcept
+        {
+            maxHeight_ = v;
+            return *this;
+        }
+        constexpr auto &fit(OverflowBoxFit f) noexcept
+        {
+            fit_ = f;
+            return *this;
+        }
+        constexpr auto &child(std::unique_ptr<Widget> child) noexcept
+        {
+            child_ = std::move(child);
+            return *this;
+        }
+        constexpr auto &child(WidgetBuild auto &&b) noexcept
+        {
+            return child(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+
+      private:
+        std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
+        Alignment alignment_ = Alignment::center;
+        std::optional<double> minWidth_;
+        std::optional<double> maxWidth_;
+        std::optional<double> minHeight_;
+        std::optional<double> maxHeight_;
+        OverflowBoxFit fit_ = OverflowBoxFit::max;
+        std::unique_ptr<Widget> child_;
+    };
+    static constexpr auto OverflowBox(std::string key = {}) noexcept // NOLINT
+    {
+        return OverflowBoxBuild{std::move(key)};
+    }
+
+    // =========================================================================
+    // UnconstrainedBox
+    //
+    // 语义（对应 Flutter 里的 ConstraintsTransformBox）：
+    //   constrainedAxis == null
+    //       两轴都放开  → child 约束 = [0, inf] x [0, inf]
+    //   constrainedAxis == horizontal
+    //       保留宽度约束，高度放开 → child 约束 = [c.minW, c.maxW] x [0, inf]
+    //   constrainedAxis == vertical
+    //       保留高度约束，宽度放开 → child 约束 = [0, inf] x [c.minH, c.maxH]
+    //
+    // 自身尺寸 = 父约束夹取 child.size；child 相对自身按 alignment 对齐。
+    // 若 child 溢出，对应方向会出现负 free 值（此处不报警，交由上层或调试期处理）。
+    // =========================================================================
+    struct UnconstrainedBoxWidget : Widget
+    {
+        // NOLINTBEGIN
+        constexpr UnconstrainedBoxWidget(
+            std::string key, std::unique_ptr<RenderObject> ro, Alignment alignment,
+            std::optional<Axis> constrainedAxis,
+            std::unique_ptr<Widget> child) noexcept // NOLINTEND
+            : Widget(std::move(key), std::move(ro)), alignment_{alignment},
+              constrainedAxis_{constrainedAxis}, child_{std::move(child)}
+        {
+        }
+
+        constexpr void layout(BoxConstraints c) override
+        {
+            const BoxConstraints inner = transform(c);
+
+            if (child_)
+            {
+                Widget &childRef = *child_;
+
+                // child 用放开后的约束布局
+                childRef.layout(inner);
+
+                // 自身 = 父约束夹取 child.size（可能因为 child 溢出而被夹住）
+                Self().size = c.constrain(childRef.size);
+            }
+            else
+            {
+                // 无 child：取父约束下的最小值
+                Self().size = c.smallest();
+            }
+        }
+
+        constexpr void updateOffset(Offset offset) noexcept override
+        {
+            Self().offset = offset;
+            if (!child_)
+                return;
+
+            Widget &childRef = *child_;
+
+            // child 可能比自身大（溢出），freeW / freeH 允许为负
+            const double freeW = Self().size.width - childRef.size.width;
+            const double freeH = Self().size.height - childRef.size.height;
+
+            const double dx = offset.x + freeW * (alignment_.x + 1.0) * 0.5;
+            const double dy = offset.y + freeH * (alignment_.y + 1.0) * 0.5;
+
+            childRef.updateOffset({dx, dy});
+        }
+
+        [[nodiscard]] constexpr std::span<const std::unique_ptr<Widget>> children()
+            const noexcept override
+        {
+            if (!child_)
+                return {};
+            return std::span<const std::unique_ptr<Widget>>{&child_, 1};
+        }
+
+      private:
+        // 三种约束变换（对应 Flutter 的 BoxConstraintsTransform）
+        [[nodiscard]] constexpr BoxConstraints transform(BoxConstraints c) const noexcept
+        {
+            constexpr auto inf = std::numeric_limits<double>::infinity();
+
+            if (!constrainedAxis_.has_value())
+            {
+                // unconstrained: 两轴都放开
+                return BoxConstraints{0.0, inf, 0.0, inf};
+            }
+
+            if (*constrainedAxis_ == Axis::horizontal)
+            {
+                // heightUnconstrained: 保留宽度，高度放开
+                return BoxConstraints{c.minWidth(), c.maxWidth(), 0.0, inf};
+            }
+
+            // Axis::vertical → widthUnconstrained: 保留高度，宽度放开
+            return BoxConstraints{0.0, inf, c.minHeight(), c.maxHeight()};
+        }
+
+        Alignment alignment_;
+        std::optional<Axis> constrainedAxis_;
+        std::unique_ptr<Widget> child_;
+    };
+    struct UnconstrainedBoxBuild
+    {
+        constexpr explicit UnconstrainedBoxBuild(std::string key) noexcept
+            : key_(std::move(key))
+        {
+        }
+
+        explicit operator std::unique_ptr<Widget>()
+        {
+            return std::make_unique<UnconstrainedBoxWidget>(
+                std::move(key_), std::move(renderObject_), alignment_, constrainedAxis_,
+                std::move(child_));
+        }
+
+        constexpr auto &key(std::string key) noexcept
+        {
+            key_ = std::move(key);
+            return *this;
+        }
+
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+
+        constexpr auto &alignment(Alignment alignment) noexcept
+        {
+            alignment_ = alignment;
+            return *this;
+        }
+
+        constexpr auto &constrainedAxis(Axis axis) noexcept
+        {
+            constrainedAxis_ = axis;
+            return *this;
+        }
+        constexpr auto &clearConstrainedAxis() noexcept
+        {
+            constrainedAxis_.reset();
+            return *this;
+        }
+
+        constexpr auto &child(std::unique_ptr<Widget> child) noexcept
+        {
+            child_ = std::move(child);
+            return *this;
+        }
+        constexpr auto &child(WidgetBuild auto &&b) noexcept
+        {
+            return child(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+
+      private:
+        std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
+        Alignment alignment_ = Alignment::center;
+        std::optional<Axis> constrainedAxis_;
+        std::unique_ptr<Widget> child_;
+    };
+    static constexpr auto UnconstrainedBox(std::string key = {}) noexcept // NOLINT
+    {
+        return UnconstrainedBoxBuild{std::move(key)};
+    }
+
+    struct LimitedBoxWidget : Widget
+    {
+        // NOLINTBEGIN
+        constexpr LimitedBoxWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                                   double maxWidth, double maxHeight,
+                                   std::unique_ptr<Widget> child) noexcept // NOLINTEND
+            : Widget(std::move(key), std::move(ro)), maxWidth_{maxWidth},
+              maxHeight_{maxHeight}, child_{std::move(child)}
+        {
+            assert(maxWidth_ >= 0.0);
+            assert(maxHeight_ >= 0.0);
+        }
+
+        constexpr void layout(BoxConstraints c) override
+        {
+            const BoxConstraints inner = innerConstraints(c);
+
+            if (child_)
+            {
+                Widget &childRef = *child_;
+                childRef.layout(inner);
+                Self().size = c.constrain(childRef.size);
+            }
+            else
+            {
+                Self().size = c.constrain(inner.smallest());
+            }
+        }
+
+        constexpr void updateOffset(Offset offset) noexcept override
+        {
+            Self().offset = offset;
+            if (child_)
+                child_->updateOffset(offset);
+        }
+
+        [[nodiscard]] constexpr std::span<const std::unique_ptr<Widget>> children()
+            const noexcept override
+        {
+            if (!child_)
+                return {};
+            return std::span<const std::unique_ptr<Widget>>{&child_, 1};
+        }
+
+      private:
+        [[nodiscard]] constexpr BoxConstraints innerConstraints(
+            BoxConstraints c) const noexcept
+        {
+            constexpr auto inf = std::numeric_limits<double>::infinity();
+
+            return BoxConstraints{
+                c.minWidth(),
+                c.maxWidth() == inf ? maxWidth_ : c.maxWidth(),
+                c.minHeight(),
+                c.maxHeight() == inf ? maxHeight_ : c.maxHeight(),
+            };
+        }
+
+        double maxWidth_;
+        double maxHeight_;
+        std::unique_ptr<Widget> child_;
+    };
+    struct LimitedBoxBuild
+    {
+        constexpr explicit LimitedBoxBuild(std::string key) noexcept
+            : key_(std::move(key))
+        {
+        }
+
+        explicit operator std::unique_ptr<Widget>()
+        {
+            return std::make_unique<LimitedBoxWidget>(std::move(key_),
+                                                      std::move(renderObject_), maxWidth_,
+                                                      maxHeight_, std::move(child_));
+        }
+
+        constexpr auto &key(std::string key) noexcept
+        {
+            key_ = std::move(key);
+            return *this;
+        }
+
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+
+        constexpr auto &maxWidth(double maxWidth) noexcept
+        {
+            maxWidth_ = maxWidth;
+            return *this;
+        }
+
+        constexpr auto &maxHeight(double maxHeight) noexcept
+        {
+            maxHeight_ = maxHeight;
+            return *this;
+        }
+
+        constexpr auto &child(std::unique_ptr<Widget> child) noexcept
+        {
+            child_ = std::move(child);
+            return *this;
+        }
+
+        constexpr auto &child(WidgetBuild auto &&b) noexcept
+        {
+            return child(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+
+      private:
+        static constexpr auto inf = std::numeric_limits<double>::infinity();
+
+        std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
+        double maxWidth_{inf};
+        double maxHeight_{inf};
+        std::unique_ptr<Widget> child_;
+    };
+    static constexpr auto LimitedBox(std::string key = {}) noexcept // NOLINT
+    {
+        return LimitedBoxBuild{std::move(key)};
+    }
+
+    // =========================================================================
+    // AspectRatio
+    //
+    // 语义（对应 Flutter RenderAspectRatio）：
+    //   aspectRatio = width / height，必须 > 0。
+    //
+    //   1. 先把宽度设成 maxWidth；若宽度无界，则取 height * aspectRatio
+    //      （height = maxHeight）或者 0（两轴都无界）。
+    //   2. 由 width 推出 height = width / aspectRatio。
+    //   3. 依次做 4 步“夹取修正”，保证 height ∈ [minH, maxH] 且 width ∈ [minW, maxW]：
+    //        · height > maxHeight  → 用 maxHeight 反推 width
+    //        · width  < minWidth   → 用 minWidth  反推 height
+    //        · height < minHeight  → 用 minHeight 反推 width
+    //   4. size = c.constrain(Size(width, height))
+    //   5. child 用 BoxConstraints::tight(size) 布局（保证子级不会改变比例）
+    //
+    //   无 child 时：size = c.smallest()。
+    // =========================================================================
+    struct AspectRatioWidget : Widget
+    {
+        // NOLINTBEGIN
+        constexpr AspectRatioWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                                    double aspectRatio,
+                                    std::unique_ptr<Widget> child) noexcept // NOLINTEND
+            : Widget(std::move(key), std::move(ro)), aspectRatio_{aspectRatio},
+              child_{std::move(child)}
+        {
+            assert(aspectRatio_ > 0.0);
+        }
+
+        constexpr void layout(BoxConstraints c) override
+        {
+            if (!child_)
+            {
+                Self().size = c.smallest();
+                return;
+            }
+
+            // ── 1. 决定初始宽度
+            double width = c.maxWidth();
+            if (!c.hasBoundedWidth())
+            {
+                width = c.hasBoundedHeight() ? c.maxHeight() * aspectRatio_ : 0.0;
+            }
+
+            // ── 2. 由宽度反推高度
+            double height = width / aspectRatio_;
+
+            // ── 3. 四步夹取修正（顺序与 Flutter 完全一致）
+            if (height > c.maxHeight())
+            {
+                height = c.maxHeight();
+                width = height * aspectRatio_;
+            }
+            if (width < c.minWidth())
+            {
+                width = c.minWidth();
+                height = width / aspectRatio_;
+            }
+            if (height < c.minHeight())
+            {
+                height = c.minHeight();
+                width = height * aspectRatio_;
+            }
+
+            // ── 4. 自身尺寸 = 约束夹取后的 (w, h)
+            Self().size = c.constrain(Size{width, height});
+
+            // ── 5. child 用 tight 约束布局（保证 child 内部不改变比例）
+            child_->layout(BoxConstraints::tight(Self().size));
+        }
+
+        constexpr void updateOffset(Offset offset) noexcept override
+        {
+            Self().offset = offset;
+            if (child_)
+            {
+                // AspectRatio 无 margin/padding，child 与自身同原点
+                child_->updateOffset(offset);
+            }
+        }
+
+        [[nodiscard]] constexpr std::span<const std::unique_ptr<Widget>> children()
+            const noexcept override
+        {
+            if (!child_)
+                return {};
+            return std::span<const std::unique_ptr<Widget>>{&child_, 1};
+        }
+
+      private:
+        double aspectRatio_;
+        std::unique_ptr<Widget> child_;
+    };
+    struct AspectRatioBuild
+    {
+        constexpr explicit AspectRatioBuild(std::string key, double aspectRatio) noexcept
+            : key_(std::move(key)), aspectRatio_{aspectRatio}
+        {
+        }
+
+        explicit operator std::unique_ptr<Widget>()
+        {
+            if (!(aspectRatio_ > 0.0))
+                throw std::logic_error{"AspectRatio requires aspectRatio > 0"};
+            return std::make_unique<AspectRatioWidget>(std::move(key_),
+                                                       std::move(renderObject_),
+                                                       aspectRatio_, std::move(child_));
+        }
+
+        constexpr auto &key(std::string key) noexcept
+        {
+            key_ = std::move(key);
+            return *this;
+        }
+
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+
+        constexpr auto &aspectRatio(double aspectRatio) noexcept
+        {
+            aspectRatio_ = aspectRatio;
+            return *this;
+        }
+
+        constexpr auto &child(std::unique_ptr<Widget> child) noexcept
+        {
+            child_ = std::move(child);
+            return *this;
+        }
+        constexpr auto &child(WidgetBuild auto &&b) noexcept
+        {
+            return child(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+
+      private:
+        std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
+        double aspectRatio_;
+        std::unique_ptr<Widget> child_;
+    };
+    static constexpr auto AspectRatio(std::string key,
+                                      double aspectRatio) noexcept // NOLINT
+    {
+        return AspectRatioBuild{std::move(key), aspectRatio};
+    }
+
+    // =========================================================================
+    // FractionallySizedBox
+    //
+    // 语义（对应 Flutter RenderFractionallySizedOverflowBox）：
+    //   widthFactor  != null → child 收到严格宽度约束 = maxWidth * widthFactor
+    //   widthFactor  == null → child 原样继承父的宽度约束
+    //   heightFactor != null → child 收到严格高度约束 = maxHeight * heightFactor
+    //   heightFactor == null → child 原样继承父的高度约束
+    //
+    //   自身尺寸 = c.constrain(child.size)（可能比 child 小，从而产生溢出）
+    //   child 相对自身按 alignment 对齐
+    // =========================================================================
+    struct FractionallySizedBoxWidget : Widget
+    {
+        // NOLINTBEGIN
+        constexpr FractionallySizedBoxWidget(
+            std::string key, std::unique_ptr<RenderObject> ro, Alignment alignment,
+            std::optional<double> widthFactor, std::optional<double> heightFactor,
+            std::unique_ptr<Widget> child) noexcept // NOLINTEND
+            : Widget(std::move(key), std::move(ro)), alignment_{alignment},
+              widthFactor_{widthFactor}, heightFactor_{heightFactor},
+              child_{std::move(child)}
+        {
+            assert(!widthFactor_.has_value() || *widthFactor_ >= 0.0);
+            assert(!heightFactor_.has_value() || *heightFactor_ >= 0.0);
+        }
+
+        constexpr void layout(BoxConstraints c) override
+        {
+            const BoxConstraints inner = innerConstraints(c);
+
+            if (child_)
+            {
+                Widget &childRef = *child_;
+
+                // 1. child 用「按比例缩放后的约束」布局
+                childRef.layout(inner);
+
+                // 2. 自身尺寸 = 父约束夹取 child.size
+                //    （若 widthFactor > 1，child 溢出，自身被夹回 maxWidth）
+                Self().size = c.constrain(childRef.size);
+            }
+            else
+            {
+                // 3. 无 child：取缩放后约束下的最小尺寸（与 Flutter 一致）
+                Self().size = c.constrain(inner.smallest());
+            }
+        }
+
+        constexpr void updateOffset(Offset offset) noexcept override
+        {
+            Self().offset = offset;
+            if (!child_)
+                return;
+
+            Widget &childRef = *child_;
+
+            // free 值可能为负 → child 溢出时按 alignment 反向偏移（与 Flutter 溢出行为一致）
+            const double freeW = Self().size.width - childRef.size.width;
+            const double freeH = Self().size.height - childRef.size.height;
+
+            const double dx = offset.x + freeW * (alignment_.x + 1.0) * 0.5;
+            const double dy = offset.y + freeH * (alignment_.y + 1.0) * 0.5;
+
+            childRef.updateOffset({dx, dy});
+        }
+
+        [[nodiscard]] constexpr std::span<const std::unique_ptr<Widget>> children()
+            const noexcept override
+        {
+            if (!child_)
+                return {};
+            return std::span<const std::unique_ptr<Widget>>{&child_, 1};
+        }
+
+      private:
+        // 对应 Flutter 的 RenderFractionallySizedOverflowBox._getInnerConstraints
+        [[nodiscard]] constexpr BoxConstraints innerConstraints(
+            BoxConstraints c) const noexcept
+        {
+            double minWidth = c.minWidth();
+            double maxWidth = c.maxWidth();
+            if (widthFactor_.has_value())
+            {
+                const double width = maxWidth * (*widthFactor_);
+                minWidth = width;
+                maxWidth = width;
+            }
+
+            double minHeight = c.minHeight();
+            double maxHeight = c.maxHeight();
+            if (heightFactor_.has_value())
+            {
+                const double height = maxHeight * (*heightFactor_);
+                minHeight = height;
+                maxHeight = height;
+            }
+
+            return BoxConstraints{minWidth, maxWidth, minHeight, maxHeight};
+        }
+
+        Alignment alignment_;
+        std::optional<double> widthFactor_;
+        std::optional<double> heightFactor_;
+        std::unique_ptr<Widget> child_;
+    };
+
+    struct FractionallySizedBoxBuild
+    {
+        constexpr explicit FractionallySizedBoxBuild(std::string key) noexcept
+            : key_(std::move(key))
+        {
+        }
+
+        explicit operator std::unique_ptr<Widget>()
+        {
+            return std::make_unique<FractionallySizedBoxWidget>(
+                std::move(key_), std::move(renderObject_), alignment_, widthFactor_,
+                heightFactor_, std::move(child_));
+        }
+
+        constexpr auto &key(std::string key) noexcept
+        {
+            key_ = std::move(key);
+            return *this;
+        }
+
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+
+        constexpr auto &alignment(Alignment alignment) noexcept
+        {
+            alignment_ = alignment;
+            return *this;
+        }
+
+        constexpr auto &widthFactor(double factor) noexcept
+        {
+            widthFactor_ = factor;
+            return *this;
+        }
+
+        constexpr auto &heightFactor(double factor) noexcept
+        {
+            heightFactor_ = factor;
+            return *this;
+        }
+
+        constexpr auto &clearWidthFactor() noexcept
+        {
+            widthFactor_.reset();
+            return *this;
+        }
+
+        constexpr auto &clearHeightFactor() noexcept
+        {
+            heightFactor_.reset();
+            return *this;
+        }
+
+        constexpr auto &child(std::unique_ptr<Widget> child) noexcept
+        {
+            child_ = std::move(child);
+            return *this;
+        }
+        constexpr auto &child(WidgetBuild auto &&b) noexcept
+        {
+            return child(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+
+      private:
+        std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
+        Alignment alignment_ = Alignment::center;
+        std::optional<double> widthFactor_;
+        std::optional<double> heightFactor_;
+        std::unique_ptr<Widget> child_;
+    };
+
+    static constexpr auto FractionallySizedBox(std::string key = {}) noexcept // NOLINT
+    {
+        return FractionallySizedBoxBuild{std::move(key)};
+    }
+
+    // ===============================================================================================
+    // flex 模式 [start]
+    // ===============================================================================================
+    // =========================================================================
+    // FlexInfo —— Flex 对每个子节点的记账信息
+    // 与 children_ 一一对应，仅存在于 Flex 内部，不进 Widget 抽象
+    // =========================================================================
+    struct FlexInfo
+    {
+        int flex = 0;                 // 0 表示非弹性
+        FlexFit fit = FlexFit::tight; // flex > 0 时才有意义
+    };
+
+    //NOTE: Spacer 引入 takeChild。 这是部分flex 语义的。因为这些标签是有关联的。因为CPP和dart是不一样的
+    // =========================================================================
+    // FlexChildBuilder concept：任何能向 Flex 贡献 (child, flex, fit) 的构建器
+    // =========================================================================
+    template <typename B>
+    concept FlexChildBuilder = requires(B &b) {
+        { b.flexValue() } -> std::convertible_to<int>;
+        { b.fitValue() } -> std::convertible_to<FlexFit>;
+        { b.takeChild() } -> std::convertible_to<std::unique_ptr<Widget>>;
+    };
+
+    // =========================================================================
+    // FlexibleBuild —— 构建期 DSL，运行时不是 Widget
+    // 通过 FlexBuild::addChild(FlexibleBuild&) 被解包为 (child, flex, fit)
+    // =========================================================================
+    struct FlexibleBuild
+    {
+        constexpr explicit FlexibleBuild(std::string key = {}) noexcept
+            : key_(std::move(key))
+        {
+        }
+
+        constexpr auto &key(std::string k) noexcept
+        {
+            key_ = std::move(k);
+            return *this;
+        }
+        constexpr auto &flex(int f) noexcept
+        {
+            flex_ = f;
+            return *this;
+        }
+        constexpr auto &fit(FlexFit f) noexcept
+        {
+            fit_ = f;
+            return *this;
+        }
+
+        constexpr auto &child(std::unique_ptr<Widget> c) noexcept
+        {
+            child_ = std::move(c);
+            return *this;
+        }
+        constexpr auto &child(WidgetBuild auto &&b) noexcept
+        {
+            return child(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+
+        // 供 FlexBuild 使用
+        [[nodiscard]] constexpr int flexValue() const noexcept
+        {
+            return flex_;
+        }
+        [[nodiscard]] constexpr FlexFit fitValue() const noexcept
+        {
+            return fit_;
+        }
+        [[nodiscard]] std::unique_ptr<Widget> takeChild() noexcept
+        {
+            return std::move(child_);
+        }
+
+      private:
+        std::string key_;
+        int flex_ = 1;
+        FlexFit fit_ = FlexFit::loose; // Flutter 默认 loose
+        std::unique_ptr<Widget> child_;
+    };
+
+    struct FlexWidget : Widget
+    {
+        constexpr FlexWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                             Axis direction, MainAxisAlignment mainAxisAlignment,
+                             MainAxisSize mainAxisSize,
+                             CrossAxisAlignment crossAxisAlignment,
+                             std::optional<TextDirection> textDirection,
+                             VerticalDirection verticalDirection,
+                             std::optional<TextBaseline> textBaseline,
+                             std::vector<std::unique_ptr<Widget>> children,
+                             std::vector<FlexInfo> flexes) noexcept
+            : Widget(std::move(key), std::move(ro)), direction_{direction},
+              mainAxisAlignment_{mainAxisAlignment}, mainAxisSize_{mainAxisSize},
+              crossAxisAlignment_{crossAxisAlignment}, textDirection_{textDirection},
+              verticalDirection_{verticalDirection}, textBaseline_{textBaseline},
+              children_{std::move(children)}, flexes_{std::move(flexes)}
+        {
+            assert(crossAxisAlignment_ != CrossAxisAlignment::baseline ||
+                   textBaseline_.has_value());
+            assert(children_.size() == flexes_.size());
+        }
+
+        constexpr void layout(BoxConstraints c) override
+        {
+            constexpr auto inf = std::numeric_limits<double>::infinity();
+            const bool h = direction_ == Axis::horizontal;
+            const double maxMain = h ? c.maxWidth() : c.maxHeight();
+            const double maxCross = h ? c.maxHeight() : c.maxWidth();
+            const bool canFlex = std::isfinite(maxMain);
+            const bool stretch = crossAxisAlignment_ == CrossAxisAlignment::stretch;
+
+            // ── 空 children 边界 ────────────────────────────────────────
+            if (children_.empty())
+            {
+                const double main =
+                    (mainAxisSize_ == MainAxisSize::max && canFlex) ? maxMain : 0.0;
+                Self().size = c.constrain(h ? Size{main, 0.0} : Size{0.0, main});
+                return;
+            }
+
+            // ── 第 1 遍：所有非弹性子节点用「主轴无界」约束 layout ──────
+            int totalFlex = 0;
+            double allocated = 0.0;
+            double maxChildCross = 0.0;
+            size_t lastFlexIdx = SIZE_MAX;
+
+            for (size_t i = 0; i < children_.size(); ++i)
+            {
+                if (flexes_[i].flex > 0)
+                {
+                    totalFlex += flexes_[i].flex;
+                    lastFlexIdx = i;
+                }
+                else
+                {
+                    const BoxConstraints cc =
+                        h ? BoxConstraints{0.0, inf, stretch ? maxCross : 0.0, maxCross}
+                          : BoxConstraints{stretch ? maxCross : 0.0, maxCross, 0.0, inf};
+                    children_[i]->layout(cc);
+                    allocated += h ? children_[i]->size.width : children_[i]->size.height;
+                    const double cs =
+                        h ? children_[i]->size.height : children_[i]->size.width;
+                    if (cs > maxChildCross)
+                        maxChildCross = cs;
+                }
+            }
+
+            // ── 第 2 遍：把剩余主轴按 flex 分配，tight/loose 决定 min ───
+            const double freeSpace = std::max(0.0, (canFlex ? maxMain : 0.0) - allocated);
+            double allocatedFlexSpace = 0.0;
+
+            if (totalFlex > 0)
+            {
+                const double spacePerFlex = canFlex ? (freeSpace / totalFlex) : inf;
+
+                for (size_t i = 0; i < children_.size(); ++i)
+                {
+                    if (flexes_[i].flex <= 0)
+                        continue;
+
+                    const double maxChildExtent = !canFlex ? inf
+                                                  : (i == lastFlexIdx)
+                                                      ? (freeSpace - allocatedFlexSpace)
+                                                      : (spacePerFlex * flexes_[i].flex);
+
+                    const double minChildExtent =
+                        (flexes_[i].fit == FlexFit::tight) ? maxChildExtent : 0.0;
+
+                    const double minCrossSize = stretch ? maxCross : 0.0;
+                    const BoxConstraints cc =
+                        h ? BoxConstraints{minChildExtent, maxChildExtent, minCrossSize,
+                                           maxCross}
+                          : BoxConstraints{minCrossSize, maxCross, minChildExtent,
+                                           maxChildExtent};
+                    children_[i]->layout(cc);
+
+                    allocated += h ? children_[i]->size.width : children_[i]->size.height;
+                    allocatedFlexSpace += maxChildExtent;
+                    const double cs =
+                        h ? children_[i]->size.height : children_[i]->size.width;
+                    if (cs > maxChildCross)
+                        maxChildCross = cs;
+                }
+            }
+
+            // ── 自身尺寸 ────────────────────────────────────────────────
+            const double idealMain =
+                (mainAxisSize_ == MainAxisSize::max && canFlex) ? maxMain : allocated;
+            const double idealCross = stretch ? maxCross : maxChildCross;
+
+            Self().size = c.constrain(h ? Size{idealMain, idealCross}
+                                        : Size{idealCross, idealMain});
+        }
+
+        constexpr void updateOffset(Offset offset) noexcept override
+        {
+            Self().offset = offset;
+            if (children_.empty())
+                return;
+
+            const bool h = direction_ == Axis::horizontal;
+            const double selfMain = h ? Self().size.width : Self().size.height;
+            const double selfCross = h ? Self().size.height : Self().size.width;
+
+            double allocated = 0.0;
+            for (auto &child : children_)
+                allocated += h ? child->size.width : child->size.height;
+
+            const double remaining = std::max(0.0, selfMain - allocated);
+            const auto n = static_cast<double>(children_.size());
+
+            double lead = 0.0, between = 0.0;
+            switch (mainAxisAlignment_)
+            {
+            case MainAxisAlignment::start:
+                break;
+            case MainAxisAlignment::end:
+                lead = remaining;
+                break;
+            case MainAxisAlignment::center:
+                lead = remaining / 2.0;
+                break;
+            case MainAxisAlignment::spaceBetween:
+                between = (n > 1.0) ? remaining / (n - 1.0) : 0.0;
+                break;
+            case MainAxisAlignment::spaceAround:
+                between = remaining / n;
+                lead = between / 2.0;
+                break;
+            case MainAxisAlignment::spaceEvenly:
+                between = remaining / (n + 1.0);
+                lead = between;
+                break;
+            }
+
+            const bool startTopLeftMain =
+                h ? (textDirection_.value_or(TextDirection::ltr) == TextDirection::ltr)
+                  : (verticalDirection_ == VerticalDirection::down);
+            const bool startTopLeftCross =
+                h ? (verticalDirection_ == VerticalDirection::down)
+                  : (textDirection_.value_or(TextDirection::ltr) == TextDirection::ltr);
+            const bool flipMain = !startTopLeftMain;
+            const bool flipCross = !startTopLeftCross;
+
+            double cursor = lead;
+            for (auto &child : children_)
+            {
+                const double childMain = h ? child->size.width : child->size.height;
+                const double childCross = h ? child->size.height : child->size.width;
+
+                const double lm = cursor;
+                double lc = 0.0;
+                switch (crossAxisAlignment_)
+                {
+                case CrossAxisAlignment::start:
+                case CrossAxisAlignment::baseline:
+                case CrossAxisAlignment::stretch:
+                    lc = 0.0;
+                    break;
+                case CrossAxisAlignment::end:
+                    lc = selfCross - childCross;
+                    break;
+                case CrossAxisAlignment::center:
+                    lc = (selfCross - childCross) / 2.0;
+                    break;
+                }
+
+                const double am = flipMain ? selfMain - lm - childMain : lm;
+                const double ac = flipCross ? selfCross - lc - childCross : lc;
+
+                double dx, dy;
+                if (h)
+                {
+                    dx = offset.x + am;
+                    dy = offset.y + ac;
+                }
+                else
+                {
+                    dx = offset.x + ac;
+                    dy = offset.y + am;
+                }
+
+                child->updateOffset({dx, dy});
+                cursor += childMain + between;
+            }
+        }
+
+        [[nodiscard]] constexpr std::span<const std::unique_ptr<Widget>> children()
+            const noexcept override
+        {
+            return children_;
+        }
+
+      private:
+        Axis direction_;
+        MainAxisAlignment mainAxisAlignment_;
+        MainAxisSize mainAxisSize_;
+        CrossAxisAlignment crossAxisAlignment_;
+        std::optional<TextDirection> textDirection_;
+        VerticalDirection verticalDirection_;
+        std::optional<TextBaseline> textBaseline_;
+        std::vector<std::unique_ptr<Widget>> children_;
+        std::vector<FlexInfo> flexes_; // 与 children_ 一一对应
+    };
+    struct FlexBuild
+    {
+        constexpr FlexBuild(std::string key) noexcept : key_(std::move(key)) {}
+
+        constexpr explicit operator std::unique_ptr<Widget>()
+        {
+            if (!direction_)
+                throw std::logic_error{"Flex requires direction value"};
+            return std::make_unique<FlexWidget>(
+                std::move(key_), std::move(renderObject_), *direction_,
+                mainAxisAlignment_, mainAxisSize_, crossAxisAlignment_, textDirection_,
+                verticalDirection_, textBaseline_, std::move(children_),
+                std::move(flexes_));
+        }
+
+        constexpr auto &key(std::string key) noexcept
+        {
+            key_ = std::move(key);
+            return *this;
+        }
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+        constexpr auto &direction(Axis v) noexcept
+        {
+            direction_ = v;
+            return *this;
+        }
+        constexpr auto &mainAxisAlignment(MainAxisAlignment v) noexcept
+        {
+            mainAxisAlignment_ = v;
+            return *this;
+        }
+        constexpr auto &mainAxisSize(MainAxisSize v) noexcept
+        {
+            mainAxisSize_ = v;
+            return *this;
+        }
+        constexpr auto &crossAxisAlignment(CrossAxisAlignment v) noexcept
+        {
+            crossAxisAlignment_ = v;
+            return *this;
+        }
+        constexpr auto &textDirection(TextDirection v) noexcept
+        {
+            textDirection_ = v;
+            return *this;
+        }
+        constexpr auto &clearTextDirection() noexcept
+        {
+            textDirection_.reset();
+            return *this;
+        }
+        constexpr auto &verticalDirection(VerticalDirection v) noexcept
+        {
+            verticalDirection_ = v;
+            return *this;
+        }
+        constexpr auto &textBaseline(TextBaseline v) noexcept
+        {
+            textBaseline_ = v;
+            return *this;
+        }
+
+        // =====================================================================
+        // ── FlexBuild::addChild 三个重载 ─────────────────────────────────
+        // (1) 普通子 Widget：flex = 0
+        constexpr auto &addChild(std::unique_ptr<Widget> child) noexcept
+        {
+            children_.push_back(std::move(child));
+            flexes_.push_back(FlexInfo{.flex = 0, .fit = FlexFit::tight});
+            return *this;
+        }
+        // (2) WidgetBuild 概念（如 SizedBoxBuild / PaddingBuild …）：转成 Widget 走 (1)
+        constexpr auto &addChild(WidgetBuild auto &&b) noexcept
+        {
+            return addChild(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+        // (3) FlexibleBuild / ExpandedBuild / SpacerBuild：解包为 (child, flex, fit)
+        template <FlexChildBuilder B>
+        constexpr auto &addChild(B &&fb) noexcept
+        {
+            children_.push_back(fb.takeChild());
+            flexes_.push_back(FlexInfo{fb.flexValue(), fb.fitValue()});
+            return *this;
+        }
+        // =====================================================================
+
+        // ── Flexible DSL：解包为 (child, flex, fit) ──────────────────
+        constexpr auto &addChild(FlexibleBuild &fb) noexcept
+        {
+            children_.push_back(fb.takeChild());
+            flexes_.push_back(FlexInfo{fb.flexValue(), fb.fitValue()});
+            return *this;
+        }
+
+      private:
+        std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
+        std::optional<Axis> direction_;
+        MainAxisAlignment mainAxisAlignment_ = MainAxisAlignment::start;
+        MainAxisSize mainAxisSize_ = MainAxisSize::max;
+        CrossAxisAlignment crossAxisAlignment_ = CrossAxisAlignment::center;
+        std::optional<TextDirection> textDirection_;
+        VerticalDirection verticalDirection_ = VerticalDirection::down;
+        std::optional<TextBaseline> textBaseline_;
+        std::vector<std::unique_ptr<Widget>> children_;
+        std::vector<FlexInfo> flexes_;
+    };
+    static constexpr auto Flex(std::string key = {}) noexcept // NOLINT
+    {
+        return FlexBuild{std::move(key)};
+    }
+
+    // ===============================================================================================
+    // Row / Column —— Flex 的语法糖
+    //
+    // 语义（对应 Dart 的 Row / Column）：
+    //   Row    = Flex(direction: Axis::horizontal)
+    //   Column = Flex(direction: Axis::vertical)
+    //
+    // 方向是固定值，调用方不可覆盖；其余字段（mainAxisAlignment / mainAxisSize /
+    // crossAxisAlignment / textDirection / verticalDirection / textBaseline / children）
+    // 全部继承自 FlexBuild。
+    // ===============================================================================================
+    struct RowBuild : FlexBuild
+    {
+        constexpr RowBuild(std::string key) noexcept : FlexBuild(std::move(key))
+        {
+            FlexBuild::direction(Axis::horizontal);
+        }
+        // Row 方向固定为 horizontal：删掉继承来的 direction() 以禁止覆盖
+        FlexBuild &direction(Axis) noexcept = delete;
+    };
+    struct ColumnBuild : FlexBuild
+    {
+        constexpr ColumnBuild(std::string key) noexcept : FlexBuild(std::move(key))
+        {
+            FlexBuild::direction(Axis::vertical);
+        }
+        // Column 方向固定为 vertical：删掉继承来的 direction() 以禁止覆盖
+        FlexBuild &direction(Axis) noexcept = delete;
+    };
+    static constexpr auto Row(std::string key = {}) noexcept // NOLINT
+    {
+        return RowBuild{std::move(key)};
+    }
+    static constexpr auto Column(std::string key = {}) noexcept // NOLINT
+    {
+        return ColumnBuild{std::move(key)};
+    }
+
+    //NOTE: ParentDataWidget<FlexParentData> 的解决是，引入 FlexibleBuild 重构 flex. 当前和flutter的有点不一样了。但是 FlexInfo 将传递方便很多。影响访问是明确的
+    static constexpr auto Flexible(std::string key = {}) noexcept // NOLINT
+    {
+        return FlexibleBuild{std::move(key)};
+    }
+
+    // =========================================================================
+    // ExpandedBuild —— Flexible(fit: FlexFit.tight) 的语法糖
+    // 复用 FlexibleBuild 的全部字段与解包逻辑，只把 fit 锁死为 tight
+    // =========================================================================
+    struct ExpandedBuild : FlexibleBuild
+    {
+        constexpr explicit ExpandedBuild(std::string key = {}) noexcept
+            : FlexibleBuild(std::move(key))
+        {
+            FlexibleBuild::fit(FlexFit::tight);
+        }
+
+        // 禁止外部覆盖 fit：Expanded 的语义就是 tight
+        FlexibleBuild &fit(FlexFit) noexcept = delete;
+    };
+    static constexpr auto Expanded(std::string key = {}) noexcept // NOLINT
+    {
+        return ExpandedBuild{std::move(key)};
+    }
+
+    // NOTE: Spacer 生成一个携带 key 的 0×0 SizedBoxWidget，同时把 (flex, tight) 交给 Flex 记账。
+    // NOTE: 唯一的改动是把 FlexBuild::addChild(FlexibleBuild&) 泛化成 concept 重载，让 Spacer 也能走同一条路
+
+    // =========================================================================
+    // SpacerBuild —— Spacer 的等价物
+    // 运行时树里生成一个真实存在的、携带 key 的 0×0 SizedBoxWidget；
+    // 同时以 (flex, FlexFit::tight) 参与 Flex 的记账。
+    // =========================================================================
+    struct SpacerBuild
+    {
+        constexpr explicit SpacerBuild(std::string key = {}) noexcept
+            : key_(std::move(key))
+        {
+            assert(flex_ > 0); // Dart: assert(flex > 0)
+        }
+
+        constexpr auto &key(std::string k) noexcept
+        {
+            key_ = std::move(k);
+            return *this;
+        }
+
+        constexpr auto &flex(int f) noexcept
+        {
+            assert(f > 0); // Dart: assert(flex > 0)
+            flex_ = f;
+            return *this;
+        }
+
+        // ── 供 FlexBuild 解包（与 FlexibleBuild 相同接口）──────────────
+        [[nodiscard]] constexpr int flexValue() const noexcept
+        {
+            return flex_;
+        }
+        [[nodiscard]] constexpr FlexFit fitValue() const noexcept
+        {
+            return FlexFit::tight;
+        }
+
+        [[nodiscard]] std::unique_ptr<Widget> takeChild() noexcept
+        {
+            // 0×0 空盒子，key 由 Spacer 提供
+            return std::make_unique<SizedBoxWidget>(std::move(key_), nullptr,
+                                                    std::nullopt, std::nullopt, nullptr);
+        }
+
+      private:
+        std::string key_;
+        int flex_ = 1;
+    };
+    static constexpr auto Spacer(std::string key = {}) noexcept // NOLINT
+    {
+        return SpacerBuild{std::move(key)};
+    }
+
+    enum class WrapAlignment : std::uint8_t
+    {
+        start,
+        end,
+        center,
+        spaceBetween,
+        spaceAround,
+        spaceEvenly
+    };
+    enum class WrapCrossAlignment : std::uint8_t
+    {
+        start,
+        end,
+        center
+    };
+    struct WrapWidget : Widget
+    {
+        // NOLINTBEGIN
+        constexpr WrapWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                             Axis direction, WrapAlignment alignment, double spacing,
+                             WrapAlignment runAlignment, double runSpacing,
+                             WrapCrossAlignment crossAxisAlignment,
+                             std::optional<TextDirection> textDirection,
+                             VerticalDirection verticalDirection,
+                             std::vector<std::unique_ptr<Widget>> children) noexcept
+            : Widget(std::move(key), std::move(ro)), direction_{direction},
+              alignment_{alignment}, spacing_{spacing}, runAlignment_{runAlignment},
+              runSpacing_{runSpacing}, crossAxisAlignment_{crossAxisAlignment},
+              textDirection_{textDirection}, verticalDirection_{verticalDirection},
+              children_{std::move(children)} // NOLINTEND
+        {
+        }
+
+        constexpr void layout(BoxConstraints c) override
+        {
+            constexpr auto inf = std::numeric_limits<double>::infinity();
+            const bool h = direction_ == Axis::horizontal;
+            const double maxMain = h ? c.maxWidth() : c.maxHeight();
+
+            // ── 空 children：返回 constraints.smallest ────────────────
+            if (children_.empty())
+            {
+                Self().size = c.smallest();
+                runs_.clear();
+                return;
+            }
+
+            // ── flip 判定（严格按 RenderWrap.performLayout）────────────
+            flipMainAxis_ =
+                h ? (textDirection_.value_or(TextDirection::ltr) == TextDirection::rtl)
+                  : (verticalDirection_ == VerticalDirection::up);
+            flipCrossAxis_ =
+                h ? (verticalDirection_ == VerticalDirection::up)
+                  : (textDirection_.value_or(TextDirection::ltr) == TextDirection::rtl);
+
+            // ── 子节点约束：只约束主轴 max，其他无界 ──────────────────
+            const BoxConstraints childConstraints =
+                h ? BoxConstraints{0.0, maxMain, 0.0, inf}
+                  : BoxConstraints{0.0, inf, 0.0, maxMain};
+
+            // ── 阶段 1：逐个子节点布局并分组为 runs ───────────────────
+            runs_.clear();
+            double runMain = 0.0;
+            double runCross = 0.0;
+            size_t runStart = 0;
+            int childCount = 0;
+            double mainAxisExtent = 0.0;
+            double crossAxisExtent = 0.0;
+
+            for (size_t i = 0; i < children_.size(); ++i)
+            {
+                auto &child = children_[i];
+                child->layout(childConstraints);
+
+                const double childMain = h ? child->size.width : child->size.height;
+                const double childCross = h ? child->size.height : child->size.width;
+
+                // 换行判定：runMain + spacing + childMain > mainAxisLimit
+                if (childCount > 0 && runMain + spacing_ + childMain > maxMain)
+                {
+                    mainAxisExtent = std::max(mainAxisExtent, runMain);
+                    crossAxisExtent += runCross;
+                    if (!runs_.empty())
+                        crossAxisExtent += runSpacing_;
+                    runs_.push_back(RunInfo{runMain, runCross, runStart,
+                                            static_cast<size_t>(childCount)});
+                    runMain = 0.0;
+                    runCross = 0.0;
+                    childCount = 0;
+                    runStart = i;
+                }
+
+                runMain += childMain;
+                if (childCount > 0)
+                    runMain += spacing_;
+                runCross = std::max(runCross, childCross);
+                ++childCount;
+            }
+            // flush 最后一个 run
+            if (childCount > 0)
+            {
+                mainAxisExtent = std::max(mainAxisExtent, runMain);
+                crossAxisExtent += runCross;
+                if (!runs_.empty())
+                    crossAxisExtent += runSpacing_;
+                runs_.push_back(RunInfo{runMain, runCross, runStart,
+                                        static_cast<size_t>(childCount)});
+            }
+
+            // ── 阶段 2：自身尺寸 ──────────────────────────────────────
+            Self().size = c.constrain(h ? Size{mainAxisExtent, crossAxisExtent}
+                                        : Size{crossAxisExtent, mainAxisExtent});
+
+            // ── 缓存给 updateOffset 用 ────────────────────────────────
+            containerMainExt_ = h ? Self().size.width : Self().size.height;
+            containerCrossExt_ = h ? Self().size.height : Self().size.width;
+            totalMainExt_ = mainAxisExtent;
+            totalCrossExt_ = crossAxisExtent;
+        }
+
+        constexpr void updateOffset(Offset offset) noexcept override
+        {
+            Self().offset = offset;
+            if (children_.empty() || runs_.empty())
+                return;
+
+            const bool h = direction_ == Axis::horizontal;
+
+            // ── runs 在交叉轴对齐 ────────────────────────────────────
+            const double crossAxisFreeSpace =
+                std::max(0.0, containerCrossExt_ - totalCrossExt_);
+            const int runCount = static_cast<int>(runs_.size());
+
+            double runLeadingSpace = 0.0;
+            double runBetweenSpace = 0.0;
+            switch (runAlignment_)
+            {
+            case WrapAlignment::start:
+                break;
+            case WrapAlignment::end:
+                runLeadingSpace = crossAxisFreeSpace;
+                break;
+            case WrapAlignment::center:
+                runLeadingSpace = crossAxisFreeSpace / 2.0;
+                break;
+            case WrapAlignment::spaceBetween:
+                runBetweenSpace =
+                    runCount > 1 ? crossAxisFreeSpace / (runCount - 1) : 0.0;
+                break;
+            case WrapAlignment::spaceAround:
+                runBetweenSpace = crossAxisFreeSpace / runCount;
+                runLeadingSpace = runBetweenSpace / 2.0;
+                break;
+            case WrapAlignment::spaceEvenly:
+                runBetweenSpace = crossAxisFreeSpace / (runCount + 1);
+                runLeadingSpace = runBetweenSpace;
+                break;
+            }
+            runBetweenSpace += runSpacing_; // ← 基础 runSpacing
+
+            double crossAxisOffset =
+                flipCrossAxis_ ? containerCrossExt_ - runLeadingSpace : runLeadingSpace;
+
+            for (int i = 0; i < runCount; ++i)
+            {
+                const auto &run = runs_[i];
+                const double runMain = run.mainSize;
+                const double runCross = run.crossSize;
+                const int cnt = static_cast<int>(run.childCount);
+
+                // ── run 内主轴对齐 ────────────────────────────────────
+                const double mainAxisFreeSpace =
+                    std::max(0.0, containerMainExt_ - runMain);
+
+                double childLeadingSpace = 0.0;
+                double childBetweenSpace = 0.0;
+                switch (alignment_)
+                {
+                case WrapAlignment::start:
+                    break;
+                case WrapAlignment::end:
+                    childLeadingSpace = mainAxisFreeSpace;
+                    break;
+                case WrapAlignment::center:
+                    childLeadingSpace = mainAxisFreeSpace / 2.0;
+                    break;
+                case WrapAlignment::spaceBetween:
+                    childBetweenSpace = cnt > 1 ? mainAxisFreeSpace / (cnt - 1) : 0.0;
+                    break;
+                case WrapAlignment::spaceAround:
+                    childBetweenSpace = mainAxisFreeSpace / cnt;
+                    childLeadingSpace = childBetweenSpace / 2.0;
+                    break;
+                case WrapAlignment::spaceEvenly:
+                    childBetweenSpace = mainAxisFreeSpace / (cnt + 1);
+                    childLeadingSpace = childBetweenSpace;
+                    break;
+                }
+                childBetweenSpace += spacing_; // ← 基础 spacing
+
+                double childMainPosition = flipMainAxis_
+                                               ? containerMainExt_ - childLeadingSpace
+                                               : childLeadingSpace;
+
+                // flipCrossAxis 时，run 的交叉轴起点先向下/向上移动一个 runCross
+                if (flipCrossAxis_)
+                    crossAxisOffset -= runCross;
+
+                for (size_t k = 0; k < run.childCount; ++k)
+                {
+                    auto &child = children_[run.startIdx + k];
+                    const double childMain = h ? child->size.width : child->size.height;
+                    const double childCross = h ? child->size.height : child->size.width;
+
+                    // ── run 内交叉轴对齐（考虑 flipCrossAxis）────────
+                    const double freeSpace = runCross - childCross;
+                    double childCrossOffset = 0.0;
+                    switch (crossAxisAlignment_)
+                    {
+                    case WrapCrossAlignment::start:
+                        childCrossOffset = flipCrossAxis_ ? freeSpace : 0.0;
+                        break;
+                    case WrapCrossAlignment::end:
+                        childCrossOffset = flipCrossAxis_ ? 0.0 : freeSpace;
+                        break;
+                    case WrapCrossAlignment::center:
+                        childCrossOffset = freeSpace / 2.0;
+                        break;
+                    }
+
+                    // flipMainAxis 时，主轴位置先回退一个 childMain
+                    if (flipMainAxis_)
+                        childMainPosition -= childMain;
+
+                    const double mPos = childMainPosition;
+                    const double cPos = crossAxisOffset + childCrossOffset;
+
+                    double dx, dy;
+                    if (h)
+                    {
+                        dx = offset.x + mPos;
+                        dy = offset.y + cPos;
+                    }
+                    else
+                    {
+                        dx = offset.x + cPos;
+                        dy = offset.y + mPos;
+                    }
+
+                    child->updateOffset({dx, dy});
+
+                    if (flipMainAxis_)
+                        childMainPosition -= childBetweenSpace;
+                    else
+                        childMainPosition += childMain + childBetweenSpace;
+                }
+
+                // ── 进入下一个 run ───────────────────────────────────
+                if (flipCrossAxis_)
+                    crossAxisOffset -= runBetweenSpace;
+                else
+                    crossAxisOffset += runCross + runBetweenSpace;
+            }
+        }
+
+        [[nodiscard]] constexpr std::span<const std::unique_ptr<Widget>> children()
+            const noexcept override
+        {
+            return children_;
+        }
+
+      private:
+        struct RunInfo
+        {
+            double mainSize;   // 该 run 的主轴尺寸（含 run 内 spacing）
+            double crossSize;  // 该 run 的交叉轴尺寸
+            size_t startIdx;   // children_ 中的起始下标
+            size_t childCount; // 该 run 中子节点数
+        };
+
+        Axis direction_;
+        WrapAlignment alignment_;
+        double spacing_;
+        WrapAlignment runAlignment_;
+        double runSpacing_;
+        WrapCrossAlignment crossAxisAlignment_;
+        std::optional<TextDirection> textDirection_;
+        VerticalDirection verticalDirection_;
+        std::vector<std::unique_ptr<Widget>> children_;
+
+        // layout 阶段填充；updateOffset 阶段读取
+        std::vector<RunInfo> runs_;
+        bool flipMainAxis_ = false;
+        bool flipCrossAxis_ = false;
+        double containerMainExt_ = 0.0;  // 自身尺寸在主轴的投影（constrain 后）
+        double containerCrossExt_ = 0.0; // 自身尺寸在交叉轴的投影（constrain 后）
+        double totalMainExt_ = 0.0;      // 所有 run 累加主轴尺寸
+        double totalCrossExt_ = 0.0;     // 所有 run 累加交叉轴尺寸（含 runSpacing）
+    };
+    struct WrapBuild
+    {
+        constexpr explicit WrapBuild(std::string key = {}) noexcept : key_(std::move(key))
+        {
+        }
+
+        constexpr auto &key(std::string k) noexcept
+        {
+            key_ = std::move(k);
+            return *this;
+        }
+        constexpr auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+        constexpr auto &direction(Axis v) noexcept
+        {
+            direction_ = v;
+            return *this;
+        }
+        constexpr auto &alignment(WrapAlignment v) noexcept
+        {
+            alignment_ = v;
+            return *this;
+        }
+        constexpr auto &spacing(double v) noexcept
+        {
+            spacing_ = v;
+            return *this;
+        }
+        constexpr auto &runAlignment(WrapAlignment v) noexcept
+        {
+            runAlignment_ = v;
+            return *this;
+        }
+        constexpr auto &runSpacing(double v) noexcept
+        {
+            runSpacing_ = v;
+            return *this;
+        }
+        constexpr auto &crossAxisAlignment(WrapCrossAlignment v) noexcept
+        {
+            crossAxisAlignment_ = v;
+            return *this;
+        }
+        constexpr auto &textDirection(TextDirection v) noexcept
+        {
+            textDirection_ = v;
+            return *this;
+        }
+        constexpr auto &clearTextDirection() noexcept
+        {
+            textDirection_.reset();
+            return *this;
+        }
+        constexpr auto &verticalDirection(VerticalDirection v) noexcept
+        {
+            verticalDirection_ = v;
+            return *this;
+        }
+
+        constexpr auto &addChild(std::unique_ptr<Widget> child) noexcept
+        {
+            children_.push_back(std::move(child));
+            return *this;
+        }
+        constexpr auto &addChild(WidgetBuild auto &&b) noexcept
+        {
+            return addChild(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+
+        constexpr explicit operator std::unique_ptr<Widget>()
+        {
+            return std::make_unique<WrapWidget>(
+                std::move(key_), std::move(renderObject_), direction_, alignment_,
+                spacing_, runAlignment_, runSpacing_, crossAxisAlignment_, textDirection_,
+                verticalDirection_, std::move(children_));
+        }
+
+      private:
+        std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
+        Axis direction_ = Axis::horizontal;
+        WrapAlignment alignment_ = WrapAlignment::start;
+        double spacing_ = 0.0;
+        WrapAlignment runAlignment_ = WrapAlignment::start;
+        double runSpacing_ = 0.0;
+        WrapCrossAlignment crossAxisAlignment_ = WrapCrossAlignment::start;
+        std::optional<TextDirection> textDirection_;
+        VerticalDirection verticalDirection_ = VerticalDirection::down;
+        std::vector<std::unique_ptr<Widget>> children_;
+    };
+    static constexpr auto Wrap(std::string key = {}) noexcept // NOLINT
+    {
+        return WrapBuild{std::move(key)};
+    }
+
+    // =========================================================================
+    // StackFit
+    // =========================================================================
+    enum class StackFit : std::uint8_t
+    {
+        loose,
+        expand,
+        passthrough
+    };
+    // =========================================================================
+    // StackChildInfo —— Stack 对每个子节点的记账（与 children_ 平行）
+    // 未设置任何属性 = 非定位；任一非 null = 定位
+    // =========================================================================
+    struct StackChildInfo
+    {
+        std::optional<double> left, top, right, bottom, width, height;
+
+        [[nodiscard]] bool isPositioned() const noexcept
+        {
+            return left.has_value() || top.has_value() || right.has_value() ||
+                   bottom.has_value() || width.has_value() || height.has_value();
+        }
+    };
+    // =========================================================================
+    // PositionedBuild —— Stack 的定位 DSL（构建期，运行时不是 Widget）
+    // =========================================================================
+    struct PositionedBuild
+    {
+        std::optional<double> left_, top_, right_, bottom_, width_, height_;
+        std::unique_ptr<Widget> child_;
+
+        auto &left(double v) noexcept
+        {
+            left_ = v;
+            return *this;
+        }
+        auto &top(double v) noexcept
+        {
+            top_ = v;
+            return *this;
+        }
+        auto &right(double v) noexcept
+        {
+            right_ = v;
+            return *this;
+        }
+        auto &bottom(double v) noexcept
+        {
+            bottom_ = v;
+            return *this;
+        }
+        auto &width(double v) noexcept
+        {
+            width_ = v;
+            return *this;
+        }
+        auto &height(double v) noexcept
+        {
+            height_ = v;
+            return *this;
+        }
+
+        // 便捷：四边都为 0（对应 Positioned.fill）
+        auto &fill() noexcept
+        {
+            left_ = 0;
+            top_ = 0;
+            right_ = 0;
+            bottom_ = 0;
+            return *this;
+        }
+
+        // 便捷：fromRect(left, top, width, height)
+        auto &fromRect(double l, double t, double w, double h) noexcept
+        {
+            left_ = l;
+            top_ = t;
+            width_ = w;
+            height_ = h;
+            return *this;
+        }
+
+        // 便捷：fromRelativeRect(left, top, right, bottom)
+        auto &fromLTRB(double l, double t, double r, double b) noexcept
+        {
+            left_ = l;
+            top_ = t;
+            right_ = r;
+            bottom_ = b;
+            return *this;
+        }
+
+        // 便捷：directional（把 start/end 按 textDirection 解析为 left/right）
+        auto &directional(TextDirection dir, double start, double top,
+                          std::optional<double> end = std::nullopt,
+                          std::optional<double> bottom = std::nullopt) noexcept
+        {
+            if (dir == TextDirection::ltr)
+            {
+                left_ = start;
+                if (end)
+                    right_ = *end;
+            }
+            else
+            {
+                right_ = start;
+                if (end)
+                    left_ = *end;
+            }
+            top_ = top;
+            if (bottom)
+                bottom_ = *bottom;
+            return *this;
+        }
+
+        auto &child(std::unique_ptr<Widget> c) noexcept
+        {
+            child_ = std::move(c);
+            return *this;
+        }
+        auto &child(WidgetBuild auto &&b) noexcept
+        {
+            return child(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+
+        [[nodiscard]] StackChildInfo info() const noexcept
+        {
+            return StackChildInfo{left_, top_, right_, bottom_, width_, height_};
+        }
+
+        [[nodiscard]] std::unique_ptr<Widget> takeChild() noexcept
+        {
+            return std::move(child_);
+        }
+    };
+    static constexpr auto Positioned() noexcept // NOLINT
+    {
+        return PositionedBuild{};
+    }
+    // =========================================================================
+    // StackWidget
+    // =========================================================================
+    struct StackWidget : Widget
+    {
+        StackWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                    Alignment alignment, StackFit fit,
+                    std::vector<std::unique_ptr<Widget>> children,
+                    std::vector<StackChildInfo> infos) noexcept
+            : Widget(std::move(key), std::move(ro)), alignment_{alignment}, fit_{fit},
+              children_{std::move(children)}, infos_{std::move(infos)}
+        {
+            assert(children_.size() == infos_.size());
+        }
+
+        void layout(BoxConstraints c) override
+        {
+            // ── 空 children ─────────────────────────────────────────
+            if (children_.empty())
+            {
+                const Size big = c.biggest();
+                const bool finite = std::isfinite(big.width) && std::isfinite(big.height);
+                Self().size = finite ? big : c.smallest();
+                return;
+            }
+
+            // ── 非定位子节点的约束（按 fit 变换）────────────────────
+            BoxConstraints npc;
+            switch (fit_)
+            {
+            case StackFit::loose:
+                npc = c.loosen();
+                break;
+            case StackFit::expand:
+                npc = BoxConstraints::tight(c.biggest());
+                break;
+            case StackFit::passthrough:
+                npc = c;
+                break;
+            }
+
+            // ── 布局非定位子节点，累加最大尺寸 ─────────────────────
+            bool hasNonPositioned = false;
+            double width = c.minWidth();
+            double height = c.minHeight();
+
+            for (size_t i = 0; i < children_.size(); ++i)
+            {
+                if (!infos_[i].isPositioned())
+                {
+                    hasNonPositioned = true;
+                    children_[i]->layout(npc);
+                    width = std::max(width, children_[i]->size.width);
+                    height = std::max(height, children_[i]->size.height);
+                }
+            }
+
+            // ── Stack 尺寸 ─────────────────────────────────────────
+            Self().size = hasNonPositioned ? Size{width, height} : c.biggest();
+
+            // ── 布局定位子节点 ─────────────────────────────────────
+            for (size_t i = 0; i < children_.size(); ++i)
+            {
+                if (infos_[i].isPositioned())
+                    layoutPositionedChild(*children_[i], infos_[i]);
+            }
+        }
+
+        constexpr void updateOffset(Offset offset) noexcept override
+        {
+            Self().offset = offset;
+
+            for (size_t i = 0; i < children_.size(); ++i)
+            {
+                auto &child = children_[i];
+                auto &info = infos_[i];
+
+                double x, y;
+                if (!info.isPositioned())
+                {
+                    const double freeW = Self().size.width - child->size.width;
+                    const double freeH = Self().size.height - child->size.height;
+                    x = freeW * (alignment_.x + 1.0) / 2.0;
+                    y = freeH * (alignment_.y + 1.0) / 2.0;
+                }
+                else
+                {
+                    // 水平
+                    if (info.left)
+                        x = *info.left;
+                    else if (info.right)
+                        x = Self().size.width - *info.right - child->size.width;
+                    else
+                    {
+                        const double freeW = Self().size.width - child->size.width;
+                        x = freeW * (alignment_.x + 1.0) / 2.0;
+                    }
+                    // 垂直
+                    if (info.top)
+                        y = *info.top;
+                    else if (info.bottom)
+                        y = Self().size.height - *info.bottom - child->size.height;
+                    else
+                    {
+                        const double freeH = Self().size.height - child->size.height;
+                        y = freeH * (alignment_.y + 1.0) / 2.0;
+                    }
+                }
+
+                child->updateOffset({offset.x + x, offset.y + y});
+            }
+        }
+
+        [[nodiscard]] constexpr std::span<const std::unique_ptr<Widget>> children()
+            const noexcept override
+        {
+            return children_;
+        }
+
+      private:
+        // 对应 RenderStack.layoutPositionedChild
+        void layoutPositionedChild(Widget &child, const StackChildInfo &info)
+        {
+            BoxConstraints cc{0.0, BoxConstraints::inf, 0.0, BoxConstraints::inf};
+
+            if (info.left && info.right)
+            {
+                const double w = Self().size.width - *info.right - *info.left;
+                cc = BoxConstraints{w, w, cc.minHeight(), cc.maxHeight()};
+            }
+            else if (info.width)
+            {
+                const double w = *info.width;
+                cc = BoxConstraints{w, w, cc.minHeight(), cc.maxHeight()};
+            }
+
+            if (info.top && info.bottom)
+            {
+                const double h = Self().size.height - *info.bottom - *info.top;
+                cc = BoxConstraints{cc.minWidth(), cc.maxWidth(), h, h};
+            }
+            else if (info.height)
+            {
+                const double h = *info.height;
+                cc = BoxConstraints{cc.minWidth(), cc.maxWidth(), h, h};
+            }
+
+            child.layout(cc);
+        }
+
+        Alignment alignment_ =
+            Alignment::topLeft; // = AlignmentDirectional.topStart (ltr)
+        StackFit fit_ = StackFit::loose;
+        std::vector<std::unique_ptr<Widget>> children_;
+        std::vector<StackChildInfo> infos_;
+    };
+    // =========================================================================
+    // StackBuild / Stack
+    // =========================================================================
+    struct StackBuild
+    {
+        explicit StackBuild(std::string key = {}) noexcept : key_(std::move(key)) {}
+
+        auto &key(std::string k) noexcept
+        {
+            key_ = std::move(k);
+            return *this;
+        }
+        auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+        auto &alignment(Alignment a) noexcept
+        {
+            alignment_ = a;
+            return *this;
+        }
+        auto &fit(StackFit f) noexcept
+        {
+            fit_ = f;
+            return *this;
+        }
+
+        // 非定位子节点
+        auto &addChild(std::unique_ptr<Widget> child) noexcept
+        {
+            children_.push_back(std::move(child));
+            infos_.push_back({}); // 未设置任何属性 → 非定位
+            return *this;
+        }
+        auto &addChild(WidgetBuild auto &&b) noexcept
+        {
+            return addChild(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+
+        // 定位子节点
+        auto &addChild(PositionedBuild &pb) noexcept
+        {
+            infos_.push_back(pb.info());
+            children_.push_back(pb.takeChild());
+            return *this;
+        }
+
+        explicit operator std::unique_ptr<Widget>()
+        {
+            return std::make_unique<StackWidget>(
+                std::move(key_), std::move(renderObject_), alignment_, fit_,
+                std::move(children_), std::move(infos_));
+        }
+
+      private:
+        std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
+        Alignment alignment_ = Alignment::topLeft;
+        StackFit fit_ = StackFit::loose;
+        std::vector<std::unique_ptr<Widget>> children_;
+        std::vector<StackChildInfo> infos_;
+    };
+    static constexpr auto Stack(std::string key = {}) noexcept // NOLINT
+    {
+        return StackBuild{std::move(key)};
+    }
+
+    ///NORE: Baseline 是针对文本布局的，现在不需要
+
+    struct OffstageWidget : Widget
+    {
+        OffstageWidget(std::string key, std::unique_ptr<RenderObject> ro, bool offstage,
+                       std::unique_ptr<Widget> child) noexcept
+            : Widget(std::move(key), std::move(ro)), offstage_{offstage},
+              child_{std::move(child)}
+        {
+        }
+
+        void layout(BoxConstraints c) override
+        {
+            // child 无论 offstage 与否都拿到原约束并 layout
+            if (child_)
+                child_->layout(c);
+
+            // 自身 size：
+            //   offstage=true  → constraints.smallest
+            //   offstage=false → child.size（无 child 时也是 smallest）
+            if (offstage_ || !child_)
+                Self().size = c.smallest();
+            else
+                Self().size = child_->size;
+        }
+
+        constexpr void updateOffset(Offset offset) noexcept override
+        {
+            Self().offset = offset;
+            if (child_)
+                child_->updateOffset(offset); // 相对 Offstage 恒为 (0,0)
+        }
+        [[nodiscard]] constexpr std::span<const std::unique_ptr<Widget>> children()
+            const noexcept override
+        {
+            if (!child_)
+                return {};
+            return std::span<const std::unique_ptr<Widget>>{&child_, 1};
+        }
+
+      private:
+        bool offstage_;
+        std::unique_ptr<Widget> child_;
+    };
+    struct OffstageBuild
+    {
+        explicit OffstageBuild(std::string key = {}) noexcept : key_(std::move(key)) {}
+        explicit operator std::unique_ptr<Widget>()
+        {
+            return std::make_unique<OffstageWidget>(
+                std::move(key_), std::move(renderObject_), offstage_, std::move(child_));
+        }
+
+        auto &key(std::string k) noexcept
+        {
+            key_ = std::move(k);
+            return *this;
+        }
+        auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+        auto &offstage(bool v) noexcept
+        {
+            offstage_ = v;
+            return *this;
+        }
+
+        auto &child(std::unique_ptr<Widget> c) noexcept
+        {
+            child_ = std::move(c);
+            return *this;
+        }
+        auto &child(WidgetBuild auto &&b) noexcept
+        {
+            return child(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+
+      private:
+        std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
+        bool offstage_ = true;
+        std::unique_ptr<Widget> child_;
+    };
+    static constexpr auto Offstage(std::string key = {}) noexcept // NOLINT
+    {
+        return OffstageBuild{std::move(key)};
+    }
+
+    // NOTE: CustomSingleChildLayout 就是把这个决策权直接暴露给用户的 widget
+    // =========================================================================
+    // SingleChildLayoutDelegate —— 用户自定义单子节点布局的接口
+    // 三个方法全部在 layout 阶段调用，返回值直接决定 W/H + Offset
+    // =========================================================================
+    struct SingleChildLayoutDelegate
+    {
+        virtual ~SingleChildLayoutDelegate() = default;
+
+        /// 返回自身想要的尺寸，会被父约束 constrain
+        virtual Size getSize(BoxConstraints c) const
+        {
+            return c.biggest();
+        }
+
+        /// 返回传给 child 的约束（不会被框架再处理，delegate 负责合理性）
+        virtual BoxConstraints getConstraintsForChild(BoxConstraints c) const
+        {
+            return c;
+        }
+
+        /// 返回 child 相对自身的偏移
+        virtual Offset getPositionForChild(Size selfSize, Size childSize) const
+        {
+            return {0.0, 0.0};
+        }
+    };
+    struct CustomSingleChildLayoutWidget : Widget
+    {
+        CustomSingleChildLayoutWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                                      std::unique_ptr<SingleChildLayoutDelegate> delegate,
+                                      std::unique_ptr<Widget> child) noexcept
+            : Widget(std::move(key), std::move(ro)), delegate_{std::move(delegate)},
+              child_{std::move(child)}
+        {
+            assert(delegate_);
+        }
+
+        void layout(BoxConstraints c) override
+        {
+            // 1. 自身尺寸 = constrain(delegate.getSize(c))
+            Self().size = c.constrain(delegate_->getSize(c));
+
+            // 2. child 用 delegate 给定的约束 layout
+            if (child_)
+                child_->layout(delegate_->getConstraintsForChild(c));
+        }
+
+        void updateOffset(Offset offset) noexcept override
+        {
+            Self().offset = offset;
+            if (!child_)
+                return;
+
+            // 3. 位置 = delegate.getPositionForChild(自身 size, child size)
+            const Offset p = delegate_->getPositionForChild(Self().size, child_->size);
+            child_->updateOffset({offset.x + p.x, offset.y + p.y});
+        }
+
+        [[nodiscard]] constexpr std::span<const std::unique_ptr<Widget>> children()
+            const noexcept override
+        {
+            if (!child_)
+                return {};
+            return std::span<const std::unique_ptr<Widget>>{&child_, 1};
+        }
+
+      private:
+        std::unique_ptr<SingleChildLayoutDelegate> delegate_;
+        std::unique_ptr<Widget> child_;
+    };
+    struct CustomSingleChildLayoutBuild
+    {
+        explicit CustomSingleChildLayoutBuild(std::string key = {}) noexcept
+            : key_(std::move(key))
+        {
+        }
+
+        auto &key(std::string k) noexcept
+        {
+            key_ = std::move(k);
+            return *this;
+        }
+
+        auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+
+        auto &delegate(std::unique_ptr<SingleChildLayoutDelegate> d) noexcept
+        {
+            delegate_ = std::move(d);
+            return *this;
+        }
+
+        auto &child(std::unique_ptr<Widget> c) noexcept
+        {
+            child_ = std::move(c);
+            return *this;
+        }
+        auto &child(WidgetBuild auto &&b) noexcept
+        {
+            return child(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+
+        explicit operator std::unique_ptr<Widget>()
+        {
+            if (!delegate_)
+                throw std::logic_error{"CustomSingleChildLayout requires a delegate"};
+            return std::make_unique<CustomSingleChildLayoutWidget>(
+                std::move(key_), std::move(renderObject_), std::move(delegate_),
+                std::move(child_));
+        }
+
+      private:
+        std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
+        std::unique_ptr<SingleChildLayoutDelegate> delegate_;
+        std::unique_ptr<Widget> child_;
+    };
+    static constexpr auto CustomSingleChildLayout(std::string key = {}) noexcept // NOLINT
+    {
+        return CustomSingleChildLayoutBuild{std::move(key)};
+    }
+
+    // =========================================================================
+    // MultiChildLayoutContext —— delegate.performLayout 里用来操作 children
+    // hasChild / layoutChild / positionChild 对应 Flutter 的同名 API
+    // =========================================================================
+    struct MultiChildLayoutContext
+    {
+        Size size{};
+        std::function<bool(const std::string &)> hasChild;
+        std::function<Size(const std::string &, BoxConstraints)> layoutChild;
+        std::function<void(const std::string &, Offset)> positionChild;
+    };
+    // =========================================================================
+    // MultiChildLayoutDelegate
+    // =========================================================================
+    struct MultiChildLayoutDelegate
+    {
+        virtual ~MultiChildLayoutDelegate() = default;
+
+        /// 返回自身想要的尺寸，被父约束 constrain
+        virtual Size getSize(BoxConstraints c) const
+        {
+            return c.biggest();
+        }
+
+        /// 在 layout 阶段调用：用 ctx.layoutChild / ctx.positionChild 摆放 children
+        virtual void performLayout(Size size, MultiChildLayoutContext &ctx) const = 0;
+    };
+    // =========================================================================
+    // LayoutIdBuild —— 把 (id, child) 绑定起来给 delegate 引用
+    // 运行时不是 Widget，被 CustomMultiChildLayoutBuild 解包
+    // =========================================================================
+    struct LayoutIdBuild
+    {
+        std::string id_;
+        std::unique_ptr<Widget> child_;
+
+        explicit LayoutIdBuild(std::string id) : id_{std::move(id)} {}
+
+        auto &child(std::unique_ptr<Widget> c)
+        {
+            child_ = std::move(c);
+            return *this;
+        }
+        auto &child(WidgetBuild auto &&b)
+        {
+            return child(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+    };
+    static auto LayoutId(std::string id) noexcept // NOLINT
+    {
+        return LayoutIdBuild{std::move(id)};
+    }
+    struct CustomMultiChildLayoutWidget : Widget
+    {
+        CustomMultiChildLayoutWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                                     std::unique_ptr<MultiChildLayoutDelegate> delegate,
+                                     std::vector<std::unique_ptr<Widget>> children,
+                                     std::vector<std::string> ids) noexcept
+            : Widget(std::move(key), std::move(ro)), delegate_{std::move(delegate)},
+              children_{std::move(children)}, ids_{std::move(ids)}
+        {
+            assert(delegate_);
+            assert(children_.size() == ids_.size());
+            for (size_t i = 0; i < ids_.size(); ++i)
+                idToIndex_[ids_[i]] = i;
+            positions_.resize(children_.size(), Offset{0.0, 0.0});
+        }
+
+        void layout(BoxConstraints c) override
+        {
+            // 1. 自身尺寸 = constrain(delegate.getSize(c))
+            Self().size = c.constrain(delegate_->getSize(c));
+
+            // 2. 重置所有 child 位置为 (0, 0)
+            std::fill(positions_.begin(), positions_.end(), Offset{0.0, 0.0});
+
+            // 3. 构造 context 交给 delegate
+            MultiChildLayoutContext ctx;
+            ctx.size = Self().size;
+            ctx.hasChild = [this](const std::string &id) -> bool {
+                return idToIndex_.count(id) > 0;
+            };
+            ctx.layoutChild = [this](const std::string &id, BoxConstraints cc) -> Size {
+                auto it = idToIndex_.find(id);
+                if (it == idToIndex_.end())
+                    return {0.0, 0.0};
+                auto &child = children_[it->second];
+                child->layout(cc);
+                return child->size;
+            };
+            ctx.positionChild = [this](const std::string &id, Offset o) {
+                auto it = idToIndex_.find(id);
+                if (it == idToIndex_.end())
+                    return;
+                positions_[it->second] = o;
+            };
+
+            delegate_->performLayout(Self().size, ctx);
+        }
+
+        void updateOffset(Offset offset) noexcept override
+        {
+            Self().offset = offset;
+            for (size_t i = 0; i < children_.size(); ++i)
+                children_[i]->updateOffset({
+                    offset.x + positions_[i].x,
+                    offset.y + positions_[i].y,
+                });
+        }
+
+        [[nodiscard]] constexpr std::span<const std::unique_ptr<Widget>> children()
+            const noexcept override
+        {
+            return children_;
+        }
+
+      private:
+        std::unique_ptr<MultiChildLayoutDelegate> delegate_;
+        std::vector<std::unique_ptr<Widget>> children_;
+        std::vector<std::string> ids_;
+        std::unordered_map<std::string, size_t> idToIndex_;
+        std::vector<Offset> positions_;
+    };
+    struct CustomMultiChildLayoutBuild
+    {
+        explicit CustomMultiChildLayoutBuild(std::string key = {}) noexcept
+            : key_(std::move(key))
+        {
+        }
+
+        auto &key(std::string k) noexcept
+        {
+            key_ = std::move(k);
+            return *this;
+        }
+
+        auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+
+        auto &delegate(std::unique_ptr<MultiChildLayoutDelegate> d) noexcept
+        {
+            delegate_ = std::move(d);
+            return *this;
+        }
+
+        auto &addChild(LayoutIdBuild &lib) noexcept
+        {
+            ids_.push_back(lib.id_);
+            children_.push_back(std::move(lib.child_));
+            return *this;
+        }
+
+        explicit operator std::unique_ptr<Widget>()
+        {
+            if (!delegate_)
+                throw std::logic_error{"CustomMultiChildLayout requires a delegate"};
+            return std::make_unique<CustomMultiChildLayoutWidget>(
+                std::move(key_), std::move(renderObject_), std::move(delegate_),
+                std::move(children_), std::move(ids_));
+        }
+
+      private:
+        std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
+        std::unique_ptr<MultiChildLayoutDelegate> delegate_;
+        std::vector<std::unique_ptr<Widget>> children_;
+        std::vector<std::string> ids_;
+    };
+    static auto CustomMultiChildLayout(std::string key = {}) noexcept // NOLINT
+    {
+        return CustomMultiChildLayoutBuild{std::move(key)};
+    }
+
+    struct RotatedBoxWidget : Widget
+    {
+        RotatedBoxWidget(std::string key, std::unique_ptr<RenderObject> ro,
+                         int quarterTurns, std::unique_ptr<Widget> child) noexcept
+            : Widget(std::move(key), std::move(ro)), quarterTurns_{quarterTurns},
+              child_{std::move(child)}
+        {
+        }
+
+        void layout(BoxConstraints c) override
+        {
+            if (!child_)
+            {
+                Self().size = c.smallest();
+                return;
+            }
+
+            const bool odd = (quarterTurns_ % 2) != 0;
+
+            // 奇数 quarterTurns：约束宽高互换
+            const BoxConstraints childC =
+                odd ? BoxConstraints{c.minHeight(), c.maxHeight(), c.minWidth(),
+                                     c.maxWidth()}
+                    : c;
+
+            child_->layout(childC);
+
+            // 自身 size = constrain(旋转后 childSize)
+            Size s = child_->size;
+            if (odd)
+                std::swap(s.width, s.height);
+            Self().size = c.constrain(s);
+        }
+
+        void updateOffset(Offset offset) noexcept override
+        {
+            Self().offset = offset;
+            if (!child_)
+                return;
+
+            const int q = ((quarterTurns_ % 4) + 4) % 4;
+            const Size cs = child_->size; // 未旋转的 child 尺寸
+
+            Offset p;
+            switch (q)
+            {
+            case 0:
+                p = {0.0, 0.0};
+                break;
+            case 1:
+                p = {cs.height, 0.0};
+                break;
+            case 2:
+                p = {cs.width, cs.height};
+                break;
+            default:
+                p = {0.0, cs.width};
+                break; // q == 3
+            }
+
+            child_->updateOffset({offset.x + p.x, offset.y + p.y});
+        }
+
+        [[nodiscard]] constexpr std::span<const std::unique_ptr<Widget>> children()
+            const noexcept override
+        {
+            if (!child_)
+                return {};
+            return std::span<const std::unique_ptr<Widget>>{&child_, 1};
+        }
+
+      private:
+        int quarterTurns_;
+        std::unique_ptr<Widget> child_;
+    };
+    struct RotatedBoxBuild
+    {
+        explicit RotatedBoxBuild(std::string key = {}) noexcept : key_(std::move(key)) {}
+
+        auto &key(std::string k) noexcept
+        {
+            key_ = std::move(k);
+            return *this;
+        }
+        auto &renderObject(std::unique_ptr<RenderObject> ro) noexcept
+        {
+            renderObject_ = std::move(ro);
+            return *this;
+        }
+        auto &quarterTurns(int q) noexcept
+        {
+            quarterTurns_ = q;
+            return *this;
+        }
+
+        auto &child(std::unique_ptr<Widget> c) noexcept
+        {
+            child_ = std::move(c);
+            return *this;
+        }
+        auto &child(WidgetBuild auto &&b) noexcept
+        {
+            return child(
+                static_cast<std::unique_ptr<Widget>>(std::forward<decltype(b)>(b)));
+        }
+
+        explicit operator std::unique_ptr<Widget>()
+        {
+            return std::make_unique<RotatedBoxWidget>(std::move(key_),
+                                                      std::move(renderObject_),
+                                                      quarterTurns_, std::move(child_));
+        }
+
+      private:
+        std::string key_;
+        std::unique_ptr<RenderObject> renderObject_;
+        int quarterTurns_ = 0;
+        std::unique_ptr<Widget> child_;
+    };
+    static constexpr auto RotatedBox(std::string key = {}) noexcept // NOLINT
+    {
+        return RotatedBoxBuild{std::move(key)};
+    }
+
+    // ===============================================================================================
+    // flex 模式 [end]
+    // ===============================================================================================
+}; // namespace ui_new
+
+// shader_data::Glyph
+
+// NOTE: hover在帧稳定才触发，noexcept 没有问题
+
+//diff: [test_dod24.cpp] end [替换旧的布局，并更新录制的算法]
+
+//diff: [test_dod22] end
+
+// ═══════════════════════════════════════════════════════════════════════
+// 【原样保留】事件系统
+// ═══════════════════════════════════════════════════════════════════════
+using mcs::vulkan::meta::class_utils;
+template <typename... Extra>
+struct type_erased_invoker
+{
+    static consteval std::optional<std::meta::info> find_function(std::meta::info cls,
+                                                                  static_string name)
+    {
+        return class_utils::find_member(
+            cls, name,
+            [](std::meta::info m) -> bool {
+                return std::meta::is_function(m) || std::meta::is_function_template(m);
+            },
+            std::meta::access_context::current());
+    }
+    static consteval std::optional<std::meta::info> find_nonstatic_data_member(
+        std::meta::info cls, static_string name)
+    {
+        return class_utils::find_member(
+            cls, name,
+            [](std::meta::info m) -> bool {
+                return std::meta::is_nonstatic_data_member(m);
+            },
+            std::meta::access_context::current());
+    }
+
+    using invoke_type = void (*)(void *ptr, const void *type, void *data,
+                                 Extra...) noexcept;
+    constexpr void invoke(void *ptr, const void *type, void *data, Extra... e) noexcept
+    {
+        assert(invoke_ != nullptr);
+        invoke_(ptr, type, data, e...);
+    }
+
+    type_erased_invoker() = default;
+    constexpr explicit type_erased_invoker(invoke_type invoke) noexcept : invoke_{invoke}
+    {
+    }
+
+    template <class Obj, static_string name>
+    struct invoke_type_info
+    {
+        constexpr static bool in_function = find_function(^^Obj, name).has_value();
+        constexpr static bool in_data_member =
+            find_nonstatic_data_member(^^Obj, name).has_value();
+
+        template <class... Args>
+        static consteval auto can_noexcept_invoke()
+        {
+            // NOTE: 默认反射的是当前的类型，而不是从父类继承下来的
+            if constexpr (requires(Obj &&obj, Args &&...args) {
+                              {
+                                  obj.template invoke<name>(std::forward<Args>(args)...)
+                              } noexcept;
+                          })
+                return true;
+            else if constexpr (in_function || in_data_member)
+            {
+                constexpr auto m = in_function ? *find_function(^^Obj, name)
+                                               : *find_nonstatic_data_member(^^Obj, name);
+                return requires(Obj &&obj, Args &&...args) {
+                    { obj.[:m:](std::forward<Args>(args)...) } noexcept;
+                } || requires(Obj &&obj, Args &&...args) {
+                    { obj.template[:m:](std::forward<Args>(args)...) } noexcept;
+                };
+            }
+            else
+                return false;
+        }
+    };
+
+    template <static_string name, typename Obj, typename... Ts>
+    static constexpr void dispatch_invoke(Obj *ptr, std::tuple<Ts...> *, const void *type,
+                                          void *p, Extra &&...e) noexcept
+        requires(
+            (invoke_type_info<Obj, name>::template can_noexcept_invoke<Ts, Extra...>() ||
+             ...))
+    {
+        using Info = invoke_type_info<Obj, name>;
+        using mcs::vulkan::runtime_type_v;
+        auto &obj = *ptr;
+        auto invoke = [&]<typename... Args>(Args &&...args) noexcept {
+            if constexpr (requires() {
+                              {
+                                  obj.template invoke<name>(std::forward<Args>(args)...)
+                              } noexcept;
+                          })
+                obj.template invoke<name>(std::forward<Args>(args)...);
+            else
+            {
+                constexpr auto m = Info::in_function
+                                       ? *find_function(^^Obj, name)
+                                       : *find_nonstatic_data_member(^^Obj, name);
+                if constexpr (requires() {
+                                  { obj.[:m:](std::forward<Args>(args)...) } noexcept;
+                              })
+                    obj.[:m:](std::forward<Args>(args)...);
+                else
+                    obj.template[:m:](std::forward<Args>(args)...);
+            }
+        };
+        ((Info::template can_noexcept_invoke<Ts, Extra...>() &&
+          type == runtime_type_v<Ts> &&
+          (invoke(*static_cast<Ts *>(p), std::forward<Extra>(e)...), true)) ||
+         ...);
+    }
+
+    template <static_string callable_name, typename data_tuple, class T>
+    static constexpr auto build() noexcept
+    {
+        using object_type = std::remove_cvref_t<T>;
+        return type_erased_invoker{invoke_type{
+            [](void *ptr, const void *type, void *data, Extra... args) noexcept {
+                auto *obj = static_cast<object_type *>(ptr);
+                dispatch_invoke<callable_name, object_type>(
+                    obj, static_cast<data_tuple *>(nullptr), type, data, args...);
+            }}};
+    }
+
+  private:
+    invoke_type invoke_{};
+};
+
+template <class Handler>
+class multicast_sink
+{
+  public:
+    using index_t = std::uint32_t;
+    static constexpr index_t npos = ~index_t{0};
+
+    struct handle
+    {
+        index_t slot = npos;
+        std::uint64_t gen = 0;
+        [[nodiscard]] constexpr bool valid() const noexcept
+        {
+            return slot != npos;
+        }
+        [[nodiscard]] constexpr explicit operator bool() const noexcept
+        {
+            return valid();
+        }
+    };
+
+    class scoped_binding
+    {
+        multicast_sink *owner_ = nullptr;
+        handle h_{};
+
+      public:
+        scoped_binding() noexcept = default;
+
+        scoped_binding(multicast_sink &o, handle hh) noexcept : owner_(&o), h_(hh) {}
+
+        constexpr scoped_binding(scoped_binding &&other) noexcept
+            : owner_(std::exchange(other.owner_, nullptr)),
+              h_(std::exchange(other.h_, {}))
+        {
+        }
+        constexpr scoped_binding &operator=(scoped_binding &&other) noexcept
+        {
+            if (this != &other)
+            {
+                release();
+                owner_ = std::exchange(other.owner_, nullptr);
+                h_ = std::exchange(other.h_, {});
+            }
+            return *this;
+        }
+        scoped_binding(const scoped_binding &) = delete;
+        scoped_binding &operator=(const scoped_binding &) = delete;
+
+        constexpr ~scoped_binding() noexcept
+        {
+            release();
+        }
+
+        constexpr void release() noexcept
+        {
+            if (owner_ && h_.valid())
+                owner_->unbind(h_);
+            owner_ = nullptr;
+            h_ = {};
+        }
+        constexpr void activate() noexcept
+        {
+            if (owner_ && h_.valid())
+                owner_->activate(h_);
+        }
+        constexpr void deactivate() noexcept
+        {
+            if (owner_ && h_.valid())
+                owner_->deactivate(h_);
+        }
+        constexpr bool valid() const noexcept
+        {
+            return owner_ && h_.valid();
+        }
+        constexpr handle get_handle() const noexcept
+        {
+            return h_;
+        }
+    };
+
+    constexpr multicast_sink() = default;
+    multicast_sink(const multicast_sink &) = delete;
+    multicast_sink &operator=(const multicast_sink &) = delete;
+
+    // 可能抛 bad_alloc（slots_ realloc）
+    constexpr handle bind(void *obj, Handler handler)
+    {
+        index_t idx;
+        if (distributing_ || free_head_ == npos)
+        {
+            idx = static_cast<index_t>(slots_.size());
+            slot s;
+            s.obj = obj;
+            s.handler = handler;
+            s.gen = 1;
+            s.occupied = true;
+            s.active = true;
+            slots_.push_back(s);
+        }
+        else
+        {
+            idx = free_head_;
+            auto &s = slots_[idx];
+            free_head_ = s.free_next;
+            s.free_next = npos;
+            s.obj = obj;
+            s.handler = handler;
+            s.gen += 1;
+            s.occupied = true;
+            s.active = true;
+        }
+        slots_[idx].active_pos = static_cast<index_t>(active_list_.size());
+        active_list_.push_back(idx);
+        return {idx, slots_[idx].gen};
+    }
+
+    // 分发外：swap-remove active_list_ + 进 free_head_。分发中：只标 occupied。
+    constexpr void unbind(handle h) noexcept
+    {
+        if (h.slot >= slots_.size())
+            return;
+        auto &s = slots_[h.slot];
+        if (!s.occupied || s.gen != h.gen)
+            return;
+        s.occupied = false;
+        s.obj = nullptr;
+        s.handler = {};
+        s.free_next = free_head_;
+        free_head_ = h.slot;
+        if (!distributing_)
+            swap_remove_active_(h.slot);
+        else
+            dirty_ = true;
+    }
+
+    // ★ attach 只做 sink 层封装：obj + handler，无类型擦除
+    scoped_binding attach(void *obj, Handler handler)
+    {
+        return scoped_binding{*this, bind(obj, std::move(handler))};
+    }
+    void attach(scoped_binding &out, void *obj, Handler handler)
+    {
+        out = attach(obj, std::move(handler));
+    }
+
+    constexpr void activate(handle h) noexcept
+    {
+        if (h.slot >= slots_.size())
+            return;
+        auto &s = slots_[h.slot];
+        if (!s.occupied || s.gen != h.gen)
+            return;
+        if (s.active)
+            return;
+        s.active = true;
+        if (s.active_pos == npos)
+        {
+            s.active_pos = static_cast<index_t>(active_list_.size());
+            active_list_.push_back(h.slot);
+        }
+    }
+
+    constexpr void deactivate(handle h) noexcept
+    {
+        if (h.slot >= slots_.size())
+            return;
+        auto &s = slots_[h.slot];
+        if (!s.occupied || s.gen != h.gen)
+            return;
+        if (!s.active)
+            return;
+        s.active = false;
+        if (!distributing_)
+            swap_remove_active_(h.slot);
+        else
+            dirty_ = true;
+    }
+
+    template <class... Args>
+    constexpr void dispatch(Args &&...args) noexcept
+    {
+        const bool outer = !distributing_;
+        if (outer)
+        {
+            distributing_ = true;
+            n_snapshot_ = static_cast<index_t>(active_list_.size());
+        }
+        for (index_t i = 0; i < n_snapshot_; ++i)
+        {
+            index_t idx = active_list_[i];
+            auto &s = slots_[idx];
+            if (!s.occupied || !s.active)
+                continue;
+            s.handler.invoke(s.obj, std::forward<Args>(args)...);
+        }
+        if (outer)
+        {
+            distributing_ = false;
+            if (dirty_)
+            {
+                compact_active_();
+                dirty_ = false;
+            }
+        }
+    }
+
+    [[nodiscard]] constexpr const Handler *handler_of(handle h) const noexcept
+    {
+        if (h.slot >= slots_.size())
+            return nullptr;
+        const auto &s = slots_[h.slot];
+        if (!s.occupied || s.gen != h.gen)
+            return nullptr;
+        return &s.handler;
+    }
+    [[nodiscard]] constexpr void *context_of(handle h) const noexcept
+    {
+        if (h.slot >= slots_.size())
+            return nullptr;
+        const auto &s = slots_[h.slot];
+        if (!s.occupied || s.gen != h.gen)
+            return nullptr;
+        return s.obj;
+    }
+
+    template <class... Args>
+    constexpr void invoke(handle h, Args &&...args) const noexcept
+    {
+        if (h.slot >= slots_.size())
+            return;
+        const auto &s = slots_[h.slot];
+        if (!s.occupied || s.gen != h.gen)
+            return;
+        s.handler.invoke(s.obj, std::forward<Args>(args)...);
+    }
+
+    [[nodiscard]] constexpr std::size_t slot_count() const noexcept
+    {
+        return slots_.size();
+    }
+    [[nodiscard]] constexpr std::size_t live_count() const noexcept
+    {
+        return active_list_.size();
+    }
+    [[nodiscard]] constexpr std::size_t active_list_size() const noexcept
+    {
+        return active_list_.size();
+    }
+
+    constexpr void reserve(std::size_t n)
+    {
+        slots_.reserve(n);
+    }
+
+  private:
+    struct slot
+    {
+        void *obj = nullptr;
+        Handler handler{};
+        index_t free_next = npos;
+        index_t active_pos = npos;
+        std::uint64_t gen = 0;
+        bool occupied = false;
+        bool active = true;
+    };
+
+    std::vector<slot> slots_;
+    index_t free_head_ = npos;
+    std::vector<index_t> active_list_;
+    index_t n_snapshot_ = 0;
+    bool distributing_ = false;
+    bool dirty_ = false;
+
+    constexpr void swap_remove_active_(index_t idx) noexcept
+    {
+        auto &s = slots_[idx];
+        index_t p = s.active_pos;
+        if (p == npos)
+            return;
+        index_t last = static_cast<index_t>(active_list_.size() - 1);
+        if (p != last)
+        {
+            index_t moved = active_list_[last];
+            active_list_[p] = moved;
+            slots_[moved].active_pos = p;
+        }
+        active_list_.pop_back();
+        s.active_pos = npos;
+    }
+
+    constexpr void compact_active_() noexcept
+    {
+        index_t write = 0;
+        for (index_t read = 0; read < active_list_.size(); ++read)
+        {
+            index_t idx = active_list_[read];
+            auto &s = slots_[idx];
+            if (s.occupied && s.active)
+            {
+                active_list_[write] = idx;
+                s.active_pos = write;
+                ++write;
+            }
+            else
+            {
+                s.active_pos = npos;
+            }
+        }
+        active_list_.resize(write);
+    }
+};
+struct glfw_input_translation
+{
+    using time_point_type = std::chrono::steady_clock::time_point;
+
+    using keyboard_event = mcs::vulkan::event::keyboard_event;
+    using mousebutton_event = mcs::vulkan::event::mousebutton_event;
+    using scroll_event = mcs::vulkan::event::scroll_event;
+    using position2d_event = mcs::vulkan::event::position2d_event;
+    using cursor_enter_event = mcs::vulkan::event::cursor_enter_event;
+
+    using char_event = mcs::vulkan::event::char_event;
+    using drop_event = mcs::vulkan::event::drop_event;
+
+    using window_focus_event = mcs::vulkan::event::window_focus_event;
+    using window_pos_event = mcs::vulkan::event::window_pos_event;
+    using window_size_event = mcs::vulkan::event::window_size_event;
+    using window_iconify_event = mcs::vulkan::event::window_iconify_event;
+    using window_maximize_event = mcs::vulkan::event::window_maximize_event;
+    using framebuffer_size_event = mcs::vulkan::event::framebuffer_size_event;
+
+    using data_tuple =
+        std::tuple<keyboard_event, mousebutton_event, scroll_event, position2d_event,
+                   cursor_enter_event, char_event, drop_event, window_focus_event,
+                   window_pos_event, window_size_event, window_iconify_event,
+                   window_maximize_event, framebuffer_size_event>;
+    using proxy_class_type = type_erased_invoker<>;
+
+    template <typename event_type>
+    struct event_dispatcher
+    {
+        constexpr static auto &instance() noexcept
+        {
+            namespace event = mcs::vulkan::event;
+            if constexpr (std::is_same_v<keyboard_event, event_type>)
+                return event::keyboard_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<mousebutton_event, event_type>)
+                return event::mousebutton_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<scroll_event, event_type>)
+                return event::scroll_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<position2d_event, event_type>)
+                return event::position2d_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<cursor_enter_event, event_type>)
+                return event::cursor_enter_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<char_event, event_type>)
+                return event::char_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<drop_event, event_type>)
+                return event::drop_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<window_focus_event, event_type>)
+                return event::window_focus_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<window_pos_event, event_type>)
+                return event::window_pos_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<window_size_event, event_type>)
+                return event::window_size_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<window_iconify_event, event_type>)
+                return event::window_iconify_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<window_maximize_event, event_type>)
+                return event::window_maximize_event_dispatcher::instance();
+            else if constexpr (std::is_same_v<framebuffer_size_event, event_type>)
+                return event::framebuffer_size_event_dispatcher::instance();
+            else
+                static_assert(false, "not find dispatcher");
+        }
+    };
+
+    template <typename... Events>
+    static constexpr void subscribe_all(void *ptr, std::tuple<Events...> *)
+    {
+        (event_dispatcher<Events>::instance().subscribe(ptr, &forwarding<Events>), ...);
+    }
+    template <typename... Events>
+    static constexpr void unsubscribe_all(void *ptr, std::tuple<Events...> *) noexcept
+    {
+        static_assert((noexcept(event_dispatcher<Events>::instance().unsubscribe(
+                           ptr, &forwarding<Events>)) &&
+                       ...),
+                      "~class() need noexcept is true");
+        (event_dispatcher<Events>::instance().unsubscribe(ptr, &forwarding<Events>), ...);
+    }
+    constexpr explicit glfw_input_translation()
+    {
+        subscribe_all(this, static_cast<data_tuple *>(nullptr));
+    }
+    constexpr ~glfw_input_translation() noexcept
+    {
+        unsubscribe_all(this, static_cast<data_tuple *>(nullptr));
+    }
+    glfw_input_translation(const glfw_input_translation &) = delete;
+    glfw_input_translation(glfw_input_translation &&) = delete;
+    glfw_input_translation &operator=(const glfw_input_translation &) = delete;
+    glfw_input_translation &operator=(glfw_input_translation &&) = delete;
+
+    using multicast_t = multicast_sink<proxy_class_type>;
+    using handle = multicast_t::handle;
+    using scoped_binding = multicast_t::scoped_binding;
+
+    template <typename event_type>
+    constexpr static void forwarding(void *self, event_type e) noexcept
+    {
+        auto *impl = static_cast<glfw_input_translation *>(self);
+        using mcs::vulkan::runtime_type_v;
+        impl->sinks_.dispatch(runtime_type_v<event_type>, &e);
+    }
+
+    // ★ 类型擦除在这里发生：Obj → (void*, proxy_class_type)
+    template <typename Obj>
+        requires(requires() {
+            proxy_class_type::build<"input_event", data_tuple, Obj>();
+        })
+    constexpr scoped_binding attach(Obj &obj)
+    {
+        return sinks_.attach(&obj,
+                             proxy_class_type::build<"input_event", data_tuple, Obj>());
+    }
+
+    template <typename Obj>
+        requires(requires() {
+            proxy_class_type::build<"input_event", data_tuple, Obj>();
+        })
+    constexpr void attach(scoped_binding &out, Obj &obj)
+    {
+        out = attach(obj);
+    }
+    constexpr void reserve(std::size_t n)
+    {
+        sinks_.reserve(n);
+    }
+
+  private:
+    multicast_t sinks_;
+};
+
+namespace intent
+{
+    using mcs::vulkan::meta::static_string;
+    using time_point = std::chrono::milliseconds;
+
+    using mcs::vulkan::meta::template_args;
+
+    // 下标类型，一处可换。
+    //   约定：**位置 / 编号 / 扫描计数**用它；**长度与容量**（kinds.size()、
+    //   数组 extent、位图字数）仍用 std::size_t —— 后者是"多少个"，不是"第几个"。
+    //   想压窄（std::uint32_t / std::uint16_t）只改这一行；改完还写着
+    //   std::size_t 的地方，恰好就是"长度 → 下标"需要复核的边界。
+    using index_t = std::size_t;
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 0. 词汇
+    // ═══════════════════════════════════════════════════════════════════
+
+    // 识别器对仲裁层唯一能说的话
+    //
+    //   idle  —— 我没有 claim
+    //   hold  —— 我有一个 claim，但这一帧没有事件（参与压制，不发射）
+    //   ready —— 我有一个 claim，这一帧有事件（可以被允许发射）
+    //
+    // ready 不是“交互结束”，而是“这一帧有一个事件要发”。一个长 claim
+    // （drag）可以在 hold/ready 之间来回很多次；非流式只是 ready 一次的特化。
+    //
+    // 没有 done / aborted / reset：帧不改变 claim 时，识别器把当前状态
+    // 原样再说一遍；自己放弃就回 idle（放弃不是判决，不产生事件）。
+    enum class claim_state : std::uint8_t
+    {
+        idle,
+        hold,
+        ready
+    };
+
+    enum class verdict : std::uint8_t
+    {
+        accepted,  // 赢
+        superseded // 让位
+    };
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 0.1 识别器 ↔ 裁决器：四个方法，两个方向
+    //
+    //   识别器 → session（每次 feed / tick 的返回值）：
+    //     ① idle / hold / ready —— 我现在是什么
+    //     ② 吃哪种帧            —— 编译期由 feed 重载决定；law_of 用它算 accepted-frame 集合
+    //
+    //   arbiter → 识别器（裁决之后，只可能调一个）：
+    //     ③ win()  —— 允许发射这一帧的事件；是否结束 claim 由识别器决定
+    //     ④ lose() —— 更具体的赢了：丢掉并结束这条 claim
+    //
+    //   裁决器本身只看到 report[] 和静态表；它不调用识别器。
+    //   调用 win/lose 的是 session。
+    //
+    //   没有 reset。识别器的内部状态只由它自己写；session 没有它的指针，
+    //   也不在裁决之后替它"清一下"。win/lose 是消息，不是复位。
+    //
+    //   ── 识别器的义务（裁决器安全/活性证明依赖这六条）──────────────
+    //   R1 一槽一条：同一时刻一个 kind 至多一条活着的 claim。
+    //   R2 单调：ready 的 claim 在收到 win/lose 之前不能自己降回 idle/hold。
+    //   R3 收到 win/lose 后，该 claim 必须结束；同一交互不得再次申报。
+    //   R4 feed/tick 只读自己的状态、无其它副作用、noexcept；tick 只推进时间。
+    //   R5 及时：一次交互从它的第一帧起就必须有 claim（hold），不能等
+    //      更低优先级的解释已经赢了之后再补报。
+    //   R6 事件消费：win 之后不得对同一个事件再次 ready；下一个 ready 必须
+    //      是新事件。长 claim 可以多次 ready，但每次都是不同事件。
+    // ═══════════════════════════════════════════════════════════════════
+    namespace recognizer
+    {
+        // 识别器只做三件事：吃帧、过时间、投递/退休。
+        // 裁决器只吃 claim_state 数组，不认识 Frame、payload、span。
+        template <class M, class Self, class Frame>
+        concept can_feed = requires(M &m, Self &self, const Frame &f, time_point t) {
+            { m.feed(self, f, t) } noexcept -> std::same_as<claim_state>;
+        };
+    } // namespace recognizer
+
+    // 一条观测记录（定长、可拷贝、不分配）
+    struct observation
+    {
+        std::string_view name{};
+        verdict v{};
+        time_point at{}; // 裁决时刻
+    };
+
+    // ── 观测：只写不读，不参与判决。整块可换 ──
+    //    trace：定长记录，满了计数丢弃（不覆盖、不分配）
+    struct trace
+    {
+        static constexpr std::size_t capacity = 64;
+        std::array<observation, capacity> buf{};
+        std::size_t n = 0, dropped_n = 0;
+
+        constexpr void push(const observation &e) noexcept
+        {
+            if (n < capacity)
+                buf[n++] = e;
+            else
+                ++dropped_n;
+        }
+        constexpr std::span<const observation> events() const noexcept
+        {
+            return {buf.data(), n};
+        }
+        constexpr void clear() noexcept
+        {
+            n = 0;
+        }
+        constexpr std::size_t dropped() const noexcept
+        {
+            return dropped_n;
+        }
+    };
+
+    // 无观测版本：编译期被 if constexpr 剪掉，不产生任何记录。
+    struct null_trace
+    {
+    };
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 1. plan：编译期的声明表（L1 同态律）
+    //      kinds  : 每片叶子的名字 / 回调名
+    //      awaits : (i,j) —— i 是 j 的抽象版
+    //      excl   : (i,j) —— i 与 j 不能共存
+    // ═══════════════════════════════════════════════════════════════════
+    struct kind_desc
+    {
+        static_string name{};    // 日志标签：不参与查找/分发，不要求唯一
+        static_string fn_name{}; // 回调的名字：invoke<fn_name>，可以多个 kind 共用一个
+
+        friend constexpr bool operator==(const kind_desc &, const kind_desc &) = default;
+    };
+    struct plan_data
+    {
+        std::vector<kind_desc> kinds;
+        // 下标一律 index_t：它只可能来自 kinds.size() 或循环计数，
+        // 负数不是"约定上不该有"，而是根本产生不出来 —— 也没有 -1 哨兵的需求。
+        std::vector<std::pair<index_t, index_t>> awaits;
+        std::vector<std::pair<index_t, index_t>> excl;
+
+        // 拼接：b 追加到a, b 的所有编号 + base （换坐标系）
+        friend consteval plan_data operator+(plan_data a, const plan_data &b)
+        {
+            const index_t base = static_cast<index_t>(a.kinds.size());
+            a.kinds.append_range(b.kinds);
+            for (auto [i, j] : b.awaits)
+                a.awaits.push_back({i + base, j + base});
+            for (auto [i, j] : b.excl)
+                a.excl.push_back({i + base, j + base});
+            return a;
+        }
+    };
+
+    // 叶子 = 纯类型：两个名字 + 状态机类型。
+    //   它不持有状态机：状态机住在 ui 的扁平元组里。
+    //
+    //   两个名字各管一摊，不耦合：
+    //     Name   —— kind 的身份。进日志、蓝图、报错；要求唯一（它是"谁"）。
+    //     FnName —— 回调的名字。sink 只会做 invoke<FnName>(payload)；
+    //               多个 kind 可以共用同一个回调。
+    //   “能吃哪些帧”不再手写：由 feed 重载在 law_of 里编译期算出来，
+    //   关系两端能不能相遇也由这个集合决定，不靠 channel 字符串。
+    template <class Fsm>
+    struct leaf
+    {
+        using protocol = Fsm; // 叶子协议：我的状态机类型（反射靠它认出叶子）
+        static constexpr auto name = Fsm::name;       // kind 的身份
+        static constexpr auto fn_name = Fsm::fn_name; // 回调的名字（invoke<fn_name>）
+        using consume_t = Fsm::consume_t;
+
+        static consteval plan_data plan()
+        {
+            return plan_data{.kinds = {{name, fn_name}}, .awaits = {}, .excl = {}};
+        }
+    };
+
+    // 并行：不加任何关系
+    template <class... Rs>
+    struct all_of
+    {
+        using children_t = std::tuple<Rs...>; // 组合子协议（仅类型）
+
+        static consteval plan_data plan()
+        {
+            plan_data p;
+            ((p = p + Rs::plan()), ...);
+            return p;
+        }
+    };
+
+    // 互斥：任意两个不同子树之间填满 excl
+    template <class... Rs>
+    struct one_of
+    {
+        using children_t = std::tuple<Rs...>;
+
+        static consteval plan_data plan()
+        {
+            constexpr std::size_t K = sizeof...(Rs);
+            std::array<plan_data, K> parts{}; //收集每个子树的 plan_data
+            index_t k = 0;
+            ((parts[k++] = Rs::plan()), ...);
+
+            // 前缀和 off 与拼接 p
+            plan_data p;
+            std::array<index_t, K + 1> off{};
+            for (std::size_t i = 0; i < K; ++i)
+            {
+                off[i + 1] = off[i] + static_cast<index_t>(parts[i].kinds.size());
+                p = p + parts[i];
+            }
+            /*
+            外层 (a, b)：枚举所有不同的子树对，并且强制 a < b（按声明序，a 在前）。
+            内层 (x, y)：x 遍历子树 a 的所有叶子下标，y 遍历子树 b 的所有叶子下标。
+            把每一对 (x, y) 加入 excl
+            */
+            // NOTE: 任意两个不同子树之间的叶子两两互斥
+            for (index_t a = 0; a < K; ++a)
+                for (index_t b = a + 1; b < K; ++b)
+                    for (index_t x = off[a]; x < off[a + 1]; ++x)
+                        for (index_t y = off[b]; y < off[b + 1]; ++y)
+                            p.excl.push_back({x, y});
+            return p;
+        }
+    };
+
+    // 细化：A 里每片叶子都等 B 里每片叶子的失败
+    template <class A, class B>
+    struct refines
+    {
+        using children_t = std::tuple<A, B>;
+
+        static consteval plan_data plan()
+        {
+            auto pa = A::plan();
+            auto pb = B::plan();
+            const index_t na = static_cast<index_t>(pa.kinds.size());
+            auto p = pa + pb; // NOTE: 先简单拼接，再在下面添加边
+            // NOTE: A 的元素  全部 等 B 的元素
+            for (index_t i = 0; i < na; ++i)
+                for (index_t j = na; j < static_cast<index_t>(p.kinds.size()); ++j)
+                    p.awaits.push_back({i, j});
+            return p;
+        }
+    };
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 2. validate：坏结构编译不过（00-goal 第 3 条）
+    //    ① 无自环 ② 细化×互斥不矛盾 ③ awaits 无环
+    //
+    //    “关系两端能不能相遇”不在这里：那要看 feed 重载，是
+    //    law_of 里按 accepted-frame 集合做的编译期检查。
+    //    name 只是日志标签，不参与查找/分发，所以**不要求唯一**；
+    //    fn_name 是回调名，也不查重 —— 多个 kind 共用一个回调是合法用法。
+    //    真正的结构约束是“同一个 FSM 类型不能在同一棵树里出现两次”，
+    //    那个在 shape 里查。
+    // ═══════════════════════════════════════════════════════════════════
+    consteval void validate(const plan_data &p)
+    {
+        const std::size_t n = p.kinds.size(); // 多少个 kind：这是长度
+
+        for (auto [i, j] : p.awaits)
+            if (i == j)
+                throw "awaits self-loop";
+        for (auto [i, j] : p.excl)
+            if (i == j)
+                throw "excl self-loop";
+        for (auto [i, j] : p.awaits)
+            for (auto [x, y] : p.excl)
+                if ((i == x && j == y) || (i == y && j == x))
+                    throw "refines x excl conflict";
+
+        // awaits 无环检查（拓扑排序 / Kahn）。
+        //
+        // 语义：awaits 里的 (i, j) 读作「i 在等 j」。
+        // 有环 ⇔ 存在一组节点互相等待（死锁），细化关系不成立 → throw。
+        //
+        // 做法（三句话）：
+        //   1. indeg[i] = 「i 还欠几个人没等到」（不是图论入度，名字别较真）
+        //   2. 反复找 indeg == 0 的节点（谁也不欠 → 自由），完成它，
+        //      再让所有「在等它」的节点少欠一个（--indeg）
+        //   3. 某一轮一个自由的都没找到 → 剩下的互相等 → 有环
+        //
+        // 复杂度 O(n² · |awaits|)：每完成一个节点就重扫整张 awaits 表。
+        // max_kinds = 64 的注释里说「爆点在 validate 的 Kahn」就是指这里。
+        std::vector<std::size_t> indeg(n, 0); // indeg[i] = i 还欠几个"等"
+        for (auto [i, j] : p.awaits)
+            ++indeg[i]; // i 等 j：i 欠一个
+
+        std::vector<bool> done(n, false);     // done[i]  = i 是否已完成
+        for (std::size_t left = n; left > 0;) // left = 还没完成的节点数
+        {
+            bool prog = false; // 本轮是否至少完成了一个
+            for (index_t i = 0; i < n; ++i)
+                if (!done[i] && indeg[i] == 0) // 不欠任何人了 → 自由
+                {
+                    done[i] = true;
+                    --left;
+                    prog = true;
+                    // 完成 i 之后，所有"在等 i"的 x 都少欠一个。
+                    // (x, y) 且 y == i 就是「x 在等 i」。
+                    for (auto [x, y] : p.awaits)
+                        if (y == i)
+                            --indeg[x];
+                    // 注意：内层 for 不 break，本轮内新变自由的节点会顺手处理。
+                }
+            if (!prog) // 一轮下来没人自由 → 死锁 → 有环
+                throw "refines cycle";
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 3. bset：一张位图，也是这套语义里唯一的"集合"
+    //
+    //    ── 位 i 的含义由**使用位置**决定，不在类型里 ──
+    //      law::beats[i]   第 j 位 = "i 打得赢 j"      （行 = 我赢谁）
+    //      live          第 i 位 = "第 i 个 kind 有活着的 claim"
+    //      ready         第 i 位 = "本拍有事件"
+    //      advance       第 i 位 = "本拍被这一帧推进过"
+    //
+    //    ── 为什么是它：裁决的每一步都是集合运算，一一对应 ──
+    //      blocked = ∪ 行(活着的)        →  for j: blocked |= beats[j]
+    //      win     = ready ∖ blocked     →  ready & ~blocked
+    //      lose    = ∪ 行(赢家) ∩ live   →  for i: lose |= beats[i]; lose &= live
+    //    "谁赢 i"没有单独存：用行并回答（∪行(j) 就是"能赢这些人的全体"），
+    //    所以 blocked 只需要行，不需要转置表。
+    //
+    //    ── 关于 64：S 没有 64 这个上限 ──
+    //      位数 = ⌈S/64⌉ 个字，64 只是一个字的宽度（S=70 就是两个字，S=6 是一个字）。
+    //      代价是平方的：beats 占 S×⌈S/64⌉×8 字节；每帧 blocked 要 S×⌈S/64⌉ 次字或；
+    //      编译期 closure 是 S²×⌈S/64⌉。先撞墙的其实不是矩阵，是 validate 的 Kahn
+    //      （它每个节点重扫一遍 awaits 列表；S=200 会撞 GCC 的 constexpr 运算上限）。
+    //
+    //    ── 约定（改代码时请保持）──
+    //      · 只由 set/clr 产生，合法区间永远是 [0,S)
+    //      · ~ 只在 [0,S) 内闭合（尾字抹零）⇒ 任何 x & ~y 都不需要前提
+    //      · 判空用 none()；不要用 !has(0) 代替
+    //      · | 是并、& 是交、差集写 x & ~y（不是 x ∖ y）
+    // ═══════════════════════════════════════════════════════════════════
+    template <std::size_t S>
+    struct bset
+    {
+        static constexpr std::size_t W = (S + 63) / 64;
+        std::array<std::uint64_t, W> w{};
+
+        constexpr void set(index_t i) noexcept
+        {
+            w[i / 64] |= std::uint64_t{1} << (i % 64);
+        }
+        constexpr void clr(index_t i) noexcept
+        {
+            w[i / 64] &= ~(std::uint64_t{1} << (i % 64));
+        }
+        // "这个集合里有 i 吗"：读一位，不写任何东西。
+        // 同一个函数在三种角色上意思不同，由上下文给：
+        //   law::beats[i].has(j)  → i 打得赢 j 吗
+        //   live.has(i)           → 第 i 个 kind 有活着的 claim 吗
+        //   advance.has(i)        → 本帧推进了这一列吗
+        constexpr bool has(index_t i) const noexcept
+        {
+            return (w[i / 64] >> (i % 64)) & 1;
+        }
+        // 只遍历置位：O(popcount)，不是 O(S)
+        template <class Fn>
+        constexpr void for_each(Fn &&f) const noexcept
+        {
+            for (std::size_t k = 0; k < W; ++k)
+            {
+                auto x = w[k];
+                while (x)
+                {
+                    const auto b = std::countr_zero(x);
+                    const auto i = static_cast<index_t>(k * 64 + b);
+                    if (i < static_cast<index_t>(S))
+                        f(i);
+                    x &= x - 1;
+                }
+            }
+        }
+        // 空吗？"没人能赢"、"没有结论"、"表清空" 都用它
+        constexpr bool none() const noexcept
+        {
+            for (auto x : w)
+                if (x)
+                    return false;
+            return true;
+        }
+        constexpr bset &operator|=(const bset &b) noexcept
+        {
+            for (std::size_t k = 0; k < W; ++k)
+                w[k] |= b.w[k];
+            return *this;
+        }
+        constexpr bset &operator&=(const bset &b) noexcept
+        {
+            for (std::size_t k = 0; k < W; ++k)
+                w[k] &= b.w[k];
+            return *this;
+        }
+        friend constexpr bset operator|(bset a, const bset &b) noexcept
+        {
+            return a |= b;
+        }
+        friend constexpr bset operator&(bset a, const bset &b) noexcept
+        {
+            return a &= b;
+        }
+        friend constexpr bset operator~(bset a) noexcept
+        {
+            for (std::size_t k = 0; k < W; ++k)
+                a.w[k] = ~a.w[k];
+            // 补集只在 [0,S) 里闭合：高位一律抹掉，
+            // 调用方就不用替它记着"左边那个操作数是干净的"
+            if constexpr (S % 64 != 0)
+                a.w[W - 1] &= (std::uint64_t{1} << (S % 64)) - 1;
+            return a;
+        }
+        constexpr bool operator==(const bset &) const noexcept = default;
+    };
+    // ═══════════════════════════════════════════════════════════════════
+    // 4. 树的形状（shape）—— 树只是类型，不产生任何对象
+    //
+    //    一个类型说清几件事，全部是编译期：
+    //      leaf_count     : 几片叶子
+    //      recognizers    : 它们的状态机元组（声明序）
+    //      consume_t      : 所有 leaf consume_t 的去重并集
+    //      consume_of<I>  : 第 I 片叶子自己的 consume_t（不去重）
+    //      unique_machines: 同一个 FSM 类型没有出现两次
+    //
+    //    "这棵树认不认识帧 F"不在这里另开一个成员：用 advance_mask<Tree,F>() 回答，
+    //    它就是"哪些列认识 F"的位图，空就是不认识（见下面 4.3）。
+    // ═══════════════════════════════════════════════════════════════════
+    namespace detail
+    {
+        // 组合子 = 声明了成员类型别名 children_t 的类。
+        // 子节点 = children_t（std::tuple<Rs...>）的模板实参。
+        consteval std::vector<std::meta::info> child_types(std::meta::info node)
+        {
+            if (!std::meta::is_class_type(node))
+                return {};
+
+            constexpr auto ctx = std::meta::access_context::current();
+            for (auto m : std::meta::members_of(node, ctx))
+            {
+                if (!std::meta::has_identifier(m) ||
+                    std::meta::identifier_of(m) != "children_t")
+                    continue;
+                if (!std::meta::is_type_alias(m))
+                    continue;
+
+                auto tup = std::meta::dealias(m); // std::tuple<Rs...>
+                std::vector<std::meta::info> out;
+                for (auto a : std::meta::template_arguments_of(tup))
+                    if (std::meta::is_type(a))
+                        out.push_back(std::meta::remove_cvref(a));
+                return out;
+            }
+            return {};
+        }
+
+        // 按声明序收集叶子（叶子 = 声明了 protocol 的节点）
+        consteval std::vector<std::meta::info> leaf_infos(std::meta::info node)
+        {
+            constexpr auto ctx = std::meta::access_context::current();
+            std::vector<std::meta::info> out;
+            for (auto m : std::meta::members_of(node, ctx))
+                if (std::meta::has_identifier(m) &&
+                    std::meta::identifier_of(m) == "protocol")
+                {
+                    out.push_back(node);
+                    return out;
+                }
+
+            for (auto c : child_types(node))
+                for (auto x : leaf_infos(c))
+                    out.push_back(x);
+            return out;
+        }
+
+        template <class... Ls>
+        struct shape
+        {
+            static constexpr std::size_t leaf_count = sizeof...(Ls);
+            using recognizers = std::tuple<typename Ls::protocol...>;
+
+            // 同一个 FSM 类型出现两次 ⇒ 两个无法区分的 claim；这是结构错误。
+            // name 是日志标签，不承担这个约束。
+            static constexpr bool unique_machines = []() consteval {
+                constexpr std::size_t N = sizeof...(Ls);
+                std::array<std::meta::info, N> m{^^typename Ls::protocol...};
+                for (std::size_t i = 0; i < N; ++i)
+                    for (std::size_t j = i + 1; j < N; ++j)
+                        if (m[i] == m[j])
+                            return false;
+                return true;
+            }();
+            static_assert(unique_machines, "同一个 FSM 类型不能在同一棵树里出现两次");
+
+            // 所有 leaf 的 consume_t 并集，按第一次出现的顺序去重。
+            static consteval auto consume_args()
+            {
+                std::vector<std::meta::info> out;
+                auto add = [&out]<class L>() {
+                    for (auto a : template_args<typename L::protocol::consume_t>())
+                    {
+                        bool seen = false;
+                        for (auto b : out)
+                            if (a == b)
+                            {
+                                seen = true;
+                                break;
+                            }
+                        if (!seen)
+                            out.push_back(a);
+                    }
+                };
+                (add.template operator()<Ls>(), ...);
+                return out;
+            }
+
+            using consume_t =
+                typename[:std::meta::substitute(^^std::tuple, consume_args()):];
+            // consume_t 只用于编译期校验（关系两端有没有共同 change）；
+            // 它不是运行期路由表，路由由 feed(frame<T>) 的重载完成。
+
+            // 第 I 个 leaf 自己的 consume_t：不去重，用来和 I 对账。
+            template <std::size_t I>
+            using consume_of = typename std::tuple_element_t<I, recognizers>::consume_t;
+        };
+
+        template <class Tree>
+        using shape_of = typename[:std::meta::substitute(^^shape, leaf_infos(^^Tree)):];
+
+        // T 是否在 Tuple 的模板实参里
+        template <class T, class Tuple>
+        static consteval bool in_tuple() noexcept
+        {
+            for (auto a : template_args<Tuple>())
+                if (std::meta::dealias(a) == std::meta::dealias(^^T))
+                    return true;
+            return false;
+        }
+
+    } // namespace detail
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 4.3 advance_mask<Tree, Frame>()：这一帧会**推进**哪些列
+    // 判断当前的 Frame 是否能够推进。就是Tree是否有识别器使用这个类型的输入
+    // ═══════════════════════════════════════════════════════════════════
+    template <class Tree, class Self, class Frame>
+    consteval auto advance_mask() noexcept
+    {
+        using Shape = typename detail::shape_of<Tree>;
+        using Recognizers = Shape::recognizers;
+        constexpr std::size_t S = Shape::leaf_count;
+        bset<S> m{};
+        template for (constexpr auto I : std::ranges::views::indices(S))
+        {
+            if constexpr (recognizer::can_feed<std::tuple_element_t<I, Recognizers>, Self,
+                                               Frame>)
+                m.set(static_cast<index_t>(I));
+        }
+        return m;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 4.2 一片树最多多少片叶子：硬上限 64
+    //
+    //   64 不是"位图装不下"——位图是 ⌈S/64⌉ 个字，任意 S 都放得下。
+    //   它是**当前实现的编译期上限**，实测出来的：
+    //     稠密 refines（A 侧 S/2 × B 侧 S/2，边数 = S²/4）
+    //       S=70 → 能编译
+    //       S=96 → 'constexpr' operation count exceeds limit of 33554432
+    //     爆点不在矩阵（closure 只要 S²×⌈S/64⌉），在 validate 的 Kahn：
+    //     它每处理一个节点就把整个 awaits 列表重扫一遍，约 O(n²·E)。
+    //
+    //   所以这里写死 64（一个 uint64 位图正好装下），宁可编译期一句人话报错，
+    //   也不要让人撞一屏模板展开。要放宽：先把 validate 的 Kahn 改成 O(n+E)，
+    //   再把这个数调大。
+    // ═══════════════════════════════════════════════════════════════════
+    inline constexpr std::size_t max_kinds = 64;
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 4.5 传递闭包（位行 Warshall）：i→k、k→j ⇒ i→j
+    //     单独拎出来，是因为它可以被单独喂数据测试（见 test_matrix_series.cpp B4）。
+    //     在 law_of::beats 里它跑一次；测试里可以用一条手搭的 3 链看它确实补边。
+    // ═══════════════════════════════════════════════════════════════════
+    template <std::size_t S>
+    consteval std::array<bset<S>, S> closure(std::array<bset<S>, S> m)
+    {
+        for (std::size_t k = 0; k < S; ++k)
+            for (std::size_t i = 0; i < S; ++i)
+                if (m[i].has(k))
+                    m[i] |= m[k];
+        return m;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 5. 法则：一张矩阵说完所有裁决
+    //
+    //    beats[i] = 第 i 行 = "i 打得赢谁"。两条来源，都是声明里已经说过的：
+    //      refines<A,B> ：B 的每片叶子打败 A 的每片叶子（更具体的赢）
+    //      one_of<R...> ：先声明的打败后声明的（互斥对之间唯一的平局规则）
+    //    再跑一遍传递闭包，矩阵自带传递性 —— 运行期不再推导任何东西。
+    //
+    //    构造完断言对角线为空 ⇒ 矩阵是**严格偏序** ⇒ 极大元唯一
+    //    ⇒ 下面的选择律与"谁先被看"无关。这就是自然选择。
+    // ═══════════════════════════════════════════════════════════════════
+    template <class Tree>
+    struct law_of
+    {
+        using shape = detail::shape_of<Tree>;
+        // 所有 leaf 的 consume_t 去重并集；运行期裁决只读 beats，不读它。
+        using change_types = typename shape::consume_t;
+        static constexpr std::size_t S = shape::leaf_count;
+        static constexpr std::size_t C = std::tuple_size_v<change_types>;
+
+        // 上限先断言：S 超过 max_kinds 就别往下算了（理由见 max_kinds 的注释）
+        static_assert(S >= 1, "一片叶子都没有的树没有意义");
+        static_assert(S <= max_kinds,
+                      "叶子太多：上限见 intent::max_kinds（=64）。"
+                      "位图放得下，是 validate 的 Kahn 会撞编译期运算上限");
+        static_assert(C >= 1, "change_types 不能为空");
+
+        // 行：i 打得赢谁
+        static constexpr std::array<bset<S>, S> beats = []() consteval {
+            std::array<bset<S>, S> m{};
+            const auto p = Tree::plan();
+            validate(p);                 // 无自环 / 细化×互斥 / awaits 无环
+            for (auto [a, b] : p.awaits) // a 等 b ⇒ b 赢 a
+                m[b].set(a);
+            for (auto [a, b] : p.excl) // 互斥对是无序的：谁先声明谁赢
+            {
+                if (b < a)
+                    std::swap(a, b); // 让 a 永远是"先声明的那一个"
+                m[a].set(b);         // 于是直接写：先声明的赢
+            }
+            m = closure<S>(m); // 传递闭包（位行 Warshall）
+            for (index_t i = 0; i < S; ++i)
+                if (m[i].has(i))
+                    throw "beats 有环：refines / one_of 互相指向，结构不成立";
+
+            // 每个 kind 消费哪些 change：来自它自己的 consume_t（不去重）。
+            // consumes 只在编译期用，不参与运行期裁决；运行期路由是
+            // feed(frame<T>) 的重载。这里只回答一条边两端有没有共同 change。
+            std::array<bset<C>, S> consumes{};
+            template for (constexpr auto I : std::ranges::views::indices(S))
+            {
+                using owned = typename shape::template consume_of<I>;
+                template for (constexpr auto J : std::ranges::views::indices(C))
+                {
+                    using Ch = std::tuple_element_t<J, change_types>;
+                    if constexpr (detail::in_tuple<Ch, owned>())
+                        consumes[I].set(J);
+                }
+                if (consumes[I].none())
+                    throw "kind 不消费任何 input_frame change";
+            }
+
+            // 关系两端必须能相遇：否则这条边是数据/实现不匹配，编译期就拒绝。
+            for (index_t i = 0; i < S; ++i)
+                for (index_t j = 0; j < S; ++j)
+                    if (m[i].has(j) && (consumes[i] & consumes[j]).none())
+                        throw "beats 跨 change：关系两端没有共同变化类型";
+            return m;
+        }();
+
+        // 每槽的名字（播报用）—— 和矩阵同一个下标。
+        //   static_string 本体只有一个 const char*（8 B），string_view 是 16 B；
+        //   名字很短、播报又稀疏，view() 时那次 strlen 可忽略，换来这张表减半。
+        static constexpr std::array<static_string, S> names = []() consteval {
+            std::array<static_string, S> r{};
+            const auto p = Tree::plan();
+            for (index_t i = 0; i < S; ++i)
+                r[i] = p.kinds[i].name;
+            return r;
+        }();
+    };
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 6. 裁决器：一个纯函数
+    //
+    //    输入：report[N]（每个识别器最近一次上报的 claim_state）
+    //          beats[N]（编译期静态表）
+    //    输出：win / lose 两个位图
+    //
+    //    它不知道 Frame、arena_event、payload、span、识别器类型，
+    //    也不调用任何识别器。调用 win/lose 是 arbiter 的事。
+    // ═══════════════════════════════════════════════════════════════════
+    template <std::size_t S>
+    struct decision
+    {
+        bset<S> win{}, lose{}; // 不相交；win 是反链
+    };
+
+    // 裁决
+    template <std::size_t S>
+    constexpr decision<S> arbitrate(const std::array<claim_state, S> &report,
+                                    const std::array<bset<S>, S> &beats) noexcept
+    {
+        // ① 一次扫，建 live / ready；这是局部量，不保存为成员
+        bset<S> live{}, ready{};
+        for (index_t i = 0; i < S; ++i)
+        {
+            if (report[i] != claim_state::idle)
+                live.set(i);
+            if (report[i] == claim_state::ready)
+                ready.set(i);
+        }
+        if (ready.none())
+            return {}; // 没 ready 就没 win，没 win 就没 lose
+
+        // ② 只遍历 live 的置位
+        bset<S> blocked{};
+        live.for_each([&](index_t j) noexcept { blocked |= beats[j]; });
+
+        // ③ ready 里的极大元
+        const bset<S> win = ready & ~blocked;
+
+        // ④ 只遍历 win 的置位
+        bset<S> lose{};
+        win.for_each([&](index_t i) noexcept { lose |= beats[i]; });
+        lose &= live & ~win;
+
+        return {win, lose};
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 9. arbiter：识别器和裁决器的唯一接线处
+    // ═══════════════════════════════════════════════════════════════════
+    template <class Tree>
+    struct arbiter
+    {
+        using shape = detail::shape_of<Tree>;
+        using law = law_of<Tree>;
+        static constexpr std::size_t S = shape::leaf_count;
+        using Recognizers = typename shape::recognizers;
+
+        Recognizers recognizers{};
+        std::array<claim_state, S> reports{}; // 最近一次上报；唯一状态源
+
+        // 无观测版本
+        template <class Self, class Frame>
+        constexpr void feed(Self &self, const Frame &f, time_point now) noexcept
+        {
+            null_trace t{};
+            feed<Self, Frame, null_trace>(self, f, now, t);
+        }
+
+        // 带 Trace 模板参数的版本：由 debug_arbiter 调用
+        template <class Self, class Frame, class Trace>
+        constexpr void feed(Self &self, const Frame &f, time_point now, Trace &t) noexcept
+        {
+            constexpr bset<S> advance = advance_mask<Tree, Self, Frame>();
+            if constexpr (advance.none())
+                return; // 没有列接受这个 Frame：不推进，也不再裁决
+
+            template for (constexpr auto I : std::ranges::views::indices(S))
+            {
+                if constexpr (advance.has(static_cast<index_t>(I)))
+                    reports[I] = std::get<I>(recognizers).feed(self, f, now);
+            }
+            resolve(self, now, t);
+        }
+
+        // 无观测版本
+        template <class Self>
+        constexpr void tick(Self &self, time_point now) noexcept
+        {
+            null_trace t{};
+            tick<Self, null_trace>(self, now, t);
+        }
+
+        // 带 Trace 模板参数的版本：由 debug_arbiter 调用
+        template <class Self, class Trace>
+        constexpr void tick(Self &self, time_point now, Trace &t) noexcept
+        {
+            template for (constexpr auto I : std::ranges::views::indices(S))
+            {
+                reports[I] = std::get<I>(recognizers).tick(self, now);
+            }
+            resolve(self, now, t);
+        }
+
+      private:
+        // report -> verdict -> 落地。先让位，再放行。
+        template <class Self, class Trace>
+        constexpr void resolve(Self &self, time_point now, Trace &t) noexcept
+        {
+            const auto d = arbitrate(reports, law::beats);
+
+            template for (constexpr auto I : std::ranges::views::indices(S))
+            {
+                if (d.lose.has(I))
+                    deliver<I>(self, false, now, t);
+            }
+            template for (constexpr auto I : std::ranges::views::indices(S))
+            {
+                if (d.win.has(I))
+                    deliver<I>(self, true, now, t);
+            }
+        }
+
+        // 唯一副作用点：win/lose 返回“裁决之后我是什么状态”，
+        // 立刻写回 report；下一拍不会拿旧的 ready 再判一次。
+        template <std::size_t Flat, class Self, class Trace>
+        constexpr void deliver(Self &self, bool won, time_point at, Trace &t) noexcept
+        {
+            auto &m = std::get<Flat>(recognizers);
+            reports[Flat] = won ? m.win(self) : m.lose(self);
+
+            if constexpr (!std::is_same_v<Trace, null_trace>)
+                t.push({law::names[Flat].view(),
+                        won ? verdict::accepted : verdict::superseded, at});
+        }
+    };
+
+    // ═══════════════════════════════════════════════════════════════════
+    // 10. debug_arbiter:  arbiter + 观测
+    //
+    //   只覆盖 feed/tick 的无观测版本，显式把 trace 作为模板参数传下去。
+    //   主 arbiter 没有 trace 成员、没有虚函数；
+    // ═══════════════════════════════════════════════════════════════════
+    template <class Tree, class Trace = trace>
+    struct debug_arbiter : arbiter<Tree>
+    {
+        using law = law_of<Tree>;
+        using base = arbiter<Tree>;
+
+        Trace obs{};
+
+        template <class Self, class Frame>
+        constexpr void feed(Self &self, const Frame &f, time_point now) noexcept
+        {
+            base::template feed<Self, Frame, Trace>(self, f, now, obs);
+        }
+
+        template <class Self>
+        constexpr void tick(Self &self, time_point now) noexcept
+        {
+            base::template tick<Self, Trace>(self, now, obs);
+        }
+
+        template <class Self>
+        constexpr decltype(auto) events(this Self &&self) noexcept
+            requires(requires() { std::forward_like<Self>(self.obs).events(); })
+        {
+            return std::forward_like<Self>(self.obs).events();
+        }
+        template <class Self>
+        constexpr void clear_events(this Self &&self) noexcept
+            requires(requires() { std::forward_like<Self>(self.obs).clear(); })
+        {
+            std::forward_like<Self>(self.obs).clear();
+        }
+        template <class Self>
+        constexpr decltype(auto) dropped(this Self &&self) noexcept
+            requires(requires() { std::forward_like<Self>(self.obs).dropped(); })
+        {
+            return std::forward_like<Self>(self.obs).dropped();
+        }
+    };
+
+} // namespace intent
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  arena_event：GLFW 与识别器之间的跨平台中间层
+//    event_context：变化前仍成立的全部状态（keys / buttons / modifier / pointer）
+//    frame<T>：context + 本帧变化 T（T 是具体的 change 类型）
+//  FSM 只看 input_frame::frame<T>，不看 GLFW 事件。
+// ═══════════════════════════════════════════════════════════════════════════
+using mcs::vulkan::event::keyboard_event;
+using mcs::vulkan::event::scroll_event;
+using mcs::vulkan::event::mousebutton_event;
+using mcs::vulkan::event::position2d_event;
+using mcs::vulkan::event::cursor_enter_event;
+using mcs::vulkan::event::Key;
+using mcs::vulkan::event::MouseButtons;
+using mcs::vulkan::event::ModifierKey;
+using mcs::vulkan::event::Action;
+
+struct input_frame
+{
+
+    enum class PointerDevice : std::uint8_t
+    {
+        Unknown,
+        Touch,
+        Mouse,
+        Stylus,
+        InvertedStylus,
+        Trackpad
+    };
+
+    using Key = mcs::vulkan::event::Key;
+    using scroll_event = mcs::vulkan::event::scroll_event;
+    using cursor_enter_event = mcs::vulkan::event::cursor_enter_event;
+
+    enum class MouseButton : std::uint8_t
+    {
+        eUNDEFINED = 0xFF,
+        eMOUSE_BUTTON_1 = 0,
+        eMOUSE_BUTTON_2 = 1,
+        eMOUSE_BUTTON_3 = 2,
+        eMOUSE_BUTTON_4 = 3,
+        eMOUSE_BUTTON_5 = 4,
+        eMOUSE_BUTTON_6 = 5,
+        eMOUSE_BUTTON_7 = 6,
+        eMOUSE_BUTTON_8 = 7,
+        eMOUSE_BUTTON_LAST = eMOUSE_BUTTON_8,
+        eMOUSE_BUTTON_LEFT = eMOUSE_BUTTON_1,
+        eMOUSE_BUTTON_RIGHT = eMOUSE_BUTTON_2,
+        eMOUSE_BUTTON_MIDDLE = eMOUSE_BUTTON_3,
+        eSIZE = static_cast<std::uint8_t>(eMOUSE_BUTTON_LAST) + 1
+    };
+
+    enum class HeldState : std::uint8_t
+    {
+        Up,
+        Down
+    };
+    enum class Transition : std::uint8_t
+    {
+        Press,
+        Release
+    };
+    enum class PointerState : std::uint8_t
+    {
+        Outside,
+        Hover,
+        Down,
+        DownMove
+    };
+
+    struct event_context
+    {
+        std::array<HeldState, std::to_underlying(Key::eSIZE)> keys{};
+        std::array<HeldState, static_cast<std::size_t>(MouseButton::eSIZE)> buttons{};
+        ModifierKey modifier{};
+
+        PointerState pointer_state = PointerState::Outside;
+        PointerDevice pointer_device = PointerDevice::Unknown;
+        double pointer_x = 0.0;
+        double pointer_y = 0.0;
+        bool pointer_position_valid = false;
+
+        constexpr decltype(auto) get_keyboard_event(this auto &&self, Key k) noexcept
+        {
+            return std::forward_like<decltype(self)>(self.keys[std::to_underlying(k)]);
+        }
+
+        constexpr decltype(auto) get_mousebutton_event(this auto &&self,
+                                                       MouseButton b) noexcept
+        {
+            return std::forward_like<decltype(self)>(self.buttons[std::to_underlying(b)]);
+        }
+
+        constexpr bool any_button_down() const noexcept
+        {
+            for (auto s : buttons)
+                if (s == HeldState::Down)
+                    return true;
+            return false;
+        }
+    };
+
+    struct key_change
+    {
+        Key key{};
+        Transition transition{};
+        bool repeat{};
+        ModifierKey modifier{};
+    };
+
+    struct button_change
+    {
+        MouseButton button{};
+        Transition transition{};
+        bool repeat{};
+        ModifierKey modifier{};
+    };
+
+    struct move_change
+    {
+        double x = 0.0, y = 0.0;
+        double dx = 0.0, dy = 0.0;
+    };
+
+    struct char_change
+    {
+        unsigned codepoint = 0;
+    };
+
+    template <class T>
+    struct frame
+    {
+        event_context context;
+        T change;
+    };
+
+    // NOTE: 枚举转发到下游的全部类型
+    template <class T>
+    static consteval bool is_change()
+    {
+        return std::same_as<T, key_change> || std::same_as<T, button_change> ||
+               std::same_as<T, move_change> ||
+               std::same_as<T, mcs::vulkan::event::scroll_event> ||
+               std::same_as<T, mcs::vulkan::event::cursor_enter_event> ||
+               std::same_as<T, char_change>;
+    }
+
+    template <class... Ts>
+    struct changes_checked
+    {
+        static_assert((is_change<Ts>() && ...),
+                      "consume_t 只允许 input_frame 的 change 类型");
+        using type = std::tuple<Ts...>;
+    };
+
+    template <class... Ts>
+    using changes = typename changes_checked<Ts...>::type;
+
+    template <class PlatformButton>
+    static constexpr MouseButton map_button(PlatformButton b) noexcept
+    {
+        using P = PlatformButton;
+        switch (b)
+        {
+        case P::eMOUSE_BUTTON_LEFT:
+            return MouseButton::eMOUSE_BUTTON_LEFT;
+        case P::eMOUSE_BUTTON_RIGHT:
+            return MouseButton::eMOUSE_BUTTON_RIGHT;
+        case P::eMOUSE_BUTTON_MIDDLE:
+            return MouseButton::eMOUSE_BUTTON_MIDDLE;
+        case P::eMOUSE_BUTTON_4:
+            return MouseButton::eMOUSE_BUTTON_4;
+        case P::eMOUSE_BUTTON_5:
+            return MouseButton::eMOUSE_BUTTON_5;
+        case P::eMOUSE_BUTTON_6:
+            return MouseButton::eMOUSE_BUTTON_6;
+        case P::eMOUSE_BUTTON_7:
+            return MouseButton::eMOUSE_BUTTON_7;
+        case P::eMOUSE_BUTTON_8:
+            return MouseButton::eMOUSE_BUTTON_8;
+        case P::eMOUSE_BUTTON_LAST:
+            return MouseButton::eMOUSE_BUTTON_LAST;
+        default:
+            return MouseButton::eUNDEFINED;
+        }
+    }
+
+    template <class Event>
+    static constexpr auto build_change(const event_context &ctx, const Event &e) noexcept
+    {
+        using T = std::remove_cvref_t<Event>;
+
+        if constexpr (std::same_as<T, mcs::vulkan::event::keyboard_event>)
+        {
+            return frame<key_change>{ctx, key_change{e.key,
+                                                     (e.press() || e.repeat())
+                                                         ? Transition::Press
+                                                         : Transition::Release,
+                                                     e.repeat(), e.modifier_key}};
+        }
+        else if constexpr (std::same_as<T, mcs::vulkan::event::mousebutton_event>)
+        {
+            return frame<button_change>{ctx, button_change{map_button(e.button),
+                                                           (e.press() || e.repeat())
+                                                               ? Transition::Press
+                                                               : Transition::Release,
+                                                           e.repeat(), e.modifier_key}};
+        }
+        else if constexpr (std::same_as<T, mcs::vulkan::event::position2d_event>)
+        {
+            const double dx = ctx.pointer_position_valid ? e.xpos - ctx.pointer_x : 0.0;
+            const double dy = ctx.pointer_position_valid ? e.ypos - ctx.pointer_y : 0.0;
+            return frame<move_change>{ctx, move_change{e.xpos, e.ypos, dx, dy}};
+        }
+        else if constexpr (std::same_as<T, mcs::vulkan::event::scroll_event>)
+        {
+            return frame<mcs::vulkan::event::scroll_event>{ctx, e};
+        }
+        else if constexpr (std::same_as<T, mcs::vulkan::event::cursor_enter_event>)
+        {
+            return frame<mcs::vulkan::event::cursor_enter_event>{ctx, e};
+        }
+        else if constexpr (std::same_as<T, mcs::vulkan::event::char_event>)
+        {
+            return frame<char_change>{ctx, char_change{e.codepoint}};
+        }
+        // 其余事件没有 return：auto 推导为 void，调用方不转发。
+    }
+
+    template <class T>
+    static constexpr void apply_change(event_context &ctx, const frame<T> &f) noexcept
+    {
+        using U = std::remove_cvref_t<T>;
+
+        if constexpr (std::same_as<U, key_change>)
+        {
+            ctx.keys[std::to_underlying(f.change.key)] =
+                f.change.transition == Transition::Press ? HeldState::Down
+                                                         : HeldState::Up;
+            ctx.modifier = f.change.modifier;
+        }
+        else if constexpr (std::same_as<U, button_change>)
+        {
+            ctx.buttons[std::to_underlying(f.change.button)] =
+                f.change.transition == Transition::Press ? HeldState::Down
+                                                         : HeldState::Up;
+            ctx.modifier = f.change.modifier;
+
+            if (f.change.transition == Transition::Press)
+            {
+                ctx.pointer_device = PointerDevice::Mouse;
+                if (ctx.pointer_state != PointerState::DownMove)
+                    ctx.pointer_state = PointerState::Down;
+            }
+            else
+            {
+                if (ctx.any_button_down())
+                {
+                    if (ctx.pointer_state != PointerState::DownMove)
+                        ctx.pointer_state = PointerState::Down;
+                }
+                else
+                {
+                    ctx.pointer_state = (ctx.pointer_state == PointerState::Outside)
+                                            ? PointerState::Outside
+                                            : PointerState::Hover;
+                }
+            }
+        }
+        else if constexpr (std::same_as<U, move_change>)
+        {
+            ctx.pointer_x = f.change.x;
+            ctx.pointer_y = f.change.y;
+            ctx.pointer_position_valid = true;
+            ctx.pointer_state =
+                ctx.any_button_down() ? PointerState::DownMove : PointerState::Hover;
+            if (ctx.pointer_device == PointerDevice::Unknown)
+                ctx.pointer_device = PointerDevice::Mouse;
+        }
+        else if constexpr (std::same_as<U, mcs::vulkan::event::cursor_enter_event>)
+        {
+            if (f.change.value)
+            {
+                ctx.pointer_device = PointerDevice::Mouse;
+                ctx.pointer_state =
+                    ctx.any_button_down() ? PointerState::Down : PointerState::Hover;
+            }
+            else
+            {
+                ctx.pointer_device = PointerDevice::Unknown;
+                ctx.pointer_state = PointerState::Outside;
+                ctx.pointer_position_valid = false;
+            }
+        }
+        // scroll / char：不改变 ctx
+    }
+};
+
+namespace gesture
+{
+    using intent::claim_state;
+    using intent::time_point;
+
+    struct none_payload
+    {
+        friend constexpr bool operator==(none_payload, none_payload) = default;
+    };
+
+    template <class T>
+    inline constexpr bool is_none_payload = std::is_same_v<T, none_payload>;
+
+    namespace state
+    {
+        constexpr claim_state latch(claim_state &cur, claim_state s) noexcept
+        {
+            if (cur == claim_state::ready && s != claim_state::idle)
+                s = claim_state::ready;
+            cur = s;
+            return s;
+        }
+        constexpr claim_state hold(claim_state &cur) noexcept
+        {
+            return latch(cur, claim_state::hold);
+        }
+        constexpr claim_state idle(claim_state &cur) noexcept
+        {
+            return latch(cur, claim_state::idle);
+        }
+        constexpr claim_state ready(claim_state &cur) noexcept
+        {
+            return latch(cur, claim_state::ready);
+        }
+        constexpr claim_state keep(claim_state &cur) noexcept
+        {
+            return latch(cur, cur);
+        }
+    } // namespace state
+
+    // 非局部 base：name / fn_name / policy / payload_t 都在库里
+    template <class Payload, static_string Name, static_string Fn, class Policy>
+    struct trait_base
+    {
+        using payload_t = Payload;
+        static constexpr auto name = Name;
+        static constexpr auto fn_name = Fn;
+        using policy = Policy;
+    };
+
+    // 数据槽：只有 data；none_payload 时为空
+    template <class Trait, bool = is_none_payload<typename Trait::payload_t>>
+    struct slot;
+
+    template <class Trait>
+    struct slot<Trait, false>
+    {
+        using payload_t = typename Trait::payload_t;
+        [[no_unique_address]] payload_t data{};
+
+        template <class Event>
+        constexpr void collect(time_point t, const Event &e) noexcept
+        {
+            Trait::collect(t, data, e);
+        }
+    };
+
+    template <class Trait>
+    struct slot<Trait, true>
+    {
+        template <class... Args>
+        constexpr void collect(Args &&...) noexcept
+        {
+        }
+    };
+
+    template <class Policy>
+    struct press_watch
+    {
+        bool down{};
+        time_point down_at{};
+        double down_x{};
+        double down_y{};
+
+        constexpr int operator()(const input_frame::frame<input_frame::button_change> &f,
+                                 time_point now) noexcept
+        {
+            const auto &b = f.change;
+            if (b.button != Policy::button)
+                return 0;
+            if (b.transition == input_frame::Transition::Press)
+            {
+                if (b.repeat)
+                    return 0;
+                down = true;
+                down_at = now;
+                down_x = f.context.pointer_x;
+                down_y = f.context.pointer_y;
+                return 1;
+            }
+            if (!down)
+                return 0;
+            down = false;
+            const bool quick = now - down_at <= time_point{Policy::tap_max_ms};
+            const bool still =
+                std::hypot(f.context.pointer_x - down_x, f.context.pointer_y - down_y) <=
+                Policy::slop_px;
+            return (quick && still) ? 2 : -1;
+        }
+
+        constexpr void clear() noexcept
+        {
+            down = false;
+        }
+    };
+
+    // ── 语义事件 ────────────────────────────────────────────────────
+    struct click_event
+    {
+        double x{}, y{};
+        time_point at{};
+    };
+    struct multi_click_event
+    {
+        double x{}, y{};
+        int count{};
+        time_point at{};
+    };
+    enum class drag_phase : std::uint8_t
+    {
+        begin,
+        move,
+        end
+    };
+    struct drag_event
+    {
+        drag_phase phase{};
+        double x{}, y{}, dx{}, dy{};
+        double total_dx{}, total_dy{};
+        time_point at{};
+        ModifierKey modifier{};
+    };
+    struct wheel_event
+    {
+        int delta{};
+        time_point at{};
+    };
+    struct key_event
+    {
+        Key key{};
+        input_frame::Transition transition{};
+        time_point at{};
+        bool repeat{};
+    };
+
+    // ── click_template ──────────────────────────────────────────────
+    template <class Trait>
+    struct click_template
+    {
+        using policy = typename Trait::policy;
+        static constexpr auto name = Trait::name;
+        static constexpr auto fn_name = Trait::fn_name;
+        using consume_t = input_frame::changes<input_frame::button_change>;
+
+        claim_state cur{};
+        press_watch<policy> watch{};
+        slot<Trait> in{};
+
+        template <class Self>
+        constexpr claim_state feed(
+            Self &self, const input_frame::frame<input_frame::button_change> &f,
+            time_point now) noexcept
+        {
+            switch (watch(f, now))
+            {
+            case 1:
+                return state::hold(cur);
+            case 2:
+                in.collect(now,
+                           click_event{f.context.pointer_x, f.context.pointer_y, now});
+                return state::ready(cur);
+            case -1:
+                return state::idle(cur);
+            default:
+                return watch.down ? state::hold(cur) : state::keep(cur);
+            }
+        }
+
+        template <class Self>
+        constexpr claim_state tick(Self &, time_point) noexcept
+        {
+            return state::keep(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state win(Self &self) noexcept
+        {
+            self.template invoke<fn_name>(in.data);
+            cur = claim_state::idle;
+            return cur;
+        }
+
+        template <class Self>
+        constexpr claim_state lose(Self &) noexcept
+        {
+            watch.clear();
+            cur = claim_state::idle;
+            return cur;
+        }
+    };
+
+    // ── multi_click_template ────────────────────────────────────────
+    template <class Trait>
+    struct multi_click_template
+    {
+        using policy = typename Trait::policy;
+        static constexpr auto name = Trait::name;
+        static constexpr auto fn_name = Trait::fn_name;
+        using consume_t = input_frame::changes<input_frame::button_change>;
+
+        claim_state cur{};
+        press_watch<policy> watch{};
+        slot<Trait> in{};
+        int clicks{};
+        time_point last{};
+        bool armed{};
+
+        template <class Self>
+        constexpr claim_state feed(
+            Self &self, const input_frame::frame<input_frame::button_change> &f,
+            time_point now) noexcept
+        {
+            if (armed && now - last > time_point{policy::gap_ms})
+            {
+                reset_chain();
+                (void)state::idle(cur);
+            }
+            switch (watch(f, now))
+            {
+            case 1:
+                return state::hold(cur);
+            case 2: {
+                ++clicks;
+                armed = true;
+                last = now;
+                if (clicks >= policy::count)
+                {
+                    const int count = clicks;
+                    reset_chain();
+                    in.collect(now, multi_click_event{f.context.pointer_x,
+                                                      f.context.pointer_y, count, now});
+                    return state::ready(cur);
+                }
+                return state::hold(cur);
+            }
+            case -1:
+                reset_chain();
+                return state::idle(cur);
+            default:
+                return (armed || clicks > 0 || watch.down) ? state::hold(cur)
+                                                           : state::keep(cur);
+            }
+        }
+
+        template <class Self>
+        constexpr claim_state tick(Self &, time_point now) noexcept
+        {
+            if (armed && now - last > time_point{policy::gap_ms})
+            {
+                reset_chain();
+                return state::idle(cur);
+            }
+            return state::keep(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state win(Self &self) noexcept
+        {
+            self.template invoke<fn_name>(in.data);
+            reset_chain();
+            cur = claim_state::idle;
+            return cur;
+        }
+
+        template <class Self>
+        constexpr claim_state lose(Self &) noexcept
+        {
+            reset_chain();
+            cur = claim_state::idle;
+            return cur;
+        }
+
+        constexpr void reset_chain() noexcept
+        {
+            clicks = 0;
+            armed = false;
+            watch.clear();
+        }
+    };
+
+    // ── drag_template ───────────────────────────────────────────────
+    template <class Trait>
+    struct drag_template
+    {
+        using policy = typename Trait::policy;
+        static constexpr auto name = Trait::name;
+        static constexpr auto fn_name = Trait::fn_name;
+        using consume_t =
+            input_frame::changes<input_frame::button_change, input_frame::move_change>;
+
+        claim_state cur{};
+        slot<Trait> in{};
+        double down_x{}, down_y{}, last_x{}, last_y{};
+        bool down{}, dragging{}, finished_{};
+
+        template <class Self>
+        constexpr claim_state feed(
+            Self &self, const input_frame::frame<input_frame::button_change> &f,
+            time_point now) noexcept
+        {
+            if (f.change.button != policy::button)
+                return state::keep(cur);
+            if (f.change.transition == input_frame::Transition::Press)
+            {
+                if (f.change.repeat)
+                    return state::keep(cur);
+                if (cur != claim_state::idle)
+                    (void)state::idle(cur);
+                down = true;
+                dragging = false;
+                down_x = last_x = f.context.pointer_x;
+                down_y = last_y = f.context.pointer_y;
+                return state::hold(cur);
+            }
+            down = false;
+            if (!dragging)
+                return state::idle(cur);
+            dragging = false;
+            finished_ = true;
+            in.collect(
+                now, drag_event{drag_phase::end, f.context.pointer_x, f.context.pointer_y,
+                                0.0, 0.0, f.context.pointer_x - down_x,
+                                f.context.pointer_y - down_y, now, f.context.modifier});
+            return state::ready(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state feed(Self &self,
+                                   const input_frame::frame<input_frame::move_change> &f,
+                                   time_point now) noexcept
+        {
+            if (!down)
+                return state::keep(cur);
+            const auto &m = f.change;
+            if (!dragging)
+            {
+                if (std::hypot(m.x - down_x, m.y - down_y) <= policy::slop_px)
+                {
+                    last_x = m.x;
+                    last_y = m.y;
+                    return state::hold(cur);
+                }
+                dragging = true;
+                last_x = m.x;
+                last_y = m.y;
+                in.collect(now,
+                           drag_event{drag_phase::begin, m.x, m.y, 0.0, 0.0, m.x - down_x,
+                                      m.y - down_y, now, f.context.modifier});
+                return state::ready(cur);
+            }
+            const double dx = m.x - last_x;
+            const double dy = m.y - last_y;
+            last_x = m.x;
+            last_y = m.y;
+            in.collect(now, drag_event{drag_phase::move, m.x, m.y, dx, dy, m.x - down_x,
+                                       m.y - down_y, now, f.context.modifier});
+            return state::ready(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state tick(Self &, time_point) noexcept
+        {
+            return state::keep(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state win(Self &self) noexcept
+        {
+            self.template invoke<fn_name>(in.data);
+            cur = finished_ ? claim_state::idle : claim_state::hold;
+            finished_ = false;
+            return cur;
+        }
+
+        template <class Self>
+        constexpr claim_state lose(Self &) noexcept
+        {
+            down = false;
+            dragging = false;
+            finished_ = false;
+            cur = claim_state::idle;
+            return cur;
+        }
+    };
+
+    // ── hover_template（none） ─────────────────────────────────────
+    template <class Trait>
+    struct hover_template
+    {
+        static constexpr auto name = Trait::name;
+        static constexpr auto fn_name = Trait::fn_name;
+        using consume_t = input_frame::changes<input_frame::cursor_enter_event>;
+
+        claim_state cur{};
+        slot<Trait> in{};
+
+        template <class Self>
+        constexpr claim_state feed(
+            Self &self, const input_frame::frame<input_frame::cursor_enter_event> &f,
+            time_point) noexcept
+        {
+            if (f.change.value)
+                return state::ready(cur);
+            return state::keep(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state tick(Self &, time_point) noexcept
+        {
+            return state::keep(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state win(Self &self) noexcept
+        {
+            self.template invoke<fn_name>();
+            cur = claim_state::idle;
+            return cur;
+        }
+
+        template <class Self>
+        constexpr claim_state lose(Self &) noexcept
+        {
+            cur = claim_state::idle;
+            return cur;
+        }
+    };
+
+    // ── wheel_template ─────────────────────────────────────────────
+    template <class Trait>
+    struct wheel_template
+    {
+        static constexpr auto name = Trait::name;
+        static constexpr auto fn_name = Trait::fn_name;
+        using consume_t = input_frame::changes<scroll_event>;
+
+        claim_state cur{};
+        slot<Trait> in{};
+
+        template <class Self>
+        constexpr claim_state feed(Self &self, const input_frame::frame<scroll_event> &f,
+                                   time_point now) noexcept
+        {
+            in.collect(now, wheel_event{static_cast<int>(f.change.yoffset), now});
+            return state::ready(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state tick(Self &, time_point) noexcept
+        {
+            return state::keep(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state win(Self &self) noexcept
+        {
+            self.template invoke<fn_name>(in.data);
+            cur = claim_state::idle;
+            return cur;
+        }
+
+        template <class Self>
+        constexpr claim_state lose(Self &) noexcept
+        {
+            cur = claim_state::idle;
+            return cur;
+        }
+    };
+
+    // ── key_template（none） ───────────────────────────────────────
+    template <class Trait>
+    struct key_template
+    {
+        using policy = typename Trait::policy;
+        static constexpr auto name = Trait::name;
+        static constexpr auto fn_name = Trait::fn_name;
+        using consume_t = input_frame::changes<input_frame::key_change>;
+
+        claim_state cur{};
+        slot<Trait> in{};
+
+        template <class Self>
+        constexpr claim_state feed(Self &self,
+                                   const input_frame::frame<input_frame::key_change> &f,
+                                   time_point) noexcept
+        {
+            if (f.change.transition == input_frame::Transition::Press &&
+                !f.change.repeat && f.change.key == policy::key)
+                return state::ready(cur);
+            return state::keep(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state tick(Self &, time_point) noexcept
+        {
+            return state::keep(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state win(Self &self) noexcept
+        {
+            self.template invoke<fn_name>();
+            cur = claim_state::idle;
+            return cur;
+        }
+
+        template <class Self>
+        constexpr claim_state lose(Self &) noexcept
+        {
+            cur = claim_state::idle;
+            return cur;
+        }
+    };
+
+    // ── key_observer_template ──────────────────────────────────────
+    template <class Trait>
+    struct key_observer_template
+    {
+        static constexpr auto name = Trait::name;
+        static constexpr auto fn_name = Trait::fn_name;
+        using consume_t = input_frame::changes<input_frame::key_change>;
+
+        claim_state cur{};
+        slot<Trait> in{};
+
+        template <class Self>
+        constexpr claim_state feed(Self &self,
+                                   const input_frame::frame<input_frame::key_change> &f,
+                                   time_point now) noexcept
+        {
+            in.collect(
+                now, key_event{f.change.key, f.change.transition, now, f.change.repeat});
+            return state::ready(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state tick(Self &, time_point) noexcept
+        {
+            return state::keep(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state win(Self &self) noexcept
+        {
+            self.template invoke<fn_name>(in.data);
+            cur = claim_state::idle;
+            return cur;
+        }
+
+        template <class Self>
+        constexpr claim_state lose(Self &) noexcept
+        {
+            cur = claim_state::idle;
+            return cur;
+        }
+    };
+
+    // ── chord_template ─────────────────────────────────────────────
+    template <class Trait>
+    struct chord_template
+    {
+        static constexpr auto name = Trait::name;
+        static constexpr auto fn_name = Trait::fn_name;
+        using consume_t = input_frame::changes<input_frame::key_change>;
+
+        claim_state cur{};
+        slot<Trait> in{};
+
+        template <class Self>
+        constexpr claim_state feed(Self &self,
+                                   const input_frame::frame<input_frame::key_change> &f,
+                                   time_point now) noexcept
+        {
+            if (auto e = Trait::match(f.change, now))
+            {
+                in.collect(now, *e);
+                return state::ready(cur);
+            }
+            return state::keep(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state tick(Self &, time_point) noexcept
+        {
+            return state::keep(cur);
+        }
+
+        template <class Self>
+        constexpr claim_state win(Self &self) noexcept
+        {
+            self.template invoke<fn_name>(in.data);
+            cur = claim_state::idle;
+            return cur;
+        }
+
+        template <class Self>
+        constexpr claim_state lose(Self &) noexcept
+        {
+            cur = claim_state::idle;
+            return cur;
+        }
+    };
+} // namespace gesture
+
+// ═══════════════════════════════════════════════════════════════════════
+//  mcs::app —— 数据 + Trait + tree + arena
+// ═══════════════════════════════════════════════════════════════════════
+namespace mcs::app
+{
+    using intent::time_point;
+
+    inline constexpr std::int64_t click_max_ms = 250;
+    inline constexpr std::int64_t dbl_gap_ms = 300;
+    inline constexpr std::int64_t triple_gap_ms = 250;
+    inline constexpr double drag_slop_px = 4.0;
+
+    inline time_point now_ms() noexcept
+    {
+        static const auto t0 = std::chrono::steady_clock::now();
+        return std::chrono::duration_cast<time_point>(std::chrono::steady_clock::now() -
+                                                      t0);
+    }
+
+    namespace policy
+    {
+        struct click
+        {
+            static constexpr auto button = input_frame::MouseButton::eMOUSE_BUTTON_LEFT;
+            static constexpr std::int64_t tap_max_ms = mcs::app::click_max_ms;
+            static constexpr double slop_px = mcs::app::drag_slop_px;
+        };
+        struct multi
+        {
+            static constexpr auto button = input_frame::MouseButton::eMOUSE_BUTTON_LEFT;
+            static constexpr std::int64_t tap_max_ms = mcs::app::click_max_ms;
+            static constexpr double slop_px = mcs::app::drag_slop_px;
+            static constexpr int count = 2;
+            static constexpr std::int64_t gap_ms = mcs::app::dbl_gap_ms;
+        };
+        struct multi3
+        {
+            static constexpr auto button = input_frame::MouseButton::eMOUSE_BUTTON_LEFT;
+            static constexpr std::int64_t tap_max_ms = mcs::app::click_max_ms;
+            static constexpr double slop_px = mcs::app::drag_slop_px;
+            static constexpr int count = 3;
+            static constexpr std::int64_t gap_ms = mcs::app::triple_gap_ms;
+        };
+        struct drag
+        {
+            static constexpr auto button = input_frame::MouseButton::eMOUSE_BUTTON_LEFT;
+            static constexpr double slop_px = mcs::app::drag_slop_px;
+        };
+        struct hover
+        {
+        };
+        struct wheel
+        {
+        };
+        struct key_a
+        {
+            static constexpr auto key = Key::eA;
+        };
+        struct key_c
+        {
+            static constexpr auto key = Key::eC;
+        };
+        struct shortcut
+        {
+        };
+    } // namespace policy
+
+    namespace detail
+    {
+        enum class command : std::uint8_t
+        {
+            copy,
+            copy_plain,
+            paste,
+            save,
+            notify
+        };
+        constexpr std::string_view command_name(command c) noexcept
+        {
+            switch (c)
+            {
+            case command::copy:
+                return "copy";
+            case command::copy_plain:
+                return "copy_plain";
+            case command::paste:
+                return "paste";
+            case command::save:
+                return "save";
+            case command::notify:
+                return "notify";
+            }
+            return "?";
+        }
+
+        struct shortcut_event
+        {
+            std::array<command, 2> items{};
+            int n = 0;
+        };
+
+        struct counters
+        {
+            int click{};
+            int double_click{};
+            int triple_click{};
+            int hover{};
+            int wheel{};
+            int key_a{};
+            int key_c{};
+            int shortcut{};
+            int any_key{};
+            int commands{};
+            int drag_begin{};
+            int drag_move{};
+            int drag_end{};
+            double x{}, y{};
+            double total_dx{}, total_dy{};
+            double move_x{}, move_y{}, move_dx{}, move_dy{};
+            int delta{};
+            friend constexpr bool operator==(const counters &,
+                                             const counters &) = default;
+        };
+
+        template <class Self>
+        inline time_point now_of(Self &self) noexcept
+        {
+            return self.manual_clock ? self.now : now_ms();
+        }
+
+        constexpr std::string_view to_string(intent::verdict v) noexcept
+        {
+            return v == intent::verdict::accepted ? "acc" : "sup";
+        }
+
+        template <class App>
+        inline void report(const App &app) noexcept
+        {
+            for (const auto &e : app.arbiter.events())
+            {
+                if (e.name == "drag" || e.name == "hover")
+                    continue;
+                std::println("  [t={:>6}ms] {:<18} {:<3}", e.at.count(), e.name,
+                             to_string(e.v));
+            }
+        }
+    } // namespace detail
+
+    // ── arena（局部 Trait：只写 payload + collect）────────────────
+    struct click_payload
+    {
+        double x{}, y{};
+        time_point at{};
+    };
+    struct Trait_click : gesture::trait_base<click_payload, static_string{"click"},
+                                             static_string{"on_click"}, policy::click>
+    {
+        static void collect(time_point, payload_t &d,
+                            const gesture::click_event &e) noexcept
+        {
+            d = {e.x, e.y, e.at};
+        }
+    };
+    using click_template_recognizer = gesture::click_template<Trait_click>;
+
+    inline auto make_arena()
+    {
+
+        struct multi_click_payload
+        {
+            double x{}, y{};
+            int count{};
+            time_point at{};
+        };
+        struct drag_payload
+        {
+            gesture::drag_phase phase{};
+            double x{}, y{}, dx{}, dy{};
+            double total_dx{}, total_dy{};
+            ModifierKey modifier{};
+            time_point at{};
+        };
+        struct wheel_payload
+        {
+            int delta{};
+            time_point at{};
+        };
+        struct any_key_payload
+        {
+            Key key{};
+            input_frame::Transition transition{};
+            time_point at{};
+        };
+
+        // name / fn_name / policy / payload_t 都在 base；局部只写 payload + collect
+
+        struct Trait_double_click
+            : gesture::trait_base<multi_click_payload, static_string{"double_click"},
+                                  static_string{"on_double_click"}, policy::multi>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::multi_click_event &e) noexcept
+            {
+                d = {e.x, e.y, e.count, e.at};
+            }
+        };
+
+        struct Trait_triple_click
+            : gesture::trait_base<multi_click_payload, static_string{"triple_click"},
+                                  static_string{"on_triple_click"}, policy::multi3>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::multi_click_event &e) noexcept
+            {
+                d = {e.x, e.y, e.count, e.at};
+            }
+        };
+
+        struct Trait_drag : gesture::trait_base<drag_payload, static_string{"drag"},
+                                                static_string{"on_drag"}, policy::drag>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::drag_event &e) noexcept
+            {
+                d = {e.phase,    e.x,        e.y,        e.dx, e.dy,
+                     e.total_dx, e.total_dy, e.modifier, e.at};
+            }
+        };
+
+        struct Trait_hover
+            : gesture::trait_base<gesture::none_payload, static_string{"hover"},
+                                  static_string{"on_hover"}, policy::hover>
+        {
+        };
+
+        struct Trait_wheel : gesture::trait_base<wheel_payload, static_string{"wheel"},
+                                                 static_string{"on_wheel"}, policy::wheel>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::wheel_event &e) noexcept
+            {
+                d = {e.delta, e.at};
+            }
+        };
+
+        struct Trait_key_a
+            : gesture::trait_base<gesture::none_payload, static_string{"key_a"},
+                                  static_string{"on_key_a"}, policy::key_a>
+        {
+        };
+
+        struct Trait_key_c
+            : gesture::trait_base<gesture::none_payload, static_string{"key_c"},
+                                  static_string{"on_key_c"}, policy::key_c>
+        {
+        };
+
+        struct Trait_shortcut
+            : gesture::trait_base<detail::shortcut_event, static_string{"shortcut"},
+                                  static_string{"on_shortcut"}, policy::shortcut>
+        {
+            static std::optional<payload_t> match(const input_frame::key_change &c,
+                                                  time_point) noexcept
+            {
+                if (c.transition != input_frame::Transition::Press || c.repeat)
+                    return std::nullopt;
+                const bool ctrl = c.modifier.hasAll(ModifierKey::Control());
+                const bool shift = c.modifier.hasAll(ModifierKey::Shift());
+                const bool alt = c.modifier.hasAll(ModifierKey::Alt());
+                if (!ctrl || alt)
+                    return std::nullopt;
+                payload_t r{};
+                if (c.key == Key::eC)
+                {
+                    r.items[0] =
+                        shift ? detail::command::copy_plain : detail::command::copy;
+                    r.n = 1;
+                    return r;
+                }
+                if (c.key == Key::eS)
+                {
+                    r.items[0] = detail::command::save;
+                    r.items[1] = detail::command::notify;
+                    r.n = 2;
+                    return r;
+                }
+                if (c.key == Key::eV)
+                {
+                    r.items[0] = detail::command::paste;
+                    r.n = 1;
+                    return r;
+                }
+                return std::nullopt;
+            }
+            static void collect(time_point, payload_t &d, const payload_t &e) noexcept
+            {
+                d = e;
+            }
+        };
+
+        struct Trait_any_key
+            : gesture::trait_base<any_key_payload, static_string{"any_key"},
+                                  static_string{"on_any_key"}, policy::hover>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::key_event &e) noexcept
+            {
+                d = {e.key, e.transition, e.at};
+            }
+        };
+
+        using tree = intent::all_of<
+            intent::refines<
+                intent::leaf<click_template_recognizer>,
+                intent::all_of<intent::leaf<gesture::drag_template<Trait_drag>>,
+                               intent::refines<intent::leaf<gesture::multi_click_template<
+                                                   Trait_double_click>>,
+                                               intent::leaf<gesture::multi_click_template<
+                                                   Trait_triple_click>>>>>,
+            intent::leaf<gesture::hover_template<Trait_hover>>,
+            intent::leaf<gesture::wheel_template<Trait_wheel>>,
+            intent::refines<intent::leaf<gesture::key_template<Trait_key_c>>,
+                            intent::leaf<gesture::chord_template<Trait_shortcut>>>,
+            intent::leaf<gesture::key_template<Trait_key_a>>,
+            intent::leaf<gesture::key_observer_template<Trait_any_key>>>;
+
+        return make_aggregate<"arena">(
+            field<"click">(Trait_click::payload_t{}),
+            field<"double_click">(Trait_double_click::payload_t{}),
+            field<"triple_click">(Trait_triple_click::payload_t{}),
+            field<"drag">(Trait_drag::payload_t{}),
+            field<"wheel">(Trait_wheel::payload_t{}),
+            field<"shortcut">(Trait_shortcut::payload_t{}),
+            field<"key_event">(Trait_any_key::payload_t{}),
+            field<"arbiter">(intent::debug_arbiter<tree>{}),
+            field<"counters">(detail::counters{}),
+            field<"input_state">(input_frame::event_context{}),
+            field<"now">(time_point{}), field<"manual_clock">(false),
+            field<"keep_trace">(false), field<"verbose">(true), field<"frames">(0u),
+            field<"input_binding">(glfw_input_translation::scoped_binding{}),
+
+            method<"on_click">([](auto &self, const Trait_click::payload_t &e) noexcept {
+                ++self.counters.click;
+                self.click = e;
+                self.counters.x = e.x;
+                self.counters.y = e.y;
+                if (self.verbose)
+                    std::println("  >>> 单击    (x={:.1f}, y={:.1f})", e.x, e.y);
+            }),
+            method<"on_double_click">(
+                [](auto &self, const Trait_double_click::payload_t &e) noexcept {
+                    ++self.counters.double_click;
+                    self.double_click = e;
+                    self.counters.x = e.x;
+                    self.counters.y = e.y;
+                    if (self.verbose)
+                        std::println("  >>> 双击    (x={:.1f}, y={:.1f}, count={})", e.x,
+                                     e.y, e.count);
+                }),
+            method<"on_triple_click">(
+                [](auto &self, const Trait_triple_click::payload_t &e) noexcept {
+                    ++self.counters.triple_click;
+                    self.triple_click = e;
+                    self.counters.x = e.x;
+                    self.counters.y = e.y;
+                    if (self.verbose)
+                        std::println("  >>> 三击    (x={:.1f}, y={:.1f}, count={})", e.x,
+                                     e.y, e.count);
+                }),
+            method<"on_drag">([](auto &self, const Trait_drag::payload_t &e) noexcept {
+                self.drag = e;
+                switch (e.phase)
+                {
+                case gesture::drag_phase::begin:
+                    ++self.counters.drag_begin;
+                    if (self.verbose)
+                        std::println("  >>> 拖拽·开始 (起点 {:.1f},{:.1f})", e.x, e.y);
+                    break;
+                case gesture::drag_phase::move:
+                    ++self.counters.drag_move;
+                    self.counters.move_x = e.x;
+                    self.counters.move_y = e.y;
+                    self.counters.move_dx = e.dx;
+                    self.counters.move_dy = e.dy;
+                    if (self.verbose)
+                        std::println(
+                            "  >>> 拖拽·移动 (到 {:.1f},{:.1f}; d={:.1f},{:.1f})", e.x,
+                            e.y, e.dx, e.dy);
+                    break;
+                case gesture::drag_phase::end:
+                    ++self.counters.drag_end;
+                    self.counters.x = e.x;
+                    self.counters.y = e.y;
+                    self.counters.total_dx = e.total_dx;
+                    self.counters.total_dy = e.total_dy;
+                    if (self.verbose)
+                        std::println(
+                            "  >>> 拖拽·释放 (到 {:.1f},{:.1f}; 总位移 {:.1f},{:.1f})",
+                            e.x, e.y, e.total_dx, e.total_dy);
+                    break;
+                }
+            }),
+            method<"on_hover">([](auto &self) noexcept {
+                ++self.counters.hover;
+                if (self.verbose)
+                    std::println("  >>> 悬停    进入窗口");
+            }),
+            method<"on_wheel">([](auto &self, const Trait_wheel::payload_t &e) noexcept {
+                ++self.counters.wheel;
+                self.wheel = e;
+                self.counters.delta = e.delta;
+                if (self.verbose)
+                    std::println("  >>> 滚轮    (delta={})", e.delta);
+            }),
+            method<"on_key_a">([](auto &self) noexcept {
+                ++self.counters.key_a;
+                if (self.verbose)
+                    std::println("  >>> 键盘 A");
+            }),
+            method<"on_key_c">([](auto &self) noexcept {
+                ++self.counters.key_c;
+                if (self.verbose)
+                    std::println("  >>> 键盘 C");
+            }),
+            method<"on_shortcut">(
+                [](auto &self, const Trait_shortcut::payload_t &e) noexcept {
+                    ++self.counters.shortcut;
+                    self.shortcut = e;
+                    self.counters.commands += e.n;
+                    if (self.verbose)
+                    {
+                        std::print("  >>> 快捷键");
+                        for (int i = 0; i < e.n; ++i)
+                            std::print(" {}", detail::command_name(e.items[i]));
+                        std::println("");
+                    }
+                }),
+            method<"on_any_key">([](auto &self,
+                                    const Trait_any_key::payload_t &e) noexcept {
+                ++self.counters.any_key;
+                self.key_event = e;
+                if (self.verbose)
+                    std::println("  >>> HUD key={} {}", static_cast<int>(e.key),
+                                 e.transition == input_frame::Transition::Press ? "down"
+                                                                                : "up");
+            }),
+
+            method<"tick">([](auto &self) noexcept {
+                const auto now = detail::now_of(self);
+                self.now = now;
+                self.arbiter.tick(self, now);
+                if (self.verbose)
+                    detail::report(self);
+                if (!self.keep_trace)
+                    self.arbiter.clear_events();
+                ++self.frames;
+            }),
+
+            method<"input_event">([](auto &self, auto e) noexcept {
+                const auto now = detail::now_of(self);
+                self.now = now;
+                using frame_t = decltype(input_frame::build_change(self.input_state, e));
+                if constexpr (!std::is_void_v<frame_t>)
+                {
+                    auto f = input_frame::build_change(self.input_state, e);
+                    self.arbiter.feed(self, f, now);
+                    input_frame::apply_change(self.input_state, f);
+                }
+            }));
+    }
+
+} // namespace mcs::app
+
+namespace app = mcs::app;
+auto &inputTranslation()
+{
+    static auto input = glfw_input_translation{};
+    return input;
+}
+
+namespace render
+{
+    // NOTE: 实现 RenderObject 的匿名实现类的效果
+    template <class Agg>
+    struct AggRenderObject final : ui_new::RenderObject
+    {
+        Agg agg;
+
+        constexpr explicit AggRenderObject(Agg a) noexcept : agg(std::move(a)) {}
+
+        constexpr void render(ui_new::ScreenWidget *s, ui_new::Widget *owner,
+                              render_context &ctx) override
+        {
+            agg.template invoke<"render">(s, owner, ctx);
+        }
+
+        void tick(double now) override
+        {
+            if constexpr (requires { agg.template invoke<"tick">(now); })
+                agg.template invoke<"tick">(now);
+        }
+    };
+
+    static constexpr auto postBindInputTranslation = [](auto &agg) {
+        inputTranslation().attach(agg.input_binding, agg);
+    };
+
+    template <class Agg, class Handler = decltype(postBindInputTranslation)>
+    [[nodiscard]] constexpr auto asRenderObject(
+        Agg &&a, Handler postHandler = postBindInputTranslation)
+    {
+        using D = std::decay_t<Agg>;
+        auto renderObject = std::make_unique<AggRenderObject<D>>(std::forward<Agg>(a));
+        if constexpr (requires() { postHandler(renderObject->agg); })
+            postHandler(renderObject->agg);
+        return renderObject;
+    }
+}; // namespace render
+//diff: [test_intent] end
+
+// ===========================================================================
+//  table: one table = data + derive + draw + input
+//
+//  This is the only seam between the table and the host (GLFW / Vulkan / ui_new).
+//  Two chains run independently and meet only at target_key.
+//
+//  draw chain (data -> draw data -> shader -> pixels)
+//    data + view
+//        | draw_sync
+//        v
+//    geometry
+//        | draw_build
+//        v
+//    frame_data (shape_op/text_op, every op carries zone = target_key)
+//        | draw_encode
+//        v
+//    shader instances (entity_index = target_key) -> GPU -> pixels
+//
+//  input chain (gesture -> data update -> redraw next frame)
+//    GLFW event
+//        | input_event
+//        v
+//    cmd_press / cmd_drag / cmd_key / cmd_wheel ...
+//        | input_dispatch
+//        v
+//    systems (handle) -> visit_owner (single dispatch point) -> view / data
+//        | apply_effects (fx_set_cell / fx_clipboard)
+//        v
+//    view.ui.version++ -> next draw_sync rebuilds geometry/frame
+//
+//  Merge point (single):
+//    draw:   shape_op.zone = zone_key(target)
+//    shader: instance.entity_index = zone_key(target)
+//    input:  hit_target(...) / resolve(data, key) -> target -> to_owner -> visit_owner
+//  Same target_key, same resolve, same owner variant in all three places.
+// ===========================================================================
+namespace table_glue
+{
+    // ---- encode: frame_data -> shader instances (the only shader ABI boundary)
+    // Pure data transform: no Vulkan, no globals. Host supplies a sink
+    // (record_builder::addInsteance in production, a counter in tests).
+    inline void clip_glyph(ui_dao::rect_px &r, UvTransform &uv,
+                           const ui_dao::rect_px &clip) noexcept
+    {
+        if (r.w <= 0.0F || r.h <= 0.0F || clip.w <= 0.0F || clip.h <= 0.0F)
+            return;
+        const float l = std::max(r.x, clip.x), t = std::max(r.y, clip.y);
+        const float q = std::min(r.x + r.w, clip.x + clip.w);
+        const float b = std::min(r.y + r.h, clip.y + clip.h);
+        if (q <= l || b <= t)
+        {
+            r = {};
+            return;
+        }
+        const float sx = (l - r.x) / r.w, sy = (t - r.y) / r.h;
+        const float sw = (q - l) / r.w, sh = (b - t) / r.h;
+        uv.offset += glm::vec2(sx * uv.scale.x, sy * uv.scale.y);
+        uv.scale *= glm::vec2(sw, sh);
+        r = {l, t, q - l, b - t};
+    }
+
+    template <class Sink>
+    inline void encode(const ui_table::frame_data &in, const ui_table::font &f,
+                       const ui_dao::view &v, Sink &&sink)
+    {
+        const std::uint32_t hfn = ui_table::hover_fn_ref();
+        const auto emit_shape = [&](const ui_table::shape_op &o) {
+            auto s = ui_dao::sdf_shape({o.r.x, o.r.y, o.r.w, o.r.h}, v, o.radius, o.color,
+                                       {}, 0.0F, 0.0F, 1.0F, o.zone);
+            s.hover_fn = hfn;
+            s.effects = shader_data::FX_FILL;
+            const bool has_border = o.border_w > 0.0F && o.border.a > 0.0F;
+            if (has_border)
+            {
+                s.border_px = o.border_w;
+                s.border_color = o.border;
+                s.effects |= shader_data::FX_BORDER;
+            }
+            if (o.color.a <= 0.0F)
+                s.effects = has_border ? shader_data::FX_BORDER : 0U;
+            if (s.effects != 0U || o.zone != 0U)
+                sink(s);
+        };
+        const auto emit_text = [&](const ui_table::text_op &o) {
+            const float px = f.px;
+            const std::string_view str{o.p, o.len};
+            float x = o.r.x;
+            std::size_t i = 0;
+            while (i < str.size())
+            {
+                char32_t cp = 0;
+                const std::size_t n = ui_table::utf8_decode(str.substr(i), cp);
+                if (const auto *g = f.find(cp))
+                {
+                    const float ydir = g->y_down ? 1.0F : -1.0F;
+                    const float left = x + g->plane.x * px;
+                    const float right = x + g->plane.z * px;
+                    const float top = o.baseline + ydir * g->plane.y * px;
+                    const float bottom = o.baseline + ydir * g->plane.w * px;
+                    ui_dao::rect_px r{left, top, right - left, bottom - top};
+                    UvTransform uv{};
+                    uv.scale = {g->uv.z - g->uv.x, g->uv.w - g->uv.y};
+                    uv.offset = {g->uv.x, g->uv.y};
+                    clip_glyph(r, uv, {o.r.x, o.r.y, o.r.w, o.r.h});
+                    if (r.w > 0.0F && r.h > 0.0F)
+                        sink(ui_dao::glyph_quad(r, v, g->tex, g->samp, g->font,
+                                                g->px_range, o.color, uv, o.zone));
+                    x += g->advance * px;
+                }
+                i += n;
+            }
+        };
+        for (const auto &s : in.draw.shapes[0])
+            emit_shape(s);
+        for (const auto &t : in.draw.texts[0])
+            emit_text(t);
+        for (const auto &s : in.draw.shapes[1])
+            emit_shape(s);
+        for (const auto &t : in.draw.texts[1])
+            emit_text(t);
+        for (const auto &s : in.draw.shapes[2])
+            emit_shape(s);
+        for (const auto &t : in.draw.texts[2])
+            emit_text(t);
+        for (const auto &s : in.draw.shapes[3])
+            emit_shape(s);
+    }
+
+    // ---- platform helpers (GLFW / clipboard / IME / cursor)
+    inline std::string read_clipboard(GLFWwindow *win)
+    {
+        if (win == nullptr)
+            return {};
+        const char *s = glfwGetClipboardString(win);
+        return s == nullptr ? std::string{} : std::string{s};
+    }
+    inline void write_clipboard(GLFWwindow *win, std::string_view text)
+    {
+        if (win == nullptr || text.empty())
+            return;
+        glfwSetClipboardString(win, std::string{text}.c_str());
+    }
+    inline std::string ime_preedit(GLFWwindow *win) noexcept
+    {
+        if (win == nullptr)
+            return {};
+        struct api_t
+        {
+            void *(*get_ctx)(void *){};
+            long (*get_str)(void *, unsigned long, void *, long){};
+            int (*rel_ctx)(void *, void *){};
+        };
+        static const api_t api = [] {
+            api_t a{};
+            HMODULE imm = ::LoadLibraryW(L"imm32.dll");
+            if (imm == nullptr)
+                return a;
+            a.get_ctx = reinterpret_cast<void *(*)(void *)>(
+                ::GetProcAddress(imm, "ImmGetContext"));
+            a.get_str = reinterpret_cast<long (*)(void *, unsigned long, void *, long)>(
+                ::GetProcAddress(imm, "ImmGetCompositionStringW"));
+            a.rel_ctx = reinterpret_cast<int (*)(void *, void *)>(
+                ::GetProcAddress(imm, "ImmReleaseContext"));
+            return a;
+        }();
+        if (api.get_ctx == nullptr || api.get_str == nullptr || api.rel_ctx == nullptr)
+            return {};
+        HWND hwnd = glfwGetWin32Window(win);
+        if (hwnd == nullptr)
+            return {};
+        void *himc = api.get_ctx(hwnd);
+        if (himc == nullptr)
+            return {};
+        std::string out;
+        constexpr unsigned long kGcsCompStr = 0x0008UL;
+        const long bytes = api.get_str(himc, kGcsCompStr, nullptr, 0);
+        if (bytes > 0)
+        {
+            std::wstring w(static_cast<std::size_t>(bytes) / sizeof(wchar_t), L'\0');
+            api.get_str(himc, kGcsCompStr, w.data(), bytes);
+            const int need =
+                ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                                      nullptr, 0, nullptr, nullptr);
+            if (need > 0)
+            {
+                out.resize(static_cast<std::size_t>(need));
+                ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                                      out.data(), need, nullptr, nullptr);
+            }
+        }
+        api.rel_ctx(hwnd, himc);
+        return out;
+    }
+    inline void apply_cursor(GLFWwindow *win, ui_table::cursor c) noexcept
+    {
+        if (win == nullptr)
+            return;
+        static GLFWcursor *pool[7] = {};
+        static int current = -1;
+        const int idx = static_cast<int>(c);
+        if (idx == current)
+            return;
+        if (idx >= 0 && pool[idx] == nullptr)
+        {
+            static constexpr int kShape[7] = {
+                GLFW_ARROW_CURSOR,         GLFW_IBEAM_CURSOR,
+                GLFW_RESIZE_EW_CURSOR,     GLFW_RESIZE_NS_CURSOR,
+                GLFW_RESIZE_NWSE_CURSOR,   GLFW_RESIZE_NESW_CURSOR,
+                GLFW_POINTING_HAND_CURSOR,
+            };
+            pool[idx] = glfwCreateStandardCursor(kShape[idx]);
+        }
+        current = idx;
+        glfwSetCursor(win, pool[idx]);
+    }
+
+    // ---- font / model (one-time init, ownership moved into table_arena)
+    inline void init_font(ui_table::font &F)
+    {
+        F.px = 15.0F;
+        for (const auto &[cp, g] : uiAsciiGlyphs())
+        {
+            ui_table::glyph_metrics m{};
+            m.uv = g.uv;
+            m.plane = g.plane;
+            m.advance = g.advance;
+            m.tex = g.tex;
+            m.samp = g.samp;
+            m.font = g.shaderFont;
+            m.px_range = g.pxRange;
+            m.y_down = g.yDown;
+            F.put(cp, m);
+        }
+        std::println("[table] font glyphs: {}", F.ascii.size());
+    }
+
+    inline std::string cell_text(const nlohmann::json &v)
+    {
+        if (v.is_string())
+            return v.get<std::string>();
+        if (v.is_null())
+            return {};
+        return v.dump();
+    }
+
+    inline constexpr const char *kTableJson = R"json(
+{
+  "style": { "header_h": 40, "row_h": 30, "row_gap": 2, "bar": 8,
+             "radius": 10, "cell_pad": 10, "frozen": 1 },
+  "columns": [
+    { "key": "name",     "title": "Name",     "width": 220, "min": 120, "max": 320, "group": "Identity" },
+    { "key": "status",   "title": "Status",   "width": 116, "min": 90,  "max": 180, "align": "left", "group": "Identity",
+      "render": "tag",
+      "tags": { "ready": "#4fbf7a", "busy": "#e0a83c", "error": "#e0574f" } },
+    { "key": "size",     "title": "Size",     "width": 100, "min": 60,  "max": 160, "align": "right", "group": "Metrics" },
+    { "key": "modified", "title": "Modified", "width": 160, "min": 100, "max": 220, "group": "Metrics" },
+    { "key": "kind",     "title": "Kind",     "width": 140, "min": 80,  "max": 220,
+      "group": "Source", "render": "dot",
+      "tags": { "gltf": "#5aa9e6", "png": "#b07ad8", "bin": "#6ec2a0", "json": "#e0a83c" } },
+    { "key": "path",     "title": "Path",     "width": 420, "min": 200, "max": 900, "group": "Source" },
+    { "key": "sha",      "title": "SHA",      "width": 300, "min": 120, "max": 600, "group": "Source" },
+    { "key": "note",     "title": "Note",     "width": 200, "min": 80,  "max": 300, "group": "Source" }
+  ],
+  "rows": []
+}
+)json";
+
+    inline void init_model(ui_table::table_data &d, ui_table::prefs &p)
+    {
+        auto j = nlohmann::json::parse(kTableJson);
+        static constexpr const char *kStatus[3] = {"ready", "busy", "error"};
+        static constexpr const char *kKind[4] = {"gltf", "png", "bin", "json"};
+        static constexpr const char *kNote[4] = {"cached", "3 blocks", "hot", "cold"};
+        for (int i = 0; i < 60; ++i)
+        {
+            j["rows"].push_back(nlohmann::json::array(
+                {std::format("asset_{:02d}.gltf", i), kStatus[i % 3],
+                 std::format("{}.{} KB", 12 + i * 7, i % 10),
+                 std::format("2026-{:02d}-{:02d}", 1 + (i % 12), 1 + (i % 28)),
+                 kKind[i % 4],
+                 std::format("assets/scene/sub{:02d}/asset_{:02d}.gltf", i / 12, i),
+                 std::format("sha256:{:012x}", 0x9f2a1c3d4e5fULL + i * 7919ULL),
+                 kNote[i % 4]}));
+        }
+
+        d = {};
+        for (const auto &c : j.at("columns"))
+        {
+            ui_table::column col;
+            col.key = c.value("key", std::string{});
+            col.title = c.value("title", col.key);
+            col.w = c.value("width", 140.0F);
+            col.min_w = c.value("min", 48.0F);
+            col.max_w = c.value("max", 640.0F);
+            col.weight = c.value("weight", 0.0F);
+            const auto a = c.value("align", std::string{"left"});
+            col.a = a == "center"  ? ui_table::align::center
+                    : a == "right" ? ui_table::align::right
+                                   : ui_table::align::left;
+            col.filterable = c.value("filterable", true);
+            col.wrap = c.value("wrap", false);
+            col.group = c.value("group", std::string{});
+            const auto rd = c.value("render", std::string{"text"});
+            col.render = rd == "tag"   ? ui_table::render_kind::tag
+                         : rd == "bar" ? ui_table::render_kind::bar
+                         : rd == "dot" ? ui_table::render_kind::dot
+                                       : ui_table::render_kind::text;
+            if (c.contains("tags") && c["tags"].is_object())
+                for (const auto &[k, v] : c["tags"].items())
+                    if (v.is_string())
+                        col.tags.emplace_back(
+                            k, ui_table::hex_color(v.get<std::string>(),
+                                                   {0.5F, 0.5F, 0.5F, 1.0F}));
+            d.cols.push_back(std::move(col));
+        }
+        d.cells.resize(d.cols.size());
+        std::uint64_t next_id = 1;
+        for (const auto &r : j.at("rows"))
+        {
+            for (std::size_t c = 0; c < d.cols.size(); ++c)
+            {
+                std::string text;
+                if (r.is_array())
+                {
+                    if (c < r.size())
+                        text = cell_text(r[c]);
+                }
+                else if (r.is_object() && r.contains(d.cols[c].key))
+                    text = cell_text(r.at(d.cols[c].key));
+                d.cells[c].push_back({std::move(text), {}});
+            }
+            d.ids.push_back(ui_table::row_id{next_id++});
+        }
+
+        if (j.contains("style"))
+        {
+            const auto &s = j.at("style");
+            p.header_h = s.value("header_h", p.header_h);
+            p.row_h = s.value("row_h", p.row_h);
+            p.row_gap = s.value("row_gap", p.row_gap);
+            p.bar = s.value("bar", p.bar);
+            p.radius = s.value("radius", p.radius);
+            p.cell_pad = s.value("cell_pad", p.cell_pad);
+            p.frozen = s.value("frozen", p.frozen);
+            p.row_select = s.value("row_select", p.row_select);
+            p.wrap = s.value("wrap", p.wrap);
+            p.group_h = s.value("group_h", p.group_h);
+        }
+        std::println("[table] json: {} cols x {} rows, frozen={}", d.cols.size(),
+                     d.ids.size(), p.frozen);
+    }
+} // namespace table_glue
+
+namespace table_ui
+{
+    namespace ev = mcs::vulkan::event;
+    inline bool cancel_modal() noexcept; // 定义在 input 链末尾
+
+    // =====================================================================
+    // table arena input：input_frame -> arbiter -> gesture::Trait -> on_*
+    //
+    //   GLFW event
+    //     -> input_frame::build_change   （归一成 key/button/move/char change）
+    //     -> arbiter.feed                （唯一裁决点）
+    //     -> table_tree：gesture 现成识别器
+    //        click / right_click / drag / wheel / key_observer
+    //     -> on_press / on_right_click / on_drag / on_wheel /
+    //        on_key / on_char            （唯一副作用入口）
+    //
+    //   之前按事件类型手写的一排 input_event 重载全部删除；现在只有
+    //   table_arena::handle_event<E> 一个模板入口。
+    // =====================================================================
+    namespace arena_input
+    {
+        using intent::time_point;
+
+        // 语义事件的 payload：只装“识别器给的量”，不装 target
+        struct click_payload
+        {
+            double x{}, y{};
+            time_point at{};
+        };
+        struct drag_payload
+        {
+            gesture::drag_phase phase{};
+            double x{}, y{}, dx{}, dy{};
+            double total_dx{}, total_dy{};
+            ModifierKey modifier{};
+            time_point at{};
+        };
+        struct wheel_payload
+        {
+            int delta{};
+            time_point at{};
+        };
+        struct key_payload
+        {
+            Key key{};
+            input_frame::Transition transition{};
+            time_point at{};
+            bool repeat{};
+        };
+        struct char_payload
+        {
+            unsigned codepoint{};
+            time_point at{};
+        };
+
+        struct none_policy
+        {
+        };
+        // 表的点击不限制按住时长（只有 4px 的抖动阈值）；双击节奏由 core 判定
+        struct click_policy
+        {
+            static constexpr auto button = input_frame::MouseButton::eMOUSE_BUTTON_LEFT;
+            static constexpr std::int64_t tap_max_ms = 60000;
+            static constexpr double slop_px = mcs::app::drag_slop_px;
+        };
+        struct right_click_policy
+        {
+            static constexpr auto button = input_frame::MouseButton::eMOUSE_BUTTON_RIGHT;
+            static constexpr std::int64_t tap_max_ms = 60000;
+            static constexpr double slop_px = mcs::app::drag_slop_px;
+        };
+
+        // Trait 只写 collect（payload 怎么从语义事件来）；
+        // 坐标有效性 / press-release / slop / repeat 全在 input_frame + gesture。
+        struct Trait_press : gesture::trait_base<click_payload, static_string{"press"},
+                                                 static_string{"on_press"}, click_policy>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::click_event &e) noexcept
+            {
+                d = {e.x, e.y, e.at};
+            }
+        };
+        struct Trait_right_click
+            : gesture::trait_base<click_payload, static_string{"right_click"},
+                                  static_string{"on_right_click"}, right_click_policy>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::click_event &e) noexcept
+            {
+                d = {e.x, e.y, e.at};
+            }
+        };
+        struct Trait_drag
+            : gesture::trait_base<drag_payload, static_string{"drag"},
+                                  static_string{"on_drag"}, mcs::app::policy::drag>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::drag_event &e) noexcept
+            {
+                d.phase = e.phase;
+                d.x = e.x;
+                d.y = e.y;
+                d.dx = e.dx;
+                d.dy = e.dy;
+                d.total_dx = e.total_dx;
+                d.total_dy = e.total_dy;
+                d.modifier = e.modifier;
+                d.at = e.at;
+            }
+        };
+        struct Trait_wheel
+            : gesture::trait_base<wheel_payload, static_string{"wheel"},
+                                  static_string{"on_wheel"}, mcs::app::policy::wheel>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::wheel_event &e) noexcept
+            {
+                d = {e.delta, e.at};
+            }
+        };
+        struct Trait_key : gesture::trait_base<key_payload, static_string{"key"},
+                                               static_string{"on_key"}, none_policy>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::key_event &e) noexcept
+            {
+                d = {e.key, e.transition, e.at, e.repeat};
+            }
+        };
+
+        // 直接复用 gesture 的现成识别器：click / right_click / drag / wheel /
+        // key_observer。双击/三击不另设识别器：core 的 note_click 在同一次
+        // click 里按时间/位置累计（单击不会被“等待双击”吞掉）。
+        using table_tree =
+            intent::all_of<intent::leaf<gesture::click_template<Trait_press>>,
+                           intent::leaf<gesture::click_template<Trait_right_click>>,
+                           intent::leaf<gesture::drag_template<Trait_drag>>,
+                           intent::leaf<gesture::wheel_template<Trait_wheel>>,
+                           intent::leaf<gesture::key_observer_template<Trait_key>>>;
+
+        using table_arbiter = intent::debug_arbiter<table_tree>;
+    } // namespace arena_input
+
+    using table_tree = arena_input::table_tree;
+    using table_arbiter = arena_input::table_arbiter;
+
+    // =====================================================================
+    // table_arena: all mutable state of one table.
+    // No static, no globals: the host owns the single instance (Table node).
+    // =====================================================================
+    struct table_arena
+    {
+        // ---- data (input writes, draw reads)
+        ui_table::table_data data;
+        ui_table::prefs prefs{};
+        ui_table::font font{};
+        ui_table::table_id id{};
+
+        // ---- derived (intermediate results of the draw chain)
+        ui_table::view view{};
+        ui_table::geometry geom{};
+        ui_table::row_pipeline pipe{};
+        ui_table::systems sys{};
+        ui_table::frame_data frame{};
+
+        // ---- input/draw merge point
+        ui_table::target pointer{}; // current pointer target (from hit_target)
+        picking_result pick{};      // GPU readback (verification only)
+        std::uint32_t pick_version{0};
+        std::vector<ui_table::effect> fx; // host effects produced by input
+
+        // ---- input arena：input_frame -> arbiter -> gesture -> on_*
+        arena_input::table_arbiter arbiter{};
+        input_frame::event_context input_state{};
+        intent::time_point now{};
+        bool esc_cancelled{false}; // on_key 成功取消了 modal，主循环据此吞掉关窗
+
+        // ---- 宿主回调（模型/选择/勾选变化）
+        struct callbacks
+        {
+            std::function<void()> on_model_changed;
+            std::function<void()> on_selection_changed;
+            std::function<void()> on_checks_changed;
+        };
+        callbacks cb{};
+
+        // 上一次已通知的选区/勾选快照（去重：输入、筛选、模型都走同一处）
+        int cb_r0{-1}, cb_c0{-1}, cb_r1{-1}, cb_c1{-1}, cb_cur_r{-1}, cb_cur_c{-1};
+        std::uint64_t cb_checks{0};
+        bool cb_valid{false};
+
+        // 唯一输入入口：任何平台事件都从这里进 arena
+        template <class E>
+        void handle_event(const E &e);
+        void advance(double seconds);
+
+        // 给库里的识别器用（drag_template 等按 fn_name 调成员）
+        template <static_string Name, class... A>
+        constexpr decltype(auto) invoke(A &&...a)
+        {
+            constexpr auto m = *type_erased_invoker<>::find_function(^^table_arena, Name);
+            return (this->[:m:])(std::forward<A>(a)...);
+        }
+
+        // arena 的 on_*（由 gesture 识别器 win 通过反射调用）
+        void on_press(const arena_input::click_payload &e);
+        void on_right_click(const arena_input::click_payload &e);
+        void on_drag(const arena_input::drag_payload &e);
+        void on_wheel(const arena_input::wheel_payload &e);
+        void on_key(const arena_input::key_payload &e);
+        void on_char(const arena_input::char_payload &e);
+        void handle_key_event(const ev::keyboard_event &e);
+
+        // ---- host
+        ui_new::ScreenWidget *screen{};
+        ui_new::Widget *owner{};
+        GLFWwindow *win{};
+        float mx{0}, my{0}; // pointer in owner coordinates
+        float wx{0}, wy{0}; // raw window cursor
+        float sx{1}, sy{1}; // window logical -> owner coordinates
+        float vw{1}, vh{1};
+
+        // ---- draw statistics (tests / verification)
+        struct draw_info
+        {
+            std::uint32_t version{};
+            std::uint32_t shapes{};
+            std::uint32_t texts{};
+            std::uint32_t zoned{};
+            std::uint32_t instances{};
+        };
+        draw_info info{};
+        std::uint32_t inputs{};
+        // 输入产生的语义变化（宿主可以据此回调；draw 不读它）
+        struct change_flags
+        {
+            bool selection{};
+            bool checks{};
+            bool model{};
+        };
+        change_flags changes{};
+    };
+
+    // The current table: the host widget tree contains exactly one Table node.
+    inline table_arena *&current_arena() noexcept
+    {
+        static table_arena *p = nullptr;
+        return p;
+    }
+
+    // =====================================================================
+    // draw chain: three named steps, fixed order, one job each
+    // =====================================================================
+
+    // 1) data + view -> geometry
+    inline void draw_sync(table_arena &s, const ui_table::rect &box)
+    {
+        const float m = 48.0F;
+        const ui_table::rect vp{box.x + m, box.y + m, std::max(box.w - 2.0F * m, 1.0F),
+                                std::max(box.h - 2.0F * m, 1.0F)};
+        s.vw = vp.w;
+        s.vh = vp.h;
+        ui_table::sync(s.data, s.view, s.prefs, s.geom, vp, s.font, s.sys, s.pipe);
+        if (std::getenv("TABLE_GEOMLOG") != nullptr)
+        {
+            static std::uint32_t last_ver = ~0U;
+            static float last_w = -1, last_h = -1;
+            if (last_ver != s.geom.version || last_w != s.geom.box.w ||
+                last_h != s.geom.box.h)
+            {
+                last_ver = s.geom.version;
+                last_w = s.geom.box.w;
+                last_h = s.geom.box.h;
+                const auto &g = s.geom;
+                std::print("[geom] box=({:.1f},{:.1f},{:.1f},{:.1f}) header_y={:.1f} "
+                           "body=({:.1f},{:.1f},{:.1f},{:.1f}) scroll=({:.1f},{:.1f}) "
+                           "cols=",
+                           g.box.x, g.box.y, g.box.w, g.box.h, g.col_header.y, g.body.x,
+                           g.body.y, g.body.w, g.body.h, g.sx, g.sy);
+                for (int i = 0; i < g.col_count(); ++i)
+                    std::print("{}:{:.1f}/{:.1f} ",
+                               g.col_index[static_cast<std::size_t>(i)], g.col_x_at(i),
+                               g.col_w[static_cast<std::size_t>(i)]);
+                std::println("");
+            }
+        }
+    }
+
+    // 2) data + view + geometry -> frame_data (DL, every op carries zone)
+    inline void draw_build(table_arena &s)
+    {
+        ui_table::build_frame(s.data, s.view, s.prefs, s.geom, s.font, s.sys, s.frame,
+                              s.id);
+        s.frame.table = s.id;
+    }
+
+    // 3) frame_data -> shader instances (entity_index = zone_key)
+    template <class Sink>
+    inline void draw_encode(const table_arena &s, const ui_dao::view &view, Sink &&sink)
+    {
+        table_glue::encode(s.frame, s.font, view, std::forward<Sink>(sink));
+    }
+
+    // full draw chain: sync -> build -> encode
+    inline const table_arena::draw_info &draw(table_arena &s, const ui_table::rect &box,
+                                              const ui_dao::view &view,
+                                              command::record_builder &rb)
+    {
+        draw_sync(s, box);
+        draw_build(s);
+
+        auto &info = s.info;
+        info = {};
+        info.version = s.view.ui.version;
+        for (const auto &ops : s.frame.draw.shapes)
+            info.shapes += static_cast<std::uint32_t>(ops.size());
+        for (const auto &ops : s.frame.draw.texts)
+            info.texts += static_cast<std::uint32_t>(ops.size());
+        for (const auto &ops : s.frame.draw.shapes)
+            for (const auto &o : ops)
+                info.zoned += o.zone != 0 ? 1U : 0U;
+
+        draw_encode(s, view, [&](auto &&inst) {
+            ++info.instances;
+            rb.addInsteance(std::forward<decltype(inst)>(inst));
+        });
+        return info;
+    }
+
+    // 六个接口的显式名字（内部实现仍是上面三条；命名对齐 HANDOFF_table_arena）
+    inline void on_pick(table_arena &s, const picking_result &r);
+    inline void sync(table_arena &s, const ui_table::rect &box)
+    {
+        draw_sync(s, box);
+    }
+    inline void build_frame(table_arena &s)
+    {
+        draw_build(s);
+    }
+    template <class Sink>
+    inline void encode(const table_arena &s, const ui_dao::view &view, Sink &&sink)
+    {
+        draw_encode(s, view, std::forward<Sink>(sink));
+    }
+    inline void picking(table_arena &s, const picking_result &r)
+    {
+        on_pick(s, r);
+    }
+
+    // =====================================================================
+    // input chain: translate (event -> cmd) -> dispatch (cmd -> systems/visit_owner)
+    // =====================================================================
+
+    // input/draw merge point: pointer -> target (same zone_key protocol as draw)
+    inline ui_table::target pointer_target(table_arena &s, float x, float y)
+    {
+        s.pointer = ui_table::hit_target(s.data, s.geom, s.view, x, y, s.id);
+        return s.pointer;
+    }
+
+    // host effects produced by input: write data / clipboard, then bump version
+    inline void apply_effects(table_arena &s)
+    {
+        bool model_changed = false;
+        for (auto &e : s.fx)
+        {
+            if (auto *p = std::get_if<ui_table::fx_set_cell>(&e))
+            {
+                const int r = s.data.index_of(p->id);
+                if (r >= 0)
+                {
+                    s.data.set_cell(r, p->col, std::move(p->text));
+                    model_changed = true;
+                }
+            }
+            else if (auto *p = std::get_if<ui_table::fx_clipboard>(&e))
+                table_glue::write_clipboard(s.win, p->text);
+        }
+        s.fx.clear();
+        s.view.ui.touch();
+        if (model_changed)
+        {
+            s.changes.model = true;
+            if (s.cb.on_model_changed)
+                s.cb.on_model_changed();
+        }
+    }
+
+    // the only semantic dispatch: systems first, fallback visit_owner lives in core
+    struct ui_signature
+    {
+        int r0{}, c0{}, r1{}, c1{}, cur_r{}, cur_c{};
+        std::uint64_t checks{};
+        friend bool operator==(const ui_signature &, const ui_signature &) = default;
+    };
+    inline ui_signature signature_of(const table_arena &s) noexcept
+    {
+        ui_signature g{s.view.sel.r0,
+                       s.view.sel.c0,
+                       s.view.sel.r1,
+                       s.view.sel.c1,
+                       s.view.sel.cur_r,
+                       s.view.sel.cur_c,
+                       0};
+        std::uint64_t h = 1469598103934665603ULL;
+        for (const auto v : s.view.checks.on)
+            h = (h ^ v) * 1099511628211ULL;
+        g.checks = h;
+        return g;
+    }
+
+    // 选区/勾选变化的唯一通知点：输入、筛选、模型对齐都走这里（去重）
+    inline void notify_change(table_arena &s)
+    {
+        const auto sig = signature_of(s);
+        const bool sel = !s.cb_valid || sig.r0 != s.cb_r0 || sig.c0 != s.cb_c0 ||
+                         sig.r1 != s.cb_r1 || sig.c1 != s.cb_c1 ||
+                         sig.cur_r != s.cb_cur_r || sig.cur_c != s.cb_cur_c;
+        const bool chk = !s.cb_valid || sig.checks != s.cb_checks;
+        if (sel)
+        {
+            s.changes.selection = true;
+            if (s.cb.on_selection_changed)
+                s.cb.on_selection_changed();
+        }
+        if (chk)
+        {
+            s.changes.checks = true;
+            if (s.cb.on_checks_changed)
+                s.cb.on_checks_changed();
+        }
+        s.cb_r0 = sig.r0;
+        s.cb_c0 = sig.c0;
+        s.cb_r1 = sig.r1;
+        s.cb_c1 = sig.c1;
+        s.cb_cur_r = sig.cur_r;
+        s.cb_cur_c = sig.cur_c;
+        s.cb_checks = sig.checks;
+        s.cb_valid = true;
+    }
+
+    template <class Cmd>
+    inline void input_dispatch(table_arena &s, const Cmd &cmd)
+    {
+        ui_table::system_event(s.data, s.view, s.prefs, s.geom, s.sys, s.font, cmd, s.fx);
+        apply_effects(s);
+        notify_change(s);
+        ++s.inputs;
+    }
+
+    // keyboard focus: single-table program, remember the last pressed table
+    inline std::uint32_t &active_table() noexcept
+    {
+        static std::uint32_t id = 0;
+        return id;
+    }
+
+    inline std::optional<ui_table::key> map_key(ev::Key k) noexcept
+    {
+        switch (k)
+        {
+        case ev::Key::eUP:
+            return ui_table::key::up;
+        case ev::Key::eDOWN:
+            return ui_table::key::down;
+        case ev::Key::eLEFT:
+            return ui_table::key::left;
+        case ev::Key::eRIGHT:
+            return ui_table::key::right;
+        case ev::Key::eHOME:
+            return ui_table::key::home;
+        case ev::Key::eEND:
+            return ui_table::key::end;
+        case ev::Key::ePAGE_UP:
+            return ui_table::key::pgup;
+        case ev::Key::ePAGE_DOWN:
+            return ui_table::key::pgdn;
+        case ev::Key::eENTER:
+            return ui_table::key::enter;
+        case ev::Key::eESCAPE:
+            return ui_table::key::esc;
+        case ev::Key::eTAB:
+            return ui_table::key::tab;
+        case ev::Key::eBACKSPACE:
+            return ui_table::key::backspace;
+        case ev::Key::eDELETE:
+            return ui_table::key::del;
+        case ev::Key::eSPACE:
+            return ui_table::key::space;
+        case ev::Key::eF2:
+            return ui_table::key::f2;
+        case ev::Key::eA:
+            return ui_table::key::a;
+        case ev::Key::eC:
+            return ui_table::key::c;
+        case ev::Key::eV:
+            return ui_table::key::v;
+        case ev::Key::eX:
+            return ui_table::key::x;
+        case ev::Key::eZ:
+            return ui_table::key::z;
+        case ev::Key::eY:
+            return ui_table::key::y;
+        case ev::Key::eF:
+            return ui_table::key::f;
+        default:
+            return std::nullopt;
+        }
+    }
+
+    inline void encode_utf8(std::uint32_t cp, std::string &out)
+    {
+        if (cp < 0x80)
+            out += static_cast<char>(cp);
+        else if (cp < 0x800)
+        {
+            out += static_cast<char>(0xC0 | (cp >> 6));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+        else if (cp < 0x10000)
+        {
+            out += static_cast<char>(0xE0 | (cp >> 12));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+        else
+        {
+            out += static_cast<char>(0xF0 | (cp >> 18));
+            out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            out += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    }
+
+    // owner coordinates: window logical -> table coordinates (DPI/layout scale once)
+    inline void set_pointer(table_arena &s, double wx, double wy) noexcept
+    {
+        s.wx = static_cast<float>(wx);
+        s.wy = static_cast<float>(wy);
+        s.mx = s.wx * s.sx + (s.owner ? static_cast<float>(s.owner->offset.x) : 0.0F);
+        s.my = s.wy * s.sy + (s.owner ? static_cast<float>(s.owner->offset.y) : 0.0F);
+    }
+
+    // =====================================================================
+    // arena 的 on_*：唯一副作用入口（识别器 win 通过反射调到这里）
+    // =====================================================================
+    inline bool cancel_modal(table_arena &s) noexcept; // 定义在 input 链末尾
+
+    // 单击（含双击/三击的每一击）：press + release 一起发；
+    // 双击/三击的判定由 core 的 note_click 按时间/位置完成。
+    inline void click_dispatch(table_arena &s, double x, double y)
+    {
+        if (!s.input_state.pointer_position_valid && s.win != nullptr)
+        {
+            double cx = 0, cy = 0;
+            glfwGetCursorPos(s.win, &cx, &cy);
+            x = cx;
+            y = cy;
+        }
+        set_pointer(s, x, y);
+        active_table() = s.id.value;
+        const auto tgt = pointer_target(s, s.mx, s.my);
+        if (std::getenv("TABLE_INPUTLOG") != nullptr)
+            std::println("[click] at=({:.1f},{:.1f}) kind={} row={} col={}", s.mx, s.my,
+                         ui_table::part_name(tgt.kind), tgt.row_index, tgt.col_index);
+        const bool shift = s.input_state.modifier.shift();
+        const bool ctrl = s.input_state.modifier.control();
+        input_dispatch(
+            s, ui_table::cmd_press{s.mx, s.my, tgt.to_zone(), false, shift, ctrl, tgt});
+        input_dispatch(s, ui_table::cmd_release{s.mx, s.my, s.view.ui.drag_target});
+    }
+
+    inline void table_arena::on_press(const arena_input::click_payload &e)
+    {
+        click_dispatch(*this, e.x, e.y);
+    }
+
+    inline void table_arena::on_right_click(const arena_input::click_payload &e)
+    {
+        set_pointer(*this, e.x, e.y);
+        const auto tgt = pointer_target(*this, mx, my);
+        ui_table::table_ctx tc{data, view, prefs, geom, font, &fx, nullptr, id};
+        sys.menu.open(tc, tgt.to_zone().col, mx, my);
+    }
+
+    inline void table_arena::on_drag(const arena_input::drag_payload &e)
+    {
+        switch (e.phase)
+        {
+        case gesture::drag_phase::begin: {
+            // 按下点 = 当前点 - 总位移：先补一发 press，再发 drag
+            set_pointer(*this, e.x - e.total_dx, e.y - e.total_dy);
+            active_table() = id.value;
+            view.ui.last_click_t = -1.0e9; // 拖拽的 press 不参与双击判定
+            const auto tgt = pointer_target(*this, mx, my);
+            input_dispatch(*this, ui_table::cmd_press{mx, my, tgt.to_zone(), false,
+                                                      e.modifier.shift(),
+                                                      e.modifier.control(), tgt});
+            set_pointer(*this, e.x, e.y);
+            input_dispatch(*this, ui_table::cmd_drag{mx, my, view.ui.drag_target});
+            break;
+        }
+        case gesture::drag_phase::move:
+            set_pointer(*this, e.x, e.y);
+            input_dispatch(*this, ui_table::cmd_drag{mx, my, view.ui.drag_target});
+            break;
+        case gesture::drag_phase::end:
+            set_pointer(*this, e.x, e.y);
+            input_dispatch(*this, ui_table::cmd_release{mx, my, view.ui.drag_target});
+            break;
+        }
+    }
+
+    inline void table_arena::on_wheel(const arena_input::wheel_payload &e)
+    {
+        if (!input_state.pointer_position_valid && win != nullptr)
+        {
+            double cx = 0, cy = 0;
+            glfwGetCursorPos(win, &cx, &cy);
+            set_pointer(*this, cx, cy);
+        }
+        else
+            set_pointer(*this, input_state.pointer_x, input_state.pointer_y);
+        if (std::getenv("TABLE_INPUTLOG") != nullptr)
+            std::println("[wheel] delta={} at=({:.1f},{:.1f})", e.delta, mx, my);
+        // 只滚指针下面的表；Shift 或悬停横向条 = 横向滚动
+        if (mx < geom.box.x || mx >= geom.box.x1() || my < geom.box.y ||
+            my >= geom.box.y1())
+            return;
+        ui_table::system_wheel(view, prefs, 0.0F, static_cast<float>(e.delta),
+                               input_state.modifier.shift(), &geom);
+        ++inputs;
+    }
+
+    inline void table_arena::on_key(const arena_input::key_payload &e)
+    {
+        if (e.transition != input_frame::Transition::Press)
+            return;
+        // 只有导航键接受 repeat；Ctrl+V / F2 / 字母等只认首次 press
+        const bool nav = e.key == ev::Key::eUP || e.key == ev::Key::eDOWN ||
+                         e.key == ev::Key::eLEFT || e.key == ev::Key::eRIGHT ||
+                         e.key == ev::Key::eHOME || e.key == ev::Key::eEND ||
+                         e.key == ev::Key::ePAGE_UP || e.key == ev::Key::ePAGE_DOWN;
+        if (e.repeat && !nav)
+            return;
+        if (active_table() != 0 && active_table() != id.value)
+            return;
+        const auto key_down = [&](ev::Key k) {
+            return input_state.get_keyboard_event(k) == input_frame::HeldState::Down;
+        };
+        const bool ctrl = input_state.modifier.control() ||
+                          key_down(ev::Key::eLEFT_CONTROL) ||
+                          key_down(ev::Key::eRIGHT_CONTROL);
+        const bool shift = input_state.modifier.shift() ||
+                           key_down(ev::Key::eLEFT_SHIFT) ||
+                           key_down(ev::Key::eRIGHT_SHIFT);
+        if (std::getenv("TABLE_INPUTLOG") != nullptr)
+            std::println("[in] key={} repeat={} sel=({},{})", e.key, e.repeat,
+                         view.sel.cur_r, view.sel.cur_c);
+        if (e.key == ev::Key::eV && ctrl)
+        {
+            ui_table::table_ctx c{data, view, prefs, geom, font, &fx, nullptr, id};
+            sys.edit.paste(c, table_glue::read_clipboard(win));
+            apply_effects(*this);
+            ++inputs;
+            return;
+        }
+        if (e.key == ev::Key::eESCAPE)
+        {
+            if (cancel_modal(*this))
+                esc_cancelled = true;
+            return;
+        }
+        if (const auto k = map_key(e.key))
+            input_dispatch(
+                *this,
+                ui_table::cmd_key{*k, shift, ctrl,
+                                  ui_table::target_of(
+                                      data, id,
+                                      ui_table::zone{ui_table::part::cell, view.sel.cur_r,
+                                                     view.sel.cur_c, id})});
+    }
+
+    inline void table_arena::on_char(const arena_input::char_payload &e)
+    {
+        std::string text;
+        encode_utf8(e.codepoint, text);
+        if (std::getenv("TABLE_INPUTLOG") != nullptr)
+            std::println("[char] cp={:#x} filter={} find={} edit={}", e.codepoint,
+                         view.filter.edit, view.find.mode, view.edit.active());
+        ui_table::table_ctx tc{data, view, prefs, geom, font, &fx, nullptr, id};
+        ui_table::system_text(tc, sys, text);
+        apply_effects(*this);
+    }
+
+    inline void table_arena::handle_key_event(const ev::keyboard_event &e)
+    {
+        now = mcs::app::now_ms();
+        view.ui.now = static_cast<double>(now.count()) / 1000.0;
+        auto f = input_frame::build_change(input_state, e);
+        arbiter.feed(*this, f, now);
+        input_frame::apply_change(input_state, f);
+    }
+
+    // =====================================================================
+    // 唯一输入入口：event -> input_frame -> arbiter -> gesture -> on_*
+    // =====================================================================
+    template <class E>
+    inline void table_arena::handle_event(const E &e)
+    {
+        if constexpr (std::same_as<E, ev::window_focus_event>)
+        {
+            if (!e.focused)
+            {
+                view.ui.left = false;
+                view.ui.drag = ui_table::drag_mode::none;
+                view.menu.open = false;
+                view.ui.touch();
+            }
+            return;
+        }
+        else
+        {
+            now = mcs::app::now_ms();
+            view.ui.now = static_cast<double>(now.count()) / 1000.0;
+            if constexpr (std::same_as<E, ev::char_event>)
+            {
+                // 文本不是手势：直接进 on_char（不经过 arbiter）
+                on_char(arena_input::char_payload{e.codepoint, now});
+                return;
+            }
+            if constexpr (std::same_as<E, ev::keyboard_event>)
+            {
+                handle_key_event(e);
+                return;
+            }
+            using frame_t = decltype(input_frame::build_change(input_state, e));
+            if constexpr (!std::is_void_v<frame_t>)
+            {
+                auto f = input_frame::build_change(input_state, e);
+                arbiter.feed(*this, f, now);
+                input_frame::apply_change(input_state, f);
+            }
+        }
+    }
+
+    inline void table_arena::advance(double /*seconds*/)
+    {
+        // 表的输入/悬停/双击全部用同一个时钟（now_ms），不混 GLFW elapsed
+        now = mcs::app::now_ms();
+        view.ui.now = static_cast<double>(now.count()) / 1000.0;
+        if (!view.ui.left)
+        {
+            // hover 是帧派生态（pointer + geometry），不是手写输入分支
+            set_pointer(*this, input_state.pointer_x, input_state.pointer_y);
+            view.ui.pointer = {mx, my};
+            ui_table::system_hover(view, pointer_target(*this, mx, my));
+        }
+        arbiter.tick(*this, now);
+        notify_change(*this);
+    }
+
+    // IME preedit is polled, not event driven: sync once per frame on the input side
+    inline void input_ime(table_arena &s)
+    {
+        if (s.win == nullptr)
+            return;
+        const bool filter = s.view.filter.edit >= 0;
+        const bool find = s.view.find.mode;
+        const bool edit = s.view.edit.active();
+        if (!filter && !find && !edit)
+            return;
+        auto pre = table_glue::ime_preedit(s.win);
+        if (filter)
+        {
+            if (pre != s.view.filter.compose)
+            {
+                s.view.filter.compose = std::move(pre);
+                s.view.ui.touch();
+            }
+            return;
+        }
+        if (find)
+        {
+            if (pre != s.view.find.compose)
+            {
+                s.view.find.compose = std::move(pre);
+                s.view.ui.touch();
+            }
+            return;
+        }
+        if (pre == s.view.edit.compose)
+            return;
+        ui_table::table_ctx tc{s.data, s.view, s.prefs, s.geom,
+                               s.font, &s.fx,  nullptr, s.id};
+        s.sys.edit.compose(tc, std::move(pre));
+    }
+
+    // Esc 取消：编辑/筛选/查找/菜单任一打开时，优先取消它而不是关窗口
+    inline bool modal_open() noexcept
+    {
+        auto *s = current_arena();
+        return s != nullptr && (s->view.filter.edit >= 0 || s->view.find.mode ||
+                                s->view.edit.active() || s->view.menu.open);
+    }
+    inline bool cancel_modal(table_arena &st) noexcept
+    {
+        auto &v = st.view;
+        if (v.filter.edit >= 0)
+        {
+            const auto col = static_cast<std::size_t>(v.filter.edit);
+            if (col < v.filter.text.size())
+                v.filter.text[col] = v.filter.orig;
+            v.filter.input = v.filter.orig;
+            v.filter.orig.clear();
+            v.filter.compose.clear();
+            v.filter.edit = -1;
+            v.ui.touch();
+            return true;
+        }
+        if (v.find.mode)
+        {
+            v.find.mode = false;
+            v.find.compose.clear();
+            v.ui.touch();
+            return true;
+        }
+        if (v.edit.active())
+        {
+            v.edit = {};
+            v.ui.touch();
+            return true;
+        }
+        if (v.menu.open)
+        {
+            v.menu.open = false;
+            v.ui.touch();
+            return true;
+        }
+        return false;
+    }
+
+    inline bool cancel_modal() noexcept
+    {
+        auto *s = current_arena();
+        return s != nullptr && cancel_modal(*s);
+    }
+
+    // =====================================================================
+    // 模型 API：数据变更 + view 对齐 + 回调，一站式
+    // =====================================================================
+    inline void notify_model(table_arena &s)
+    {
+        s.changes.model = true;
+        s.view.ui.touch();
+        if (s.cb.on_model_changed)
+            s.cb.on_model_changed();
+    }
+
+    inline ui_table::row_id insert_row(table_arena &s, int at = -1)
+    {
+        const auto id = s.data.insert_row(at);
+        s.view.reconcile(s.data);
+        notify_model(s);
+        return id;
+    }
+    inline bool remove_row(table_arena &s, int at)
+    {
+        if (!s.data.remove_row(at))
+            return false;
+        s.view.reconcile(s.data);
+        notify_model(s);
+        return true;
+    }
+    inline ui_table::column_id insert_column(table_arena &s, int at, ui_table::column c)
+    {
+        const auto id = s.data.insert_column(at, std::move(c));
+        s.view.reconcile(s.data);
+        notify_model(s);
+        return id;
+    }
+    inline bool remove_column(table_arena &s, int at)
+    {
+        if (!s.data.remove_column(at))
+            return false;
+        s.view.reconcile(s.data);
+        notify_model(s);
+        return true;
+    }
+    inline void set_cell(table_arena &s, int row, int col, std::string text)
+    {
+        s.data.set_cell(row, col, std::move(text));
+        notify_model(s);
+    }
+    inline void on_pick(table_arena &s, const picking_result &r)
+    {
+        s.pick = r;
+        s.pick_version = s.view.ui.version;
+        if (std::getenv("TABLE_PICKCHECK") == nullptr || r.key.object_type == 0xFFFFFFFF)
+            return;
+        const auto from_gpu = ui_table::resolve(s.data, r.key.entity_index);
+        const auto from_hit =
+            ui_table::hit_target(s.data, s.geom, s.view, s.mx, s.my, s.id);
+        if (from_gpu.to_zone() != from_hit.to_zone())
+            std::println("[pick] MISMATCH gpu=({}, {}, {}) hit=({}, {}, {})",
+                         ui_table::part_name(from_gpu.kind), from_gpu.row_index,
+                         from_gpu.col_index, ui_table::part_name(from_hit.kind),
+                         from_hit.row_index, from_hit.col_index);
+        else
+            std::println("[pick] ok {} row={} col={} entity={:#x}",
+                         ui_table::part_name(from_gpu.kind), from_gpu.row_index,
+                         from_gpu.col_index, r.key.entity_index);
+    }
+
+    // hover pool callback: hand the GPU readback to the current table
+    inline void on_hover(picking_result r, bool enter, InputCtx &,
+                         ui_new::ScreenWidget *) noexcept
+    {
+        if (auto *st = current_arena())
+            on_pick(*st, r);
+        ui_table::trace("[hover] {} key={:#x}", enter ? "ENTER" : "LEAVE",
+                        r.key.entity_index);
+    }
+    inline std::uint32_t hover_index()
+    {
+        static const std::uint32_t fn = hoverPool().bind(&on_hover);
+        return fn;
+    }
+
+    // =====================================================================
+    // widget adapter: table_arena <-> ui_new tree / glfw_input_translation
+    // Three jobs only: own the state, give the owner box to draw,
+    // hand events to input.
+    // =====================================================================
+    inline auto make_table(ui_table::table_data data, ui_table::prefs p, ui_table::font f)
+    {
+        data.finalize();
+        table_arena st;
+        st.data = std::move(data);
+        st.prefs = p;
+        st.font = std::move(f);
+        st.id = ui_table::next_table_id();
+        st.view.reset(st.data);
+        return make_aggregate<"Table">(
+            field<"arena">(std::move(st)),
+            field<"input_binding">(glfw_input_translation::scoped_binding{}),
+
+            // event entry: single template, straight into the arena
+            method<"input_event">(
+                [](auto &self, auto e) noexcept { self.arena.handle_event(e); }),
+
+            // frame time: arena tick + tooltip / double-click detection
+            method<"tick">([](auto &self, double t) { self.arena.advance(t); }),
+
+            // draw entry: single, straight into the draw chain
+            method<"render">([](auto &self, ui_new::ScreenWidget *screen,
+                                ui_new::Widget *owner, render_context &ctx) {
+                auto &s = self.arena;
+                s.screen = screen;
+                s.owner = owner;
+                s.win = named_resource::frameState().window->data();
+                if (s.win != nullptr && owner != nullptr)
+                {
+                    int ww = 1, wh = 1;
+                    glfwGetWindowSize(s.win, &ww, &wh);
+                    if (ww > 0 && wh > 0)
+                    {
+                        s.sx = static_cast<float>(owner->size.width) /
+                               static_cast<float>(ww);
+                        s.sy = static_cast<float>(owner->size.height) /
+                               static_cast<float>(wh);
+                    }
+                    if (std::getenv("TABLE_GEOMLOG") != nullptr)
+                    {
+                        static double lw = -1, lh = -1, lx = -1, ly = -1;
+                        if (owner->size.width != lw || owner->size.height != lh ||
+                            owner->offset.x != lx || owner->offset.y != ly)
+                        {
+                            lw = owner->size.width;
+                            lh = owner->size.height;
+                            lx = owner->offset.x;
+                            ly = owner->offset.y;
+                            std::println("[host] owner=({:.0f},{:.0f} @ {:.0f},{:.0f}) "
+                                         "win={}x{} scale=({:.3f},{:.3f})",
+                                         owner->size.width, owner->size.height,
+                                         owner->offset.x, owner->offset.y, ww, wh, s.sx,
+                                         s.sy);
+                        }
+                    }
+                }
+                const ui_table::rect box{
+                    owner ? static_cast<float>(owner->offset.x) : 0.0F,
+                    owner ? static_cast<float>(owner->offset.y) : 0.0F,
+                    owner ? static_cast<float>(owner->size.width) : 1.0F,
+                    owner ? static_cast<float>(owner->size.height) : 1.0F};
+                table_ui::draw(s, box, ctx.view, ctx.builder);
+                table_glue::apply_cursor(s.win,
+                                         ui_table::cursor_for(s.view.ui.hover.to_zone()));
+            }));
+    }
+
+    using table_agg = decltype(make_table(std::declval<ui_table::table_data>(),
+                                          std::declval<ui_table::prefs>(),
+                                          std::declval<ui_table::font>()));
+
+    inline std::uint32_t version() noexcept
+    {
+        auto *s = current_arena();
+        return s != nullptr ? s->view.ui.version : 0;
+    }
+
+    inline ui_new::ScreenWidget make_screen(double w, double h)
+    {
+        auto data = ui_table::table_data{};
+        auto prefs = ui_table::prefs{};
+        auto font = ui_table::font{};
+        table_glue::init_font(font);
+        table_glue::init_model(data, prefs);
+        ui_table::hover_fn_ref() = hover_index();
+        auto t = make_table(std::move(data), prefs, std::move(font));
+        auto ro = render::asRenderObject(std::move(t));
+        current_arena() = &ro->agg.arena;
+        return ui_new::ScreenWidget{
+            ui_new::Size{w, h}, ui_new::Container("panel").renderObject(std::move(ro))};
+    }
+
+    // =====================================================================
+    // TABLE_EVTEST: headless self-test of both chains
+    //   The same draw chain (sync -> build -> encode) and the same input
+    //   chain (cmd -> systems -> visit_owner -> view/data) are asserted.
+    // =====================================================================
+    inline int event_probe()
+    {
+        int fails = 0;
+        const auto check = [&](bool ok, const char *what) {
+            if (!ok)
+            {
+                ++fails;
+                std::println("[chain] FAIL: {}", what);
+            }
+            else
+                std::println("[chain] ok: {}", what);
+        };
+
+        table_arena s;
+        {
+            ui_table::column c;
+            c.key = "v";
+            c.title = "V";
+            c.w = 200;
+            s.data.cols.push_back(c);
+        }
+        s.data.finalize();
+        s.data.cells.resize(1);
+        for (int i = 0; i < 50; ++i)
+        {
+            s.data.cells[0].push_back({std::format("r{}", i), {}});
+            s.data.ids.push_back(ui_table::row_id{static_cast<std::uint64_t>(i + 1)});
+        }
+        s.id = ui_table::next_table_id();
+        s.view.reset(s.data);
+        s.prefs.row_h = 30.0F;
+        s.font.px = 15.0F;
+        ui_table::glyph_metrics gm;
+        gm.advance = 0.5F;
+        for (int c = 32; c < 127; ++c)
+            s.font.put(static_cast<char32_t>(c), gm);
+
+        const ui_table::rect box{0, 0, 500, 220};
+        const ui_dao::view view{500.0F, 220.0F};
+
+        // ---- draw chain: sync -> build -> encode
+        table_ui::draw_sync(s, box);
+        check(s.geom.col_count() == 1 && s.geom.row_count() > 0,
+              "draw.sync: data+view -> geometry");
+        table_ui::draw_build(s);
+        check(s.frame.draw.op_count() > 0, "draw.build: geometry -> frame_data");
+        {
+            std::size_t zero_ops = 0, no_owner = 0;
+            for (const auto &stream_shapes : s.frame.draw.shapes)
+                for (const auto &o : stream_shapes)
+                {
+                    if (o.zone == 0)
+                        ++zero_ops;
+                    else if (std::holds_alternative<ui_table::none_owner>(o.who))
+                        ++no_owner;
+                }
+            for (const auto &stream_texts : s.frame.draw.texts)
+                for (const auto &o : stream_texts)
+                {
+                    if (o.zone == 0)
+                        ++zero_ops;
+                    else if (std::holds_alternative<ui_table::none_owner>(o.who))
+                        ++no_owner;
+                }
+            check(zero_ops == 0, "dl: every op carries target_key");
+            check(no_owner == 0, "dl: every zoned op carries owner");
+        }
+        std::uint32_t instances = 0, zoned = 0, owners = 0;
+        table_ui::draw_encode(s, view, [&](auto &&inst) {
+            ++instances;
+            if (inst.entity_index != 0)
+            {
+                ++zoned;
+                const auto t = ui_table::resolve(s.data, inst.entity_index);
+                owners += t.kind != ui_table::part::none ? 1U : 0U;
+            }
+        });
+        check(instances > 0, "draw.encode: frame_data -> shader instances");
+        check(zoned > 0 && zoned == owners,
+              "draw.encode: every entity_index resolves to a target");
+        {
+            // CPU side of the pixel loop: draw zone and input hit share target_key
+            const int r = s.geom.view_rows.front();
+            const float x = s.geom.col_x_at(0) + 10.0F;
+            const float y = s.geom.row_index.empty() ? s.geom.body.y + 5.0F
+                                                     : s.geom.row_y.front() + 5.0F;
+            const auto hit = ui_table::hit_target(s.data, s.geom, s.view, x, y, s.id);
+            const auto key = ui_table::zone_key(hit.to_zone());
+            bool found = false;
+            for (const auto &ops : s.frame.draw.shapes)
+                for (const auto &o : ops)
+                    if (o.zone == key)
+                        found = true;
+            check(found, "merge: frame op.zone == input target_key");
+            check(hit.row_index == r && hit.col_index == 0,
+                  "merge: hit_target gives the same target");
+        }
+
+        // ---- input chain: cmd -> systems/visit_owner -> view/data
+        const std::uint32_t v0 = s.view.ui.version;
+        const int r0 = s.geom.view_rows.front();
+        input_dispatch(s, ui_table::cmd_press{
+                              s.geom.col_x_at(0) + 10.0F,
+                              s.geom.row_y.front() + 5.0F,
+                              {ui_table::part::cell, r0, 0, s.id},
+                              false,
+                              false,
+                              false,
+                              ui_table::make_target(ui_table::part::cell, r0, 0, s.id)});
+        check(s.view.sel.cur_r == r0 && s.view.sel.cur_c == 0,
+              "input: press -> selection");
+        check(s.view.ui.version > v0, "input: press bumps draw version");
+        check(s.changes.selection, "input: selection change is reported");
+        s.changes = {};
+        input_dispatch(s, ui_table::cmd_key{ui_table::key::space, false, false});
+        check(s.changes.checks, "input: row-check change is reported");
+        input_dispatch(s, ui_table::cmd_key{ui_table::key::down, false, false});
+        check(s.view.sel.cur_r > r0, "input: key down -> selection moves");
+
+        // ---- arena 入口：event -> input_frame -> arbiter -> gesture -> on_*
+        {
+            int sel_cb = 0, chk_cb = 0, model_cb = 0;
+            s.cb.on_selection_changed = [&] {
+                ++sel_cb;
+            };
+            s.cb.on_checks_changed = [&] {
+                ++chk_cb;
+            };
+            s.cb.on_model_changed = [&] {
+                ++model_cb;
+            };
+            const float px = s.geom.col_x_at(0) + 10.0F;
+            const float py = s.geom.row_y.front() + 5.0F;
+            const auto press = [&](ev::MouseButtons b) {
+                s.handle_event(ev::mousebutton_event{.button = b,
+                                                     .action = ev::Action::ePRESS,
+                                                     .modifier_key = ev::ModifierKey{}});
+            };
+            const auto release = [&](ev::MouseButtons b) {
+                s.handle_event(ev::mousebutton_event{.button = b,
+                                                     .action = ev::Action::eRELEASE,
+                                                     .modifier_key = ev::ModifierKey{}});
+            };
+
+            s.view.ui.last_click_t = -1.0e9;
+            s.view.edit = {};
+            s.handle_event(ev::position2d_event{.xpos = px, .ypos = py});
+            press(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
+            release(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
+            check(s.view.sel.cur_r == r0, "arena: click event -> selection");
+            check(sel_cb > 0, "callback: selection_changed fires");
+            {
+                const int chk0 = chk_cb;
+                input_dispatch(s, ui_table::cmd_key{ui_table::key::space, false, false});
+                check(chk_cb > chk0, "callback: checks_changed fires");
+            }
+
+            s.view.ui.last_click_t = -1.0e9;
+            s.view.edit = {};
+            s.handle_event(ev::keyboard_event{.key = ev::Key::eDOWN,
+                                              .action = ev::Action::ePRESS,
+                                              .modifier_key = ev::ModifierKey{},
+                                              .scancode = 0});
+            check(s.view.sel.cur_r > r0, "arena: key event -> selection");
+            const int after_press = s.view.sel.cur_r;
+            s.handle_event(ev::keyboard_event{.key = ev::Key::eDOWN,
+                                              .action = ev::Action::eREPEAT,
+                                              .modifier_key = ev::ModifierKey{},
+                                              .scancode = 0});
+            check(s.view.sel.cur_r > after_press,
+                  "arena: key repeat -> selection moves again");
+            s.handle_event(ev::keyboard_event{.key = ev::Key::eDOWN,
+                                              .action = ev::Action::eRELEASE,
+                                              .modifier_key = ev::ModifierKey{},
+                                              .scancode = 0});
+
+            const auto scroll_before = s.view.scroll.y;
+            s.handle_event(ev::scroll_event{.xoffset = 0.0, .yoffset = -1.0});
+            check(s.view.scroll.y > scroll_before, "arena: wheel event -> scroll");
+
+            // 拖拽：press -> move 超过 slop -> release
+            s.view.ui.last_click_t = -1.0e9;
+            s.view.edit = {};
+            s.view.scroll.y = 0.0F;
+            s.handle_event(ev::position2d_event{.xpos = px, .ypos = py});
+            press(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
+            s.handle_event(ev::position2d_event{.xpos = px, .ypos = py + 40.0F});
+            s.handle_event(ev::position2d_event{.xpos = px, .ypos = py + 70.0F});
+            check(s.view.sel.r1 > s.view.sel.r0, "arena: drag event -> extend");
+            release(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
+
+            // 双击：两次 click 落在同一格 -> core 进编辑并选词
+            s.view.ui.last_click_t = -1.0e9;
+            s.view.edit = {};
+            s.handle_event(ev::position2d_event{.xpos = px, .ypos = py});
+            press(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
+            release(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
+            press(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
+            release(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
+            check(s.view.edit.active(), "arena: double click -> edit");
+            s.handle_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+                                              .action = ev::Action::ePRESS,
+                                              .modifier_key = ev::ModifierKey{},
+                                              .scancode = 0});
+            s.handle_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+                                              .action = ev::Action::eRELEASE,
+                                              .modifier_key = ev::ModifierKey{},
+                                              .scancode = 0});
+
+            // 字符：F2 进编辑，char 进 system_text
+            s.view.ui.last_click_t = -1.0e9;
+            s.view.edit = {};
+            s.handle_event(ev::keyboard_event{.key = ev::Key::eF2,
+                                              .action = ev::Action::ePRESS,
+                                              .modifier_key = ev::ModifierKey{},
+                                              .scancode = 0});
+            s.handle_event(ev::keyboard_event{.key = ev::Key::eF2,
+                                              .action = ev::Action::eRELEASE,
+                                              .modifier_key = ev::ModifierKey{},
+                                              .scancode = 0});
+            s.handle_event(ev::char_event{.codepoint = U'Z'});
+            check(s.view.edit.active() && !s.view.edit.buf.empty() &&
+                      s.view.edit.buf.back() == 'Z',
+                  "arena: char event -> edit buffer");
+            s.handle_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+                                              .action = ev::Action::ePRESS,
+                                              .modifier_key = ev::ModifierKey{},
+                                              .scancode = 0});
+            s.handle_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+                                              .action = ev::Action::eRELEASE,
+                                              .modifier_key = ev::ModifierKey{},
+                                              .scancode = 0});
+
+            // 覆盖 overlay 状态：菜单 + tooltip 底色也必须带 owner/zone
+            s.view.edit = {};
+            s.handle_event(
+                ev::position2d_event{.xpos = px, .ypos = s.geom.col_header.y + 10.0F});
+            press(ev::MouseButtons::eMOUSE_BUTTON_RIGHT);
+            release(ev::MouseButtons::eMOUSE_BUTTON_RIGHT);
+            s.view.tip.hover_t = s.view.ui.now - 1.0;
+            s.view.ui.hover = ui_table::make_target(ui_table::part::cell, r0, 0, s.id);
+            table_ui::draw_build(s);
+            {
+                std::size_t zero_ops = 0, no_owner = 0;
+                for (const auto &ss : s.frame.draw.shapes)
+                    for (const auto &o : ss)
+                    {
+                        zero_ops += o.zone == 0;
+                        no_owner += o.zone != 0 &&
+                                    std::holds_alternative<ui_table::none_owner>(o.who);
+                    }
+                for (const auto &tt : s.frame.draw.texts)
+                    for (const auto &o : tt)
+                    {
+                        zero_ops += o.zone == 0;
+                        no_owner += o.zone != 0 &&
+                                    std::holds_alternative<ui_table::none_owner>(o.who);
+                    }
+                check(zero_ops == 0 && no_owner == 0,
+                      "dl: overlay ops also carry target_key + owner");
+            }
+            s.view.menu.open = false;
+
+            // 模型回调 + view 对齐（中间插入：勾选和选区按 row_id 跟着走）
+            {
+                s.view.checks.on.assign(s.data.rows(), 0);
+                s.view.checks.ids = s.data.ids;
+                s.view.checks.on[0] = 1;
+                const auto keep = s.data.ids[0];
+                const auto sel_before = s.view.sel.cur_r;
+                (void)table_ui::insert_row(s, 0);
+                check(s.view.checks.on[1] == 1 && s.view.checks.ids[1] == keep,
+                      "model: insert at 0 keeps checks by row_id");
+                check(s.view.sel.cur_r == sel_before + 1,
+                      "model: insert at 0 keeps selection by row_id");
+                (void)table_ui::remove_row(s, 0);
+                check(s.view.checks.on[0] == 1 && s.view.checks.ids[0] == keep,
+                      "model: remove at 0 keeps checks by row_id");
+                check(s.view.sel.cur_r == sel_before,
+                      "model: remove at 0 keeps selection by row_id");
+            }
+            const auto rows_before = s.data.rows();
+            (void)table_ui::insert_row(s, 1);
+            check(s.data.rows() == rows_before + 1 &&
+                      s.view.checks.on.size() == s.data.rows(),
+                  "callback: insert_row reconciles view");
+            check(model_cb > 0, "callback: model_changed fires");
+            (void)table_ui::remove_row(s, 1);
+            check(s.data.rows() == rows_before, "callback: remove_row restores");
+        }
+
+        // redraw after input: the same draw chain sees the new view
+        const std::uint32_t v1 = s.view.ui.version;
+        table_ui::draw_sync(s, box);
+        table_ui::draw_build(s);
+        check(s.geom.version == v1, "loop: input version -> geometry version");
+        check(s.frame.draw.op_count() > 0, "loop: input -> next frame redraw");
+
+        std::println("[chain] done, {} failed", fails);
+        return fails;
+    }
+
+} // namespace table_ui
+
+int main()
+try
+{
+#ifdef VERT_SHADER_PATH
+    std::cout << "VERT_SHADER_PATH: " << VERT_SHADER_PATH << '\n';
+#endif
+#ifdef FRAG_SHADER_PATH
+    std::cout << "FRAG_SHADER_PATH: " << FRAG_SHADER_PATH << '\n';
+#endif
+    // 表格自测：只驱动 update/normalize 的数据面，不碰窗口 / GPU / Vulkan。
+    // TABLE_SELFTEST=1 时先跑再退出，失败返回非 0。
+    if (std::getenv("TABLE_EVTEST") != nullptr)
+        return table_ui::event_probe();
+    if (std::getenv("TABLE_SELFTEST") != nullptr)
+    {
+        const int fails = ui_table::selftest();
+        return fails == 0 ? 0 : 1;
+    }
+    auto hardwareCtx = init();
+    auto &window = *hardwareCtx.window.get();
+    auto &physical_device = *hardwareCtx.physicalDevice.get();
+    auto &surface = *hardwareCtx.surface.get();
+    auto &device = *hardwareCtx.device.get();
+    auto &GRAPHICS_AND_PRESENT = *hardwareCtx.queue.get();
+    auto &commandPool = *hardwareCtx.commandPool.get();
+    auto &commandBuffers = *hardwareCtx.commandBuffers.get();
+
+    auto &swapchainBuild = hardwareCtx.swapchainBuild;
+    auto &swapchain = hardwareCtx.swapchain;
+    auto &frameContext = hardwareCtx.frameContext;
+
+    auto descriptorCtx = descriptorInit(hardwareCtx);
+    auto &descriptorSetLayout = *descriptorCtx.descriptorSetLayout.get();
+    auto &descriptorPool = *descriptorCtx.descriptorPool.get();
+    auto &descriptorSets = *descriptorCtx.descriptorSets.get();
+    auto &uniformBuffers = *descriptorCtx.uniformBuffers.get();
+    auto &textureManager = *descriptorCtx.textureManager.get();
+    auto &samplerManager = *descriptorCtx.samplerManager.get();
+
+    auto &descriptorSetManager = descriptorCtx.descriptorSetManager;
+
+    static uint32_t UITextureIndex =
+        textureManager.find_slot_by_name(texture_ui_key).value();
+
+    auto fontCtx = initFont(hardwareCtx, descriptorCtx);
+    auto &fontFactory = *fontCtx.fontFactory.get();
+    auto &fontSelect = fontCtx.fontSelect;
+    using FontContext = std::remove_cvref_t<decltype(fontFactory)>::font_context_type;
+
+    descriptorSetManager.update_uniform_buffer();
+    descriptorSetManager.update_texture(textureManager.view_used_indexes());
+    descriptorSetManager.update_sampler(samplerManager.view_used_indexes());
+
+    auto inputDataCtx = inputInit(swapchain.refImageExtent().width /
+                                  static_cast<float>(swapchain.refImageExtent().height));
+    auto inputCtx = InputCtx(inputDataCtx);
+    using input_type = InputCtx;
+
+    //diff: [test_dod12] end
+
+    auto meshManager = initMeshManager();
+    auto &[allVertices, allIndices, meshMap] = meshManager;
+    uiMeshes().cube = meshMap.at("cube");
+    uiMeshes().sphere = meshMap.at("sphere");
+
+    // ============================================================
+    // 简单 Glyph 测试：只 shape 一个字符 "A"，生成 1 个 Glyph 实例。
+    // 目标：验证迁移后的着色器配置（test_dod19.vert/frag，Glyph-only，
+    //       移植自 test_sdf）能从实例堆读取 Glyph 并正确渲染 MSDF 字形。
+    // ============================================================
+    auto textResult = run_text_pipeline(fontSelect, u8"A", "zh-CN");
+    const auto &shapeResult = textResult.shape_result;
+    using ShapeResult = std::remove_cvref_t<decltype(shapeResult)>;
+    // ── 文本 Unicode：真实 shape 结果驱动的多语言行 ──────────────────────
+    auto shapeLine = [&](const char *utf8) {
+        text_line line;
+        auto res = run_text_pipeline(fontSelect, utf8, "zh-CN");
+        for (const auto &run : res.shape_result)
+        {
+            for (const auto &g : run)
+            {
+                text_glyph tg{};
+                tg.uv = {static_cast<float>(g.uv_bounds.left),
+                         static_cast<float>(g.uv_bounds.top),
+                         static_cast<float>(g.uv_bounds.right),
+                         static_cast<float>(g.uv_bounds.bottom)};
+                tg.plane = {static_cast<float>(g.plane_bounds.left),
+                            static_cast<float>(g.plane_bounds.top),
+                            static_cast<float>(g.plane_bounds.right),
+                            static_cast<float>(g.plane_bounds.bottom)};
+                tg.advance = static_cast<float>(g.advance_x);
+                tg.tex = g.font_ctx->bind.texture_index;
+                tg.samp = g.font_ctx->bind.sampler_index;
+                tg.yDown = (g.font_ctx->font.atlas.yOrigin == "top");
+                tg.pxRange = static_cast<float>(
+                    g.font_ctx->font.atlas.distanceRange.value_or(0.0));
+                // FontType 决定着色器走距离场还是位图采样
+                using FT = mcs::vulkan::font::FontType;
+                const FT ftype = g.font_ctx->type;
+                switch (ftype)
+                {
+                case FT::eSDF:
+                    tg.shaderFont = 2;
+                    break;
+                case FT::ePSDF:
+                    tg.shaderFont = 3;
+                    break;
+                case FT::eMSDF:
+                    tg.shaderFont = 4;
+                    break;
+                case FT::eMTSDF:
+                    tg.shaderFont = 5;
+                    break;
+                default:
+                    tg.shaderFont = 6; // bitmap
+                    break;
+                }
+                line.glyphs.push_back(tg);
+            }
+        }
+        return line;
+    };
+    // ASCII 字形表：一次 shape 全部可打印字符，之后所有标签都走这张表
+    //   配对用 HarfBuzz 的 logical_idx（连字也不会错位）
+    {
+        auto &glyphs = uiAsciiGlyphs();
+        const char *corpus = " !\"#$%&'()*+,-./"
+                             "0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`"
+                             "abcdefghijklmnopqrstuvwxyz{|}~";
+        auto ascii = shapeLine(corpus);
+        for (const auto &g : ascii.glyphs)
+        {
+            (void)g;
+        }
+        std::size_t idx = 0;
+        for (const auto &run :
+             run_text_pipeline(fontSelect, corpus, "zh-CN").shape_result)
+        {
+            for (const auto &g : run)
+            {
+                const std::size_t ci = g.logical_idx;
+                if (ci >= std::strlen(corpus))
+                    continue;
+                text_glyph tg{};
+                tg.uv = {static_cast<float>(g.uv_bounds.left),
+                         static_cast<float>(g.uv_bounds.top),
+                         static_cast<float>(g.uv_bounds.right),
+                         static_cast<float>(g.uv_bounds.bottom)};
+                tg.plane = {static_cast<float>(g.plane_bounds.left),
+                            static_cast<float>(g.plane_bounds.top),
+                            static_cast<float>(g.plane_bounds.right),
+                            static_cast<float>(g.plane_bounds.bottom)};
+                tg.advance = static_cast<float>(g.advance_x);
+                tg.tex = g.font_ctx->bind.texture_index;
+                tg.samp = g.font_ctx->bind.sampler_index;
+                // NOTE: 这三项之前漏了 —— yDown 决定字形矩形的上下方向，
+                //       shaderFont / pxRange 决定 frag 的 MSDF 分支和抗锯齿范围
+                tg.yDown = (g.font_ctx->font.atlas.yOrigin == "top");
+                tg.pxRange = static_cast<float>(
+                    g.font_ctx->font.atlas.distanceRange.value_or(0.0));
+                using FT = mcs::vulkan::font::FontType;
+                const FT ftype = g.font_ctx->type;
+                switch (ftype)
+                {
+                case FT::eSDF:
+                    tg.shaderFont = 2;
+                    break;
+                case FT::ePSDF:
+                    tg.shaderFont = 3;
+                    break;
+                case FT::eMSDF:
+                    tg.shaderFont = 4;
+                    break;
+                case FT::eMTSDF:
+                    tg.shaderFont = 5;
+                    break;
+                default:
+                    tg.shaderFont = 6; // bitmap
+                    break;
+                }
+                glyphs[static_cast<char32_t>(static_cast<unsigned char>(corpus[ci]))] =
+                    tg;
+                ++idx;
+            }
+        }
+        std::println("[TEXT] ascii glyph table: {} codepoints", glyphs.size());
+    }
+    {
+        auto &lines = uiUnicodeLines();
+        lines[0] = shapeLine("UI ABILITY");
+        lines[1] = shapeLine("世界 ABC");
+        lines[2] = shapeLine("MSDF 0123");
+        lines[3] = shapeLine("😀 OK"); // 😀 在 atlas 里（🙂 不在）
+        for (int i = 0; i < 4; ++i)
+        {
+            const auto &ln = lines[static_cast<std::size_t>(i)];
+            std::println("[TEXT] line {}: {} glyphs tex={}", i, ln.glyphs.size(),
+                         ln.glyphs.empty() ? 0u : ln.glyphs[0].tex);
+        }
+    }
+
+    // 离屏层：blur / backdrop / group 的真实渲染目标（每帧 4 张）
+    initUiLayers(device, commandPool, GRAPHICS_AND_PRESENT,
+                 swapchainBuild.refImageFormat(),
+                 static_cast<uint32_t>(
+                     samplerManager.find_slot_by_name(font_linear_sampler_key).value()),
+                 textureManager, descriptorSetManager);
+
+    // 真实 UI 纹理：九宫格源图 / alpha 遮罩 / 带 mip 链的棋盘
+    initUiTextures(device, commandPool, GRAPHICS_AND_PRESENT,
+                   static_cast<uint32_t>(
+                       samplerManager.find_slot_by_name(ui_clamp_sampler_key).value()),
+                   textureManager, descriptorSetManager);
+
+    // 字体图集是在 run_text_pipeline 里懒加载的（槽位 4 起），
+    // 必须在这之后再把新槽位写进描述符数组，否则着色器采样到的是未绑定的槽位。
+    descriptorSetManager.update_texture(textureManager.view_used_indexes());
+    descriptorSetManager.update_sampler(samplerManager.view_used_indexes());
+
+    auto mainPipelineCtx = initPipeline(hardwareCtx, descriptorCtx);
+    auto &[pipelineLayout, pipelineOpaque3D, pipelineTransparent3D, pipelineOpaqueUI,
+           pipelineTransparentUI, pipelineUILayer, swapchainAttachments,
+           pickingAttachments] = mainPipelineCtx;
+    auto &[depthResourcesBuild, depthResource, msaaResourcesBuild, msaaResource] =
+        swapchainAttachments;
+    auto &[pickResourcesBuild, pickResource, resolveResourcesBuild, resolveResource,
+           pickingFrames, pickMouse] = pickingAttachments;
+
+    // 每个 frame-in-flight 一套 ShaderBuffers：
+    // 第 N 帧用自己的 buffer，上一帧仍可安全读自己的那套；每套仍保留自动扩容。
+    constexpr VkDeviceSize kFrameHeapBytes = 64u * 1024u;
+    constexpr VkDeviceSize kFrameIndirectBytes = 8u * 1024u;
+    constexpr VkDeviceSize kFrameConstantBytes = 4u * 1024u;
+    constexpr VkDeviceSize kCorpusVertexBytes = 64u * 1024u;
+    constexpr VkDeviceSize kCorpusIndexBytes = 64u * 1024u;
+    // 每个 frame-in-flight 一套 ShaderBuffers；扩容只影响自己的那一套。
+    std::array<shader_data::ShaderBuffers, MAX_FRAMES_IN_FLIGHT> shaderBuffers;
+    for (auto &sb : shaderBuffers)
+        sb = shader_data::ShaderBuffers(device, kCorpusVertexBytes, kCorpusIndexBytes,
+                                        kFrameHeapBytes, kFrameIndirectBytes,
+                                        kFrameConstantBytes);
+
+    // 所有 recorder 程序共用的顶点/索引池：quad + cube（任意 mesh 都从这里切 range）
+    {
+        const auto vertBytes =
+            static_cast<VkDeviceSize>(allVertices.size() * sizeof(Vertex));
+        const auto idxBytes =
+            static_cast<VkDeviceSize>(allIndices.size() * sizeof(uint32_t));
+        for (auto &sb : shaderBuffers)
+        {
+            sb.globalVertexBuffer.write(0, allVertices.data(), vertBytes);
+            sb.globalIndexBuffer.write(0, allIndices.data(), idxBytes);
+        }
+    }
+
+    auto pickCtx =
+        make_aggregate_ref<"pickCtx", "pickResourcesBuild", "pickResource",
+                           "resolveResourcesBuild", "resolveResource", "frames", "mouse">(
+            pickResourcesBuild, pickResource, resolveResourcesBuild, resolveResource,
+            pickingFrames, pickMouse);
+
+    auto globalCtx =
+        make_aggregate_ref<"globalCtx", "device", "window", "surface", "swapchainBuild",
+                           "swapchain", "frameContext", "commandPool", "commandBuffers",
+                           "queue", "meshMap">(
+            device, window, surface, swapchainBuild, swapchain, frameContext, commandPool,
+            commandBuffers, GRAPHICS_AND_PRESENT, meshMap);
+
+    auto mainCtx =
+        make_aggregate_ref<"mainCtx", "pipelineOpaque3D", "pipelineTransparent3D",
+                           "pipelineOpaqueUI", "pipelineTransparentUI", "pipelineUILayer",
+                           "pipelineLayout", "depthResourcesBuild", "depthResource",
+                           "msaaResourcesBuild", "msaaResource", "shaderBuffers">(
+            pipelineOpaque3D, pipelineTransparent3D, pipelineOpaqueUI,
+            pipelineTransparentUI, pipelineUILayer, pipelineLayout, depthResourcesBuild,
+            depthResource, msaaResourcesBuild, msaaResource, shaderBuffers);
+
+    auto mainShaderCtx =
+        make_aggregate_ref<"mainShaderCtx", "uniformBuffers", "descriptorSets">(
+            uniformBuffers, descriptorSets);
+
+    auto screen = table_ui::make_screen(WIDTH, HEIGHT);
+    shader_data::hover_manager hoverManager{.screen = &screen};
+    std::println("[table] hover_fn = {}", ui_table::hover_fn_ref());
+    // 新的 soaCtx 仅包含 uiRects 和 uiWireRects
+    auto soaCtx = make_aggregate_ref<"soaCtx", "screen">(screen);
+
+    // record_info
+    auto recordCtx = make_aggregate<"recordCtx", "info">(record_info{});
+    auto world =
+        make_aggregate_ref<"world", "globalCtx", "mainCtx", "mainShaderCtx", "pickCtx",
+                           "recordCtx", "hoverPool", "hoverManager", "fontCtx">(
+            globalCtx, mainCtx, mainShaderCtx, pickCtx, recordCtx, hoverPool(),
+            hoverManager, fontCtx);
+    using world_type = decltype(world);
+
+    using data_type = decltype(soaCtx);
+
+    // diff: [test_dod2] start:  world之后 才能调用 数据API
+
+    // init data
+
+    // 随机生成两个纹理索引和采样器索引
+
+    //diff: [test_dod3] end
+
+    // diff: [test_dod2] end
+
+    static constexpr auto views_matrix_update = [](world_type &world,
+                                                   const input_type &inputCtx,
+                                                   data_type &soaCtx) {
+        const auto &input = inputCtx.input;
+        auto &camera = inputCtx.camera; // 类型现在是 GenCamera<...>
+
+        using mcs::vulkan::event::Key;
+        const float step = 0.1f;
+
+        // 移动方向由 ViewMatrixObject 的 moveForward/moveRight 等自动处理手系
+        if (input.isKeyPressedOrRepeat(Key::eW))
+            camera.refView().moveForward(step);
+        if (input.isKeyPressedOrRepeat(Key::eS))
+            camera.refView().moveForward(-step);
+        if (input.isKeyPressedOrRepeat(Key::eA))
+            camera.refView().moveRight(-step);
+        if (input.isKeyPressedOrRepeat(Key::eD))
+            camera.refView().moveRight(step);
+        if (input.isKeyPressedOrRepeat(Key::eQ))
+            camera.refView().moveUp(-step);
+        if (input.isKeyPressedOrRepeat(Key::eE))
+            camera.refView().moveUp(step);
+
+        // ========== Ctrl+右键旋转视角 ==========
+        {
+            static mcs::vulkan::event::position2d_event lastRightPos{};
+            static bool isRightDragging = false;
+            using mcs::vulkan::event::MouseButtons;
+
+            bool ctrlPressed = input.isKeyPressedOrRepeat(Key::eLEFT_CONTROL) ||
+                               input.isKeyPressedOrRepeat(Key::eRIGHT_CONTROL);
+            bool curRightPressed =
+                input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_RIGHT);
+
+            // clang-format off
+            struct DefaultMode {};
+            struct PitchOnlyMode {};
+            struct YawOnlyMode {};
+            struct RollMode {};
+            // clang-format on
+            using CameraRotateMode =
+                std::variant<DefaultMode, PitchOnlyMode, YawOnlyMode, RollMode>;
+            constexpr auto getCameraRotateMode =
+                [](bool alt, bool shift) noexcept -> CameraRotateMode {
+                if (alt && shift)
+                    return RollMode{};
+                if (alt)
+                    return PitchOnlyMode{};
+                if (shift)
+                    return YawOnlyMode{};
+                return DefaultMode{};
+            };
+
+            if (curRightPressed && ctrlPressed)
+            {
+                auto cur = input.cursorPos();
+                if (!isRightDragging)
+                {
+                    lastRightPos = cur;
+                    isRightDragging = true;
+                }
+                else
+                {
+                    float dx = static_cast<float>(cur.xpos - lastRightPos.xpos);
+                    float dy = static_cast<float>(cur.ypos - lastRightPos.ypos);
+                    if (dx != 0.0f || dy != 0.0f)
+                    {
+                        const float sens = 0.005f;
+                        auto [rawYaw, rawPitch] =
+                            camera::VulkanNDCConfig::ScreenDragToCameraYawPitch(dx, dy,
+                                                                                sens);
+
+                        auto &viewObj = camera.refView();
+                        glm::vec3 forward = viewObj.getForward();
+                        constexpr float maxPitch = glm::radians(89.0f);
+                        float curPitch = std::asin(glm::clamp(forward.y, -1.0f, 1.0f));
+
+                        bool altPressed = input.isKeyPressedOrRepeat(Key::eLEFT_ALT) ||
+                                          input.isKeyPressedOrRepeat(Key::eRIGHT_ALT);
+                        bool shiftPressed =
+                            input.isKeyPressedOrRepeat(Key::eLEFT_SHIFT) ||
+                            input.isKeyPressedOrRepeat(Key::eRIGHT_SHIFT);
+
+                        glm::quat deltaRot = match(
+                            getCameraRotateMode(altPressed, shiftPressed),
+                            [&](DefaultMode) noexcept {
+                                float pitch =
+                                    glm::clamp(curPitch + rawPitch, -maxPitch, maxPitch) -
+                                    curPitch;
+                                return glm::angleAxis(rawYaw, glm::vec3(0, 1, 0)) *
+                                       glm::angleAxis(pitch, viewObj.getRight());
+                            },
+                            [&](PitchOnlyMode) noexcept {
+                                float pitch =
+                                    glm::clamp(curPitch + rawPitch, -maxPitch, maxPitch) -
+                                    curPitch;
+                                return glm::angleAxis(pitch, viewObj.getRight());
+                            },
+                            [&](YawOnlyMode) noexcept {
+                                return glm::angleAxis(rawYaw, glm::vec3(0, 1, 0));
+                            },
+                            [&](RollMode) noexcept {
+                                float rollAngle = rawYaw;
+                                return glm::angleAxis(rollAngle, forward);
+                            });
+                        viewObj.rotateWorld(deltaRot);
+                    }
+                    lastRightPos = cur;
+                }
+            }
+            else
+            {
+                isRightDragging = false;
+            }
+        }
+    };
+
+    static constexpr auto views_perspective_update =
+        [](world_type &world, const input_type &inputCtx, data_type &soaCtx) {
+            const auto &input = inputCtx.input;
+            auto &camera = inputCtx.camera;
+            using mcs::vulkan::event::Key;
+
+            constexpr float stepDeg = 1.0f; // 度数步长
+            constexpr float aspectStep = 0.1f;
+            auto &proj = camera.refProjection();
+
+            // FOV 增大（限制不超过 179°）
+            if (input.isKeyPressedOrRepeat(Key::eR))
+                proj.adjustFovSafe(stepDeg);
+
+            // FOV 减小（必须大于 0°）
+            if (input.isKeyPressedOrRepeat(Key::eF))
+                proj.adjustFovSafe(-stepDeg);
+
+            // 宽高比增大（无上限，无需保护）
+            if (input.isKeyPressedOrRepeat(Key::eT))
+                proj.adjustAspect(aspectStep);
+            // 宽高比减小（必须大于 0）
+            if (input.isKeyPressedOrRepeat(Key::eG))
+                proj.adjustAspectSafe(-aspectStep);
+
+            // 近平面减小（必须大于 0）
+            if (input.isKeyPressedOrRepeat(Key::eH))
+                proj.adjustNearSafe(-stepDeg);
+            // 近平面增大（无上限，无需保护）
+            if (input.isKeyPressedOrRepeat(Key::eY))
+                proj.adjustNearSafe(stepDeg);
+            // 远平面增大（无上限，无需保护）
+            if (input.isKeyPressedOrRepeat(Key::eU))
+                proj.adjustFarSafe(stepDeg);
+            // 远平面减小（必须大于 near）
+            if (input.isKeyPressedOrRepeat(Key::eJ))
+                proj.adjustFarSafe(-stepDeg);
+
+            // 打印当前值
+            // std::print("fov: {} deg, aspect: {}, near: {}, far: {}\n", proj.getFov(),
+            //            proj.getAspect(), proj.getNear(), proj.getFar());
+        };
+
+    // diff: [test_model_matrix3] 小小调整
+
+    static constexpr auto views_ui_camera_update = [](world_type &world,
+                                                      const input_type &inputCtx,
+                                                      data_type &soaCtx) noexcept {
+        const auto &input = inputCtx.input;
+        auto &uiCam = inputCtx.uiCamera;
+        using mcs::vulkan::event::Key;
+        using mcs::vulkan::event::MouseButtons;
+
+        // 窗口尺寸，用于拖拽坐标转换
+        auto &swapchain = world.globalCtx.swapchain;
+        auto extent = swapchain.refImageExtent();
+        float w = static_cast<float>(extent.width);
+        float h = static_cast<float>(extent.height);
+
+        // ---------- Alt 修饰键 ----------
+        bool alt = input.isKeyPressedOrRepeat(Key::eLEFT_ALT) ||
+                   input.isKeyPressedOrRepeat(Key::eRIGHT_ALT);
+        if (!alt)
+            return;
+
+        // clang-format off
+        struct UiTranslateKey { float dx, dy; };
+        struct UiDrag { float ndcDx, ndcDy; };
+        struct UiZoom { float factor; };
+        struct UiRotate { float angle; glm::vec3 axis; };
+        struct UiReset {};
+        using UiAction = std::variant<UiTranslateKey, UiDrag, UiZoom, UiRotate, UiReset>;
+        // clang-format on
+
+        // 统一的执行器（每次直接 match）
+        auto exec = [&](const UiAction &action) noexcept {
+            match(
+                action,
+                [&](const UiTranslateKey &t) noexcept {
+                    uiCam.refView().moveRight(t.dx);
+                    uiCam.refView().moveUp(t.dy);
+                },
+                [&](const UiDrag &d) noexcept {
+                    uiCam.refView().moveRight(d.ndcDx);
+                    uiCam.refView().moveUp(d.ndcDy);
+                },
+                [&](const UiZoom &z) noexcept {
+                    uiCam.refProjection().scaleOrthoView(z.factor);
+                },
+                [&](const UiRotate &r) noexcept {
+                    uiCam.refView().rotateWorld(
+                        glm::angleAxis(r.angle, glm::normalize(r.axis)));
+                },
+                [&](const UiReset &) noexcept {
+                    uiCam.refView().setPosition(glm::vec3(0.0f));
+                    uiCam.refView().setOrientation(glm::identity<glm::quat>());
+                    uiCam.refProjection().setOrthoBounds(-1.0f, 1.0f, -1.0f, 1.0f);
+                });
+        };
+
+        // ---------- 按键平移（Alt + WASD） ----------
+        constexpr float keyStep = 0.02f;
+        if (input.isKeyPressedOrRepeat(Key::eW))
+            exec(UiTranslateKey{0.0f, keyStep}); // 向上
+        if (input.isKeyPressedOrRepeat(Key::eS))
+            exec(UiTranslateKey{0.0f, -keyStep}); // 向下
+        if (input.isKeyPressedOrRepeat(Key::eA))
+            exec(UiTranslateKey{-keyStep, 0.0f}); // 向左
+        if (input.isKeyPressedOrRepeat(Key::eD))
+            exec(UiTranslateKey{keyStep, 0.0f}); // 向右
+
+        // ---------- 缩放（Alt + E/Q） ----------
+        constexpr float zoomFactor = 1.05f;
+        if (input.isKeyPressedOrRepeat(Key::eE))
+            exec(UiZoom{1.0f / zoomFactor}); // 放大
+        if (input.isKeyPressedOrRepeat(Key::eQ))
+            exec(UiZoom{zoomFactor}); // 缩小
+
+        // ---------- 旋转 ----------
+        // 旋转（Alt + R/F 绕 Z，Alt + T/G 绕 Y，Alt + Y/H 绕 X）
+        constexpr float rotAngle = glm::radians(10.0f);
+        if (input.isKeyPressedOrRepeat(Key::eR))
+            exec(UiRotate{rotAngle, glm::vec3(0, 0, 1)});
+        if (input.isKeyPressedOrRepeat(Key::eF))
+            exec(UiRotate{-rotAngle, glm::vec3(0, 0, 1)});
+
+        if (input.isKeyPressedOrRepeat(Key::eT))
+            exec(UiRotate{rotAngle, glm::vec3(0, 1, 0)});
+        if (input.isKeyPressedOrRepeat(Key::eG))
+            exec(UiRotate{-rotAngle, glm::vec3(0, 1, 0)});
+        if (input.isKeyPressedOrRepeat(Key::eY))
+            exec(UiRotate{rotAngle, glm::vec3(1, 0, 0)});
+        if (input.isKeyPressedOrRepeat(Key::eH))
+            exec(UiRotate{-rotAngle, glm::vec3(1, 0, 0)});
+
+        // ---------- 拖拽平移（Alt + 左键） ----------
+        {
+            static bool wasDragging = false;
+            static glm::dvec2 lastCursor{0.0, 0.0};
+            bool leftPressed =
+                input.isMouseButtonPressed(MouseButtons::eMOUSE_BUTTON_LEFT);
+
+            if (leftPressed)
+            {
+                auto cur = input.cursorPos();
+                if (!wasDragging)
+                {
+                    lastCursor = {cur.xpos, cur.ypos};
+                    wasDragging = true;
+                }
+                else
+                {
+                    float dx = static_cast<float>(cur.xpos - lastCursor.x);
+                    float dy = static_cast<float>(cur.ypos - lastCursor.y);
+                    float ndcDx = (dx / w) * 2.0f;
+                    float ndcDy = (dy / h) * 2.0f;
+                    // 注意：拖拽鼠标向上（dy<0） => UI 整体上移 => 相机需下移
+                    // 相机需要反向移动才能让 UI 跟随鼠标
+                    exec(UiDrag{-ndcDx, -ndcDy}); // 之前只有 y 取负，现已修正 x 也取负
+                    lastCursor = {cur.xpos, cur.ypos};
+                }
+            }
+            else
+            {
+                wasDragging = false;
+            }
+        }
+
+        // ---------- 重置（Alt + Z） ----------
+        if (input.isKeyPressedOrRepeat(Key::eZ))
+            exec(UiReset{});
+    };
+
+    // diff: [test_model_matrix2] end
+    static constexpr auto updateVertexData = [](world_type &world, input_type &inputCtx,
+                                                data_type &soaCtx,
+                                                uint32_t currentFrame) noexcept {
+
+    };
+
+    // diff: [test_indirectdraw] start prepareBatch：动态分配合批资源并填充数据 // NOLINTNEXTLINE
+    static constexpr auto prepareBatch = [](world_type &world, input_type &inputCtx,
+                                            data_type &soaCtx, uint32_t currentFrame) {
+        auto &globalCtx = world.globalCtx;
+        auto &mainShaderCtx = world.mainShaderCtx;
+
+        auto &meshMap = globalCtx.meshMap;
+    };
+
+    // diff: [test_indirectdraw] end
+    // diff: [test_dod5] start
+    // ═══════════════════════════════════════════════════════════════════════
+    // UI 命令层（C 风格）
+    //
+    //   一条 UI 命令 = 一个全屏三角形 + 一组推送常量：
+    //       setScissor    → 这条命令的裁剪
+    //       pushConstants → 这条命令的全部参数（mode/rect/颜色/几何）
+    //       draw(3)       → 全屏三角形，形状由片元着色器按 mode 求 SDF
+    //
+    //   能力全部在 test_ui_ability.frag 的 mode 表里（与下面的枚举一一对应），
+    //   这里只按顺序记录命令，不做批处理、不做间接绘制、没有后端对象。
+    //
+    //   按约定：除 draw 之外，mainPipeline.xxx 全部留空。
+    // ═══════════════════════════════════════════════════════════════════════
+    enum ui_mode : int
+    {
+        MODE_FILL = 0,        // 圆角矩形填充
+        MODE_LINEAR,          // 线性渐变
+        MODE_RADIAL,          // 径向渐变
+        MODE_CONIC,           // 圆锥渐变
+        MODE_ARC,             // 圆弧/环
+        MODE_OUTER_SHADOW,    // 外阴影
+        MODE_INNER_SHADOW,    // 内阴影
+        MODE_PERCORNER,       // 每角半径
+        MODE_ALPHA_MASK,      // alpha 遮罩
+        MODE_PATH_AA,         // 路径解析抗锯齿
+        MODE_DASH,            // 虚线描边
+        MODE_ROTATE,          // 旋转
+        MODE_SKEW,            // 斜切
+        MODE_NINE_SLICE,      // 九宫格
+        MODE_EVENODD,         // 奇偶填充
+        MODE_GLYPH,           // MSDF 字形
+        MODE_SRGB,            // sRGB / 线性渐变
+        MODE_BLUR,            // 模糊
+        MODE_BACKDROP,        // 背景模糊
+        MODE_GROUP,           // 组不透明度
+        MODE_MIPMAP,          // mipmap
+        MODE_PICKING,         // 拾取
+        MODE_BLEND,           // 混合模式
+        MODE_LAYER_BLUR,      // 离屏可分离模糊（y=方向 z=半径 w=源纹理 aux.x=源采样器）
+        MODE_LAYER_COMPOSITE, // 离屏合成（y=不透明度 z=源纹理 w=源采样器 aux.x=圆角）
+        MODE_CHECKER,         // 棋盘背景内容（背景模糊的来源）
+        MODE_NINE_SLICE_TEX,  // 纹理九宫格（y=源边框 z=源纹理 w=源采样器 aux.xy=源尺寸）
+        MODE_ALPHA_MASK_TEX,  // 纹理 alpha 遮罩（z=纹理 w=源采样器）
+        MODE_MIPMAP_TEX,      // 真 mip 采样（y=最大 lod z=纹理 w=源采样器）
+        MODE_CLIP_MASK,       // 模板裁剪遮罩（形状外 discard）
+        MODE_SOLID,           // 纯色覆盖（几何 / 模板覆盖 pass 用）
+        MODE_SOLID_GEOM,      // 几何覆盖（颜色写死）
+        MODE_PATH_STROKE,     // 路径描边：解析覆盖率 AA（y=半宽 z=1 开 AA）
+        MODE_GLYPH_BITMAP,    // 位图字形（emoji）：图集 RGBA，不走距离场
+    };
+
+    // 几何入口标记（PushData.geomEntry 是专用字段）：0 = 普通全屏三角形
+    constexpr uint32_t kGeomStroke = 1u;       // 描边批处理（段数据在 storage buffer）
+    constexpr uint32_t kGeomFan = 2u;          // 填充扇形批处理（顶点在 buffer 高位区）
+    constexpr uint32_t kFanVertexBase = 2048u; // 与 VS 里 kFanBase 一致
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 填全局资源表：名字 -> 对象指针（表本身在 main 外部，见 named_resource）
+    //
+    //   一、init 后不变：只写这一次；
+    //   二、recreateSwapChain 要重新取的项：现在记下初始对象，之后按第二层
+    //       的依赖（extent/format/imageCount）决定要不要换。
+    // ──────────────────────────────────────────────────────────────────────
+    {
+        auto &r = named_resource::resources();
+        auto &fs = named_resource::frameState();
+
+        // 一、init 后不变
+        r.device = &device;
+        r.surface = &surface;
+        r.queue = &GRAPHICS_AND_PRESENT;
+        r.commandPool = &commandPool;
+        r.commandBuffers = &commandBuffers;
+        r.pipelineLayout = &pipelineLayout;
+        r.descriptorSetLayout = &descriptorSetLayout;
+        r.descriptorPool = &descriptorPool;
+        r.descriptorSets = &descriptorSets;
+        r.uniformBuffers = &uniformBuffers;
+        r.pickingFrames = &pickingFrames;
+        r.shaderBuffers = &shaderBuffers;
+
+        // 宿主侧：每帧状态 / 窗口 / 建造配置
+        fs.window = &window;
+        fs.frameInfo = &recordCtx.info;
+        fs.pickMouse = &pickMouse;
+        fs.depthResourcesBuild = &depthResourcesBuild;
+        fs.msaaResourcesBuild = &msaaResourcesBuild;
+        fs.pickResourcesBuild = &pickResourcesBuild;
+        fs.resolveResourcesBuild = &resolveResourcesBuild;
+
+        // 二、recreateSwapChain 必须处理
+        r.swapchain = &swapchain;
+        r.depthResource = &depthResource;
+        r.msaaResource = &msaaResource;
+        r.pickResource = &pickResource;
+        r.resolveResource = &resolveResource;
+        r.pipelines = {{static_string{"pipelineOpaque3D"}, &pipelineOpaque3D},
+                       {static_string{"pipelineTransparent3D"}, &pipelineTransparent3D},
+                       {static_string{"pipelineOpaqueUI"}, &pipelineOpaqueUI},
+                       {static_string{"pipelineTransparentUI"}, &pipelineTransparentUI},
+                       {static_string{"pipelineUILayer"}, &pipelineUILayer}};
+        r.frameContext = &frameContext;
+    }
+
+    static constexpr auto mainPipeline = make_aggregate<"mainPipeline">(
+        // NOTE: 布局转换 / 开始渲染 / 管线状态 / 结束渲染 都并进 draw 了
+        method<"transitionImageLayout">([](world_type &, input_type &, data_type &) {}),
+        method<"beginRendering">([](world_type &, input_type &, data_type &) {}),
+        method<"setPipelineState">([](world_type &, input_type &, data_type &) {}),
+        method<"draw">([](world_type &world, input_type &inputCtx, data_type &soaCtx) {
+            (void)world;
+            // 资源从 resources() 取，宿主状态（每帧序号/UI 场景）从 frameState() 取
+            auto &r = named_resource::resources();
+            auto &fs = named_resource::frameState();
+
+            auto &swapchain = *r.swapchain;
+            auto &commandBuffers = *r.commandBuffers;
+            auto &pipelineLayout = *r.pipelineLayout;
+            auto &descriptorSets = *r.descriptorSets;
+            auto &uniformBuffers = *r.uniformBuffers;
+            auto &pickingFrames = *r.pickingFrames;
+            auto &depthResource = *r.depthResource;
+            auto &msaaResource = *r.msaaResource;
+            auto &pickResource = *r.pickResource;
+            auto &resolveResource = *r.resolveResource;
+            auto &depthResourcesBuild = *fs.depthResourcesBuild;
+
+            auto &pipelineTransparentUI = *named_resource::find(
+                r.pipelines, static_string{"pipelineTransparentUI"}.view());
+            auto &pipelineOpaque3D = *named_resource::find(
+                r.pipelines, static_string{"pipelineOpaque3D"}.view());
+
+            // 一个 VkCommandBuffer；绘制录入交给 command_recorder。
+            const auto &[currentFrame, imageIndex] = *fs.frameInfo;
+            const auto &commandBuffer = commandBuffers[currentFrame];
+
+            const VkDescriptorSet descriptorSet = descriptorSets[currentFrame];
+
+            const VkExtent2D extent = swapchain.refImageExtent();
+            const float W = static_cast<float>(extent.width);
+            const float H = static_cast<float>(extent.height);
+
+            const VkImage image = swapchain.image(imageIndex);
+            const VkImage depthImage = depthResource.image();
+            const VkImage msaaImage = msaaResource.image();
+            const VkImage pickingImage = pickResource.image();
+            const VkImage resolveImage = resolveResource.image();
+
+            const ui_dao::view view{W, H};
+
+            // 帧级：record_builder 代理一切；段由 begin/end 自动开闭。
+            command::record_builder frame;
+            frame.resources = &r;
+
+            // 每个 frame-in-flight 一份 UBO；当前 fence 已经等过，写当前槽安全。
+            static const auto k3dStart = std::chrono::steady_clock::now();
+            const float t3d =
+                std::chrono::duration<float>(std::chrono::steady_clock::now() - k3dStart)
+                    .count();
+            // 点光源绕场景转：gizmo 和着色共用同一位置，肉眼可验证
+            const glm::vec3 light_pos{glm::cos(t3d * 0.7F) * 1.15F, 0.8F,
+                                      glm::sin(t3d * 0.7F) * 1.15F};
+            UniformBufferObject ubo{};
+            // 槽 0：3D 相机（每帧更新 view，绕 Y 轴环绕；MVP 在动）
+            {
+                const float orbit = t3d * 0.6F;
+                const glm::vec3 eye(glm::sin(orbit) * 3.4F, 1.0F, glm::cos(orbit) * 3.4F);
+                ubo.cameraInfo[0].view =
+                    glm::lookAt(eye, glm::vec3(0.0F), glm::vec3(0.0F, 1.0F, 0.0F));
+            }
+            ubo.cameraInfo[0].proj = glm::perspectiveRH_ZO(
+                glm::radians(45.0F), k3dAreaW / k3dAreaH, 0.1F, 10.0F);
+            // 槽 1：UI 正交（单位矩阵）
+            ubo.cameraInfo[1].view = glm::mat4(1.0F);
+            ubo.cameraInfo[1].proj = glm::mat4(1.0F);
+            ubo.light.pos = glm::vec4(light_pos, 1.0F);
+            ubo.light.color = glm::vec4(0.95F, 0.95F, 0.92F, 1.0F);
+            ubo.light.ambient = glm::vec4(0.22F, 0.24F, 0.30F, 1.0F);
+            std::memcpy(uniformBuffers[currentFrame].mapPtr(), &ubo, sizeof(ubo));
+
+            const bool hasStencil = depthResourcesBuild.hasStencilComponent();
+            const VkImageAspectFlags depthAspect =
+                hasStencil ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                           : VK_IMAGE_ASPECT_DEPTH_BIT;
+
+            const auto to_color = [](VkImage img) {
+                return my_render::image_info{
+                    .image = img,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            .access_mask = VK_ACCESS_2_NONE,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}};
+            };
+            const my_render::image_info depth_transition{
+                .image = depthImage,
+                .aspect_mask = depthAspect,
+                .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                        .access_mask = VK_ACCESS_2_NONE,
+                        .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                .dst = {.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT}};
+            frame.add_transition(to_color(image), to_color(msaaImage),
+                                 to_color(pickingImage), to_color(resolveImage),
+                                 depth_transition);
+
+            // ── 离屏层：capture 主 framebuffer 的区域，再模糊 ──────────────
+            //   layerCapture：从 swapchain blit 出来的“真实 UI 内容”
+            //   layerBlur   ：对 layerCapture 做高斯模糊
+            auto &layerCapture = uiLayers().layers[currentFrame][0];
+            auto &layerBlur = uiLayers().layers[currentFrame][1];
+            auto &layerGroup = uiLayers().layers[currentFrame][2];
+            auto &layerPipeline = *named_resource::find(
+                r.pipelines, static_string{"pipelineUILayer"}.view());
+
+            const ui_dao::view layerView{
+                static_cast<float>(ui_layer_ctx::kExtent.width),
+                static_cast<float>(ui_layer_ctx::kExtent.height)};
+
+            const auto layer_begin = [&](VkImageView view) {
+                command::rendering_info info;
+                info.renderArea = {.offset = {.x = 0, .y = 0},
+                                   .extent = ui_layer_ctx::kExtent};
+                info.layerCount = 1;
+                info.viewMask = 0;
+                info.colorAttachments.emplace_back(
+                    command::rendering_info::rendering_attachment{
+                        .imageView = view,
+                        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                        .clearValue = {.color = {.float32 = {0.0F, 0.0F, 0.0F, 1.0F}}}});
+                frame.begin_rendering(std::move(info));
+                frame.setPipeline(*layerPipeline);
+                frame.setPipelineLayout(*pipelineLayout);
+                frame.setDescriptorSet(descriptorSet);
+                frame.setViewport(
+                    VkViewport{.x = 0.0F,
+                               .y = 0.0F,
+                               .width = static_cast<float>(ui_layer_ctx::kExtent.width),
+                               .height = static_cast<float>(ui_layer_ctx::kExtent.height),
+                               .minDepth = 0.0F,
+                               .maxDepth = 1.0F});
+                frame.setScissor(VkRect2D{{0, 0}, ui_layer_ctx::kExtent});
+                frame.setCameraIndex(1);
+            };
+
+            const auto layer_to_sampled = [&](VkImage img) {
+                frame.add_transition(my_render::image_info{
+                    .image = img,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                            .stage_mask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT}});
+            };
+
+            // ── group 层：两个半透明形状先合成，再整体按 0.55 合成（组透明度）──
+            frame.add_transition(my_render::image_info{
+                .image = layerGroup.image,
+                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                        .access_mask = VK_ACCESS_2_NONE,
+                        .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
+            layer_begin(layerGroup.view);
+            frame.addInsteance(ui_dao::sdf_shape({20.0F, 40.0F, 170.0F, 120.0F},
+                                                 layerView, 24.0F,
+                                                 glm::vec4(0.95F, 0.4F, 0.25F, 0.85F)));
+            frame.addInsteance(ui_dao::sdf_shape({120.0F, 60.0F, 170.0F, 120.0F},
+                                                 layerView, 24.0F,
+                                                 glm::vec4(0.25F, 0.7F, 0.95F, 0.85F)));
+            layer_to_sampled(layerGroup.image);
+
+            VkRenderingAttachmentInfo color0_clear{
+                .sType = sType<VkRenderingAttachmentInfo>(),
+                .imageView = msaaResource.imageView(),
+                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT,
+                .resolveImageView = swapchain.imageView(imageIndex),
+                .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = {.color = {.float32 = {0.05F, 0.06F, 0.08F, 1.0F}}}};
+            VkRenderingAttachmentInfo color1_clear{
+                .sType = sType<VkRenderingAttachmentInfo>(),
+                .imageView = pickResource.imageView(),
+                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+                .resolveImageView = resolveResource.imageView(),
+                .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = {.color = {.uint32 = {0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 0u}}}};
+            VkRenderingAttachmentInfo depth_clear{
+                .sType = sType<VkRenderingAttachmentInfo>(),
+                .imageView = depthResource.imageView(),
+                .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = {.depthStencil = {.depth = 1.0F, .stencil = 0u}}};
+
+            // VkRenderingAttachmentInfo → rendering_attachment（完整字段）
+            const auto to_attach = [](const VkRenderingAttachmentInfo &a) {
+                command::rendering_info::rendering_attachment r{};
+                r.imageView = a.imageView;
+                r.imageLayout = a.imageLayout;
+                r.resolveMode = a.resolveMode;
+                r.resolveImageView = a.resolveImageView;
+                r.resolveImageLayout = a.resolveImageLayout;
+                r.loadOp = a.loadOp;
+                r.storeOp = a.storeOp;
+                r.clearValue = a.clearValue;
+                return r;
+            };
+
+            command::rendering_info info_clear;
+            info_clear.renderArea = {.offset = {.x = 0, .y = 0}, .extent = extent};
+            info_clear.layerCount = 1;
+            info_clear.viewMask = 0;
+            info_clear.colorAttachments.emplace_back(to_attach(color0_clear));
+            info_clear.colorAttachments.emplace_back(to_attach(color1_clear));
+            info_clear.depthAttachment = to_attach(depth_clear);
+            if (hasStencil)
+                info_clear.stencilAttachment = to_attach(depth_clear);
+
+            // 内部段：builder 代理激活的 command_recorder
+            frame.begin_rendering(std::move(info_clear));
+
+            const VkViewport full_vp{0.0F, 0.0F, W, H, 0.0F, 1.0F};
+            const VkRect2D full_scissor{{0, 0}, extent};
+
+            // ── command_recorder 场景 ──────────────────────────────────
+            frame.setPipeline(*pipelineTransparentUI);
+            frame.setPipelineLayout(*pipelineLayout);
+            frame.setDescriptorSet(descriptorSet);
+            frame.setViewport(full_vp);
+            frame.setScissor(full_scissor);
+
+            // renderVersion = 表格的几何版本：picking 回读用它过滤"数据切换中间帧"
+            std::uint32_t renderVersion = 0;
+            frame.setCameraIndex(0);
+            // 主 UI 管线声明了 ext2/3 动态状态：blend / A2C / stencil 全部动态设置
+            frame.setDynamicUI(true);
+
+            // ══════════════════════════════════════════════════════════════
+            // 表格 widget：z 序 = 交互优先级（最后画的在拾取上赢）
+            //   外框 → 列头 → 行带 → 格 → 文字 → 列分隔 → 滚动条 → 8 向把手
+            //   每个实例都带 zone；文字用"格子"的 zone
+            // ══════════════════════════════════════════════════════════════
+            frame.setCameraIndex(1);
+
+            // ══ 表走 UI 树：布局由 Container 给，事件来自 glfw_input_translation ══
+            auto &screen = soaCtx.screen;
+            screen.updateSize(W, H);
+            screen.layout();
+            screen.tick(inputCtx.clock.getElapsed()); // 帧级副作用：从根 DFS
+            {
+                render_context ctx{frame, inputCtx.input, inputCtx.clock,
+                                   world.fontCtx.fontSelect, view};
+                screen.render(ctx);
+            }
+            renderVersion = table_ui::version();
+            // 外部 API 调用会自动闭合当前 pass
+            auto &pickMouse = *fs.pickMouse;
+            frame.add_transition(my_render::image_info{
+                .image = resolveImage,
+                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                .dst = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
+
+            const std::int32_t px = std::clamp(
+                pickMouse.pos.x, 0, static_cast<std::int32_t>(extent.width) - 1);
+            const std::int32_t py = std::clamp(
+                pickMouse.pos.y, 0, static_cast<std::int32_t>(extent.height) - 1);
+            const VkBufferImageCopy region{
+                .bufferOffset = 0,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                .imageOffset = {px, py, 0},
+                .imageExtent = {1, 1, 1}};
+            frame.add_copy_image_to_buffer(
+                resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                pickingFrames[currentFrame].buffer(), std::span{&region, 1});
+
+            frame.add_transition(my_render::image_info{
+                .image = resolveImage,
+                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .src = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT},
+                .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
+
+            frame.add_transition(my_render::image_info{
+                .image = image,
+                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                .dst = {.layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                        .access_mask = VK_ACCESS_2_NONE,
+                        .stage_mask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT}});
+
+            // 段顺序：[outer0, inter0] [outer1]
+            frame.replay(commandBuffer, currentFrame, renderVersion);
+
+            // 回溯：段结构 + 外部命令（首次且设置 MCS_DUMP_SCOPES 时打印）
+            static bool dumped = false;
+            if (!dumped && std::getenv("MCS_DUMP_SCOPES") != nullptr)
+            {
+                dumped = true;
+                for (std::uint32_t s = 0; s < frame.scopes_view().size(); ++s)
+                {
+                    const auto &scope = frame.scopes_view()[s];
+                    std::println("scope[{}] outer={} inter={} opened={} closed={}", s,
+                                 scope.outer, scope.inter, scope.opened, scope.closed);
+                    if (scope.outer == command::no_scope)
+                        continue;
+                    for (const auto &it : frame.outer_of(s).entries())
+                    {
+                        const auto bytes = frame.outer_of(s).payload(it);
+                        // 每个 opcode 的布局不同，按类型取 count
+                        std::uint32_t count = 0;
+                        switch (it.op.type)
+                        {
+                        case command::outer_opcode::transition:
+                            count = reinterpret_cast<const my_render::barrier2_header *>(
+                                        bytes.data())
+                                        ->image_count;
+                            break;
+                        case command::outer_opcode::copy_image_to_buffer:
+                            count = *reinterpret_cast<const std::uint32_t *>(
+                                bytes.data() +
+                                sizeof(my_render::copy_image_to_buffer_info));
+                            break;
+                        case command::outer_opcode::blit_image:
+                            count = *reinterpret_cast<const std::uint32_t *>(
+                                bytes.data() + sizeof(my_render::blit_image_header));
+                            break;
+                        case command::outer_opcode::Count:
+                            break;
+                        }
+                        std::println("  {} payload={}B count={}",
+                                     command::command_recorder_outer::name(it.op.type),
+                                     it.size, count);
+                    }
+                }
+            }
+        }),
+        method<"endRendering">([](world_type &, input_type &, data_type &) {}));
+
+    // NOLINTNEXTLINE
+    static constexpr auto recordCommandBuffer =
+        [](world_type &world, input_type &inputCtx, data_type &soaCtx) {
+            auto &globalCtx = world.globalCtx;
+            auto &recordCtx = world.recordCtx;
+            auto &commandBuffers = globalCtx.commandBuffers;
+
+            auto [currentFrame, imageIndex] = recordCtx.info;
+            const auto &commandBuffer = commandBuffers[currentFrame];
+
+            commandBuffer.begin({.sType = sType<VkCommandBufferBeginInfo>()});
+            mainPipeline.draw(world, inputCtx, soaCtx); // 全部 vkCmd* 都在 draw 里
+            commandBuffer.end();
+        };
+    // diff: [test_dod5] end
+
+    // NOLINTNEXTLINE
+    static constexpr auto recreateSwapChain = [](world_type &world, input_type &inputCtx,
+                                                 data_type &soaCtx) constexpr {
+        auto &globalCtx = world.globalCtx;
+        auto &pickCtx = world.pickCtx;
+        auto &mainCtx = world.mainCtx;
+
+        auto &device = globalCtx.device;
+        auto &surface = globalCtx.surface;
+        auto &swapchainBuild = globalCtx.swapchainBuild;
+        auto &swapchain = globalCtx.swapchain;
+        auto &camera = inputCtx.camera;
+        auto &frameContext = globalCtx.frameContext;
+
+        auto &msaaResourcesBuild = mainCtx.msaaResourcesBuild;
+        auto &depthResource = mainCtx.depthResource;
+        auto &depthResourcesBuild = mainCtx.depthResourcesBuild;
+        auto &msaaResource = mainCtx.msaaResource;
+
+        auto &pickResourcesBuild = pickCtx.pickResourcesBuild;
+        auto &pickResource = pickCtx.pickResource;
+        auto &resolveResourcesBuild = pickCtx.resolveResourcesBuild;
+        auto &resolveResource = pickCtx.resolveResource;
+        auto &pickMouse = pickCtx.mouse;
+
+        auto &screen = soaCtx.screen;
+
+        surface.waitGoodFramebufferSize();
+        device.waitIdle();
+
+        swapchain = swapchainBuild.rebuild(device, surface);
+        auto newExtent = swapchain.refImageExtent();
+        VkExtent3D imageExtent = {
+            .width = newExtent.width, .height = newExtent.height, .depth = 1};
+
+        screen.updateSize(newExtent.width, newExtent.height);
+
+        msaaResource = msaaResourcesBuild.setCreateInfoExtent(imageExtent).build(device);
+        depthResource =
+            depthResourcesBuild.setCreateInfoExtent(imageExtent).build(device);
+        camera.refProjection().setAspect(newExtent.width /
+                                         static_cast<float>(newExtent.height));
+
+        pickResource = pickResourcesBuild.setCreateInfoExtent(imageExtent).build(device);
+        resolveResource =
+            resolveResourcesBuild.setCreateInfoExtent(imageExtent).build(device);
+
+        pickMouse.valid = false;
+        frameContext =
+            std::decay_t<decltype(frameContext)>(device, swapchain.imagesSize());
+    };
+    // diff: [test_dod5] start
+
+    static constexpr auto limit_frame_rate = [](input_type &inputCtx,
+                                                float targetFPS) noexcept {
+        auto &clk = inputCtx.clock;
+        using namespace std::chrono;
+        using Clock = FrameClock::Clock;
+        using FloatSeconds = duration<float>;
+
+        const auto targetFrameDuration = FloatSeconds(1.0f / targetFPS);
+        auto now = Clock::now();
+
+        // 计算下一帧的理想开始时间（基于上一帧结束时间）
+        auto nextFrameTime =
+            clk.lastTime + duration_cast<Clock::duration>(targetFrameDuration);
+
+        // 如果当前时间已经晚于理想时间，说明上一帧超时，不等待
+        if (now < nextFrameTime)
+        {
+            std::this_thread::sleep_until(nextFrameTime);
+            // sleep 后重新获取精确时间，更新 lastTime，避免累积误差
+            clk.lastTime = Clock::now();
+        }
+        else
+        {
+            // 已经超时，直接更新 lastTime 为当前时间
+            clk.lastTime = now;
+        }
+    };
+    static constexpr auto tickClock = [](input_type &inputCtx) noexcept {
+        auto &clk = inputCtx.clock;
+        auto now = FrameClock::Clock::now();
+        if (clk.lastTime.time_since_epoch().count() != 0)
+        {
+            float raw = std::chrono::duration<float>(now - clk.lastTime).count();
+            clk.deltaTime = glm::clamp(raw, 0.001f, 0.1f);
+        }
+        clk.lastTime = now;
+    };
+    static constexpr auto FrameRateMonitor = [](world_type &world, input_type &inputCtx,
+                                                data_type &soaCtx) {
+        auto &clk = inputCtx.clock;
+        static auto lastPrint =
+            FrameClock::Clock::now(); // 这里的 static 只用于打印间隔，无伤大雅
+        static int frames = 0;
+        ++frames;
+        auto now = FrameClock::Clock::now();
+        float elapsed = std::chrono::duration<float>(now - lastPrint).count();
+        if (elapsed >= 1.0f)
+        {
+            float fps = frames / elapsed;
+            std::println("[FPS] {:5.1f} (avg frame: {:.3f} ms)", fps, 1000.0f / fps);
+            frames = 0;
+            lastPrint = now;
+        }
+    };
+    // diff: [test_dod5] end
+    static constexpr auto InputController = [](world_type &world, input_type &inputCtx,
+                                               data_type &soaCtx) {
+        auto &pickCtx = world.pickCtx;
+        auto &globalCtx = world.globalCtx;
+
+        auto &input = inputCtx.input;
+        auto &pickMouse = pickCtx.mouse;
+        auto &swapchain = globalCtx.swapchain;
+
+        Window::pollEvents();
+
+        auto cur = input.cursorPos();
+        auto ext = swapchain.refImageExtent();
+        if (cur.xpos >= 0 && cur.xpos < static_cast<int>(ext.width) && cur.ypos >= 0 &&
+            cur.ypos < static_cast<int>(ext.height))
+        {
+            pickMouse.pos = {cur.xpos, cur.ypos};
+            pickMouse.valid = true;
+        }
+        else
+        {
+            pickMouse.valid = false;
+        }
+
+        // 无 UI 组件，无需额外输入控制
+        // inputController(world, inputCtx, soaCtx); // 已空
+    };
+
+    //NOTE: 下面的内联做的更好，编译期的数据更利于优化
+    constexpr auto marking_function = ^^decltype([](auto &&...) noexcept {});
+    static constexpr auto task_graph = make_task<
+        init_task<
+            {.name = "input_start", .function = marking_function},
+            {.name = "input_end", .function = marking_function},
+            {.name = "after_waitForfences_start", .function = marking_function},
+            {.name = "after_waitForfences_end", .function = marking_function},
+            {.name = "before_recordCommandBuffer_start", .function = marking_function},
+            {.name = "before_recordCommandBuffer_end", .function = marking_function}>,
+        [] {
+            return schedulable_task{
+                .task = {.name = "input_handle",
+                         .function =
+                             ^^decltype([](world_type &world, input_type &inputCtx,
+                                           data_type &soaCtx) {
+                                 tickClock(inputCtx); // ① 唯一的时间推进
+                                 limit_frame_rate(inputCtx,
+                                                  60.0f); // ② 帧率限制（可选）
+                                 InputController(world, inputCtx, soaCtx);
+                                 views_matrix_update(world, inputCtx, soaCtx);
+                                 views_perspective_update(world, inputCtx, soaCtx);
+                                 views_ui_camera_update(world, inputCtx, soaCtx);
+                                 // model_update 已空，可删除此行
+                                 FrameRateMonitor(world, inputCtx,
+                                                  soaCtx); // ③ 纯监控
+                                 // 表只用 glfw_input_translation 的事件；这里清掉旧快照
+                                 inputCtx.input.scroll() = {};
+                             })},
+                .befores = {"input_start"},
+                .afters = {"input_end"}};
+        },
+        [] {
+            return schedulable_task{
+                .task = {.name = "waitforfences_post_processing",
+                         .function =
+                             ^^decltype([](world_type &world, input_type &, data_type &) {
+                                 // picking 回读改到 submit 之后、同一帧 fence 之后做，
+                                 // 见 drawFrame 里的 TABLE_PICKCHECK 段。
+                                 (void)world;
+                             })},
+                .befores = {"after_waitForfences_start"},
+                .afters = {"after_waitForfences_end"},
+            };
+        },
+        [] {
+            return schedulable_task{
+                .task = {.name = "update_upload_data",
+                         .function =
+                             ^^decltype([](world_type &world, input_type &inputCtx,
+                                           data_type &soaCtx) {
+                                 auto &globalCtx = world.globalCtx;
+                                 auto &mainShaderCtx = world.mainShaderCtx;
+
+                                 auto &frameContext = globalCtx.frameContext;
+                                 auto &camera = inputCtx.camera;
+
+                                 auto &currentFrame = frameContext.currentFrame;
+
+                                 auto &uniformBuffers = mainShaderCtx.uniformBuffers;
+
+                                 //diff: [test_dod3] start
+                                 // update 已空，删除
+                                 // updateVertexData 已空，删除
+                                 prepareBatch(world, inputCtx, soaCtx, currentFrame);
+                                 //diff: [test_dod3] end
+                             })},
+                .befores = {"before_recordCommandBuffer_start"},
+                .afters = {"before_recordCommandBuffer_end"}};
+        }>{};
+    std::cout << "task_graph: [begin]\n"
+              << task_graph.task_sequence_string_detail() << "\ntask_graph: [end]\n";
+
+    // NOLINTNEXTLINE
+    static constexpr auto drawFrame = [](world_type &world, input_type &inputCtx,
+                                         data_type &soaCtx) constexpr {
+        auto &globalCtx = world.globalCtx;
+        auto &pickCtx = world.pickCtx;
+        auto &recordCtx = world.recordCtx;
+
+        auto &device = globalCtx.device;
+
+        auto &swapchain = globalCtx.swapchain;
+        auto &frameContext = globalCtx.frameContext;
+        auto &window = globalCtx.window;
+        auto &commandBuffers = globalCtx.commandBuffers;
+        const auto &GRAPHICS_AND_PRESENT = globalCtx.queue;
+
+        auto &pickingFrames = pickCtx.frames;
+        auto &pickMouse = pickCtx.mouse;
+
+        auto &inFlightFences = frameContext.inFlightFences;
+        auto &currentFrame = frameContext.currentFrame;
+        auto &presentCompleteSemaphore = frameContext.presentCompleteSemaphore;
+        auto &semaphoreIndex = frameContext.semaphoreIndex;
+        auto &renderFinishedSemaphore = frameContext.renderFinishedSemaphore;
+
+        while (device.waitForFences(1, inFlightFences[currentFrame], VK_TRUE,
+                                    UINT64_MAX) == VK_TIMEOUT)
+            ;
+        task_graph.invoke_ranges<"after_waitForfences_start", "after_waitForfences_end">(
+            world, inputCtx, soaCtx);
+
+        auto [result, imageIndex] = swapchain.acquireNextImage(
+            UINT64_MAX, presentCompleteSemaphore[semaphoreIndex], nullptr);
+        if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
+        {
+            recreateSwapChain(world, inputCtx, soaCtx);
+            return;
+        }
+        if (result != VK_SUCCESS)
+            throw std::runtime_error("failed to acquire swap chain image!");
+        device.resetFences(1, inFlightFences[currentFrame]);
+
+        task_graph.invoke_ranges<"before_recordCommandBuffer_start",
+                                 "before_recordCommandBuffer_end">(world, inputCtx,
+                                                                   soaCtx);
+
+        const auto &commandBuffer = commandBuffers[currentFrame];
+        commandBuffer.reset({});
+        recordCtx.info = {.current_frame = currentFrame, .image_index = imageIndex};
+        recordCommandBuffer(world, inputCtx, soaCtx);
+
+        // NOLINTNEXTLINE
+        VkPipelineStageFlags waitDestinationStageMask[] = {
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+        GRAPHICS_AND_PRESENT.submit(
+            1,
+            {.sType = sType<VkSubmitInfo>(),
+             .waitSemaphoreCount = 1,
+             .pWaitSemaphores = &presentCompleteSemaphore[semaphoreIndex],
+             .pWaitDstStageMask = waitDestinationStageMask,
+             .commandBufferCount = 1,
+             .pCommandBuffers = &*commandBuffer,
+             .signalSemaphoreCount = 1,
+             .pSignalSemaphores = &renderFinishedSemaphore[imageIndex]},
+            inFlightFences[currentFrame]);
+
+        result = GRAPHICS_AND_PRESENT.presentKHR(
+            {.sType = sType<VkPresentInfoKHR>(),
+             .waitSemaphoreCount = 1,
+             .pWaitSemaphores = &renderFinishedSemaphore[imageIndex],
+             .swapchainCount = 1,
+             .pSwapchains = &(*swapchain),
+             .pImageIndices = &imageIndex});
+        if (auto &framebufferResized = window.refFramebufferResized();
+            result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR ||
+            framebufferResized)
+        {
+            framebufferResized = false;
+            recreateSwapChain(world, inputCtx, soaCtx);
+        }
+        // 同一帧的 picking 回读：等本帧 fence 后读本帧 buffer。
+        // 只在验证模式启用，避免正常渲染每帧 CPU 等 GPU。
+        if (std::getenv("TABLE_PICKCHECK") != nullptr)
+        {
+            device.waitForFences(1, inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
+            auto *data =
+                static_cast<picking_result *>(pickingFrames[currentFrame].mapPtr());
+            picking_result r = *data;
+            if (!pickMouse.valid)
+                r.key.object_type = 0xFFFFFFFF;
+            if (auto *arena = table_ui::current_arena())
+                table_ui::on_pick(*arena, r);
+        }
+        semaphoreIndex = (semaphoreIndex + 1) % presentCompleteSemaphore.size();
+        currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+    };
+    uint32_t autoExitFrames = 0;
+    while (globalCtx.window.shouldClose() == 0)
+    {
+        task_graph.invoke_ranges<"input_start", "input_end">(world, inputCtx, soaCtx);
+        // Esc 由 on_key 取消 modal 并置 esc_cancelled；这里只负责吞掉关窗。
+        // esc_cancelled=true 说明 modal 已取消，保留窗口；否则保持关窗。
+        if (auto *win = named_resource::frameState().window->data();
+            win != nullptr && glfwWindowShouldClose(win))
+        {
+            bool esc = false;
+            if (auto *arena = table_ui::current_arena())
+            {
+                esc = arena->esc_cancelled;
+                arena->esc_cancelled = false;
+            }
+            if (esc)
+                glfwSetWindowShouldClose(win, GLFW_FALSE);
+        }
+        table_ui::input_ime(*table_ui::current_arena());
+        drawFrame(world, inputCtx, soaCtx);
+        if (std::getenv("TABLE_INPUTLOG") != nullptr)
+            std::fflush(stdout);
+        // 可选自动退出：只给验证用（DSH_AUTOEXIT 设了就渲染 150 帧后退出），
+        // 这样退出路径（含 device 销毁）也能被 validation 覆盖到
+        if (std::getenv("DSH_AUTOEXIT") != nullptr && ++autoExitFrames >= 150)
+            break;
+    }
+    device.waitIdle();
+
+    // 必须在 device 销毁前清掉静态管线：函数内 static 的析构晚于 device，
+    // 否则退出时每条管线都会报 "VkPipeline ... has not been destroyed"
+    uiPipelines().reset();
+
+    std::cout << "main done\n";
+    return 0;
+}
+catch (std::exception &e)
+{
+    std::println("main catch exception: {}", e.what());
+}
