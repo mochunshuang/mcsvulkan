@@ -156,6 +156,13 @@ namespace table::command
         }
     };
 
+    // 合并两个结果（保持左值字段，右值只贡献 handled/effects）
+    inline Outcome merged(Outcome a, Outcome b) noexcept
+    {
+        a.merge(b);
+        return a;
+    }
+
     // bool 风格的 feature helper 返回值 → Outcome（行为不变：handled 即原 bool）
     inline Outcome handled(bool ok) noexcept
     {
@@ -172,7 +179,6 @@ namespace table::command
         const intent::Theme &p;
         const frame::Layout &g;
         const Font &ft;
-        std::vector<Effect> *fx{nullptr};
         bool trace{false};
         TableId id{};
     };

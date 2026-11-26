@@ -28,11 +28,11 @@ namespace table::detail
         }
 
         template <class E>
-        inline void gesture(const Table &d, State &v, Interaction &ix, const Theme &p,
-                                   const Layout &g, AppRouter &sy, const Font &ft,
-                                   const E &c, std::vector<Effect> &fx)
+        inline Outcome gesture(const Table &d, State &v, Interaction &ix, const Theme &p,
+                               const Layout &g, AppRouter &sy, const Font &ft,
+                               const E &c)
         {
-            Context tc{d, v, ix, p, g, ft, &fx, false, {}};
+            Context tc{d, v, ix, p, g, ft, false, {}};
             {
                 using T = E;
                 if constexpr (std::is_same_v<T, Press>)
@@ -49,7 +49,7 @@ namespace table::detail
                     const bool dbl = c.dbl || ix.click_count >= 2;
                     if (v.edit.active() && z.kind == Part::cell && v.edit.row == z.row &&
                         v.edit.col == z.col)
-                        return;
+                        return {};
                     ix.drag = DragMode::none;
                     ix.drag_target = tgt;
                     visit_owner(
@@ -291,6 +291,7 @@ namespace table::detail
                     v.touch();
                 }
             }
+            return {};
         }
 
         inline Zone hit_test(const Layout &g, float x, float y)

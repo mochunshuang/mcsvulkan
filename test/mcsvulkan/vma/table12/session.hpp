@@ -100,9 +100,7 @@ inline Outcome dispatch(Session &s, const command::Command &cmd)
     if (const auto *p = std::get_if<command::Press>(&cmd))
         detail::note_click(s.state, s.interaction, *p);
 
-    std::vector<command::Effect> fx;
-    command::Context ctx{s.model, s.state, s.interaction, s.theme, s.layout, s.font, &fx, s.trace,
-                         s.id};
+    command::Context ctx{s.model, s.state, s.interaction, s.theme, s.layout, s.font, s.trace, s.id};
 
     command::Outcome routed;
     std::visit([&](const auto &one) { routed.merge(s.router.handle(ctx, one)); }, cmd);
@@ -111,18 +109,16 @@ inline Outcome dispatch(Session &s, const command::Command &cmd)
         // 没人认领 → gesture fallback（选择/拖拽/滚动）
         std::visit(
             [&](const auto &one) {
-                detail::gesture(s.model, s.state, s.interaction, s.theme, s.layout, s.router, s.font,
-                                one, fx);
+                routed.merge(detail::gesture(s.model, s.state, s.interaction, s.theme,
+                                             s.layout, s.router, s.font, one));
             },
             cmd);
     }
 
     out.merge(routed);
-    out.handled = out.handled || !fx.empty();
+    out.handled = out.handled || !out.effects.empty();
     // Model 不在这里写：由 Host 调 apply_effects（Outcome.model_changed 恒 false）
     out.model_changed = false;
-    for (auto &e : fx)
-        command::push_effect(out.effects, std::move(e));
 
     // blanket touch：等价 ability11 apply_effects 末尾那次 ui.touch()。
     // feature/gesture 自己的 65 处 touch 全部保留，这里只补一次。
@@ -155,13 +151,9 @@ inline bool apply_effects(Session &s, const Outcome &out)
 inline Outcome feed_text(Session &s, std::string_view text)
 {
     Outcome out;
-    std::vector<command::Effect> fx;
-    command::Context ctx{s.model, s.state, s.interaction, s.theme, s.layout, s.font, &fx, s.trace,
-                         s.id};
+    command::Context ctx{s.model, s.state, s.interaction, s.theme, s.layout, s.font, s.trace, s.id};
     out.handled = s.router.text(ctx, text);
     out.model_changed = false;
-    for (auto &e : fx)
-        out.effects.push_back(std::move(e));
     s.state.touch();
     out.state_changed = true;
     return out;
@@ -170,9 +162,7 @@ inline Outcome feed_text(Session &s, std::string_view text)
 // ---- 窄门：IME 预编辑串（平台读 IME，核心只存 compose） -----------------
 inline void ime_compose(Session &s, std::string text)
 {
-    std::vector<command::Effect> fx;
-    command::Context ctx{s.model, s.state, s.interaction, s.theme, s.layout, s.font, &fx, s.trace,
-                         s.id};
+    command::Context ctx{s.model, s.state, s.interaction, s.theme, s.layout, s.font, s.trace, s.id};
     s.router.get<detail::EditFeature>().compose(ctx, std::move(text));
     s.state.touch();
 }
@@ -180,8 +170,7 @@ inline void ime_compose(Session &s, std::string text)
 // ---- 窄门：右键菜单 / 剪贴板粘贴 / Esc 取消（平台先做 I/O，再交给核心） --
 inline void open_menu(Session &s, int col, float x, float y)
 {
-    command::Context ctx{s.model, s.state, s.interaction, s.theme, s.layout, s.font, nullptr, s.trace,
-                         s.id};
+    command::Context ctx{s.model, s.state, s.interaction, s.theme, s.layout, s.font, s.trace, s.id};
     s.router.get<detail::MenuFeature>().open(ctx, col, x, y);
     s.state.touch();
 }
@@ -189,13 +178,9 @@ inline void open_menu(Session &s, int col, float x, float y)
 inline Outcome paste_text(Session &s, std::string text)
 {
     Outcome out;
-    std::vector<command::Effect> fx;
-    command::Context ctx{s.model, s.state, s.interaction, s.theme, s.layout, s.font, &fx, s.trace,
-                         s.id};
-    out.handled = s.router.get<detail::EditFeature>().paste(ctx, std::move(text));
+    command::Context ctx{s.model, s.state, s.interaction, s.theme, s.layout, s.font, s.trace, s.id};
+    out.merge(s.router.get<detail::EditFeature>().paste(ctx, std::move(text)));
     out.model_changed = false;
-    for (auto &e : fx)
-        out.effects.push_back(std::move(e));
     s.state.touch();
     out.state_changed = true;
     return out;

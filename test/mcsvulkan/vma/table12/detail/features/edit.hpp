@@ -37,24 +37,26 @@ namespace table::detail
                 v.touch();
             }
 
-            static void commit(Context &c)
+            static Outcome commit(Context &c)
             {
+        Outcome o;
                 auto &e = c.v.edit;
                 if (!e.active())
-                    return;
+                return o;
                 if (e.buf != e.orig)
                 {
                     const auto id = e.ref.row;
                     if (c.trace)
                         std::println("[commit] row={} col={} id={} text={}", e.row,
                                      e.col, id.v, e.buf);
-                    if (c.fx)
-                        c.fx->push_back(SetCell{id, e.col, e.buf});
+                    if (true)
+                        command::push_effect(o.effects, SetCell{id, e.col, e.buf});
                     c.v.history.undo.push_back({{id, e.col, e.orig, e.buf}});
                     c.v.history.redo.clear();
                 }
                 e = {};
                 c.v.touch();
+            return o;
             }
 
             static void replace_sel(State &v, std::string_view s)
@@ -96,8 +98,9 @@ namespace table::detail
                 return best;
             }
 
-            bool paste(Context &c, std::string text)
+            Outcome paste(Context &c, std::string text)
             {
+        Outcome o;
                 auto &v = c.v;
                 if (v.edit.active())
                 {
@@ -107,7 +110,7 @@ namespace table::detail
                             ch = ' ';
                     replace_sel(v, text);
                 }
-                else if (v.sel.cur_r >= 0 && v.sel.cur_c >= 0 && c.fx)
+                else if (v.sel.cur_r >= 0 && v.sel.cur_c >= 0)
                 {
                     const int r = v.sel.cur_r;
                     const int col = v.sel.cur_c;
@@ -135,7 +138,7 @@ namespace table::detail
                                 const auto old = c.d.text(rr, cc);
                                 const auto id = c.d.ids[static_cast<std::size_t>(rr)];
                                 std::string val{ln.substr(p, e2 - p)};
-                                c.fx->push_back(SetCell{id, cc, val});
+                                command::push_effect(o.effects, SetCell{id, cc, val});
                                 batch.push_back({id, cc, std::string(old), val});
                             }
                             ++dc;
@@ -155,7 +158,9 @@ namespace table::detail
                     }
                 }
                 v.touch();
-                return true;
+                o.handled = true;
+                return o;
+            return o;
             }
 
             bool begin(Context &c, const Target &t)
@@ -246,6 +251,7 @@ namespace table::detail
             template <class E>
             Outcome handle(Context &c, const E &x)
             {
+                Outcome o;
                 auto &v = c.v;
                 auto &ix = c.ix;
                 using T = E;
@@ -273,7 +279,7 @@ namespace table::detail
                             }
                         }
                         else
-                            commit(c);
+                            o.merge(commit(c));
                     }
                     return {}; // 让 core 继续处理按下
                 }
@@ -281,7 +287,7 @@ namespace table::detail
                 else if constexpr (std::is_same_v<T, Drag>)
                 {
                     if (!v.edit.active())
-                return {};
+                return o;
                     const Target tgt =
                         x.t.kind != Part::none ? x.t : target_of(c.d, {}, x.t.to_zone());
                     bool in_row = false;
@@ -303,12 +309,12 @@ namespace table::detail
                         v.touch();
                         return Outcome::handled_now(); // 编辑框内拖动 = 选文本，不是选单元格
                     }
-                return {};
+                return o;
                 }
                 else if constexpr (std::is_same_v<T, KeyPress>)
                 {
                     if (!v.edit.active())
-                return {};
+                return o;
                     auto &e = v.edit;
                     switch (x.k)
                     {
@@ -318,7 +324,7 @@ namespace table::detail
                     case Key::enter: {
                         const int row = e.row;
                         const int col = e.col;
-                        commit(c);
+                        o.merge(commit(c));
                         const int pos = pos_of(c.g, row);
                         if (pos + 1 < static_cast<int>(c.g.view_rows.size()))
                         {
@@ -332,7 +338,7 @@ namespace table::detail
                         break;
                     }
                     case Key::tab: {
-                        commit(c);
+                        o.merge(commit(c));
                         const int nc = std::clamp(v.sel.cur_c + (x.shift ? -1 : 1), 0,
                                                   c.d.cols_count() - 1);
                         v.sel.cur_c = v.sel.c0 = v.sel.c1 = nc;
@@ -417,8 +423,8 @@ namespace table::detail
                         }
                         break;
                     case Key::c:
-                        if (x.ctrl && c.fx)
-                            c.fx->push_back(WriteClipboard{
+                        if (x.ctrl)
+                            command::push_effect(o.effects, WriteClipboard{
                                 e.has_sel()
                                     ? e.buf.substr(static_cast<std::size_t>(e.sel_lo()),
                                                    static_cast<std::size_t>(e.sel_hi() -
@@ -428,8 +434,8 @@ namespace table::detail
                     case Key::x:
                         if (x.ctrl)
                         {
-                            if (e.has_sel() && c.fx)
-                                c.fx->push_back(WriteClipboard{e.buf.substr(
+                            if (e.has_sel())
+                                command::push_effect(o.effects, WriteClipboard{e.buf.substr(
                                     static_cast<std::size_t>(e.sel_lo()),
                                     static_cast<std::size_t>(e.sel_hi() - e.sel_lo()))});
                             snapshot(v, c.ix, true);
@@ -463,9 +469,9 @@ namespace table::detail
                         break;
                     }
                     v.touch();
-                return Outcome::handled_now();
+                return command::merged(std::move(o), Outcome::handled_now());
                 }
-                return command::handled({});
+                return command::merged(std::move(o), command::handled({}));
             }
 
             void rows(Context &, std::vector<row_idx> &) {}
@@ -541,11 +547,12 @@ namespace table::detail
         // 列宽：拖分隔条只发 begin/move/end，宽度写 State.col_w
         struct ClipboardFeature
         {
-            static void clear_sel(Context &c)
+            static Outcome clear_sel(Context &c)
             {
+        Outcome o;
                 auto &v = c.v;
-                if (v.sel.r0 < 0 || !c.fx)
-                    return;
+                if (v.sel.r0 < 0)
+                return o;
                 std::vector<State::undo_change> batch;
                 for (int r = std::min(v.sel.r0, v.sel.r1);
                      r <= std::max(v.sel.r0, v.sel.r1); ++r)
@@ -556,7 +563,7 @@ namespace table::detail
                         if (old.empty())
                             continue;
                         const auto id = c.d.ids[static_cast<std::size_t>(r)];
-                        c.fx->push_back(SetCell{id, cc, {}});
+                        command::push_effect(o.effects, SetCell{id, cc, {}});
                         batch.push_back({id, cc, std::string(old), {}});
                     }
                 if (!batch.empty())
@@ -565,13 +572,18 @@ namespace table::detail
                     v.history.redo.clear();
                     v.touch();
                 }
+            return o;
             }
 
-            bool copy(Context &c, bool cut)
+            Outcome copy(Context &c, bool cut)
             {
+        Outcome o;
                 auto &v = c.v;
-                if (v.sel.r0 < 0 || !c.fx)
-                    return true;
+                if (v.sel.r0 < 0)
+                {
+                o.handled = true;
+                return o;
+                }
                 std::string tsv;
                 for (int r = std::min(v.sel.r0, v.sel.r1);
                      r <= std::max(v.sel.r0, v.sel.r1); ++r)
@@ -585,20 +597,25 @@ namespace table::detail
                     }
                     tsv += '\n';
                 }
-                c.fx->push_back(WriteClipboard{std::move(tsv)});
+                command::push_effect(o.effects, WriteClipboard{std::move(tsv)});
                 if (cut)
-                    clear_sel(c);
-                return true;
+                    o.merge(clear_sel(c));
+                o.handled = true;
+                return o;
+            return o;
             }
-            bool remove(Context &c)
+            Outcome remove(Context &c)
             {
-                clear_sel(c);
-                return true;
+                Outcome o;
+                o.merge(clear_sel(c));
+                o.handled = true;
+                return o;
             }
             template <class E>
             Outcome handle(Context &, const E &)
             {
-                return command::handled({});
+                Outcome o;
+                return command::merged(std::move(o), command::handled({}));
             }
             void rows(Context &, std::vector<row_idx> &) {}
             void paint(const PaintContext &, DrawList &) const {}
@@ -607,28 +624,38 @@ namespace table::detail
         // 撤销 / 重做：只消费 State.undo / State.redo
         struct UndoFeature
         {
-            bool run(Context &c, bool redo)
+            Outcome run(Context &c, bool redo)
             {
+        Outcome o;
                 auto &v = c.v;
-                if (!c.fx)
-                    return true;
+                if (false)
+                {
+                o.handled = true;
+                return o;
+                }
                 auto &from = redo ? v.history.redo : v.history.undo;
                 auto &to = redo ? v.history.undo : v.history.redo;
                 if (from.empty())
-                    return true;
+                {
+                o.handled = true;
+                return o;
+                }
                 auto batch = std::move(from.back());
                 from.pop_back();
                 for (const auto &ch : batch)
-                    c.fx->push_back(
+                    command::push_effect(o.effects, 
                         SetCell{ch.id, ch.col, redo ? ch.after : ch.before});
                 to.push_back(std::move(batch));
                 v.touch();
-                return true;
+                o.handled = true;
+                return o;
+            return o;
             }
             template <class E>
             Outcome handle(Context &, const E &)
             {
-                return command::handled({});
+                Outcome o;
+                return command::merged(std::move(o), command::handled({}));
             }
             void rows(Context &, std::vector<row_idx> &) {}
             void paint(const PaintContext &, DrawList &) const {}

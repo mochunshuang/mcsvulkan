@@ -127,8 +127,8 @@ using model::Table;
         for (int c = 32; c < 127; ++c)
             ft.put(static_cast<char32_t>(c), gm);
 
-                std::vector<Effect> fx;
         // 和 host 完全相同的分发：命令 → dispatch（feature 短路链 → gesture）
+        std::vector<Effect> fx;
         auto send = [&]<class E>(const E &c) {
             const auto out = session::dispatch(S, command::Command{c});
             fx.assign(out.effects.begin(), out.effects.end());
@@ -138,7 +138,7 @@ using model::Table;
             fx.assign(out.effects.begin(), out.effects.end());
         };
         auto send_begin = [&](int r, int col) {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<EditFeature>().begin(tc, r, col);
         };
         // 公共门：一次 compose = layout passes + paint passes
@@ -338,15 +338,15 @@ const Rect vp{0, 0, 800, 600};
         sync(vp);
         const float w0 = v.cols.w[0];
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<ResizeFeature>().begin(tc, 0, 0.0F, w0);
         }
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<ResizeFeature>().move(tc, 300.0F);
         }
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<ResizeFeature>().end(tc);
         }
         check(v.cols.w[0] > w0, "resize feature writes col_w");
@@ -359,28 +359,28 @@ const Rect vp{0, 0, 800, 600};
         }
 
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<ReorderFeature>().begin(tc, 0, 0.0F);
         }
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<ReorderFeature>().move(tc, 450.0F);
         }
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<ReorderFeature>().end(tc);
         }
         check(v.cols.order[0] != 0, "reorder feature writes order");
 
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<FreezeFeature>().set(tc, 2);
         }
         check(v.cols.frozen == 2, "freeze feature writes frozen");
 
         // 10) checks / clipboard / undo / table resize
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<ChecksFeature>().toggle(tc, 0, false);
         }
         check(v.checks.on[0] == 1 && v.checks.ids[0] == d.ids[0],
@@ -421,13 +421,16 @@ const Rect vp{0, 0, 800, 600};
             check(on == 0, "checks: header clears all");
         }
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<SelectionFeature>().set(tc, 1, 0);
         }
         fx.clear();
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
-            sy.get<ClipboardFeature>().copy(tc, false);
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
+            {
+                auto o_ = sy.get<ClipboardFeature>().copy(tc, false);
+                fx.assign(o_.effects.begin(), o_.effects.end());
+            }
         }
         bool clip = false;
         for (const auto &e : fx)
@@ -435,8 +438,11 @@ const Rect vp{0, 0, 800, 600};
         check(clip, "clipboard feature");
         fx.clear();
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
-            sy.get<ClipboardFeature>().remove(tc);
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
+            {
+                auto o_ = sy.get<ClipboardFeature>().remove(tc);
+                fx.assign(o_.effects.begin(), o_.effects.end());
+            }
         }
         bool del = false;
         for (const auto &e : fx)
@@ -444,27 +450,30 @@ const Rect vp{0, 0, 800, 600};
         check(del, "delete feature");
         fx.clear();
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
-            sy.get<UndoFeature>().run(tc, false);
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
+            {
+                auto o_ = sy.get<UndoFeature>().run(tc, false);
+                fx.assign(o_.effects.begin(), o_.effects.end());
+            }
         }
         check(!fx.empty(), "undo feature");
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<TableResizeFeature>().begin(tc, 0, 0, 800, 600);
         }
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<TableResizeFeature>().move(tc, 120, 120);
         }
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<TableResizeFeature>().end(tc);
         }
         check(v.cols.user_w > 0, "table resize feature");
 
         // 11) 恢复项：筛选 UI / 查找 / 列菜单 / 粘贴 / 编辑撤销
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<FilterFeature>().begin(tc, 0);
         }
         send_text("alpha");
@@ -495,13 +504,13 @@ const Rect vp{0, 0, 800, 600};
             sync(vp);
         }
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<FilterFeature>().clear(tc, 0);
         }
         sync(vp);
 
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<FindFeature>().toggle(tc);
         }
         send_text("alpha");
@@ -511,7 +520,7 @@ const Rect vp{0, 0, 800, 600};
             sync({0, 0, 800, 120});
             v.scroll.y = 0;
             {
-                command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+                command::Context tc{d, v, ix, p, g, ft, false, S.id};
                 sy.get<FindFeature>().close(tc);
                 sy.get<FindFeature>().toggle(tc);
             }
@@ -527,17 +536,17 @@ const Rect vp{0, 0, 800, 600};
             v.scroll.y = 0;
         }
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<FindFeature>().close(tc);
         }
 
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<MenuFeature>().open(tc, 0, 10.0F, 10.0F);
         }
         check(v.menu.open, "context menu opens");
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<MenuFeature>().item(tc, 2);
         }
         check(v.cols.hidden[0] == 1, "hide column");
@@ -545,7 +554,7 @@ const Rect vp{0, 0, 800, 600};
         check(g.col_count() == 2, "hidden column excluded from geometry");
         {
             // 键盘左右只走可见列：隐藏 col0 后从 col1 往右到 col2，再往右停住
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<SelectionFeature>().set(tc, g.view_rows.front(), g.col_index.front());
         }
         send(KeyPress{Key::right, false, false});
@@ -558,39 +567,42 @@ const Rect vp{0, 0, 800, 600};
               "hidden: keyboard stops at last visible");
         check(v.sel.cur_c != 0, "hidden: never lands on hidden column");
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<MenuFeature>().open(tc, 1, 10.0F, 10.0F);
         }
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<MenuFeature>().item(tc, 3);
         }
         check(v.cols.hidden[0] == 0, "show all restores columns");
         sync(vp);
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<MenuFeature>().open(tc, 0, 10.0F, 10.0F);
         }
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<MenuFeature>().item(tc, 0);
         }
         check(v.cols.w[0] > 0.0F, "autofit writes width");
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<MenuFeature>().open(tc, 1, 10.0F, 10.0F);
         }
         send(Press{10, 10, {Part::menu_item, -1, 3}, false, false, false});
         check(!v.menu.open && v.cols.hidden[0] == 0, "menu item click path");
 
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<SelectionFeature>().set(tc, 0, 0);
         }
         fx.clear();
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
-            sy.get<EditFeature>().paste(tc, "P1\tP2");
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
+            {
+                auto o_ = sy.get<EditFeature>().paste(tc, "P1\tP2");
+                fx.assign(o_.effects.begin(), o_.effects.end());
+            }
         }
         check(!fx.empty(), "paste emits cells");
 
@@ -615,8 +627,11 @@ const Rect vp{0, 0, 800, 600};
         check(!v.edit.active(), "commit before undo");
         fx.clear();
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
-            sy.get<UndoFeature>().run(tc, false);
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
+            {
+                auto o_ = sy.get<UndoFeature>().run(tc, false);
+                fx.assign(o_.effects.begin(), o_.effects.end());
+            }
         }
         check(!fx.empty(), "ctrl+z after commit");
 
@@ -624,15 +639,15 @@ const Rect vp{0, 0, 800, 600};
         sync({0, 0, 800, 120});
         const float sy0 = v.scroll.y;
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<ScrollFeature>().begin(tc, 0, sy0, 0.0F);
         }
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<ScrollFeature>().move(tc, -50.0F);
         }
         {
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
             sy.get<ScrollFeature>().end(tc);
         }
         check(sy0 > 0.0F && v.scroll.y < sy0, "scrollbar thumb drag");
@@ -1067,13 +1082,17 @@ const Rect vp{0, 0, 800, 600};
             check(v.checks.on.size() == static_cast<std::size_t>(d.rows()),
                   "checks: array grows with rows");
             v.checks.on[0] = 1;
-            command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};
-            sy.get<ChecksFeature>().toggle_all(tc);
+            command::Context tc{d, v, ix, p, g, ft, false, S.id};
+            {
+                sy.get<ChecksFeature>().toggle_all(tc);
+            }
             int on = 0;
             for (auto x : v.checks.on)
                 on += x != 0;
             check(on == d.rows(), "checks: toggle_all from partial -> all");
-            sy.get<ChecksFeature>().toggle_all(tc);
+            {
+                sy.get<ChecksFeature>().toggle_all(tc);
+            }
             on = 0;
             for (auto x : v.checks.on)
                 on += x != 0;

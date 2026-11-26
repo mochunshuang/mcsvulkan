@@ -228,7 +228,7 @@ inline void pass_rows(LayoutContext &c)
 {
             c.pipe.base(c.d);
             {
-                Context ctx{c.d, c.v, c.ix, c.p, c.g, c.ft, nullptr, false, {}};
+                Context ctx{c.d, c.v, c.ix, c.p, c.g, c.ft, false, {}};
                 c.sy.rows(ctx, c.pipe.buf);
             }
             c.g.view_rows.assign(c.pipe.buf.begin(), c.pipe.buf.end());
