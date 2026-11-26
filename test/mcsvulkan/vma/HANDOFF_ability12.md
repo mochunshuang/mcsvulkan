@@ -994,3 +994,21 @@ Esc 取消 modal 后存活
 ## 15. 一句话
 
 **ability12 不是“再加一层架构”，而是把 ability11 的隐边变成显式的七个 schema、五个门、两个 composer；让主线一眼可见，让孤岛节点通过组合形成完整表达。**
+
+## 16. 验收边界（G6 定案）
+
+**行数只约束 ability12-owned 文件**：
+
+| 范围 | 计入 |
+|---|---|
+| `table12/**`（schema / detail / features / test/access / narrow / session.cpp） | ✅ |
+| `table12_app/**`（host / window_input / window_draw / scene / encode / platform / shader_abi / glue） | ✅ |
+| `table12/test/probes.hpp`、`table12/test/selftest.hpp` | ✅（测试代码同样计入，不做 demo 豁免） |
+| `test_ui_ability12_table.cpp` 的 demo 宿主（窗口/渲染/输入循环，约 12k 行） | ❌ 不计入 |
+
+这是**范围定义，不是设计豁免**：ability12 自己的文件每个 ≤1500 行（当前最大
+`selftest.hpp` 1204、`edit.hpp` 638），demo 宿主不拆、不重写，也不设额外的
+"框架拆分阶段"。
+
+说明：`test_ui_ability12_table.cpp` 只保留 main 接线与既有框架代码；ability12
+的 owned 段落 < 400 行（C1 验收）。

@@ -134,3 +134,9 @@ struct Context { /* 无 fx */ const model::Table &d; intent::State &v; intent::I
 ### 7.5 测量口径（HANDOFF §16）
 
 "单文件 < 1500"只统计 ability12-owned 代码；demo 框架不计入；拆框架另立项。
+
+### 7.6 pimpl 访问缝（G5 定案）
+
+`table::session::Internals` 只是 pimpl 的 **access token**：不是 schema、不是门、
+不携带数据、不出现在任何业务签名里；只有 `session.cpp` 里的门实现使用它。
+若出现第二个实现名，必须退回「门改成成员函数」或「逐门 friend」方案。

@@ -169,8 +169,7 @@ namespace table::command
         return ok ? Outcome::handled_now() : Outcome{};
     }
 
-    // ── Context：feature 的唯一入口参数 ────────────────────────────────────
-    //   过渡期仍保留 fx（G4-core-b 删除：helper 返回 Outcome，Context 不再有输出口）。
+    // ── Context：feature 的唯一入口参数（没有 fx：Outcome 是唯一结果） ──────
     struct Context
     {
         const model::Table &d;
