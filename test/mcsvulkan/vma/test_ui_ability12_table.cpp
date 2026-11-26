@@ -1,4 +1,4 @@
-#include <any>
+﻿#include <any>
 #include <array>
 #include <bit>
 #include <cassert>
@@ -492,141 +492,13 @@ struct UvTransform
 };
 
 //diff: [test_dod16] start
-struct object_key
-{
-    uint32_t object_type{};
-    uint32_t entity_index{};
-    auto operator<=>(const object_key &) const = default;
-};
-namespace std
-{
-    template <>
-    struct hash<object_key>
-    {
-        constexpr size_t operator()(const object_key &k) const noexcept
-        {
-            size_t h1 = hash<uint32_t>{}(k.object_type);
-            size_t h2 = hash<uint32_t>{}(k.entity_index);
-            return h1 ^ (h2 << 1);
-        }
-    };
-}; // namespace std
-static_assert(sizeof(object_key) == 2 * sizeof(uint32_t));
+// ABI 类型已搬到 table12_app/shader_abi.hpp（G0 冻结成 table::platform::*）。
+// demo 保留三个过渡别名，避免 200+ 处无谓改名；G6 清理。
+#include "table12_app/shader_abi.hpp"
 
-template <std::size_t Bits>
-class render_version
-{
-    static_assert(Bits >= 1 && Bits <= 32,
-                  "render_version: bit width must be in [1, 32]");
-
-  public:
-    // ── 最佳底层 uint 类型 ────────────────────────────────
-    //   Bits <=  8 → uint8_t
-    //   Bits <= 16 → uint16_t
-    //   Bits <= 32 → uint32_t
-    template <std::size_t B>
-    using best_uint_t =
-        std::conditional_t<(B <= 8), std::uint8_t,
-                           std::conditional_t<(B <= 16), std::uint16_t, std::uint32_t>>;
-
-    using underlying_t = best_uint_t<Bits>;
-
-    static constexpr std::size_t bit_width = Bits;
-
-    // ── 掩码：全 1 ────────────────────────────────────────
-    //   用 lambda + if constexpr 避开 `1u << 32` 的 UB
-    static constexpr underlying_t mask = [] {
-        if constexpr (Bits >= 32)
-            return static_cast<underlying_t>(~std::uint32_t{0});
-        else
-            return static_cast<underlying_t>((std::uint32_t{1} << Bits) - 1u);
-    }();
-
-    // ── 构造 ─────────────────────────────────────────────
-    constexpr render_version() noexcept = default;
-
-    // 从外部整数导入：自动按 mask 截断
-    constexpr explicit render_version(std::uint32_t v) noexcept
-        : value_{static_cast<underlying_t>(v & mask)}
-    {
-    }
-
-    // ── 自增：到 mask 后回绕到 0，永不越界 ────────────────
-    constexpr render_version &operator++() noexcept
-    {
-        value_ = static_cast<underlying_t>((value_ + 1u) & mask);
-        return *this;
-    }
-    constexpr render_version operator++(int) noexcept
-    {
-        auto old = *this;
-        ++*this;
-        return old;
-    }
-
-    // ── 隐式转换到最佳 uint 类型 ──────────────────────────
-    [[nodiscard]] constexpr operator underlying_t() const noexcept
-    {
-        return value_;
-    }
-
-    // 显式取 uint32（打包用）
-    [[nodiscard]] constexpr std::uint32_t to_u32() const noexcept
-    {
-        return static_cast<std::uint32_t>(value_);
-    }
-
-    [[nodiscard]] constexpr bool operator==(const render_version &) const noexcept =
-        default;
-
-  private:
-    underlying_t value_ = 0;
-};
-using render_version_t = render_version<16>; // 16 位版本号
-// picking_result：与 R32G32B32A32_UINT 附件 + frag 的 uvec4 输出严格对齐（16B）
-// xy = object_key(type_id, entity_index) 外键；z = primitive_id；w = hover_fn（池实体下标，0xFFFFFFFF = 未绑定）
-struct picking_result
-{
-    // ── 位分配：由 version_t 的 bit_width 推导出 primitive 位宽 ──
-    using version_t = render_version_t; // 例如 render_version<16>
-    static constexpr std::size_t version_bits = version_t::bit_width;
-    static constexpr std::size_t total_bits = 32;
-    static constexpr std::size_t primitive_bits = total_bits - version_bits;
-
-    static_assert(primitive_bits >= 1 && primitive_bits < total_bits,
-                  "picking_result: version_t leaves no room for primitive_id");
-
-    // ── primitive_id 的返回类型同样按位宽选 ─────────────────
-    using primitive_t = version_t::template best_uint_t<primitive_bits>;
-
-    // ── 掩码 ────────────────────────────────────────────────
-    static constexpr std::uint32_t primitive_mask =
-        (std::uint32_t{1} << primitive_bits) - 1u;
-
-    // ── 数据 ────────────────────────────────────────────────
-    object_key key; // outPicking.xy
-    std::uint32_t
-        packed; // outPicking.z：高 version_bits=版本，低 primitive_bits=primitive_id
-    std::uint32_t hover_fn; // outPicking.w
-
-    // ── 读取 ────────────────────────────────────────────────
-    [[nodiscard]] constexpr primitive_t primitive_id() const noexcept
-    {
-        return static_cast<primitive_t>(packed & primitive_mask);
-    }
-    [[nodiscard]] constexpr version_t::underlying_t render_version() const noexcept
-    {
-        return version_t{packed >> version_bits}; // 构造时内部会再 mask 一次
-    }
-
-    // ── 写入（shader 侧对应同一个 pack 逻辑）────────────────
-    static constexpr std::uint32_t pack(version_t v, primitive_t p) noexcept
-    {
-        return (v.to_u32() << version_bits) |
-               (static_cast<std::uint32_t>(p) & primitive_mask);
-    }
-};
-static_assert(sizeof(picking_result) == 16);
+using object_key = table::platform::ObjectKey;
+using render_version_t = table::platform::RenderVersion16;
+using picking_result = table::platform::PickingResult;
 //diff: [test_dod16] end
 struct mesh_data
 {
@@ -8562,17 +8434,17 @@ struct glfw_input_translation
     // ★ 类型擦除在这里发生：Obj → (void*, proxy_class_type)
     template <typename Obj>
         requires(requires() {
-            proxy_class_type::build<"input_event", data_tuple, Obj>();
+            proxy_class_type::build<"route_event", data_tuple, Obj>();
         })
     constexpr scoped_binding attach(Obj &obj)
     {
         return sinks_.attach(&obj,
-                             proxy_class_type::build<"input_event", data_tuple, Obj>());
+                             proxy_class_type::build<"route_event", data_tuple, Obj>());
     }
 
     template <typename Obj>
         requires(requires() {
-            proxy_class_type::build<"input_event", data_tuple, Obj>();
+            proxy_class_type::build<"route_event", data_tuple, Obj>();
         })
     constexpr void attach(scoped_binding &out, Obj &obj)
     {
@@ -10833,7 +10705,7 @@ namespace mcs::app
                 ++self.frames;
             }),
 
-            method<"input_event">([](auto &self, auto e) noexcept {
+            method<"route_event">([](auto &self, auto e) noexcept {
                 const auto now = detail::now_of(self);
                 self.now = now;
                 using frame_t = decltype(input_frame::build_change(self.input_state, e));
@@ -10909,7 +10781,7 @@ namespace render
 //
 //  input chain (gesture -> data update -> redraw next frame)
 //    GLFW event
-//        | input_event
+//        | route_event
 //        v
 //    cmd_press / cmd_drag / cmd_key / cmd_wheel ...
 //        | input_dispatch
@@ -11178,7 +11050,7 @@ namespace table_ui
     //     -> on_press / on_right_click / on_drag / on_wheel /
     //        on_key / on_char            （唯一副作用入口）
     //
-    //   之前按事件类型手写的一排 input_event 重载全部删除；现在只有
+    //   之前按事件类型手写的一排 route_event 重载全部删除；现在只有
     //   Binding::handle_event<E> 一个模板入口。
     // =====================================================================
     namespace arena_input
@@ -11698,7 +11570,7 @@ namespace table_ui
         }
 
         template <class E>
-        void input_event(const E &e) noexcept
+        void route_event(const E &e) noexcept
         {
             using T = std::remove_cvref_t<E>;
             if constexpr (std::same_as<T, ev::position2d_event>)
@@ -12357,7 +12229,7 @@ namespace table_ui
         s.pick_version = s.view.revision;
         if (std::getenv("TABLE_PICKCHECK") == nullptr || r.key.object_type == 0xFFFFFFFF)
             return;
-        const auto from_gpu = table::model::resolve(s.data, r.key.entity_index);
+        const auto from_gpu = table::platform::resolve(s.data, r);
         const auto from_hit = table::session::hit(s, s.mx, s.my);
         if (from_gpu.to_zone() != from_hit.to_zone())
             std::println("[pick] MISMATCH gpu=({}, {}, {}) hit=({}, {}, {})",
@@ -12630,7 +12502,7 @@ namespace table_ui
             if (inst.entity_index != 0)
             {
                 ++zoned;
-                const auto t = table::model::resolve(s.data, inst.entity_index);
+                const auto t = table::platform::resolve(s.data, inst.entity_index);
                 owners += t.kind != table::Part::none ? 1U : 0U;
             }
         });
@@ -12862,7 +12734,7 @@ namespace table_ui
     // =====================================================================
     // TABLE_MULTITEST: headless multi-table test for one window.
     // Both host entry points use the real path:
-    //   CPU hover: host.input_event(position) -> advance -> system_hover
+    //   CPU hover: host.route_event(position) -> advance -> system_hover
     //   GPU pick : table_ui::on_hover(picking, ..., &screen) -> accept_pick
     // =====================================================================
     inline void init_multi_table(Binding &s, std::uint32_t id, int rows)
@@ -12938,7 +12810,7 @@ namespace table_ui
               "init: A/B hover empty");
 
         // 2a. CPU hover: position -> advance -> only B writes ix.hover
-        h.input_event(ev::position2d_event{.xpos = 620.0, .ypos = 100.0});
+        h.route_event(ev::position2d_event{.xpos = 620.0, .ypos = 100.0});
         a.advance(0.0);
         b.advance(0.0);
         check(h.hovered == &b, "cpu-hover: host.hovered == B");
@@ -12964,11 +12836,11 @@ namespace table_ui
 
         // 3. click B: focused=B, B has a selection, A does not
         const int a_sel0 = a.view.sel.cur_r;
-        h.input_event(
+        h.route_event(
             ev::mousebutton_event{.button = ev::MouseButtons::eMOUSE_BUTTON_LEFT,
                                   .action = ev::Action::ePRESS,
                                   .modifier_key = ev::ModifierKey{}});
-        h.input_event(
+        h.route_event(
             ev::mousebutton_event{.button = ev::MouseButtons::eMOUSE_BUTTON_LEFT,
                                   .action = ev::Action::eRELEASE,
                                   .modifier_key = ev::ModifierKey{}});
@@ -12979,13 +12851,13 @@ namespace table_ui
         // 4. keyboard goes to focused (B) only
         {
             const int b0 = b.view.sel.cur_r;
-            h.input_event(ev::keyboard_event{.key = ev::Key::eDOWN,
+            h.route_event(ev::keyboard_event{.key = ev::Key::eDOWN,
                                              .action = ev::Action::ePRESS,
                                              .modifier_key = ev::ModifierKey{},
                                              .scancode = 0});
             check(b.view.sel.cur_r > b0, "keyboard: focused B moves");
             check(a.view.sel.cur_r == a_sel0, "keyboard: A does not move");
-            h.input_event(ev::keyboard_event{.key = ev::Key::eDOWN,
+            h.route_event(ev::keyboard_event{.key = ev::Key::eDOWN,
                                              .action = ev::Action::eRELEASE,
                                              .modifier_key = ev::ModifierKey{},
                                              .scancode = 0});
@@ -12993,25 +12865,25 @@ namespace table_ui
 
         // 5. chars go to focused (B) only
         {
-            h.input_event(ev::keyboard_event{.key = ev::Key::eF2,
+            h.route_event(ev::keyboard_event{.key = ev::Key::eF2,
                                              .action = ev::Action::ePRESS,
                                              .modifier_key = ev::ModifierKey{},
                                              .scancode = 0});
-            h.input_event(ev::keyboard_event{.key = ev::Key::eF2,
+            h.route_event(ev::keyboard_event{.key = ev::Key::eF2,
                                              .action = ev::Action::eRELEASE,
                                              .modifier_key = ev::ModifierKey{},
                                              .scancode = 0});
             check(b.view.edit.active(), "char: F2 opens B edit");
-            h.input_event(ev::char_event{.codepoint = U'z'});
+            h.route_event(ev::char_event{.codepoint = U'z'});
             check(b.view.edit.active() && !b.view.edit.buf.empty() &&
                       b.view.edit.buf.back() == 'z',
                   "char: z goes into B edit buffer");
             check(!a.view.edit.active(), "char: A edit stays closed");
-            h.input_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+            h.route_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
                                              .action = ev::Action::ePRESS,
                                              .modifier_key = ev::ModifierKey{},
                                              .scancode = 0});
-            h.input_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+            h.route_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
                                              .action = ev::Action::eRELEASE,
                                              .modifier_key = ev::ModifierKey{},
                                              .scancode = 0});
@@ -13019,25 +12891,25 @@ namespace table_ui
 
         // 6. click A switches focus: later keyboard moves A only
         {
-            h.input_event(ev::position2d_event{.xpos = 120.0, .ypos = 100.0});
-            h.input_event(
+            h.route_event(ev::position2d_event{.xpos = 120.0, .ypos = 100.0});
+            h.route_event(
                 ev::mousebutton_event{.button = ev::MouseButtons::eMOUSE_BUTTON_LEFT,
                                       .action = ev::Action::ePRESS,
                                       .modifier_key = ev::ModifierKey{}});
-            h.input_event(
+            h.route_event(
                 ev::mousebutton_event{.button = ev::MouseButtons::eMOUSE_BUTTON_LEFT,
                                       .action = ev::Action::eRELEASE,
                                       .modifier_key = ev::ModifierKey{}});
             check(h.focused == &a, "focus: click A -> focused == A");
             const int a0 = a.view.sel.cur_r;
             const int b0 = b.view.sel.cur_r;
-            h.input_event(ev::keyboard_event{.key = ev::Key::eDOWN,
+            h.route_event(ev::keyboard_event{.key = ev::Key::eDOWN,
                                              .action = ev::Action::ePRESS,
                                              .modifier_key = ev::ModifierKey{},
                                              .scancode = 0});
             check(a.view.sel.cur_r > a0, "focus: keyboard moves A only");
             check(b.view.sel.cur_r == b0, "focus: B does not move");
-            h.input_event(ev::keyboard_event{.key = ev::Key::eDOWN,
+            h.route_event(ev::keyboard_event{.key = ev::Key::eDOWN,
                                              .action = ev::Action::eRELEASE,
                                              .modifier_key = ev::ModifierKey{},
                                              .scancode = 0});
@@ -13045,40 +12917,40 @@ namespace table_ui
 
         // 6b. wheel goes only to the table under the pointer
         {
-            h.input_event(ev::position2d_event{.xpos = 120.0, .ypos = 100.0});
+            h.route_event(ev::position2d_event{.xpos = 120.0, .ypos = 100.0});
             const auto a0 = a.view.scroll.y;
             const auto b0 = b.view.scroll.y;
-            h.input_event(ev::scroll_event{.xoffset = 0.0, .yoffset = -1.0});
+            h.route_event(ev::scroll_event{.xoffset = 0.0, .yoffset = -1.0});
             check(a.view.scroll.y > a0 && b.view.scroll.y == b0,
                   "wheel: pointer over A scrolls only A");
 
-            h.input_event(ev::position2d_event{.xpos = 620.0, .ypos = 100.0});
+            h.route_event(ev::position2d_event{.xpos = 620.0, .ypos = 100.0});
             const auto a1 = a.view.scroll.y;
             const auto b1 = b.view.scroll.y;
-            h.input_event(ev::scroll_event{.xoffset = 0.0, .yoffset = -1.0});
+            h.route_event(ev::scroll_event{.xoffset = 0.0, .yoffset = -1.0});
             check(b.view.scroll.y > b1 && a.view.scroll.y == a1,
                   "wheel: pointer over B scrolls only B");
         }
 
         // 6c. right click opens the menu only on the table under the pointer
         {
-            h.input_event(ev::position2d_event{.xpos = 620.0, .ypos = 100.0});
-            h.input_event(
+            h.route_event(ev::position2d_event{.xpos = 620.0, .ypos = 100.0});
+            h.route_event(
                 ev::mousebutton_event{.button = ev::MouseButtons::eMOUSE_BUTTON_RIGHT,
                                       .action = ev::Action::ePRESS,
                                       .modifier_key = ev::ModifierKey{}});
-            h.input_event(
+            h.route_event(
                 ev::mousebutton_event{.button = ev::MouseButtons::eMOUSE_BUTTON_RIGHT,
                                       .action = ev::Action::eRELEASE,
                                       .modifier_key = ev::ModifierKey{}});
             check(b.view.menu.open && !a.view.menu.open,
                   "menu: right click opens only the B menu");
             check(h.focused == &b, "menu: right click focuses B");
-            h.input_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+            h.route_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
                                              .action = ev::Action::ePRESS,
                                              .modifier_key = ev::ModifierKey{},
                                              .scancode = 0});
-            h.input_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+            h.route_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
                                              .action = ev::Action::eRELEASE,
                                              .modifier_key = ev::ModifierKey{},
                                              .scancode = 0});
@@ -13116,7 +12988,7 @@ namespace table_ui
             h.begin_frame();
             h.mark_drawn(&b);
             h.mark_drawn(&a);
-            h.input_event(ev::position2d_event{.xpos = 120.0, .ypos = 100.0});
+            h.route_event(ev::position2d_event{.xpos = 120.0, .ypos = 100.0});
             a.advance(0.0);
             b.advance(0.0);
             check(h.table_at(120.0, 100.0) == &a, "zorder: table_at top == A");
@@ -13129,7 +13001,7 @@ namespace table_ui
             h.begin_frame();
             h.mark_drawn(&a);
             h.mark_drawn(&b);
-            h.input_event(ev::position2d_event{.xpos = 120.0, .ypos = 100.0});
+            h.route_event(ev::position2d_event{.xpos = 120.0, .ypos = 100.0});
             a.advance(0.0);
             b.advance(0.0);
             check(h.table_at(120.0, 100.0) == &b, "zorder: table_at top == B");
@@ -13142,7 +13014,7 @@ namespace table_ui
             h.begin_frame();
             h.mark_drawn(&a);
             h.mark_drawn(&b);
-            h.input_event(ev::position2d_event{.xpos = 2000.0, .ypos = 2000.0});
+            h.route_event(ev::position2d_event{.xpos = 2000.0, .ypos = 2000.0});
             a.advance(0.0);
             b.advance(0.0);
             check(h.hovered == nullptr, "zorder: pointer outside -> no hovered");
@@ -13183,36 +13055,36 @@ namespace table_ui
             check(a.keyboard_focus, "detach: promoted A has keyboard_focus == true");
             {
                 const int a0 = a.view.sel.cur_r;
-                h.input_event(ev::keyboard_event{.key = ev::Key::eDOWN,
+                h.route_event(ev::keyboard_event{.key = ev::Key::eDOWN,
                                                  .action = ev::Action::ePRESS,
                                                  .modifier_key = ev::ModifierKey{},
                                                  .scancode = 0});
                 check(a.view.sel.cur_r > a0,
                       "detach: A keyboard still works after focused table removed");
-                h.input_event(ev::keyboard_event{.key = ev::Key::eDOWN,
+                h.route_event(ev::keyboard_event{.key = ev::Key::eDOWN,
                                                  .action = ev::Action::eRELEASE,
                                                  .modifier_key = ev::ModifierKey{},
                                                  .scancode = 0});
             }
             {
-                h.input_event(ev::keyboard_event{.key = ev::Key::eF2,
+                h.route_event(ev::keyboard_event{.key = ev::Key::eF2,
                                                  .action = ev::Action::ePRESS,
                                                  .modifier_key = ev::ModifierKey{},
                                                  .scancode = 0});
-                h.input_event(ev::keyboard_event{.key = ev::Key::eF2,
+                h.route_event(ev::keyboard_event{.key = ev::Key::eF2,
                                                  .action = ev::Action::eRELEASE,
                                                  .modifier_key = ev::ModifierKey{},
                                                  .scancode = 0});
                 check(a.view.edit.active(), "detach: A can open edit after promotion");
-                h.input_event(ev::char_event{.codepoint = U'q'});
+                h.route_event(ev::char_event{.codepoint = U'q'});
                 check(a.view.edit.active() && !a.view.edit.buf.empty() &&
                           a.view.edit.buf.back() == 'q',
                       "detach: A still receives char after promotion");
-                h.input_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+                h.route_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
                                                  .action = ev::Action::ePRESS,
                                                  .modifier_key = ev::ModifierKey{},
                                                  .scancode = 0});
-                h.input_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+                h.route_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
                                                  .action = ev::Action::eRELEASE,
                                                  .modifier_key = ev::ModifierKey{},
                                                  .scancode = 0});
@@ -13235,7 +13107,7 @@ namespace table_ui
             check(empty.focused == nullptr, "empty: focused == nullptr");
             check(!modal_open(&empty), "empty: modal_open false");
             check(!cancel_modal(empty), "empty: cancel_modal false");
-            empty.input_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+            empty.route_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
                                                  .action = ev::Action::ePRESS,
                                                  .modifier_key = ev::ModifierKey{},
                                                  .scancode = 0});

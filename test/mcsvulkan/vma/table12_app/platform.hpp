@@ -13,9 +13,24 @@
 // ============================================================================
 
 #include "../table12/frame.hpp"
+#include "../table12/model.hpp"
+#include "shader_abi.hpp"
 
 namespace table::platform
 {
+// ── 唯一 GPU 入口：TargetKey → Target（picking 回读） ─────────────────
+//   与 HANDOFF §6.4 草案的差异：Target 需要 row_id/column_id，必须查 model；
+//   model::resolve 仍是纯函数，但只有这里调用它。
+[[nodiscard]] inline Target resolve(const model::Table &m, const PickingResult &r)
+{
+    return model::resolve(m, r.key.entity_index);
+}
+
+// 调试/合并检查用：手上只有 entity_index（例如 shader instance），没有完整 PickingResult
+[[nodiscard]] inline Target resolve(const model::Table &m, TargetKey key)
+{
+    return model::resolve(m, key);
+}
 // ── 字形裁剪（encode 的私有工具，纯几何） ───────────────────────────
     inline void clip_glyph(ui_dao::rect_px &r, UvTransform &uv,
                            const ui_dao::rect_px &clip) noexcept

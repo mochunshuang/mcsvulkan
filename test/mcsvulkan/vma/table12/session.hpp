@@ -22,9 +22,10 @@
 //   每次命令的 touch：feature/gesture 自身的 65 处原样 + dispatch 末尾 1 次 blanket
 //   （等价 ability11 apply_effects 末尾那次 ui.touch()）；apply_effects 不 touch。
 //
-//   member 名字：模型/意图/交互/布局/绘制指令沿用 ability11 的短名
-//   （data/view/ix/prefs/geom/frame），另有 model()/state()/interaction()/
-//   layout()/draw_list() 访问器，便于与 HANDOFF 的 schema 词汇对齐。
+//   member 名字（G0 冻结）：model / state / interaction / theme / font / router /
+//   pipe / layout / draw；不再有 data/view/... 之类的短名，也没有同名访问器。
+//   注意：成员 model 会遮蔽 table::model 命名空间，Session 内禁止写 model::X
+//   （需要时写全限定 table::model::X，或把实现放到类外的门里）。
 //
 //   依赖：contract/model/intent/frame/command + detail（features/passes）。
 //   不 include window/platform/ui_new/GLFW/Vulkan。
@@ -63,27 +64,8 @@ struct Session
     TableId id{};
     bool trace{false};
 
-    // 规范名访问器：和 HANDOFF 的 schema 词汇对齐（同一份数据，不是副本）
-    [[nodiscard]] model::Table &model() noexcept
-    {
-        return data;
-    }
-    [[nodiscard]] intent::State &state() noexcept
-    {
-        return view;
-    }
-    [[nodiscard]] intent::Interaction &interaction() noexcept
-    {
-        return ix;
-    }
-    [[nodiscard]] frame::Layout &layout() noexcept
-    {
-        return geom;
-    }
-    [[nodiscard]] frame::DrawList &draw_list() noexcept
-    {
-        return frame;
-    }
+    // G0 冻结：字段名就是规范名（model/state/interaction/theme/font/layout/draw），
+    // 不再提供 model()/state()/... 访问器（G2 一次性改字段名时也不加回来）。
     [[nodiscard]] std::uint32_t revision() const noexcept
     {
         return view.revision;

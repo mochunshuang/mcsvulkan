@@ -86,3 +86,51 @@ cpp        ← 全部
 | Draw 字段 | `frame::DrawList` + 对应 `pass_*` + `platform::encode` |
 | 命令 | `command::Command` + 一个 feature（不碰 Host） |
 | 视觉 | 新增一个 `pass_*` + 插进 `kPaintPasses`（不碰其他 pass） |
+
+## 7. G0 冻结清单（2026-11，单向门）
+
+> 这一节是**不可回退**的名字与签名；后续阶段只实现，不再改名。
+> 完整清单与代码骨架见 `PLAN_ability12_fix.md` §4。
+
+### 7.1 五门
+
+```cpp
+// table12_app/host.hpp
+namespace table::window { struct Host { void route_event(const event::Event &); ... }; }
+// table12/session.hpp
+namespace table::session {
+Outcome dispatch(Session &, const command::Command &);   // 只写 State/Interaction
+bool    apply_effects(Session &, const Outcome &);       // 唯一 Model 写点
+Frame   compose(Session &, const Rect &viewport);        // 只写 layout/draw 缓存
+Target  hit(const Session &, float x, float y);          // CPU 命中门（只读）
+}
+// table12_app/platform.hpp
+namespace table::platform {
+template <class View, class Sink>
+void encode(const frame::DrawList &, const Font &, const View &, Sink &&, std::uint32_t hover_fn);
+[[nodiscard]] Target resolve(const model::Table &, const PickingResult &);
+}
+```
+
+### 7.2 ABI（`table12_app/shader_abi.hpp`）
+
+`ObjectKey` 8B · `RenderVersion16`（16 bit）· `PickingResult` 16B（version 16 / primitive 16）。
+静态断言写死在头里；demo 里只保留 `object_key/render_version_t/picking_result` 三个过渡别名。
+
+### 7.3 Session 字段
+
+`model / state / interaction / theme / font / router / pipe / layout / draw / id / trace`。
+不再有 `data/view/ix/prefs/geom/frame` 短名，也不再有 `model()/state()/…` 访问器。
+（成员 `model` 遮蔽 `table::model` 命名空间：Session 内禁止 `model::X`。）
+
+### 7.4 Outcome（G4 实现，签名先冻结）
+
+```cpp
+using EffectList = std::inplace_vector<Effect, 8>;
+struct Outcome { bool handled, model_changed, state_changed; EffectList effects; ... };
+struct Context { /* 无 fx */ const model::Table &d; intent::State &v; intent::Interaction &ix; ... };
+```
+
+### 7.5 测量口径（HANDOFF §16）
+
+"单文件 < 1500"只统计 ability12-owned 代码；demo 框架不计入；拆框架另立项。

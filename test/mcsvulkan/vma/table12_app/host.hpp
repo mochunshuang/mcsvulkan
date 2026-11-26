@@ -9,7 +9,7 @@
 //   GLFW、Vulkan、输入栈和 demo 的 Widget 类型，这些都不属于核心。本头只把
 //   规范名字暴露出来，让主线可读：
 //
-//     GLFW event → window::Host::input_event → Binding::handle_event
+//     GLFW event → window::Host::route_event → Binding::handle_event
 //                → session::dispatch（唯一写入口）
 //     session::compose → frame::DrawList → platform::encode（唯一 GPU 出口）
 //
