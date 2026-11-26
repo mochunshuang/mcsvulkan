@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // ============================================================================
 // table12/test/probes.hpp — ability12 的测试驱动（test-only）
 //
@@ -36,8 +36,8 @@ namespace table_ui
             s.session.font.put(static_cast<char32_t>(ch), gm);
         // headless must initialize the coordinate transform explicitly:
         // owner == nullptr and sx/sy == 1.
-        s.owner = nullptr;
-        s.sx = s.sy = 1.0F;
+        s.window_slot.owner = nullptr;
+        s.window_slot.sx = s.window_slot.sy = 1.0F;
     }
 
 inline int event_probe()

@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // ============================================================================
 // table12_app/host.hpp — window::Binding / window::Host（窗口 layer）
 //
@@ -155,6 +155,18 @@ void on_pick(Binding &binding, const table::platform::PickingResult &r);
         using table_arbiter = ::intent::debug_arbiter<table_tree>;
     } // namespace arena_input
 
+    // ---- 窗口槽位：屏幕/属主/缩放/指针坐标（Binding 的窗口侧字段）
+    struct WindowSlot
+    {
+        ui_new::ScreenWidget *screen{};
+        ui_new::Widget *owner{};
+        GLFWwindow *win{};
+        float mx{0}, my{0}; // pointer in owner coordinates
+        float wx{0}, wy{0}; // raw window cursor
+        float sx{1}, sy{1}; // window logical -> owner coordinates
+        float vw{1}, vh{1};
+    };
+
     struct Binding
     {
         // ---- 核心：真值/意图/派生缓存都在 Session（组合，不是继承）
@@ -207,14 +219,8 @@ void on_pick(Binding &binding, const table::platform::PickingResult &r);
         void on_char(const arena_input::char_payload &e);
         void handle_key_event(const ev::keyboard_event &e);
 
-        // ---- host
-        ui_new::ScreenWidget *screen{};
-        ui_new::Widget *owner{};
-        GLFWwindow *win{};
-        float mx{0}, my{0}; // pointer in owner coordinates
-        float wx{0}, wy{0}; // raw window cursor
-        float sx{1}, sy{1}; // window logical -> owner coordinates
-        float vw{1}, vh{1};
+        // ---- window slot（窗口侧字段集中在这里）
+        WindowSlot window_slot{};
 
         // ---- window host wiring (host lives as long as the window; a table
         // may be destroyed before the window)
@@ -345,8 +351,8 @@ void on_pick(Binding &binding, const table::platform::PickingResult &r);
                 Binding *a = *it;
                 if (a == nullptr)
                     continue;
-                const float lx = static_cast<float>(wx) * a->sx;
-                const float ly = static_cast<float>(wy) * a->sy;
+                const float lx = static_cast<float>(wx) * a->window_slot.sx;
+                const float ly = static_cast<float>(wy) * a->window_slot.sy;
                 const auto &b = a->session.layout.box;
                 if (b.w > 0.0F && b.h > 0.0F && lx >= b.x && lx < b.x1() && ly >= b.y &&
                     ly < b.y1())

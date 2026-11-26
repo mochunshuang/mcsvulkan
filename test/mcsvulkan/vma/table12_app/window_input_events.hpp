@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // ============================================================================
 // table12_app/window_input_events.hpp — input events：trace/on_hover + 指针链路 + Binding::on_* 成员定义
 //
@@ -41,10 +41,10 @@ inline void on_hover(picking_result r, bool enter, InputCtx &,
 
     inline void set_pointer(Binding &s, double wx, double wy) noexcept
     {
-        s.wx = static_cast<float>(wx);
-        s.wy = static_cast<float>(wy);
-        s.mx = s.wx * s.sx;
-        s.my = s.wy * s.sy;
+        s.window_slot.wx = static_cast<float>(wx);
+        s.window_slot.wy = static_cast<float>(wy);
+        s.window_slot.mx = s.window_slot.wx * s.window_slot.sx;
+        s.window_slot.my = s.window_slot.wy * s.window_slot.sy;
     }
 
 
@@ -59,23 +59,23 @@ inline void on_hover(picking_result r, bool enter, InputCtx &,
 
     inline void click_dispatch(Binding &s, double x, double y)
     {
-        if (!s.input_state.pointer_position_valid && s.win != nullptr)
+        if (!s.input_state.pointer_position_valid && s.window_slot.win != nullptr)
         {
             double cx = 0, cy = 0;
-            glfwGetCursorPos(s.win, &cx, &cy);
+            glfwGetCursorPos(s.window_slot.win, &cx, &cy);
             x = cx;
             y = cy;
         }
         set_pointer(s, x, y);
-        const auto tgt = pointer_target(s, s.mx, s.my);
+        const auto tgt = pointer_target(s, s.window_slot.mx, s.window_slot.my);
         if (std::getenv("TABLE_INPUTLOG") != nullptr)
-            std::println("[click] at=({:.1f},{:.1f}) kind={} row={} col={}", s.mx, s.my,
+            std::println("[click] at=({:.1f},{:.1f}) kind={} row={} col={}", s.window_slot.mx, s.window_slot.my,
                          table::part_name(tgt.kind), tgt.row_index, tgt.col_index);
         const bool shift = s.input_state.modifier.shift();
         const bool ctrl = s.input_state.modifier.control();
         input_dispatch(
-            s, table::command::Press{s.mx, s.my, tgt.to_zone(), false, shift, ctrl, tgt});
-        input_dispatch(s, table::command::Release{s.mx, s.my, s.session.interaction.drag_target});
+            s, table::command::Press{s.window_slot.mx, s.window_slot.my, tgt.to_zone(), false, shift, ctrl, tgt});
+        input_dispatch(s, table::command::Release{s.window_slot.mx, s.window_slot.my, s.session.interaction.drag_target});
     }
 
 
@@ -87,8 +87,8 @@ inline void Binding::on_press(const arena_input::click_payload &e)
 inline void Binding::on_right_click(const arena_input::click_payload &e)
     {
         set_pointer(*this, e.x, e.y);
-        const auto tgt = pointer_target(*this, mx, my);
-        table::session::open_menu(session, tgt.to_zone().col, mx, my);
+        const auto tgt = pointer_target(*this, window_slot.mx, window_slot.my);
+        table::session::open_menu(session, tgt.to_zone().col, window_slot.mx, window_slot.my);
     }
 
 inline void Binding::on_drag(const arena_input::drag_payload &e)
@@ -99,40 +99,40 @@ inline void Binding::on_drag(const arena_input::drag_payload &e)
             // 按下点 = 当前点 - 总位移：先补一发 press，再发 drag
             set_pointer(*this, e.x - e.total_dx, e.y - e.total_dy);
             session.interaction.last_click_t = -1.0e9; // 拖拽的 press 不参与双击判定
-            const auto tgt = pointer_target(*this, mx, my);
-            input_dispatch(*this, table::command::Press{mx, my, tgt.to_zone(), false,
+            const auto tgt = pointer_target(*this, window_slot.mx, window_slot.my);
+            input_dispatch(*this, table::command::Press{window_slot.mx, window_slot.my, tgt.to_zone(), false,
                                                       e.modifier.shift(),
                                                       e.modifier.control(), tgt});
             set_pointer(*this, e.x, e.y);
-            input_dispatch(*this, table::command::Drag{mx, my, session.interaction.drag_target});
+            input_dispatch(*this, table::command::Drag{window_slot.mx, window_slot.my, session.interaction.drag_target});
             break;
         }
         case gesture::drag_phase::move:
             set_pointer(*this, e.x, e.y);
-            input_dispatch(*this, table::command::Drag{mx, my, session.interaction.drag_target});
+            input_dispatch(*this, table::command::Drag{window_slot.mx, window_slot.my, session.interaction.drag_target});
             break;
         case gesture::drag_phase::end:
             set_pointer(*this, e.x, e.y);
-            input_dispatch(*this, table::command::Release{mx, my, session.interaction.drag_target});
+            input_dispatch(*this, table::command::Release{window_slot.mx, window_slot.my, session.interaction.drag_target});
             break;
         }
     }
 
 inline void Binding::on_wheel(const arena_input::wheel_payload &e)
     {
-        if (!input_state.pointer_position_valid && win != nullptr)
+        if (!input_state.pointer_position_valid && window_slot.win != nullptr)
         {
             double cx = 0, cy = 0;
-            glfwGetCursorPos(win, &cx, &cy);
+            glfwGetCursorPos(window_slot.win, &cx, &cy);
             set_pointer(*this, cx, cy);
         }
         else
             set_pointer(*this, input_state.pointer_x, input_state.pointer_y);
         if (std::getenv("TABLE_INPUTLOG") != nullptr)
-            std::println("[wheel] delta={} at=({:.1f},{:.1f})", e.delta, mx, my);
+            std::println("[wheel] delta={} at=({:.1f},{:.1f})", e.delta, window_slot.mx, window_slot.my);
         // 只滚指针下面的表；Shift 或悬停横向条 = 横向滚动
-        if (mx < session.layout.box.x || mx >= session.layout.box.x1() || my < session.layout.box.y ||
-            my >= session.layout.box.y1())
+        if (window_slot.mx < session.layout.box.x || window_slot.mx >= session.layout.box.x1() || window_slot.my < session.layout.box.y ||
+            window_slot.my >= session.layout.box.y1())
             return;
         table::session::wheel(session, 0.0F, static_cast<float>(e.delta),
                               input_state.modifier.shift());
@@ -167,7 +167,7 @@ inline void Binding::on_key(const arena_input::key_payload &e)
         if (e.key == ev::Key::eV && ctrl)
         {
             const auto out =
-                table::session::paste_text(session, table_glue::read_clipboard(win));
+                table::session::paste_text(session, table_glue::read_clipboard(window_slot.win));
             apply_effects(*this, out);
             ++inputs;
             return;
@@ -265,8 +265,8 @@ inline void Binding::advance(double /*seconds*/)
                 // resolved by the topmost entry of draw_order.
                 if (host->hovered == this)
                 {
-                    session.interaction.pointer = {mx, my};
-                    table::session::update_hover(session, pointer_target(*this, mx, my));
+                    session.interaction.pointer = {window_slot.mx, window_slot.my};
+                    table::session::update_hover(session, pointer_target(*this, window_slot.mx, window_slot.my));
                 }
                 else
                 {
@@ -276,8 +276,8 @@ inline void Binding::advance(double /*seconds*/)
             else
             {
                 // headless single table: keep pointer -> hit -> hover
-                session.interaction.pointer = {mx, my};
-                table::session::update_hover(session, pointer_target(*this, mx, my));
+                session.interaction.pointer = {window_slot.mx, window_slot.my};
+                table::session::update_hover(session, pointer_target(*this, window_slot.mx, window_slot.my));
             }
         }
         arbiter.tick(*this, now);

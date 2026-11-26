@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // ============================================================================
 // table12_app/scene.hpp — 场景/宿主接线（app 层，不是 demo 框架）
 //
@@ -85,26 +85,26 @@ inline auto make_table(table::model::Table data, table::intent::Theme p, table::
             method<"render">([](auto &self, ui_new::ScreenWidget *screen,
                                 ui_new::Widget *owner, render_context &ctx) {
                 auto &s = self.arena;
-                s.screen = screen;
-                s.owner = owner;
+                s.window_slot.screen = screen;
+                s.window_slot.owner = owner;
                 // Record this frame's draw order: table_at walks it in reverse
                 // (not the attach order).
                 if (screen != nullptr && screen->table_host_ctx != nullptr)
                     screen->table_host_ctx->mark_drawn(&s);
-                s.win = named_resource::frameState().window->data();
-                if (s.win != nullptr && owner != nullptr)
+                s.window_slot.win = named_resource::frameState().window->data();
+                if (s.window_slot.win != nullptr && owner != nullptr)
                 {
                     int ww = 1, wh = 1;
-                    glfwGetWindowSize(s.win, &ww, &wh);
+                    glfwGetWindowSize(s.window_slot.win, &ww, &wh);
                     if (ww > 0 && wh > 0)
                     {
                         // Window logical -> framebuffer pixels. This must use the
                         // screen size (DPI scale), not the owner width: with N
                         // tables the owner is only a sub-rect of the screen.
                         const auto screenSize = screen->size();
-                        s.sx =
+                        s.window_slot.sx =
                             static_cast<float>(screenSize.width) / static_cast<float>(ww);
-                        s.sy = static_cast<float>(screenSize.height) /
+                        s.window_slot.sy = static_cast<float>(screenSize.height) /
                                static_cast<float>(wh);
                     }
                     if (std::getenv("TABLE_GEOMLOG") != nullptr)
@@ -120,8 +120,8 @@ inline auto make_table(table::model::Table data, table::intent::Theme p, table::
                             std::println("[host] owner=({:.0f},{:.0f} @ {:.0f},{:.0f}) "
                                          "win={}x{} scale=({:.3f},{:.3f})",
                                          owner->size.width, owner->size.height,
-                                         owner->offset.x, owner->offset.y, ww, wh, s.sx,
-                                         s.sy);
+                                         owner->offset.x, owner->offset.y, ww, wh, s.window_slot.sx,
+                                         s.window_slot.sy);
                         }
                     }
                 }
@@ -215,14 +215,14 @@ inline auto make_table(table::model::Table data, table::intent::Theme p, table::
 
     inline void input_ime(Binding &s)
     {
-        if (s.win == nullptr)
+        if (s.window_slot.win == nullptr)
             return;
         const bool filter = s.session.state.filter.edit >= 0;
         const bool find = s.session.state.find.mode;
         const bool edit = s.session.state.edit.active();
         if (!filter && !find && !edit)
             return;
-        auto pre = table_glue::ime_preedit(s.win);
+        auto pre = table_glue::ime_preedit(s.window_slot.win);
         if (filter)
         {
             if (pre != s.session.state.filter.compose)

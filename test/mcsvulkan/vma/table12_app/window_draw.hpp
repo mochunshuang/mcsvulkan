@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // ============================================================================
 // table12_app/window_draw.hpp — window 层的 draw 链（只放定义）
 //
@@ -20,8 +20,8 @@ namespace table::window
         const float m = 48.0F;
         const table::Rect vp{box.x + m, box.y + m, std::max(box.w - 2.0F * m, 1.0F),
                                 std::max(box.h - 2.0F * m, 1.0F)};
-        s.vw = vp.w;
-        s.vh = vp.h;
+        s.window_slot.vw = vp.w;
+        s.window_slot.vh = vp.h;
         // 门：compose = layout passes + paint passes（唯一派生入口）
         table::session::compose(s.session, vp);
         if (std::getenv("TABLE_GEOMLOG") != nullptr)
@@ -100,7 +100,7 @@ inline void draw_encode(const Binding &s, const ui_dao::view &view, Sink &&sink)
         if (std::getenv("TABLE_PICKCHECK") == nullptr || r.key.object_type == 0xFFFFFFFF)
             return;
         const auto from_gpu = table::platform::resolve(s.session.model, r);
-        const auto from_hit = table::session::hit(s.session, s.mx, s.my);
+        const auto from_hit = table::session::hit(s.session, s.window_slot.mx, s.window_slot.my);
         if (from_gpu.to_zone() != from_hit.to_zone())
             std::println("[pick] MISMATCH gpu=({}, {}, {}) hit=({}, {}, {})",
                          table::part_name(from_gpu.kind), from_gpu.row_index,

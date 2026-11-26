@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 // ============================================================================
 // table12_app/window_input_effects.hpp — input effects：apply_effects / notify_* / 模型 API / cancel_modal
 //
@@ -69,7 +69,7 @@ namespace table::window
         const bool model_changed = table::session::apply_effects(s.session, out);
         for (const auto &e : out.effects)
             if (const auto *p = std::get_if<table::command::WriteClipboard>(&e))
-                table_glue::write_clipboard(s.win, p->text);
+                table_glue::write_clipboard(s.window_slot.win, p->text);
         if (model_changed)
         {
             s.changes.model = true;
