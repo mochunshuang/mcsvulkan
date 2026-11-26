@@ -77,14 +77,14 @@ using model::Table;
 
         // 一个 Session = 一张表：真值 + 持久意图 + 临时交互 + 派生缓存
         session::Session S;
-        model::Table &d = S.data;
-        test::ViewFacade v{S.view, S.ix};
-        intent::Interaction &ix = S.ix;
-        intent::Theme &p = S.prefs;
+        model::Table &d = S.model;
+        test::ViewFacade v{S.state, S.interaction};
+        intent::Interaction &ix = S.interaction;
+        intent::Theme &p = S.theme;
         Font &ft = S.font;
-        detail::AppRouter &sy = S.sys;
+        detail::AppRouter &sy = S.router;
         frame::RowPipeline &pipe = S.pipe;
-        frame::Layout &g = S.geom;
+        frame::Layout &g = S.layout;
         {
             Column c;
             c.key = "name";
@@ -171,7 +171,7 @@ const Rect vp{0, 0, 800, 600};
         {
             // 第二张表 = 第二个 Session：同一套门（compose / hit / dispatch）
             session::Session S2;
-            Table &dg = S2.data;
+            Table &dg = S2.model;
             Column gc;
             for (int i = 0; i < 4; ++i)
             {
@@ -191,12 +191,12 @@ const Rect vp{0, 0, 800, 600};
             }
             dg.ids.push_back(RowId{1});
             dg.ids.push_back(RowId{2});
-            S2.prefs = p;
+            S2.theme = p;
             S2.font = ft;
             S2.reset();
             session::compose(S2, vp);
-            State &vg = S2.view;
-            const Layout &gg = S2.geom;
+            State &vg = S2.state;
+            const Layout &gg = S2.layout;
             const auto gz = session::hit(S2, gg.col_x_at(1) + 5.0F, gg.group.y + 5.0F);
             check(gz.to_zone().kind == Part::header_group && gz.to_zone().col >= 0,
                   "group hit test carries first column");

@@ -48,19 +48,20 @@ using frame::Frame;
 struct Session
 {
     // ── 真值：唯一写入口是 session::apply_effects（Host 在 dispatch 之后调用） ──
-    model::Table data{}; // Model：列 + 列主序单元格 + 稳定行身份
+    model::Table model{}; // Model：列 + 列主序单元格 + 稳定行身份
+    // 注：成员 model 遮蔽 table::model，Session 内禁止再写 model::X（用 table::model::X）
     // ── 意图：持久（State）+ 临时（Interaction），ability11 的 view 拆分 ──
-    intent::State view{};      // State：滚动/排序/筛选/选择/勾选/列/历史/菜单/编辑
-    intent::Interaction ix{};  // Interaction：hover/拖拽/指针/连击计时
+    intent::State state{};      // State：滚动/排序/筛选/选择/勾选/列/历史/菜单/编辑
+    intent::Interaction interaction{}; // Interaction：hover/拖拽/指针/连击计时
     // ── 呈现配置：由宿主提供，核心只读 ────────────────────────────────
-    intent::Theme prefs{};   // 样式与开关
+    intent::Theme theme{};   // 样式与开关
     Font font{};             // 字形表
     // ── 组合根：feature 组合 + 行变换缓冲 ─────────────────────────────
-    detail::AppRouter sys{};   // CommandRouter（15 个 feature 的有序组合）
-    frame::RowPipeline pipe{}; // 行变换缓冲（filter/sort 写，compose 读）
+    detail::AppRouter router{}; // CommandRouter（15 个 feature 的有序组合）
+    frame::RowPipeline pipe{};   // 行变换缓冲（filter/sort 写，compose 读）
     // ── 派生缓存：compose 写，hit 读；随时可丢，不是第二份真值 ────────
-    frame::Layout geom{};    // Layout（layout passes 的输出）
-    frame::DrawList frame{}; // DrawList（paint passes 的输出）
+    frame::Layout layout{};  // Layout（layout passes 的输出）
+    frame::DrawList draw{};  // DrawList（paint passes 的输出）
     TableId id{};
     bool trace{false};
 
@@ -68,19 +69,19 @@ struct Session
     // 不再提供 model()/state()/... 访问器（G2 一次性改字段名时也不加回来）。
     [[nodiscard]] std::uint32_t revision() const noexcept
     {
-        return view.revision;
+        return state.revision;
     }
 
     void reset()
     {
-        view.reset(data);
-        ix.reset();
-        geom = {};
-        frame = {};
+        state.reset(model);
+        interaction.reset();
+        layout = {};
+        draw = {};
     }
     void reconcile()
     {
-        view.reconcile(data);
+        state.reconcile(model);
     }
 };
 
@@ -97,20 +98,20 @@ inline Outcome dispatch(Session &s, const command::Command &cmd)
     Outcome out;
     // 连击计数必须在 feature 之前更新（edit 先读 click_count）
     if (const auto *p = std::get_if<command::Press>(&cmd))
-        detail::note_click(s.view, s.ix, *p);
+        detail::note_click(s.state, s.interaction, *p);
 
     std::vector<command::Effect> fx;
-    command::Context ctx{s.data, s.view, s.ix, s.prefs, s.geom, s.font, &fx, s.trace,
+    command::Context ctx{s.model, s.state, s.interaction, s.theme, s.layout, s.font, &fx, s.trace,
                          s.id};
 
     bool handled = false;
-    std::visit([&](const auto &one) { handled = s.sys.handle(ctx, one); }, cmd);
+    std::visit([&](const auto &one) { handled = s.router.handle(ctx, one); }, cmd);
     if (!handled)
     {
         // 没人认领 → gesture fallback（选择/拖拽/滚动）
         std::visit(
             [&](const auto &one) {
-                detail::gesture(s.data, s.view, s.ix, s.prefs, s.geom, s.sys, s.font,
+                detail::gesture(s.model, s.state, s.interaction, s.theme, s.layout, s.router, s.font,
                                 one, fx);
             },
             cmd);
@@ -124,7 +125,7 @@ inline Outcome dispatch(Session &s, const command::Command &cmd)
 
     // blanket touch：等价 ability11 apply_effects 末尾那次 ui.touch()。
     // feature/gesture 自己的 65 处 touch 全部保留，这里只补一次。
-    s.view.touch();
+    s.state.touch();
     out.state_changed = true;
     return out;
 }
@@ -137,10 +138,10 @@ inline bool apply_effects(Session &s, const Outcome &out)
     {
         if (const auto *p = std::get_if<command::SetCell>(&e))
         {
-            const int r = s.data.index_of(p->id);
+            const int r = s.model.index_of(p->id);
             if (r >= 0)
             {
-                s.data.set_cell(r, p->col, p->text);
+                s.model.set_cell(r, p->col, p->text);
                 model_changed = true;
             }
         }
@@ -154,13 +155,13 @@ inline Outcome feed_text(Session &s, std::string_view text)
 {
     Outcome out;
     std::vector<command::Effect> fx;
-    command::Context ctx{s.data, s.view, s.ix, s.prefs, s.geom, s.font, &fx, s.trace,
+    command::Context ctx{s.model, s.state, s.interaction, s.theme, s.layout, s.font, &fx, s.trace,
                          s.id};
-    out.handled = s.sys.text(ctx, text);
+    out.handled = s.router.text(ctx, text);
     out.model_changed = false;
     for (auto &e : fx)
         out.effects.push_back(std::move(e));
-    s.view.touch();
+    s.state.touch();
     out.state_changed = true;
     return out;
 }
@@ -169,46 +170,46 @@ inline Outcome feed_text(Session &s, std::string_view text)
 inline void ime_compose(Session &s, std::string text)
 {
     std::vector<command::Effect> fx;
-    command::Context ctx{s.data, s.view, s.ix, s.prefs, s.geom, s.font, &fx, s.trace,
+    command::Context ctx{s.model, s.state, s.interaction, s.theme, s.layout, s.font, &fx, s.trace,
                          s.id};
-    s.sys.get<detail::EditFeature>().compose(ctx, std::move(text));
-    s.view.touch();
+    s.router.get<detail::EditFeature>().compose(ctx, std::move(text));
+    s.state.touch();
 }
 
 // ---- 窄门：右键菜单 / 剪贴板粘贴 / Esc 取消（平台先做 I/O，再交给核心） --
 inline void open_menu(Session &s, int col, float x, float y)
 {
-    command::Context ctx{s.data, s.view, s.ix, s.prefs, s.geom, s.font, nullptr, s.trace,
+    command::Context ctx{s.model, s.state, s.interaction, s.theme, s.layout, s.font, nullptr, s.trace,
                          s.id};
-    s.sys.get<detail::MenuFeature>().open(ctx, col, x, y);
-    s.view.touch();
+    s.router.get<detail::MenuFeature>().open(ctx, col, x, y);
+    s.state.touch();
 }
 
 inline Outcome paste_text(Session &s, std::string text)
 {
     Outcome out;
     std::vector<command::Effect> fx;
-    command::Context ctx{s.data, s.view, s.ix, s.prefs, s.geom, s.font, &fx, s.trace,
+    command::Context ctx{s.model, s.state, s.interaction, s.theme, s.layout, s.font, &fx, s.trace,
                          s.id};
-    out.handled = s.sys.get<detail::EditFeature>().paste(ctx, std::move(text));
+    out.handled = s.router.get<detail::EditFeature>().paste(ctx, std::move(text));
     out.model_changed = false;
     for (auto &e : fx)
         out.effects.push_back(std::move(e));
-    s.view.touch();
+    s.state.touch();
     out.state_changed = true;
     return out;
 }
 
 [[nodiscard]] inline bool modal_open(const Session &s) noexcept
 {
-    return s.view.filter.edit >= 0 || s.view.find.mode || s.view.edit.active() ||
-           s.view.menu.open;
+    return s.state.filter.edit >= 0 || s.state.find.mode || s.state.edit.active() ||
+           s.state.menu.open;
 }
 
 // Esc 优先取消模态（编辑/筛选/查找/菜单），而不是关窗口
 inline bool cancel_modal(Session &s) noexcept
 {
-    auto &v = s.view;
+    auto &v = s.state;
     if (v.filter.edit >= 0)
     {
         const auto col = static_cast<std::size_t>(v.filter.edit);
@@ -246,29 +247,29 @@ inline bool cancel_modal(Session &s) noexcept
 // ---- 窄门：只写 Interaction（hover / pointer / wheel），不碰 Model ------
 inline void observe_pointer(Session &s, Point p, double now) noexcept
 {
-    s.ix.pointer = p;
-    s.ix.now = now;
+    s.interaction.pointer = p;
+    s.interaction.now = now;
 }
 
 inline void update_hover(Session &s, const Target &t)
 {
-    intent::hover(s.view, s.ix, t);
+    intent::hover(s.state, s.interaction, t);
 }
 
 inline void clear_hover(Session &s)
 {
-    s.ix.hover = {};
-    s.ix.band_row = s.ix.band_col = -1;
-    s.ix.left = false;
-    s.ix.drag = intent::DragMode::none;
-    s.view.menu.open = false;
-    s.view.touch();
+    s.interaction.hover = {};
+    s.interaction.band_row = s.interaction.band_col = -1;
+    s.interaction.left = false;
+    s.interaction.drag = intent::DragMode::none;
+    s.state.menu.open = false;
+    s.state.touch();
 }
 
 inline void wheel(Session &s, float dx, float dy, bool shift)
 {
-    intent::wheel(s.view, s.ix, s.prefs, dx, dy, shift, &s.geom);
-    s.view.touch();
+    intent::wheel(s.state, s.interaction, s.theme, dx, dy, shift, &s.layout);
+    s.state.touch();
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -276,12 +277,12 @@ inline void wheel(Session &s, float dx, float dy, bool shift)
 // ════════════════════════════════════════════════════════════════════════
 inline Frame compose(Session &s, const Rect &viewport)
 {
-    detail::compose_layout(s.data, s.view, s.ix, s.prefs, s.geom, viewport, s.font,
-                           s.sys, s.pipe);
-    detail::compose_draw(s.data, s.view, s.ix, s.prefs, s.geom, s.font, s.sys, s.frame,
+    detail::compose_layout(s.model, s.state, s.interaction, s.theme, s.layout, viewport, s.font,
+                           s.router, s.pipe);
+    detail::compose_draw(s.model, s.state, s.interaction, s.theme, s.layout, s.font, s.router, s.draw,
                          s.id);
-    s.geom.version = s.view.revision;
-    return Frame{s.geom, s.frame, s.view.revision, s.id};
+    s.layout.version = s.state.revision;
+    return Frame{s.layout, s.draw, s.state.revision, s.id};
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -289,7 +290,7 @@ inline Frame compose(Session &s, const Rect &viewport)
 // ════════════════════════════════════════════════════════════════════════
 [[nodiscard]] inline Target hit(const Session &s, float x, float y)
 {
-    const Zone z = detail::hit_zone(s.data, s.geom, s.view, x, y, s.id);
-    return model::target_of(s.data, s.id, z);
+    const Zone z = detail::hit_zone(s.model, s.layout, s.state, x, y, s.id);
+    return model::target_of(s.model, s.id, z);
 }
 } // namespace table::session

@@ -179,6 +179,29 @@ demo cpp 里保留过渡别名（G0，避免 200 处无谓改名）：
 
 ### 4.4 `Session` 最终字段名（G2 一次改名）
 
+**字段归属表（G2a 的可审计矩阵：先按域切开，再替换）**
+
+| 归属 | 字段 | 在 app/Binding 里的写法 |
+|---|---|---|
+| **Session**（要 `s.session.` 前缀） | `data→model`、`view→state`、`ix→interaction`、`prefs→theme`、`font→font`、`geom→layout`、`frame→draw`、`sys→router`、`pipe→pipe`、`id→id` | `s.session.model` / `s.session.state` / … |
+| **Binding 自己**（保持 `s.`） | `screen`、`owner`、`win`、`mx/my/wx/wy/sx/sy/vw/vh`、`pointer`、`pick`、`pick_version`、`arbiter`、`input_state`、`now`、`esc_cancelled`、`cb`、`cb_r0…cb_valid`、`changes`、`inputs`、`info` | `s.win` / `s.arbiter` / … 不变 |
+| **Host 自己** | `tables`、`draw_order`、`focused`、`pressed`、`hovered`、`binding`、`input_attached`、`pointer_x/y`、`pointer_inside`、`frame_serial`、`hover_fn`、`next_table_id`、`last_pick` | `h.focused` / … 不变 |
+
+**三个替换域（顺序固定，不交叉）**
+
+| 域 | 文件 | 规则 |
+|---|---|---|
+| ① Session 内部 | `table12/session.hpp` | `s.data→s.model`、`s.view→s.state`、`s.ix→s.interaction`、`s.prefs→s.theme`、`s.geom→s.layout`、`s.frame→s.draw`、`s.sys→s.router`；**不加** `session.` |
+| ② Binding / app | `test_ui_ability12_table.cpp` | 同上字段映射，但前缀是 `s.session.*`；`s.screen/s.win/s.arbiter/s.pointer/s.cb/...` 不动 |
+| ③ selftest | `table12/test/selftest.hpp` | 绑定行 `S.data→S.model`、`S.view→S.state`、`S.ix→S.interaction`、`S.prefs→S.theme`、`S.geom→S.layout`、`S.sys→S.router`；facade 用 `{S.state, S.interaction}` |
+
+审计顺序（用编译器当审计器）：
+1. 先改 `Session` 字段声明 + 域①；编译 → 域②的 `s.data` 全部报错；
+2. 按接收者（`s.` / `st.` / `a->` / `hovered->` / `focused->` / `pressed->` / `arena.`）补 `s.session.`；
+3. `grep -nE '\bs\.(data|view|ix|prefs|geom|frame)\b'` 应为 0；
+4. `grep -n 's\.session\.' table12/session.hpp` 应为 0（域不交叉）；
+5. 四门 + oracle 全绿再提交。
+
 ```cpp
 struct Session {
     model::Table model;            // 注意：成员 model 遮蔽 table::model，类内禁止写 model::X
@@ -213,7 +236,6 @@ framework(ui_new/intent/gesture/ui_dao/input_frame) → shader_abi/glue/platform
 ```
 
 ### 4.6 不返工矩阵（阶段 × 文件）
-
 `●` 新建 · `◐` 会再改 · `○` 不再改 · `—` 不涉及
 
 | 文件 | G0 | G2 | G3 | G4 | G5 | G6 | G7 |
