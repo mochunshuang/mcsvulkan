@@ -493,9 +493,13 @@ inline void pass_owners(DrawContext &c)
             }
 }
 
-constexpr std::array<void (*)(DrawContext &), 10> kPaintPasses = {
-    pass_visual, pass_frame, pass_group_bands, pass_header, pass_rows,
-    pass_cells, pass_separators, pass_zones, pass_features, pass_owners,
+using PaintPassFn = void (*)(DrawContext &);
+inline constexpr auto kPaintPasses = std::tuple{
+    static_cast<PaintPassFn>(pass_visual),      static_cast<PaintPassFn>(pass_frame),
+    static_cast<PaintPassFn>(pass_group_bands), static_cast<PaintPassFn>(pass_header),
+    static_cast<PaintPassFn>(pass_rows),        static_cast<PaintPassFn>(pass_cells),
+    static_cast<PaintPassFn>(pass_separators),  static_cast<PaintPassFn>(pass_zones),
+    static_cast<PaintPassFn>(pass_features),    static_cast<PaintPassFn>(pass_owners),
 };
 
 // ── 唯一入口：paint passes 的有序组合 ─────────────────────────────────
@@ -508,7 +512,6 @@ inline void compose_draw(const Table &d, const State &v, const Interaction &ix,
     out.version = v.revision;
     if (g.box.empty())
         return;
-    for (const auto pass : kPaintPasses)
-        pass(c);
+    std::apply([&](auto... pass) { (pass(c), ...); }, kPaintPasses);
 }
 } // namespace table::detail

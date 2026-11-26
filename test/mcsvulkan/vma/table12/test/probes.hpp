@@ -8,6 +8,7 @@
 // ============================================================================
 
 #include "../../table12_app/scene.hpp"
+#include "alloc_count.hpp"
 
 namespace table_ui
 {
@@ -770,4 +771,54 @@ inline int event_probe()
         std::println("[multi] done, {} failed", fails);
         return fails;
     }
+// ── 性能探针（TABLE_PERF）：compose x10k / dispatch x100k + DrawList 指纹 ──
+inline int perf_probe()
+{
+    Binding s;
+    init_multi_table(s, 1, 200);
+    const table::Rect vp{0.0F, 0.0F, 900.0F, 600.0F};
+    table::session::compose(s.session, vp);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 10000; ++i)
+        table::session::compose(s.session, vp);
+    const auto t1 = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < 2000; ++i)
+        table::session::dispatch(s.session, table::command::Command{table::command::Hover{}});
+    const auto t2 = std::chrono::steady_clock::now();
+    table::test::alloc_reset();
+    for (int i = 0; i < 100000; ++i)
+        table::session::dispatch(s.session, table::command::Command{table::command::Hover{}});
+    const auto allocs = table::test::allocs();
+    const auto t3 = std::chrono::steady_clock::now();
+    // Outcome 常见路径（Hover，无 effect）必须 0 分配
+    if (allocs != 0)
+    {
+        std::println("[perf] FAIL: dispatch allocated {} times", allocs);
+        return 1;
+    }
+
+    // DrawList 指纹：zones/visual/version（顺序敏感）
+    std::uint64_t h = 1469598103934665603ull;
+    const auto mix = [&](std::uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ull;
+    };
+    mix(s.session.draw.zones.size());
+    mix(s.session.draw.visual.size());
+    mix(s.session.draw.version);
+    for (const auto &z : s.session.draw.zones)
+        mix(static_cast<std::uint64_t>(z.z.kind) * 1000003ull +
+            static_cast<std::uint64_t>(z.z.row + 1) * 1009ull +
+            static_cast<std::uint64_t>(z.z.col + 1));
+    const std::uint64_t ops = s.session.draw.zones.size();
+    const auto ms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    std::println("[perf] compose_10k={:.3f}ms dispatch_100k={:.3f}ms ops={} hash={:016x} allocs=0",
+                 ms(t0, t1), ms(t2, t3), ops, h);
+    return 0;
+}
+
 } // namespace table_ui

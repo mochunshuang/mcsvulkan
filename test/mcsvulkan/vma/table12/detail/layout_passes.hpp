@@ -382,9 +382,13 @@ inline void pass_edges(LayoutContext &c)
             assert(c.g.header.h == c.g.group_h + c.p.header_h);
 }
 
-constexpr std::array<void (*)(LayoutContext &), 9> kLayoutPasses = {
-    pass_reconcile, pass_frame, pass_columns, pass_metrics, pass_rows,
-    pass_frozen,    pass_visible, pass_bars, pass_edges,
+using LayoutPassFn = void (*)(LayoutContext &);
+inline constexpr auto kLayoutPasses = std::tuple{
+    static_cast<LayoutPassFn>(pass_reconcile), static_cast<LayoutPassFn>(pass_frame),
+    static_cast<LayoutPassFn>(pass_columns),   static_cast<LayoutPassFn>(pass_metrics),
+    static_cast<LayoutPassFn>(pass_rows),      static_cast<LayoutPassFn>(pass_frozen),
+    static_cast<LayoutPassFn>(pass_visible),   static_cast<LayoutPassFn>(pass_bars),
+    static_cast<LayoutPassFn>(pass_edges),
 };
 
 // ── 唯一入口：layout passes 的有序组合 ────────────────────────────────
@@ -393,8 +397,7 @@ inline void compose_layout(const Table &d, State &v, Interaction &ix, const Them
                            AppRouter &sy, RowPipeline &pipe)
 {
     LayoutContext c{d, v, ix, p, viewport, ft, sy, pipe, g};
-    for (const auto pass : kLayoutPasses)
-        pass(c);
+    std::apply([&](auto... pass) { (pass(c), ...); }, kLayoutPasses);
 }
 
 // ── 语义选择工具：只写 State，不碰 Model ─────────────────────────────

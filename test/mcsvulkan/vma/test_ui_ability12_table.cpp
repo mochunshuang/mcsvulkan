@@ -11013,6 +11013,9 @@ namespace table_ui
 int main()
 try
 {
+    if (std::getenv("TABLE_PERF") != nullptr)
+        return table_ui::perf_probe();
+
 #ifdef VERT_SHADER_PATH
     std::cout << "VERT_SHADER_PATH: " << VERT_SHADER_PATH << '\n';
 #endif
