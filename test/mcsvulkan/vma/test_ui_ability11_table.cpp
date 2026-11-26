@@ -682,6 +682,11 @@ struct pick_mouse
 //   分三层，和“init 后对象不变 / per-frame 槽位 / recreateSwapChain 必须重建”
 //   对齐；第二层逐项标注依赖 swapchain 的哪个属性。
 // ─────────────────────────────────────────────────────────────────────────
+namespace table_ui
+{
+    struct table_host;
+} // namespace table_ui
+
 namespace named_resource
 {
     template <class T>
@@ -733,6 +738,9 @@ namespace named_resource
         mcs::vulkan::memory::create_resources *msaaResourcesBuild{};
         mcs::vulkan::memory::create_resources *pickResourcesBuild{};
         mcs::vulkan::memory::create_resources *resolveResourcesBuild{};
+        // Window-level multi-table host, owned by shared_ptr and living with the
+        // window. One host per window; N tables are N Table nodes in one screen.
+        std::shared_ptr<table_ui::table_host> tableHost;
     };
 
     // 全局唯一实例
@@ -4500,6 +4508,10 @@ namespace ui_new
     };
     struct ScreenWidget
     {
+        // Host of the window this screen lives in (bound by make_table_screen,
+        // non-owning). ui_new does not own table_host: frameState does.
+        table_ui::table_host *table_host_ctx{};
+
         constexpr render_version_t::underlying_t renderVersion() const noexcept { return renderVersion_ + static_cast<uint8_t>(versionDirty_);}
 
         constexpr void makeLayoutDirty(uint32_t frame) noexcept
@@ -4595,6 +4607,7 @@ namespace ui_new
             return *this;
         }
         constexpr auto& size(double width, double height) noexcept { return size({width,height});}
+        [[nodiscard]] constexpr Size size() const noexcept { return size_; }
         
         template <WidgetBuild Build>
         constexpr auto &root(Build &&b) noexcept 
@@ -10864,19 +10877,13 @@ namespace render
         }
     };
 
-    static constexpr auto postBindInputTranslation = [](auto &agg) {
-        inputTranslation().attach(agg.input_binding, agg);
-    };
-
-    template <class Agg, class Handler = decltype(postBindInputTranslation)>
-    [[nodiscard]] constexpr auto asRenderObject(
-        Agg &&a, Handler postHandler = postBindInputTranslation)
+    // A Table no longer attaches input itself: the window has exactly one host
+    // and it attaches once. No post handler, so no per-table input binding.
+    template <class Agg>
+    [[nodiscard]] constexpr auto asRenderObject(Agg &&a)
     {
         using D = std::decay_t<Agg>;
-        auto renderObject = std::make_unique<AggRenderObject<D>>(std::forward<Agg>(a));
-        if constexpr (requires() { postHandler(renderObject->agg); })
-            postHandler(renderObject->agg);
-        return renderObject;
+        return std::make_unique<AggRenderObject<D>>(std::forward<Agg>(a));
     }
 }; // namespace render
 //diff: [test_intent] end
@@ -11237,7 +11244,6 @@ namespace table_glue
 namespace table_ui
 {
     namespace ev = mcs::vulkan::event;
-    inline bool cancel_modal() noexcept; // 定义在 input 链末尾
 
     // =====================================================================
     // table arena input：input_frame -> arbiter -> gesture::Trait -> on_*
@@ -11457,6 +11463,21 @@ namespace table_ui
         float sx{1}, sy{1}; // window logical -> owner coordinates
         float vw{1}, vh{1};
 
+        // ---- window host wiring (host lives as long as the window; a table
+        // may be destroyed before the window)
+        table_host *host{nullptr};   // only for ~table_arena / detach
+        bool keyboard_focus{true};   // set by the host; headless default true
+        std::uint64_t draw_serial{}; // mark_drawn dedup: drawn this frame?
+
+        // ~table_arena is only declared here: table_host is still incomplete.
+        // The definition follows table_host (see ~table_arena below).
+        ~table_arena();
+        table_arena() = default;
+        table_arena(const table_arena &) = delete;
+        table_arena &operator=(const table_arena &) = delete;
+        table_arena(table_arena &&) = default;
+        table_arena &operator=(table_arena &&) = default;
+
         // ---- draw statistics (tests / verification)
         struct draw_info
         {
@@ -11478,12 +11499,9 @@ namespace table_ui
         change_flags changes{};
     };
 
-    // The current table: the host widget tree contains exactly one Table node.
-    inline table_arena *&current_arena() noexcept
-    {
-        static table_arena *p = nullptr;
-        return p;
-    }
+    // The single-table "current arena" global is gone: window state lives in
+    // table_host, table state lives in table_arena. No production path uses a
+    // process-level current table any more.
 
     // =====================================================================
     // draw chain: three named steps, fixed order, one job each
@@ -11582,6 +11600,281 @@ namespace table_ui
     inline void picking(table_arena &s, const picking_result &r)
     {
         on_pick(s, r);
+    }
+
+    // =====================================================================
+    // table_host: window-level router for one window with N tables.
+    //
+    //   * holds pointers only, never owns table_arena;
+    //   * input: glfw_input_translation attaches once per window, then
+    //     routes by focused / table_at / pressed;
+    //   * picking: the frame-level renderVersion is compared only in
+    //     accept_pick (once);
+    //   * hover: CPU path is gated by host.hovered; GPU on_hover only
+    //     updates pick/last_pick.
+    // =====================================================================
+    struct table_host
+    {
+        std::vector<table_arena *> tables;     // attach order (focused etc.)
+        std::vector<table_arena *> draw_order; // this frame's draw order (z)
+        table_arena *focused{};
+        table_arena *pressed{};
+        table_arena *hovered{};
+        glfw_input_translation::scoped_binding binding{};
+        bool input_attached{};
+        double pointer_x{}, pointer_y{};
+        bool pointer_inside{true};
+        std::uint64_t frame_serial{0};
+        picking_result last_pick{};
+
+        ~table_host();
+
+        // Construction-time attach: id must be 1..31 (target_key holds 5 bits)
+        void attach(table_arena &a)
+        {
+            if (a.id.value == 0 || a.id.value > 31)
+                throw std::runtime_error(std::format(
+                    "table_host::attach: table_id {} out of range 1..31", a.id.value));
+            if (find(a.id) != nullptr)
+                throw std::runtime_error(std::format(
+                    "table_host::attach: duplicate table_id {}", a.id.value));
+            a.host = this;
+            tables.push_back(&a);
+            if (!input_attached)
+            {
+                inputTranslation().attach(binding, *this);
+                input_attached = true;
+            }
+            if (focused == nullptr)
+                set_focus(&a);
+            else
+                a.keyboard_focus = (focused == &a);
+            // Before the first render: seed a draw order in attach order
+            // (begin_frame clears it every frame and mark_drawn rebuilds it).
+            bool present = false;
+            for (auto *t : draw_order)
+                present = present || (t == &a);
+            if (!present)
+                draw_order.push_back(&a);
+        }
+
+        void detach(table_arena &a) noexcept
+        {
+            std::erase(tables, &a);
+            std::erase(draw_order, &a);
+            if (focused == &a)
+            {
+                focused = nullptr;
+                // Promote a survivor, otherwise every remaining table keeps
+                // keyboard_focus == false and keyboard/char input dies until
+                // the user clicks again.
+                if (!tables.empty())
+                    set_focus(tables.front());
+            }
+            if (pressed == &a)
+                pressed = nullptr;
+            if (hovered == &a)
+                hovered = nullptr;
+            a.host = nullptr;
+            a.keyboard_focus = true;
+        }
+
+        table_arena *find(ui_table::table_id id) const noexcept
+        {
+            for (auto *a : tables)
+                if (a != nullptr && a->id == id)
+                    return a;
+            return nullptr;
+        }
+
+        // window logical -> screen (same scale set_pointer applies), then hit
+        // the last frame's draw_order from top to bottom. geom.box already
+        // includes the owner's offset, so no extra offset is added here.
+        table_arena *table_at(double wx, double wy) const noexcept
+        {
+            for (auto it = draw_order.rbegin(); it != draw_order.rend(); ++it)
+            {
+                table_arena *a = *it;
+                if (a == nullptr)
+                    continue;
+                const float lx = static_cast<float>(wx) * a->sx;
+                const float ly = static_cast<float>(wy) * a->sy;
+                const auto &b = a->geom.box;
+                if (b.w > 0.0F && b.h > 0.0F && lx >= b.x && lx < b.x1() &&
+                    ly >= b.y && ly < b.y1())
+                    return a;
+            }
+            return nullptr;
+        }
+
+        void set_focus(table_arena *a) noexcept
+        {
+            focused = a;
+            for (auto *t : tables)
+                if (t != nullptr)
+                    t->keyboard_focus = (t == a);
+        }
+
+        void begin_frame() noexcept
+        {
+            ++frame_serial;
+            hovered = pointer_inside ? table_at(pointer_x, pointer_y) : nullptr;
+            draw_order.clear();
+        }
+
+        void mark_drawn(table_arena *a) noexcept
+        {
+            if (a == nullptr)
+                return;
+            if (a->draw_serial == frame_serial)
+                return;
+            a->draw_serial = frame_serial;
+            draw_order.push_back(a);
+        }
+
+        // The only consumer of renderVersion: accepts this frame's picking only.
+        bool accept_pick(const picking_result &r) noexcept
+        {
+            if (r.key.object_type == 0xFFFFFFFF)
+                return false; // no hit, keep last_pick
+            // render_version is 16 bit in the ABI; compare at the same width so
+            // frame_serial wrap-around does not reject valid picking.
+            if (r.render_version() != render_version_t{static_cast<std::uint32_t>(
+                                        frame_serial)})
+                return false; // stale frame / another frame
+            last_pick = r;
+            return true;
+        }
+
+        // Picking already accepted by accept_pick: route by entity_index.table
+        void on_pick(const picking_result &r)
+        {
+            const auto z = ui_table::zone_from(r.key.entity_index);
+            table_arena *t = find(z.table);
+            if (t != nullptr)
+                table_ui::on_pick(*t, r); // version already filtered by accept_pick
+        }
+
+        void clear_hover()
+        {
+            pointer_inside = false;
+            if (hovered != nullptr)
+                ui_table::system_hover(hovered->view, {});
+            hovered = nullptr;
+        }
+
+        // Cursor is window-level state: written once by the host, never per table
+        void apply_cursor(GLFWwindow *win) noexcept
+        {
+            if (win == nullptr)
+                return;
+            if (hovered != nullptr)
+                table_glue::apply_cursor(
+                    win, ui_table::cursor_for(hovered->view.ui.hover.to_zone()));
+            else
+                table_glue::apply_cursor(win, ui_table::cursor::arrow);
+        }
+
+        template <class E>
+        void input_event(const E &e) noexcept
+        {
+            using T = std::remove_cvref_t<E>;
+            if constexpr (std::same_as<T, ev::position2d_event>)
+            {
+                pointer_inside = true;
+                pointer_x = e.xpos;
+                pointer_y = e.ypos;
+                hovered = table_at(pointer_x, pointer_y);
+                // keep every table's input_state.pointer identical; no clicks
+                for (auto *t : tables)
+                    if (t != nullptr)
+                        t->handle_event(e);
+            }
+            else if constexpr (std::same_as<T, ev::mousebutton_event>)
+            {
+                if (e.press() || e.repeat())
+                {
+                    table_arena *t = table_at(pointer_x, pointer_y);
+                    if (t != nullptr)
+                    {
+                        set_focus(t);
+                        pressed = t;
+                        t->handle_event(e);
+                    }
+                }
+                else
+                {
+                    // releasing outside still goes back to the pressed table
+                    table_arena *t = pressed != nullptr ? pressed
+                                                       : table_at(pointer_x, pointer_y);
+                    if (t != nullptr)
+                        t->handle_event(e);
+                    pressed = nullptr;
+                }
+            }
+            else if constexpr (std::same_as<T, ev::scroll_event>)
+            {
+                if (table_arena *t = table_at(pointer_x, pointer_y))
+                    t->handle_event(e);
+            }
+            else if constexpr (std::same_as<T, ev::keyboard_event> ||
+                               std::same_as<T, ev::char_event>)
+            {
+                if (focused != nullptr)
+                    focused->handle_event(e);
+            }
+            else if constexpr (std::same_as<T, ev::cursor_enter_event>)
+            {
+                if (!e.value)
+                    clear_hover();
+                else
+                    pointer_inside = true;
+                for (auto *t : tables)
+                    if (t != nullptr)
+                        t->handle_event(e);
+            }
+            else if constexpr (std::same_as<T, ev::window_focus_event>)
+            {
+                for (auto *t : tables)
+                    if (t != nullptr)
+                        t->handle_event(e);
+                if (!e.focused)
+                {
+                    clear_hover();
+                    pressed = nullptr;
+                }
+            }
+            // other window events are not routed by this task
+        }
+    };
+
+    // Order: ~table_arena declared -> table_host complete -> ~table_arena ->
+    // ~table_host. Do not inline host->detach inside the arena class: the type
+    // would be incomplete there.
+    inline table_arena::~table_arena()
+    {
+        if (host != nullptr)
+            host->detach(*this);
+    }
+    inline table_host::~table_host()
+    {
+        // host dies before its arenas: clear residual arena->host first, so a
+        // later arena destructor does not call back into a dead host.
+        for (auto *a : tables)
+            if (a != nullptr)
+                a->host = nullptr;
+    }
+
+    // One host per window: idempotent, make_screen must not replace it
+    inline table_host &window_tables() noexcept
+    {
+        // Construct the process-wide input system first so it outlives the
+        // host: the host binding calls back into the sink when it is destroyed.
+        (void)inputTranslation();
+        auto &slot = named_resource::frameState().tableHost;
+        if (!slot)
+            slot = std::make_shared<table_host>();
+        return *slot;
     }
 
     // =====================================================================
@@ -11685,12 +11978,8 @@ namespace table_ui
         ++s.inputs;
     }
 
-    // keyboard focus: single-table program, remember the last pressed table
-    inline std::uint32_t &active_table() noexcept
-    {
-        static std::uint32_t id = 0;
-        return id;
-    }
+    // Keyboard focus is synced by table_host::set_focus into every table's
+    // keyboard_focus flag; headless single table defaults to true.
 
     inline std::optional<ui_table::key> map_key(ev::Key k) noexcept
     {
@@ -11769,13 +12058,15 @@ namespace table_ui
         }
     }
 
-    // owner coordinates: window logical -> table coordinates (DPI/layout scale once)
+    // window logical -> framebuffer pixels (DPI scale applied once). mx/my use
+    // the same space as geom.box (layout already encodes the owner offset), so
+    // multi-table sub-rects need no extra owner offset here.
     inline void set_pointer(table_arena &s, double wx, double wy) noexcept
     {
         s.wx = static_cast<float>(wx);
         s.wy = static_cast<float>(wy);
-        s.mx = s.wx * s.sx + (s.owner ? static_cast<float>(s.owner->offset.x) : 0.0F);
-        s.my = s.wy * s.sy + (s.owner ? static_cast<float>(s.owner->offset.y) : 0.0F);
+        s.mx = s.wx * s.sx;
+        s.my = s.wy * s.sy;
     }
 
     // =====================================================================
@@ -11795,7 +12086,6 @@ namespace table_ui
             y = cy;
         }
         set_pointer(s, x, y);
-        active_table() = s.id.value;
         const auto tgt = pointer_target(s, s.mx, s.my);
         if (std::getenv("TABLE_INPUTLOG") != nullptr)
             std::println("[click] at=({:.1f},{:.1f}) kind={} row={} col={}", s.mx, s.my,
@@ -11827,7 +12117,6 @@ namespace table_ui
         case gesture::drag_phase::begin: {
             // 按下点 = 当前点 - 总位移：先补一发 press，再发 drag
             set_pointer(*this, e.x - e.total_dx, e.y - e.total_dy);
-            active_table() = id.value;
             view.ui.last_click_t = -1.0e9; // 拖拽的 press 不参与双击判定
             const auto tgt = pointer_target(*this, mx, my);
             input_dispatch(*this, ui_table::cmd_press{mx, my, tgt.to_zone(), false,
@@ -11880,7 +12169,7 @@ namespace table_ui
                          e.key == ev::Key::ePAGE_UP || e.key == ev::Key::ePAGE_DOWN;
         if (e.repeat && !nav)
             return;
-        if (active_table() != 0 && active_table() != id.value)
+        if (!keyboard_focus)
             return;
         const auto key_down = [&](ev::Key k) {
             return input_state.get_keyboard_event(k) == input_frame::HeldState::Down;
@@ -11988,10 +12277,31 @@ namespace table_ui
         view.ui.now = static_cast<double>(now.count()) / 1000.0;
         if (!view.ui.left)
         {
-            // hover 是帧派生态（pointer + geometry），不是手写输入分支
+            // Pointer coordinates stay current for every table (picking
+            // diagnostics need them); only hover writes are gated below.
             set_pointer(*this, input_state.pointer_x, input_state.pointer_y);
-            view.ui.pointer = {mx, my};
-            ui_table::system_hover(view, pointer_target(*this, mx, my));
+            // hover 是帧派生态（pointer + geometry），不是手写输入分支
+            if (host != nullptr)
+            {
+                // CPU hover z-order gate: only host.hovered may write
+                // view.ui.hover; all other tables are cleared. Overlap is
+                // resolved by the topmost entry of draw_order.
+                if (host->hovered == this)
+                {
+                    view.ui.pointer = {mx, my};
+                    ui_table::system_hover(view, pointer_target(*this, mx, my));
+                }
+                else
+                {
+                    ui_table::system_hover(view, {}); // clear old hover/tooltip
+                }
+            }
+            else
+            {
+                // headless single table: keep pointer -> hit -> hover
+                view.ui.pointer = {mx, my};
+                ui_table::system_hover(view, pointer_target(*this, mx, my));
+            }
         }
         arbiter.tick(*this, now);
         notify_change(*this);
@@ -12034,9 +12344,10 @@ namespace table_ui
     }
 
     // Esc 取消：编辑/筛选/查找/菜单任一打开时，优先取消它而不是关窗口
-    inline bool modal_open() noexcept
+    // Reads only the focused table; a null focused means there is no modal.
+    inline bool modal_open(const table_host *h) noexcept
     {
-        auto *s = current_arena();
+        const table_arena *s = (h != nullptr) ? h->focused : nullptr;
         return s != nullptr && (s->view.filter.edit >= 0 || s->view.find.mode ||
                                 s->view.edit.active() || s->view.menu.open);
     }
@@ -12077,10 +12388,9 @@ namespace table_ui
         return false;
     }
 
-    inline bool cancel_modal() noexcept
+    inline bool cancel_modal(table_host &h) noexcept
     {
-        auto *s = current_arena();
-        return s != nullptr && cancel_modal(*s);
+        return h.focused != nullptr && cancel_modal(*h.focused);
     }
 
     // =====================================================================
@@ -12149,12 +12459,23 @@ namespace table_ui
                          from_gpu.col_index, r.key.entity_index);
     }
 
-    // hover pool callback: hand the GPU readback to the current table
+    // hover pool callback: diagnostics only (TABLE_PICKCHECK / TABLE_MULTITEST).
+    // Production hover is the CPU path: host forwards position -> advance ->
+    // system_hover -> view.ui.hover. This is a stateless router; instance
+    // identity comes from the table bits in picking_result.entity_index, so no
+    // per-table hover_fn is needed.
     inline void on_hover(picking_result r, bool enter, InputCtx &,
-                         ui_new::ScreenWidget *) noexcept
+                         ui_new::ScreenWidget *screen) noexcept
     {
-        if (auto *st = current_arena())
-            on_pick(*st, r);
+        if (screen == nullptr || screen->table_host_ctx == nullptr)
+        {
+            ui_table::trace("[hover] dropped: no screen/host");
+            return;
+        }
+        auto &h = *screen->table_host_ctx;
+        if (!h.accept_pick(r))
+            return; // the only frame-level renderVersion comparison
+        h.on_pick(r); // diagnostics: update pick/last_pick only
         ui_table::trace("[hover] {} key={:#x}", enter ? "ENTER" : "LEAVE",
                         r.key.entity_index);
     }
@@ -12165,9 +12486,9 @@ namespace table_ui
     }
 
     // =====================================================================
-    // widget adapter: table_arena <-> ui_new tree / glfw_input_translation
-    // Three jobs only: own the state, give the owner box to draw,
-    // hand events to input.
+    // widget adapter: table_arena <-> ui_new tree
+    // Three jobs only: own the state, give the owner box to draw, and mark
+    // the draw order for the window host. Input binding lives in table_host.
     // =====================================================================
     inline auto make_table(ui_table::table_data data, ui_table::prefs p, ui_table::font f)
     {
@@ -12180,11 +12501,6 @@ namespace table_ui
         st.view.reset(st.data);
         return make_aggregate<"Table">(
             field<"arena">(std::move(st)),
-            field<"input_binding">(glfw_input_translation::scoped_binding{}),
-
-            // event entry: single template, straight into the arena
-            method<"input_event">(
-                [](auto &self, auto e) noexcept { self.arena.handle_event(e); }),
 
             // frame time: arena tick + tooltip / double-click detection
             method<"tick">([](auto &self, double t) { self.arena.advance(t); }),
@@ -12195,6 +12511,10 @@ namespace table_ui
                 auto &s = self.arena;
                 s.screen = screen;
                 s.owner = owner;
+                // Record this frame's draw order: table_at walks it in reverse
+                // (not the attach order).
+                if (screen != nullptr && screen->table_host_ctx != nullptr)
+                    screen->table_host_ctx->mark_drawn(&s);
                 s.win = named_resource::frameState().window->data();
                 if (s.win != nullptr && owner != nullptr)
                 {
@@ -12202,9 +12522,13 @@ namespace table_ui
                     glfwGetWindowSize(s.win, &ww, &wh);
                     if (ww > 0 && wh > 0)
                     {
-                        s.sx = static_cast<float>(owner->size.width) /
+                        // Window logical -> framebuffer pixels. This must use the
+                        // screen size (DPI scale), not the owner width: with N
+                        // tables the owner is only a sub-rect of the screen.
+                        const auto screenSize = screen->size();
+                        s.sx = static_cast<float>(screenSize.width) /
                                static_cast<float>(ww);
-                        s.sy = static_cast<float>(owner->size.height) /
+                        s.sy = static_cast<float>(screenSize.height) /
                                static_cast<float>(wh);
                     }
                     if (std::getenv("TABLE_GEOMLOG") != nullptr)
@@ -12231,8 +12555,7 @@ namespace table_ui
                     owner ? static_cast<float>(owner->size.width) : 1.0F,
                     owner ? static_cast<float>(owner->size.height) : 1.0F};
                 table_ui::draw(s, box, ctx.view, ctx.builder);
-                table_glue::apply_cursor(s.win,
-                                         ui_table::cursor_for(s.view.ui.hover.to_zone()));
+                // Cursor is written once by the host after screen.render
             }));
     }
 
@@ -12240,25 +12563,82 @@ namespace table_ui
                                           std::declval<ui_table::prefs>(),
                                           std::declval<ui_table::font>()));
 
-    inline std::uint32_t version() noexcept
+    // Build N tables at construction time: N Table nodes in one screen,
+    // laid out by a Row. Runtime add_table is NOT supported (it would need a
+    // relayoutable Flex root and is out of scope for this task).
+    struct table_spec
     {
-        auto *s = current_arena();
-        return s != nullptr ? s->view.ui.version : 0;
+        ui_table::table_data data;
+        ui_table::prefs prefs;
+        ui_table::font font;
+        float flex{1.0F}; // share of the Row
+    };
+
+    inline ui_new::ScreenWidget make_table_screen(double w, double h,
+                                                  std::vector<table_spec> specs)
+    {
+        ui_table::hover_fn_ref() = hover_index();
+        auto &hs = window_tables();
+        if (specs.empty())
+            specs.push_back(table_spec{});
+
+        auto row = ui_new::Row("tables");
+        row.mainAxisSize(ui_new::MainAxisSize::max);
+        row.crossAxisAlignment(ui_new::CrossAxisAlignment::stretch);
+        for (std::size_t i = 0; i < specs.size(); ++i)
+        {
+            auto &spec = specs[i];
+            auto t = make_table(std::move(spec.data), spec.prefs, std::move(spec.font));
+            auto ro = render::asRenderObject(std::move(t));
+            // attach MUST follow asRenderObject(std::move(agg)): only then is
+            // ro->agg.arena's address stable. Later unique_ptr moves do not
+            // move the aggregate itself.
+            auto &arena = ro->agg.arena;
+            arena.host = &hs;
+            hs.attach(arena);
+            const int flex = std::max(1, static_cast<int>(spec.flex + 0.5F));
+            row.addChild(ui_new::Expanded(std::format("table{}", i))
+                             .flex(flex)
+                             .child(ui_new::Container(std::format("panel{}", i))
+                                        .renderObject(std::move(ro))));
+        }
+
+        ui_new::ScreenWidget screen{ui_new::Size{w, h},
+                                    static_cast<std::unique_ptr<ui_new::Widget>>(row)};
+        // raw pointer only; the host is owned by frameState's shared_ptr
+        screen.table_host_ctx = &hs;
+        return screen;
     }
 
     inline ui_new::ScreenWidget make_screen(double w, double h)
     {
-        auto data = ui_table::table_data{};
-        auto prefs = ui_table::prefs{};
-        auto font = ui_table::font{};
-        table_glue::init_font(font);
-        table_glue::init_model(data, prefs);
-        ui_table::hover_fn_ref() = hover_index();
-        auto t = make_table(std::move(data), prefs, std::move(font));
-        auto ro = render::asRenderObject(std::move(t));
-        current_arena() = &ro->agg.arena;
-        return ui_new::ScreenWidget{
-            ui_new::Size{w, h}, ui_new::Container("panel").renderObject(std::move(ro))};
+        // Real on-screen demo: two independent tables side by side. This is the
+        // visible proof that the single-table singleton is gone.
+        std::vector<table_spec> specs(2);
+        for (auto &spec : specs)
+        {
+            table_glue::init_font(spec.font);
+            table_glue::init_model(spec.data, spec.prefs);
+        }
+        // B is a different KIND of table: 3 columns, taller rows, 24 rows and a
+        // warm accent. Independent schema + model + view proves that the two
+        // tables are real instances, not the same state drawn twice.
+        table_spec &b = specs[1];
+        b.data.cols.resize(3);
+        b.data.cells.resize(3);
+        b.data.finalize();
+        b.prefs.row_h = 38.0F;
+        b.prefs.header_h = 46.0F;
+        b.prefs.accent = {0.95F, 0.62F, 0.35F, 0.95F};
+        b.prefs.header_bg = {0.24F, 0.19F, 0.15F, 1.0F};
+        constexpr int kBRows = 24;
+        if (b.data.rows() > kBRows)
+        {
+            b.data.ids.resize(static_cast<std::size_t>(kBRows));
+            for (auto &col : b.data.cells)
+                col.resize(static_cast<std::size_t>(kBRows));
+        }
+        return make_table_screen(w, h, std::move(specs));
     }
 
     // =====================================================================
@@ -12568,6 +12948,473 @@ namespace table_ui
         return fails;
     }
 
+    // =====================================================================
+    // TABLE_MULTITEST: headless multi-table test for one window.
+    // Both host entry points use the real path:
+    //   CPU hover: host.input_event(position) -> advance -> system_hover
+    //   GPU pick : table_ui::on_hover(picking, ..., &screen) -> accept_pick
+    // =====================================================================
+    inline void init_multi_table(table_arena &s, std::uint32_t id, int rows)
+    {
+        ui_table::column c;
+        c.key = "v";
+        c.title = "V";
+        c.w = 200.0F;
+        s.data.cols.push_back(c);
+        s.data.finalize();
+        s.data.cells.resize(1);
+        for (int i = 0; i < rows; ++i)
+        {
+            s.data.cells[0].push_back({std::format("r{}", i), {}});
+            s.data.ids.push_back(ui_table::row_id{static_cast<std::uint64_t>(i + 1)});
+        }
+        s.id = ui_table::table_id{id};
+        s.view.reset(s.data);
+        s.prefs.row_h = 30.0F;
+        s.font.px = 15.0F;
+        ui_table::glyph_metrics gm;
+        gm.advance = 0.5F;
+        for (int ch = 32; ch < 127; ++ch)
+            s.font.put(static_cast<char32_t>(ch), gm);
+        // headless must initialize the coordinate transform explicitly:
+        // owner == nullptr and sx/sy == 1.
+        s.owner = nullptr;
+        s.sx = s.sy = 1.0F;
+    }
+
+    inline int multi_probe()
+    {
+        int fails = 0;
+        const auto check = [&](bool ok, const char *what) {
+            if (!ok)
+            {
+                ++fails;
+                std::println("[multi] FAIL: {}", what);
+            }
+            else
+                std::println("[multi] ok: {}", what);
+        };
+        namespace ev = mcs::vulkan::event;
+
+        // on_hover needs an InputCtx& (the diagnostic callback ignores it):
+        // build a headless InputCtx with the real inputInit; no window / GPU.
+        auto inputData = inputInit(16.0F / 9.0F);
+        auto inputCtx = InputCtx(inputData);
+
+        table_arena a;
+        table_arena b;
+        init_multi_table(a, 1, 10);
+        init_multi_table(b, 2, 10);
+        draw_sync(a, {0.0F, 0.0F, 400.0F, 300.0F});
+        draw_sync(b, {500.0F, 0.0F, 400.0F, 300.0F});
+
+        table_host h;
+        ui_new::ScreenWidget screen{}; // only used as the host binding
+        screen.table_host_ctx = &h;
+        h.attach(a);
+        h.attach(b);
+
+        const auto make_pick = [](const table_arena &t, std::uint32_t version) {
+            return picking_result{
+                object_key{1U, ui_table::zone_key(
+                                    {ui_table::part::cell, 0, 0, t.id})},
+                picking_result::pack(render_version_t{version}, 0), ~0U};
+        };
+
+        // 1. initial focus
+        check(h.focused == &a, "init: focused == A");
+        check(a.view.ui.hover.kind == ui_table::part::none &&
+                  b.view.ui.hover.kind == ui_table::part::none,
+              "init: A/B hover empty");
+
+        // 2a. CPU hover: position -> advance -> only B writes view.ui.hover
+        h.input_event(ev::position2d_event{.xpos = 620.0, .ypos = 100.0});
+        a.advance(0.0);
+        b.advance(0.0);
+        check(h.hovered == &b, "cpu-hover: host.hovered == B");
+        check(b.view.ui.hover.kind == ui_table::part::cell &&
+                  b.view.ui.hover.row_index >= 0,
+              "cpu-hover: B view.ui.hover is a B cell");
+        check(a.view.ui.hover.kind == ui_table::part::none,
+              "cpu-hover: A view.ui.hover stays empty");
+
+        // 2b. GPU pick: real on_hover routed through ScreenWidget::table_host_ctx
+        {
+            const auto rb = make_pick(b, static_cast<std::uint32_t>(h.frame_serial));
+            table_ui::on_hover(rb, true, inputCtx, &screen);
+            check(b.pick.key == rb.key, "gpu-hover: B pick updated via on_hover");
+            check(a.pick.key.object_type != rb.key.object_type,
+                  "gpu-hover: A pick untouched");
+
+            const auto ra = make_pick(a, static_cast<std::uint32_t>(h.frame_serial));
+            table_ui::on_hover(ra, true, inputCtx, &screen);
+            check(a.pick.key == ra.key, "gpu-hover: A pick updated via on_hover");
+            check(b.pick.key == rb.key, "gpu-hover: B pick unchanged by A pick");
+        }
+
+        // 3. click B: focused=B, B has a selection, A does not
+        const int a_sel0 = a.view.sel.cur_r;
+        h.input_event(ev::mousebutton_event{.button = ev::MouseButtons::eMOUSE_BUTTON_LEFT,
+                                            .action = ev::Action::ePRESS,
+                                            .modifier_key = ev::ModifierKey{}});
+        h.input_event(ev::mousebutton_event{.button = ev::MouseButtons::eMOUSE_BUTTON_LEFT,
+                                            .action = ev::Action::eRELEASE,
+                                            .modifier_key = ev::ModifierKey{}});
+        check(h.focused == &b, "click: focused == B");
+        check(b.view.sel.cur_r >= 0, "click: B has a selection");
+        check(a.view.sel.cur_r == a_sel0, "click: A selection unchanged");
+
+        // 4. keyboard goes to focused (B) only
+        {
+            const int b0 = b.view.sel.cur_r;
+            h.input_event(ev::keyboard_event{.key = ev::Key::eDOWN,
+                                             .action = ev::Action::ePRESS,
+                                             .modifier_key = ev::ModifierKey{},
+                                             .scancode = 0});
+            check(b.view.sel.cur_r > b0, "keyboard: focused B moves");
+            check(a.view.sel.cur_r == a_sel0, "keyboard: A does not move");
+            h.input_event(ev::keyboard_event{.key = ev::Key::eDOWN,
+                                             .action = ev::Action::eRELEASE,
+                                             .modifier_key = ev::ModifierKey{},
+                                             .scancode = 0});
+        }
+
+        // 5. chars go to focused (B) only
+        {
+            h.input_event(ev::keyboard_event{.key = ev::Key::eF2,
+                                             .action = ev::Action::ePRESS,
+                                             .modifier_key = ev::ModifierKey{},
+                                             .scancode = 0});
+            h.input_event(ev::keyboard_event{.key = ev::Key::eF2,
+                                             .action = ev::Action::eRELEASE,
+                                             .modifier_key = ev::ModifierKey{},
+                                             .scancode = 0});
+            check(b.view.edit.active(), "char: F2 opens B edit");
+            h.input_event(ev::char_event{.codepoint = U'z'});
+            check(b.view.edit.active() && !b.view.edit.buf.empty() &&
+                      b.view.edit.buf.back() == 'z',
+                  "char: z goes into B edit buffer");
+            check(!a.view.edit.active(), "char: A edit stays closed");
+            h.input_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+                                             .action = ev::Action::ePRESS,
+                                             .modifier_key = ev::ModifierKey{},
+                                             .scancode = 0});
+            h.input_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+                                             .action = ev::Action::eRELEASE,
+                                             .modifier_key = ev::ModifierKey{},
+                                             .scancode = 0});
+        }
+
+        // 6. click A switches focus: later keyboard moves A only
+        {
+            h.input_event(ev::position2d_event{.xpos = 120.0, .ypos = 100.0});
+            h.input_event(
+                ev::mousebutton_event{.button = ev::MouseButtons::eMOUSE_BUTTON_LEFT,
+                                      .action = ev::Action::ePRESS,
+                                      .modifier_key = ev::ModifierKey{}});
+            h.input_event(
+                ev::mousebutton_event{.button = ev::MouseButtons::eMOUSE_BUTTON_LEFT,
+                                      .action = ev::Action::eRELEASE,
+                                      .modifier_key = ev::ModifierKey{}});
+            check(h.focused == &a, "focus: click A -> focused == A");
+            const int a0 = a.view.sel.cur_r;
+            const int b0 = b.view.sel.cur_r;
+            h.input_event(ev::keyboard_event{.key = ev::Key::eDOWN,
+                                             .action = ev::Action::ePRESS,
+                                             .modifier_key = ev::ModifierKey{},
+                                             .scancode = 0});
+            check(a.view.sel.cur_r > a0, "focus: keyboard moves A only");
+            check(b.view.sel.cur_r == b0, "focus: B does not move");
+            h.input_event(ev::keyboard_event{.key = ev::Key::eDOWN,
+                                             .action = ev::Action::eRELEASE,
+                                             .modifier_key = ev::ModifierKey{},
+                                             .scancode = 0});
+        }
+
+        // 6b. wheel goes only to the table under the pointer
+        {
+            h.input_event(ev::position2d_event{.xpos = 120.0, .ypos = 100.0});
+            const auto a0 = a.view.scroll.y;
+            const auto b0 = b.view.scroll.y;
+            h.input_event(ev::scroll_event{.xoffset = 0.0, .yoffset = -1.0});
+            check(a.view.scroll.y > a0 && b.view.scroll.y == b0,
+                  "wheel: pointer over A scrolls only A");
+
+            h.input_event(ev::position2d_event{.xpos = 620.0, .ypos = 100.0});
+            const auto a1 = a.view.scroll.y;
+            const auto b1 = b.view.scroll.y;
+            h.input_event(ev::scroll_event{.xoffset = 0.0, .yoffset = -1.0});
+            check(b.view.scroll.y > b1 && a.view.scroll.y == a1,
+                  "wheel: pointer over B scrolls only B");
+        }
+
+        // 6c. right click opens the menu only on the table under the pointer
+        {
+            h.input_event(ev::position2d_event{.xpos = 620.0, .ypos = 100.0});
+            h.input_event(
+                ev::mousebutton_event{.button = ev::MouseButtons::eMOUSE_BUTTON_RIGHT,
+                                      .action = ev::Action::ePRESS,
+                                      .modifier_key = ev::ModifierKey{}});
+            h.input_event(
+                ev::mousebutton_event{.button = ev::MouseButtons::eMOUSE_BUTTON_RIGHT,
+                                      .action = ev::Action::eRELEASE,
+                                      .modifier_key = ev::ModifierKey{}});
+            check(b.view.menu.open && !a.view.menu.open,
+                  "menu: right click opens only the B menu");
+            check(h.focused == &b, "menu: right click focuses B");
+            h.input_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+                                             .action = ev::Action::ePRESS,
+                                             .modifier_key = ev::ModifierKey{},
+                                             .scancode = 0});
+            h.input_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+                                             .action = ev::Action::eRELEASE,
+                                             .modifier_key = ev::ModifierKey{},
+                                             .scancode = 0});
+            check(!b.view.menu.open, "menu: Esc cancels the B menu");
+        }
+
+        // 6d. duplicate table_id is rejected before it corrupts routing
+        {
+            table_host hd;
+            table_arena d1;
+            table_arena d2;
+            init_multi_table(d1, 7, 3);
+            init_multi_table(d2, 7, 3);
+            hd.attach(d1);
+            bool threw = false;
+            try
+            {
+                hd.attach(d2);
+            }
+            catch (const std::runtime_error &)
+            {
+                threw = true;
+            }
+            check(threw, "attach: duplicate table_id rejected");
+            check(hd.tables.size() == 1 &&
+                      hd.find(ui_table::table_id{7}) == &d1,
+                  "attach: duplicate does not corrupt the host");
+            check(d2.host == nullptr, "attach: rejected arena keeps host == nullptr");
+        }
+
+        // 7. draw order / overlap / hover z-order
+        {
+            draw_sync(a, {0.0F, 0.0F, 400.0F, 300.0F});
+            draw_sync(b, {0.0F, 0.0F, 400.0F, 300.0F});
+            // attach order is A, B; drawing B then A -> topmost A wins
+            h.begin_frame();
+            h.mark_drawn(&b);
+            h.mark_drawn(&a);
+            h.input_event(ev::position2d_event{.xpos = 120.0, .ypos = 100.0});
+            a.advance(0.0);
+            b.advance(0.0);
+            check(h.table_at(120.0, 100.0) == &a, "zorder: table_at top == A");
+            check(a.view.ui.hover.kind == ui_table::part::cell,
+                  "zorder: only A hovers (B drawn first)");
+            check(b.view.ui.hover.kind == ui_table::part::none,
+                  "zorder: B hover cleared");
+
+            // swap draw order: only B
+            h.begin_frame();
+            h.mark_drawn(&a);
+            h.mark_drawn(&b);
+            h.input_event(ev::position2d_event{.xpos = 120.0, .ypos = 100.0});
+            a.advance(0.0);
+            b.advance(0.0);
+            check(h.table_at(120.0, 100.0) == &b, "zorder: table_at top == B");
+            check(b.view.ui.hover.kind == ui_table::part::cell,
+                  "zorder: only B hovers (A drawn first)");
+            check(a.view.ui.hover.kind == ui_table::part::none,
+                  "zorder: A hover cleared");
+
+            // pointer outside every table: both hovers are cleared
+            h.begin_frame();
+            h.mark_drawn(&a);
+            h.mark_drawn(&b);
+            h.input_event(ev::position2d_event{.xpos = 2000.0, .ypos = 2000.0});
+            a.advance(0.0);
+            b.advance(0.0);
+            check(h.hovered == nullptr, "zorder: pointer outside -> no hovered");
+            check(a.view.ui.hover.kind == ui_table::part::none &&
+                      b.view.ui.hover.kind == ui_table::part::none,
+                  "zorder: both hovers cleared outside");
+        }
+
+        // 8. frame version consumer (renderVersion compared once in accept_pick)
+        {
+            h.begin_frame();
+            const std::uint32_t serial = static_cast<std::uint32_t>(h.frame_serial);
+            const auto good = make_pick(b, serial);
+            check(h.accept_pick(good), "version: same-frame picking accepted");
+            table_ui::on_hover(good, true, inputCtx, &screen);
+            check(b.pick.key == good.key, "version: same-frame updates B");
+
+            // differing per-table view.ui.version must not filter picking
+            b.view.ui.touch();
+            a.view.ui.touch();
+            table_ui::on_hover(good, true, inputCtx, &screen);
+            check(b.pick.key == good.key,
+                  "version: per-table view version does not filter picking");
+
+            const auto stale = make_pick(b, serial + 1);
+            const auto a_before = a.pick.key;
+            table_ui::on_hover(stale, true, inputCtx, &screen);
+            check(!h.accept_pick(stale), "version: stale picking rejected");
+            check(b.pick.key == good.key && a.pick.key == a_before,
+                  "version: stale picking updates nothing");
+        }
+
+        // 9. detach: B is no longer routed, A still works
+        {
+            h.detach(b);
+            check(h.find(b.id) == nullptr, "detach: B removed from host");
+            check(h.focused == &a, "detach: focused promotes to the surviving A");
+            check(a.keyboard_focus, "detach: promoted A has keyboard_focus == true");
+            {
+                const int a0 = a.view.sel.cur_r;
+                h.input_event(ev::keyboard_event{.key = ev::Key::eDOWN,
+                                                 .action = ev::Action::ePRESS,
+                                                 .modifier_key = ev::ModifierKey{},
+                                                 .scancode = 0});
+                check(a.view.sel.cur_r > a0,
+                      "detach: A keyboard still works after focused table removed");
+                h.input_event(ev::keyboard_event{.key = ev::Key::eDOWN,
+                                                 .action = ev::Action::eRELEASE,
+                                                 .modifier_key = ev::ModifierKey{},
+                                                 .scancode = 0});
+            }
+            {
+                h.input_event(ev::keyboard_event{.key = ev::Key::eF2,
+                                                 .action = ev::Action::ePRESS,
+                                                 .modifier_key = ev::ModifierKey{},
+                                                 .scancode = 0});
+                h.input_event(ev::keyboard_event{.key = ev::Key::eF2,
+                                                 .action = ev::Action::eRELEASE,
+                                                 .modifier_key = ev::ModifierKey{},
+                                                 .scancode = 0});
+                check(a.view.edit.active(), "detach: A can open edit after promotion");
+                h.input_event(ev::char_event{.codepoint = U'q'});
+                check(a.view.edit.active() && !a.view.edit.buf.empty() &&
+                          a.view.edit.buf.back() == 'q',
+                      "detach: A still receives char after promotion");
+                h.input_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+                                                 .action = ev::Action::ePRESS,
+                                                 .modifier_key = ev::ModifierKey{},
+                                                 .scancode = 0});
+                h.input_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+                                                 .action = ev::Action::eRELEASE,
+                                                 .modifier_key = ev::ModifierKey{},
+                                                 .scancode = 0});
+            }
+            h.begin_frame();
+            h.mark_drawn(&a);
+            check(h.table_at(120.0, 100.0) == &a, "detach: table_at only A");
+            const auto b_before = b.pick.key;
+            const auto rb = make_pick(b, static_cast<std::uint32_t>(h.frame_serial));
+            table_ui::on_hover(rb, true, inputCtx, &screen);
+            check(b.pick.key == b_before, "detach: on_hover B key not routed");
+            const auto ra = make_pick(a, static_cast<std::uint32_t>(h.frame_serial));
+            table_ui::on_hover(ra, true, inputCtx, &screen);
+            check(a.pick.key == ra.key, "detach: A still routed");
+        }
+
+        // 10. empty focused: main-loop guards do not crash
+        {
+            table_host empty;
+            check(empty.focused == nullptr, "empty: focused == nullptr");
+            check(!modal_open(&empty), "empty: modal_open false");
+            check(!cancel_modal(empty), "empty: cancel_modal false");
+            empty.input_event(ev::keyboard_event{.key = ev::Key::eESCAPE,
+                                                 .action = ev::Action::ePRESS,
+                                                 .modifier_key = ev::ModifierKey{},
+                                                 .scancode = 0});
+            check(empty.focused == nullptr, "empty: keyboard ignored, no crash");
+        }
+
+        // 11. the real construction entry: make_screen must build TWO Table
+        //     render objects in one screen, attached to ONE window host, with
+        //     independent models/ids, side-by-side layout, and detach on exit.
+        {
+            auto scr = make_screen(1536.0, 1000.0);
+            check(scr.table_host_ctx == &window_tables(),
+                  "screen: bound to the one window host");
+            check(window_tables().tables.size() == 2,
+                  "screen: window host has two tables");
+
+            scr.updateSize(1536.0, 1000.0);
+            scr.layout();
+            auto *p0 = scr.findByKey("panel0");
+            auto *p1 = scr.findByKey("panel1");
+            check(p0 != nullptr && p1 != nullptr,
+                  "screen: two Table panel nodes");
+            if (p0 != nullptr && p1 != nullptr)
+            {
+                check(p0->renderObject != nullptr && p1->renderObject != nullptr,
+                      "screen: each panel owns a Table render object");
+                check(p0->size.width > 0.0 && p1->size.width > 0.0,
+                      "screen: both panels laid out");
+                check(p1->offset.x >= p0->offset.x + p0->size.width - 1.0,
+                      "screen: panels are side by side");
+            }
+
+            auto &host2 = window_tables();
+            if (host2.tables.size() == 2)
+            {
+                check(host2.tables[0] != host2.tables[1],
+                      "screen: two distinct arena instances");
+                check(host2.tables[0]->data.rows() == 60 &&
+                          host2.tables[1]->data.rows() == 24,
+                      "screen: independent models (60 rows vs 24 rows)");
+                check(host2.tables[0]->data.cols_count() == 8 &&
+                          host2.tables[1]->data.cols_count() == 3,
+                      "screen: independent schemas (8 cols vs 3 cols)");
+                check(host2.tables[0]->id != host2.tables[1]->id,
+                      "screen: distinct table ids");
+            }
+            check(host2.focused == (host2.tables.empty() ? nullptr : host2.tables[0]),
+                  "screen: first table is focused");
+        }
+        check(window_tables().tables.empty(),
+              "screen: scope exit detaches both tables");
+
+        // 12. arena destroyed while the host is still alive: ~table_arena must
+        //     detach, and the host must never access the destroyed arena again.
+        {
+            table_host h3;
+            ui_new::ScreenWidget s3{}; // only for on_hover routing
+            s3.table_host_ctx = &h3;
+            {
+                table_arena c;
+                init_multi_table(c, 3, 5);
+                draw_sync(c, {0.0F, 0.0F, 400.0F, 300.0F});
+                h3.attach(c);
+                h3.begin_frame();
+                h3.mark_drawn(&c);
+                check(h3.tables.size() == 1 && h3.find(c.id) != nullptr,
+                      "life: arena attached before destruction");
+            }
+            check(h3.tables.empty() && h3.find(ui_table::table_id{3}) == nullptr,
+                  "life: ~table_arena detaches from the host");
+            check(h3.focused == nullptr && h3.pressed == nullptr &&
+                      h3.hovered == nullptr,
+                  "life: destruction clears host pointers");
+            check(h3.table_at(120.0, 100.0) == nullptr,
+                  "life: host does not return the destroyed arena");
+            const auto r3 = picking_result{
+                object_key{1U, ui_table::zone_key(
+                                    {ui_table::part::cell, 0, 0, ui_table::table_id{3}})},
+                picking_result::pack(
+                    render_version_t{static_cast<std::uint32_t>(h3.frame_serial)}, 0),
+                ~0U};
+            table_ui::on_hover(r3, true, inputCtx, &s3); // must be a safe no-op
+            check(h3.find(ui_table::table_id{3}) == nullptr,
+                  "life: on_hover for a destroyed table is a safe no-op");
+        }
+
+        std::println("[multi] done, {} failed", fails);
+        return fails;
+    }
+
 } // namespace table_ui
 
 int main()
@@ -12581,6 +13428,8 @@ try
 #endif
     // 表格自测：只驱动 update/normalize 的数据面，不碰窗口 / GPU / Vulkan。
     // TABLE_SELFTEST=1 时先跑再退出，失败返回非 0。
+    if (std::getenv("TABLE_MULTITEST") != nullptr)
+        return table_ui::multi_probe();
     if (std::getenv("TABLE_EVTEST") != nullptr)
         return table_ui::event_probe();
     if (std::getenv("TABLE_SELFTEST") != nullptr)
@@ -13535,7 +14384,7 @@ try
             frame.setViewport(full_vp);
             frame.setScissor(full_scissor);
 
-            // renderVersion = 表格的几何版本：picking 回读用它过滤"数据切换中间帧"
+            // renderVersion = this frame's picking label: only host.frame_serial
             std::uint32_t renderVersion = 0;
             frame.setCameraIndex(0);
             // 主 UI 管线声明了 ext2/3 动态状态：blend / A2C / stencil 全部动态设置
@@ -13552,13 +14401,20 @@ try
             auto &screen = soaCtx.screen;
             screen.updateSize(W, H);
             screen.layout();
+            // Timing: input -> begin_frame -> tick -> render. begin_frame must
+            // run before tick: advance() reads this frame's hovered, while
+            // input uses the draw_order built by the previous frame's render.
+            auto &tableHost = table_ui::window_tables();
+            tableHost.begin_frame();
             screen.tick(inputCtx.clock.getElapsed()); // 帧级副作用：从根 DFS
             {
                 render_context ctx{frame, inputCtx.input, inputCtx.clock,
                                    world.fontCtx.fontSelect, view};
                 screen.render(ctx);
             }
-            renderVersion = table_ui::version();
+            // Cursor is window-level state: written once by the host.
+            tableHost.apply_cursor(named_resource::frameState().window->data());
+            renderVersion = static_cast<std::uint32_t>(tableHost.frame_serial);
             // 外部 API 调用会自动闭合当前 pass
             auto &pickMouse = *fs.pickMouse;
             frame.add_transition(my_render::image_info{
@@ -13968,8 +14824,9 @@ try
             picking_result r = *data;
             if (!pickMouse.valid)
                 r.key.object_type = 0xFFFFFFFF;
-            if (auto *arena = table_ui::current_arena())
-                table_ui::on_pick(*arena, r);
+            auto &tableHost = table_ui::window_tables();
+            if (tableHost.accept_pick(r))
+                tableHost.on_pick(r);
         }
         semaphoreIndex = (semaphoreIndex + 1) % presentCompleteSemaphore.size();
         currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
@@ -13984,7 +14841,8 @@ try
             win != nullptr && glfwWindowShouldClose(win))
         {
             bool esc = false;
-            if (auto *arena = table_ui::current_arena())
+            auto &tableHost = table_ui::window_tables();
+            if (auto *arena = tableHost.focused)
             {
                 esc = arena->esc_cancelled;
                 arena->esc_cancelled = false;
@@ -13992,7 +14850,12 @@ try
             if (esc)
                 glfwSetWindowShouldClose(win, GLFW_FALSE);
         }
-        table_ui::input_ime(*table_ui::current_arena());
+        // IME preedit only goes to the focused table
+        {
+            auto &tableHost = table_ui::window_tables();
+            if (auto *arena = tableHost.focused)
+                table_ui::input_ime(*arena);
+        }
         drawFrame(world, inputCtx, soaCtx);
         if (std::getenv("TABLE_INPUTLOG") != nullptr)
             std::fflush(stdout);
