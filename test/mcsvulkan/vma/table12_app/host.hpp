@@ -18,7 +18,12 @@ namespace table::window
 {
 namespace ev = mcs::vulkan::event;
 
+// ABI 别名（不依赖 demo cpp 的 using）
+using picking_result = table::platform::PickingResult;
+using render_version_t = table::platform::RenderVersion16;
+
 // Binding 在 Host 之前定义，所以 Host 先前置声明
+struct Binding;
 struct Host;
 
 // 由 window_draw.hpp 提供（Host::on_pick 的落点）；先声明，定义在后面
