@@ -22,8 +22,8 @@ namespace table::platform
 }
 
 // 调试/合并检查用：手上只有 entity_index（例如 shader instance），没有完整 PickingResult。
-// G4 起改名为 resolve_key，保证 resolve 只有一处（五门唯一）。
-[[nodiscard]] inline Target resolve(const model::Table &m, TargetKey key)
+// 名字与主门分开：resolve 只有一处（五门唯一），调试入口叫 resolve_key。
+[[nodiscard]] inline Target resolve_key(const model::Table &m, TargetKey key)
 {
     return model::resolve(m, key);
 }

@@ -112,7 +112,7 @@ inline int event_probe()
             if (inst.entity_index != 0)
             {
                 ++zoned;
-                const auto t = table::platform::resolve(s.session.model, inst.entity_index);
+                const auto t = table::platform::resolve_key(s.session.model, inst.entity_index);
                 owners += t.kind != table::Part::none ? 1U : 0U;
             }
         });
