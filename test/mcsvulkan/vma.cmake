@@ -259,6 +259,7 @@ ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_ui_ability11_table test_ui_ability7.vert test_ui_ability7.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_ui_ability12_table test_ui_ability7.vert test_ui_ability7.frag)
+target_sources(mcsvulkan-vma-test_ui_ability12_table PRIVATE ${CMAKE_CURRENT_LIST_DIR}/vma/table12/session.cpp)
 ADD_MSDF_DEF(${TARGET_NAME})
 
 # end

@@ -13,6 +13,10 @@
 // ============================================================================
 
 #include "../session.hpp"
+#include "access.hpp"
+#include "../detail/gestures.hpp"
+#include "../detail/layout_passes.hpp"
+#include "../detail/paint_passes.hpp"
 #include "view_facade.hpp"
 
 namespace table::test
@@ -82,8 +86,8 @@ using model::Table;
         intent::Interaction &ix = S.interaction;
         intent::Theme &p = S.theme;
         Font &ft = S.font;
-        detail::AppRouter &sy = S.router;
-        frame::RowPipeline &pipe = S.pipe;
+        auto &sy = test::access(S).router;
+        auto &pipe = test::access(S).pipe;
         frame::Layout &g = S.layout;
         {
             Column c;
