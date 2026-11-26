@@ -10807,6 +10807,7 @@ namespace render
 // 窗口层：Binding/Host 定义（G2b-1）
 #include "table12_app/host.hpp"
 #include "table12_app/window_draw.hpp"
+#include "table12_app/window_input.hpp"
 
 namespace table_ui
 {
@@ -10819,14 +10820,8 @@ namespace table_ui
     using table::window::draw;
     using table::window::pointer_target;
     using table::window::on_pick;
-    // 诊断开关（环境变量）留在 app 层：核心不读环境变量、不做 I/O
-    template <class... A>
-    inline void trace(std::format_string<A...> fmt, A &&...a)
-    {
-        static const bool on = std::getenv("TABLE_TRACE") != nullptr;
-        if (on)
-            std::println(fmt, std::forward<A>(a)...);
-    }
+    using table::window::trace;
+    using table::window::on_hover;
 
     namespace ev = mcs::vulkan::event;
 
@@ -11533,21 +11528,6 @@ namespace table_ui
     // system_hover -> ix.hover. This is a stateless router; instance
     // identity comes from the table bits in picking_result.entity_index, so no
     // per-table hover_fn is needed.
-    inline void on_hover(picking_result r, bool enter, InputCtx &,
-                         ui_new::ScreenWidget *screen) noexcept
-    {
-        if (screen == nullptr || screen->table_host_ctx == nullptr)
-        {
-            table_ui::trace("[hover] dropped: no screen/host");
-            return;
-        }
-        auto &h = *screen->table_host_ctx;
-        if (!h.accept_pick(r))
-            return;   // the only frame-level renderVersion comparison
-        h.on_pick(r); // diagnostics: update pick/last_pick only
-        table_ui::trace("[hover] {} key={:#x}", enter ? "ENTER" : "LEAVE",
-                        r.key.entity_index);
-    }
     inline std::uint32_t hover_index()
     {
         static const std::uint32_t fn = hoverPool().bind(&on_hover);
@@ -12021,7 +12001,7 @@ namespace table_ui
     // TABLE_MULTITEST: headless multi-table test for one window.
     // Both host entry points use the real path:
     //   CPU hover: host.route_event(position) -> advance -> system_hover
-    //   GPU pick : table_ui::on_hover(picking, ..., &screen) -> accept_pick
+    //   GPU pick : table::window::on_hover(picking, ..., &screen) -> accept_pick
     // =====================================================================
     inline void init_multi_table(Binding &s, std::uint32_t id, int rows)
     {
@@ -12109,13 +12089,13 @@ namespace table_ui
         // 2b. GPU pick: real on_hover routed through ScreenWidget::table_host_ctx
         {
             const auto rb = make_pick(b, static_cast<std::uint32_t>(h.frame_serial));
-            table_ui::on_hover(rb, true, inputCtx, &screen);
+            table::window::on_hover(rb, true, inputCtx, &screen);
             check(b.pick.key == rb.key, "gpu-hover: B pick updated via on_hover");
             check(a.pick.key.object_type != rb.key.object_type,
                   "gpu-hover: A pick untouched");
 
             const auto ra = make_pick(a, static_cast<std::uint32_t>(h.frame_serial));
-            table_ui::on_hover(ra, true, inputCtx, &screen);
+            table::window::on_hover(ra, true, inputCtx, &screen);
             check(a.pick.key == ra.key, "gpu-hover: A pick updated via on_hover");
             check(b.pick.key == rb.key, "gpu-hover: B pick unchanged by A pick");
         }
@@ -12315,19 +12295,19 @@ namespace table_ui
             const std::uint32_t serial = static_cast<std::uint32_t>(h.frame_serial);
             const auto good = make_pick(b, serial);
             check(h.accept_pick(good), "version: same-frame picking accepted");
-            table_ui::on_hover(good, true, inputCtx, &screen);
+            table::window::on_hover(good, true, inputCtx, &screen);
             check(b.pick.key == good.key, "version: same-frame updates B");
 
             // differing per-table ix.version must not filter picking
             b.session.state.touch();
             a.session.state.touch();
-            table_ui::on_hover(good, true, inputCtx, &screen);
+            table::window::on_hover(good, true, inputCtx, &screen);
             check(b.pick.key == good.key,
                   "version: per-table view version does not filter picking");
 
             const auto stale = make_pick(b, serial + 1);
             const auto a_before = a.pick.key;
-            table_ui::on_hover(stale, true, inputCtx, &screen);
+            table::window::on_hover(stale, true, inputCtx, &screen);
             check(!h.accept_pick(stale), "version: stale picking rejected");
             check(b.pick.key == good.key && a.pick.key == a_before,
                   "version: stale picking updates nothing");
@@ -12380,10 +12360,10 @@ namespace table_ui
             check(h.table_at(120.0, 100.0) == &a, "detach: table_at only A");
             const auto b_before = b.pick.key;
             const auto rb = make_pick(b, static_cast<std::uint32_t>(h.frame_serial));
-            table_ui::on_hover(rb, true, inputCtx, &screen);
+            table::window::on_hover(rb, true, inputCtx, &screen);
             check(b.pick.key == b_before, "detach: on_hover B key not routed");
             const auto ra = make_pick(a, static_cast<std::uint32_t>(h.frame_serial));
-            table_ui::on_hover(ra, true, inputCtx, &screen);
+            table::window::on_hover(ra, true, inputCtx, &screen);
             check(a.pick.key == ra.key, "detach: A still routed");
         }
 
@@ -12472,7 +12452,7 @@ namespace table_ui
                 picking_result::pack(
                     render_version_t{static_cast<std::uint32_t>(h3.frame_serial)}, 0),
                 ~0U};
-            table_ui::on_hover(r3, true, inputCtx, &s3); // must be a safe no-op
+            table::window::on_hover(r3, true, inputCtx, &s3); // must be a safe no-op
             check(h3.find(table::TableId{3}) == nullptr,
                   "life: on_hover for a destroyed table is a safe no-op");
         }
