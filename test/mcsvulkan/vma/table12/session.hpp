@@ -9,8 +9,8 @@
 //     session::hit             唯一命中入口（几何 + 语义覆盖，只读）
 //
 //   实现细节（AppRouter / RowPipeline / passes / gestures）全部藏在
-//   session::Session::Impl（table12/detail/runtime.hpp + session.cpp）。
-//   本头不出现 detail/，也不出现 detail::（G5 验收）。
+//   Session::Impl（实现见 session.cpp；测试见 test/access.hpp）。
+//   本头只依赖 schema 头（G5 验收）。
 //
 //   数据流：
 //     Command -> dispatch -> Router(feature 短路链) -> Outcome{effects}
