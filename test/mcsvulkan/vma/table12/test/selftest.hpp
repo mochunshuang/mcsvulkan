@@ -128,14 +128,14 @@ using model::Table;
             ft.put(static_cast<char32_t>(c), gm);
 
         // 和 host 完全相同的分发：命令 → dispatch（feature 短路链 → gesture）
-        std::vector<Effect> fx;
+        command::EffectList fx;
         auto send = [&]<class E>(const E &c) {
             const auto out = session::dispatch(S, command::Command{c});
-            fx.assign(out.effects.begin(), out.effects.end());
+            fx = out.effects;
         };
         auto send_text = [&](std::string_view s) {
             const auto out = session::feed_text(S, s);
-            fx.assign(out.effects.begin(), out.effects.end());
+            fx = out.effects;
         };
         auto send_begin = [&](int r, int col) {
             command::Context tc{d, v, ix, p, g, ft, false, S.id};
@@ -429,7 +429,7 @@ const Rect vp{0, 0, 800, 600};
             command::Context tc{d, v, ix, p, g, ft, false, S.id};
             {
                 auto o_ = sy.get<ClipboardFeature>().copy(tc, false);
-                fx.assign(o_.effects.begin(), o_.effects.end());
+                fx = o_.effects;
             }
         }
         bool clip = false;
@@ -441,7 +441,7 @@ const Rect vp{0, 0, 800, 600};
             command::Context tc{d, v, ix, p, g, ft, false, S.id};
             {
                 auto o_ = sy.get<ClipboardFeature>().remove(tc);
-                fx.assign(o_.effects.begin(), o_.effects.end());
+                fx = o_.effects;
             }
         }
         bool del = false;
@@ -453,7 +453,7 @@ const Rect vp{0, 0, 800, 600};
             command::Context tc{d, v, ix, p, g, ft, false, S.id};
             {
                 auto o_ = sy.get<UndoFeature>().run(tc, false);
-                fx.assign(o_.effects.begin(), o_.effects.end());
+                fx = o_.effects;
             }
         }
         check(!fx.empty(), "undo feature");
@@ -601,7 +601,7 @@ const Rect vp{0, 0, 800, 600};
             command::Context tc{d, v, ix, p, g, ft, false, S.id};
             {
                 auto o_ = sy.get<EditFeature>().paste(tc, "P1\tP2");
-                fx.assign(o_.effects.begin(), o_.effects.end());
+                fx = o_.effects;
             }
         }
         check(!fx.empty(), "paste emits cells");
@@ -630,7 +630,7 @@ const Rect vp{0, 0, 800, 600};
             command::Context tc{d, v, ix, p, g, ft, false, S.id};
             {
                 auto o_ = sy.get<UndoFeature>().run(tc, false);
-                fx.assign(o_.effects.begin(), o_.effects.end());
+                fx = o_.effects;
             }
         }
         check(!fx.empty(), "ctrl+z after commit");
