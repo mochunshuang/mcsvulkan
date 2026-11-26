@@ -382,13 +382,17 @@ inline void pass_edges(LayoutContext &c)
             assert(c.g.header.h == c.g.group_h + c.p.header_h);
 }
 
-using LayoutPassFn = void (*)(LayoutContext &);
+// 编译期 pass 列表：每个元素是独立 lambda 类型（无函数指针、无运行时 type-erasure）
 inline constexpr auto kLayoutPasses = std::tuple{
-    static_cast<LayoutPassFn>(pass_reconcile), static_cast<LayoutPassFn>(pass_frame),
-    static_cast<LayoutPassFn>(pass_columns),   static_cast<LayoutPassFn>(pass_metrics),
-    static_cast<LayoutPassFn>(pass_rows),      static_cast<LayoutPassFn>(pass_frozen),
-    static_cast<LayoutPassFn>(pass_visible),   static_cast<LayoutPassFn>(pass_bars),
-    static_cast<LayoutPassFn>(pass_edges),
+    [](LayoutContext &c) { pass_reconcile(c); },
+    [](LayoutContext &c) { pass_frame(c); },
+    [](LayoutContext &c) { pass_columns(c); },
+    [](LayoutContext &c) { pass_metrics(c); },
+    [](LayoutContext &c) { pass_rows(c); },
+    [](LayoutContext &c) { pass_frozen(c); },
+    [](LayoutContext &c) { pass_visible(c); },
+    [](LayoutContext &c) { pass_bars(c); },
+    [](LayoutContext &c) { pass_edges(c); },
 };
 
 // ── 唯一入口：layout passes 的有序组合 ────────────────────────────────

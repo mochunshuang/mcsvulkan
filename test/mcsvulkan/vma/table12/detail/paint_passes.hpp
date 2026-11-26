@@ -493,13 +493,18 @@ inline void pass_owners(DrawContext &c)
             }
 }
 
-using PaintPassFn = void (*)(DrawContext &);
+// 编译期 pass 列表：每个元素是独立 lambda 类型（无函数指针、无运行时 type-erasure）
 inline constexpr auto kPaintPasses = std::tuple{
-    static_cast<PaintPassFn>(pass_visual),      static_cast<PaintPassFn>(pass_frame),
-    static_cast<PaintPassFn>(pass_group_bands), static_cast<PaintPassFn>(pass_header),
-    static_cast<PaintPassFn>(pass_rows),        static_cast<PaintPassFn>(pass_cells),
-    static_cast<PaintPassFn>(pass_separators),  static_cast<PaintPassFn>(pass_zones),
-    static_cast<PaintPassFn>(pass_features),    static_cast<PaintPassFn>(pass_owners),
+    [](DrawContext &c) { pass_visual(c); },
+    [](DrawContext &c) { pass_frame(c); },
+    [](DrawContext &c) { pass_group_bands(c); },
+    [](DrawContext &c) { pass_header(c); },
+    [](DrawContext &c) { pass_rows(c); },
+    [](DrawContext &c) { pass_cells(c); },
+    [](DrawContext &c) { pass_separators(c); },
+    [](DrawContext &c) { pass_zones(c); },
+    [](DrawContext &c) { pass_features(c); },
+    [](DrawContext &c) { pass_owners(c); },
 };
 
 // ── 唯一入口：paint passes 的有序组合 ─────────────────────────────────
