@@ -11471,7 +11471,7 @@ namespace table_ui
     //   Host 只做平台 side：剪贴板 / 回调 / 重绘标记，不自己写 Session 数据
     inline void apply_effects(Binding &s, const table::command::Outcome &out)
     {
-        // P0：Binding 继承 Session，直接传基类引用；P1 改组合后会是 s.session
+        // G2a 起 Binding 组合 Session：传 session 成员（不再有基类继承）
         const bool model_changed = table::session::apply_effects(s.session, out);
         for (const auto &e : out.effects)
             if (const auto *p = std::get_if<table::command::WriteClipboard>(&e))

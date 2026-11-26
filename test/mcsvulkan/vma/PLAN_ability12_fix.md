@@ -282,7 +282,6 @@ framework(ui_new/intent/gesture/ui_dao/input_frame) → shader_abi/glue/platform
 见附录 E。tag `ability12-c0`。
 
 ### G2：app 层搬移（P1；C1 检查点）
-
 **目标**：demo cpp 里 ability12 段 2,395 → < 400 行；`host.hpp` 是真 Host（组合 Session）；文件 DAG 落地。
 
 1. **改名一次到位**（§4.4）：`data→model`、`view→state`、`ix→interaction`、`prefs→theme`、`geom→layout`、
@@ -298,6 +297,50 @@ framework(ui_new/intent/gesture/ui_dao/input_frame) → shader_abi/glue/platform
 5. **验收（C1）**：`171/32/71/150` + oracle 三项 0 差异；cpp ≤ 13,000 且 ability12 段 < 400；
    6 个新头各 < 1500；`grep -n "struct Binding" host.hpp` 命中且是组合；DAG 顺序与 include 一致；
    `shader_abi.hpp` 在 G0 已可用（host.hpp 直接依赖它）；ability10/11 零改动。
+
+#### G2b 执行清单（已定位，可直接照做）
+
+**进度**：G2 slice-1（`glue.hpp` 226 行）与 slice-2（`encode.hpp` 105 行）已完成；
+**G2a（Session 字段改名 + Binding 组合）已完成**（commit `4fe3b30`，四门 + oracle 全绿）。
+剩余 G2b = 把 `arena_input` / `Binding` / `Host` 及其方法定义搬出 cpp。
+
+| 块 | demo cpp 位置 | 去哪个头 | 说明 |
+|---|---|---|---|
+| `arena_input`（traits + arbiter + table_tree） | 10833–10956（124 行） | `host.hpp`（Binding 之前） | Binding 的 `arbiter` 成员需要它 |
+| `struct Binding` | 10969–11069（101 行） | `host.hpp` | 目标：`namespace table::window { struct Binding { table::session::Session session; ... }; }` |
+| `struct Host` | 11181–11424（244 行） | `host.hpp`（Binding 之后） | 含 `bindings`/`focus`/`draw_order`/`frame_serial`/`hover_fn`/`pick` |
+| `Binding::~Binding` / `Host::~Host` / `Host::*` 类外定义 | 11425 起 | `host.hpp` 同步搬，或留在 cpp 但放进 `namespace table::window` | **最容易漏**：留在 table_ui 会编译失败 |
+| `draw_sync/draw_build/draw_encode/draw/pointer_target/on_pick` | 11074–11180 + 12010–12050 | `window_draw.hpp` | 只放方法定义 |
+| `Binding::on_*` / `click_dispatch` / `map_key` / `input_dispatch` / `apply_effects` / `notify_change` / `notify_model` / 模型 API / `cancel_modal` | 11500–12000 | `window_input.hpp` | 只放方法定义 |
+
+**搬移时必须一起改的 4 个旧引用**（先 grep 再搬）：
+
+| 位置 | 现状 | 改成 |
+|---|---|---|
+| cpp:557（table_ui 前置声明） | `struct Host;` | `namespace table::window { struct Binding; struct Host; }` |
+| cpp:616 `frame_state::tableHost` | `std::shared_ptr<table_ui::Host>` | `std::shared_ptr<table::window::Host>` |
+| cpp:4386 `ScreenWidget::table_host_ctx` | `table_ui::Host *` | `table::window::Host *` |
+| `window_tables()` / main 里的 `table_ui::Host` | 返回/持有 `table_ui::Host&` | `table::window::Host&`（或 table_ui 内一行 `using table::window::Host;`） |
+
+**include 与 using 的落点**：
+```
+cpp 10806 之前： #include "table12_app/host.hpp"     // 必须在 input_frame/gesture/ui_new 之后
+cpp 10806 内：   namespace table_ui { using table::window::arena_input; using table::window::Binding;
+                                     using table::window::Host; ... }
+```
+`window_draw.hpp` / `window_input.hpp` 各自 `#include "host.hpp"`，且只在 demo cpp 里被 include。
+
+**C1 审计命令**：
+```powershell
+# 1) ability12-owned 段行数（10806 起的 table_ui 块）
+# 2) host.hpp 是真类型
+Select-String table12_app\host.hpp -Pattern 'struct Binding|struct Host|Session session'
+# 3) 旧定义必须为空（防"复制而非搬移"）
+Select-String test_ui_ability12_table.cpp -Pattern 'struct Binding|struct Host|namespace arena_input'
+# 4) DAG
+Select-String test_ui_ability12_table.cpp -Pattern 'table12_app/(host|window_draw|window_input|glue|encode|platform)'
+```
+
 
 ### G3：核心文件切分（P2，纯移动）
 
