@@ -1,4 +1,4 @@
-﻿# ability12 重构设计规范（交接给下一个 AI）
+# ability12 重构设计规范（交接给下一个 AI）
 
 > **读者**：接手重构的 AI / 工程师  
 > **输入**：`test_ui_ability11_table.cpp/.hpp`（功能已验收，171/32/71/150 全绿）  
@@ -525,8 +525,17 @@ struct Frame {
 
 - `Session` **不持有** `screen/owner/win/sx/sy/mx/my/host`；这些去 `window::Binding`；
 - `Session` 不 include `ui_new/GLFW/Vulkan`；
-- `compose` 只写 `last_layout` 缓存；Model/State 永远只由 `dispatch` 写；
+- `compose` 只写 `last_layout` 缓存；State 只由 `dispatch` 写，Model 只由 `apply_effects` 写（见下方补充）；
 - `last_layout` 是派生缓存，可随时丢弃；不要把它当第二份真值。
+
+> **写入口口径（ability12 实现补充，2026-11 验收确认）**
+> `dispatch` 只写 State/Interaction（feature + gesture），产出 `Outcome.effects`；
+> 新增 `session::apply_effects(Session&, const Outcome&) -> bool` 作为**唯一 Model 写点**，
+> 由 `window::Host` 在 `dispatch` 之后调用（顺序：dispatch → apply_effects → 剪贴板 → 回调 → 重绘）。
+> 二者合起来是"唯一写路径"，Host 不自己写任何 Session 数据。
+> `Outcome.model_changed` 在 dispatch 阶段恒为 false，由 `apply_effects` 的返回值补上。
+> touch 口径：feature/gesture 自身的 `touch()` 原样保留，`dispatch` 末尾补 1 次 blanket touch
+> （等价 ability11 `apply_effects` 末尾那次 `ui.touch()`）；`apply_effects` 与 Host 都不 touch。
 
 ### 5.8 两条链：draw 与 input
 

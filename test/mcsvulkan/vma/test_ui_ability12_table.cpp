@@ -1,4 +1,4 @@
-﻿#include <any>
+#include <any>
 #include <array>
 #include <bit>
 #include <cassert>
@@ -684,8 +684,9 @@ struct pick_mouse
 // ─────────────────────────────────────────────────────────────────────────
 namespace table_ui
 {
-    struct table_host;
+    struct Host;
 } // namespace table_ui
+
 
 namespace named_resource
 {
@@ -740,7 +741,7 @@ namespace named_resource
         mcs::vulkan::memory::create_resources *resolveResourcesBuild{};
         // Window-level multi-table host, owned by shared_ptr and living with the
         // window. One host per window; N tables are N Table nodes in one screen.
-        std::shared_ptr<table_ui::table_host> tableHost;
+        std::shared_ptr<table_ui::Host> tableHost;
     };
 
     // 全局唯一实例
@@ -4509,8 +4510,8 @@ namespace ui_new
     struct ScreenWidget
     {
         // Host of the window this screen lives in (bound by make_table_screen,
-        // non-owning). ui_new does not own table_host: frameState does.
-        table_ui::table_host *table_host_ctx{};
+        // non-owning). ui_new does not own Host: frameState does.
+        table_ui::Host *table_host_ctx{};
 
         constexpr render_version_t::underlying_t renderVersion() const noexcept { return renderVersion_ + static_cast<uint8_t>(versionDirty_);}
 
@@ -10924,98 +10925,10 @@ namespace render
 //    input:  hit_target(...) / resolve(data, key) -> target -> to_owner -> visit_owner
 //  Same target_key, same resolve, same owner variant in all three places.
 // ===========================================================================
+#include "table12_app/platform.hpp"
+
 namespace table_glue
 {
-    // ---- encode: frame_data -> shader instances (the only shader ABI boundary)
-    // Pure data transform: no Vulkan, no globals. Host supplies a sink
-    // (record_builder::addInsteance in production, a counter in tests).
-    inline void clip_glyph(ui_dao::rect_px &r, UvTransform &uv,
-                           const ui_dao::rect_px &clip) noexcept
-    {
-        if (r.w <= 0.0F || r.h <= 0.0F || clip.w <= 0.0F || clip.h <= 0.0F)
-            return;
-        const float l = std::max(r.x, clip.x), t = std::max(r.y, clip.y);
-        const float q = std::min(r.x + r.w, clip.x + clip.w);
-        const float b = std::min(r.y + r.h, clip.y + clip.h);
-        if (q <= l || b <= t)
-        {
-            r = {};
-            return;
-        }
-        const float sx = (l - r.x) / r.w, sy = (t - r.y) / r.h;
-        const float sw = (q - l) / r.w, sh = (b - t) / r.h;
-        uv.offset += glm::vec2(sx * uv.scale.x, sy * uv.scale.y);
-        uv.scale *= glm::vec2(sw, sh);
-        r = {l, t, q - l, b - t};
-    }
-
-    template <class Sink>
-    inline void encode(const ui_table::frame_data &in, const ui_table::font &f,
-                       const ui_dao::view &v, Sink &&sink)
-    {
-        const std::uint32_t hfn = ui_table::hover_fn_ref();
-        const auto emit_shape = [&](const ui_table::shape_op &o) {
-            auto s = ui_dao::sdf_shape({o.r.x, o.r.y, o.r.w, o.r.h}, v, o.radius, o.color,
-                                       {}, 0.0F, 0.0F, 1.0F, o.zone);
-            s.hover_fn = hfn;
-            s.effects = shader_data::FX_FILL;
-            const bool has_border = o.border_w > 0.0F && o.border.a > 0.0F;
-            if (has_border)
-            {
-                s.border_px = o.border_w;
-                s.border_color = o.border;
-                s.effects |= shader_data::FX_BORDER;
-            }
-            if (o.color.a <= 0.0F)
-                s.effects = has_border ? shader_data::FX_BORDER : 0U;
-            if (s.effects != 0U || o.zone != 0U)
-                sink(s);
-        };
-        const auto emit_text = [&](const ui_table::text_op &o) {
-            const float px = f.px;
-            const std::string_view str{o.p, o.len};
-            float x = o.r.x;
-            std::size_t i = 0;
-            while (i < str.size())
-            {
-                char32_t cp = 0;
-                const std::size_t n = ui_table::utf8_decode(str.substr(i), cp);
-                if (const auto *g = f.find(cp))
-                {
-                    const float ydir = g->y_down ? 1.0F : -1.0F;
-                    const float left = x + g->plane.x * px;
-                    const float right = x + g->plane.z * px;
-                    const float top = o.baseline + ydir * g->plane.y * px;
-                    const float bottom = o.baseline + ydir * g->plane.w * px;
-                    ui_dao::rect_px r{left, top, right - left, bottom - top};
-                    UvTransform uv{};
-                    uv.scale = {g->uv.z - g->uv.x, g->uv.w - g->uv.y};
-                    uv.offset = {g->uv.x, g->uv.y};
-                    clip_glyph(r, uv, {o.r.x, o.r.y, o.r.w, o.r.h});
-                    if (r.w > 0.0F && r.h > 0.0F)
-                        sink(ui_dao::glyph_quad(r, v, g->tex, g->samp, g->font,
-                                                g->px_range, o.color, uv, o.zone));
-                    x += g->advance * px;
-                }
-                i += n;
-            }
-        };
-        for (const auto &s : in.draw.shapes[0])
-            emit_shape(s);
-        for (const auto &t : in.draw.texts[0])
-            emit_text(t);
-        for (const auto &s : in.draw.shapes[1])
-            emit_shape(s);
-        for (const auto &t : in.draw.texts[1])
-            emit_text(t);
-        for (const auto &s : in.draw.shapes[2])
-            emit_shape(s);
-        for (const auto &t : in.draw.texts[2])
-            emit_text(t);
-        for (const auto &s : in.draw.shapes[3])
-            emit_shape(s);
-    }
-
     // ---- platform helpers (GLFW / clipboard / IME / cursor)
     inline std::string read_clipboard(GLFWwindow *win)
     {
@@ -11081,7 +10994,7 @@ namespace table_glue
         api.rel_ctx(hwnd, himc);
         return out;
     }
-    inline void apply_cursor(GLFWwindow *win, ui_table::cursor c) noexcept
+    inline void apply_cursor(GLFWwindow *win, table::Cursor c) noexcept
     {
         if (win == nullptr)
             return;
@@ -11104,19 +11017,19 @@ namespace table_glue
         glfwSetCursor(win, pool[idx]);
     }
 
-    // ---- font / model (one-time init, ownership moved into table_arena)
-    inline void init_font(ui_table::font &F)
+    // ---- font / model (one-time init, ownership moved into Binding)
+    inline void init_font(table::Font &F)
     {
         F.px = 15.0F;
         for (const auto &[cp, g] : uiAsciiGlyphs())
         {
-            ui_table::glyph_metrics m{};
+            table::GlyphMetrics m{};
             m.uv = g.uv;
             m.plane = g.plane;
             m.advance = g.advance;
             m.tex = g.tex;
             m.samp = g.samp;
-            m.font = g.shaderFont;
+            m.font_id = g.shaderFont;
             m.px_range = g.pxRange;
             m.y_down = g.yDown;
             F.put(cp, m);
@@ -11155,7 +11068,7 @@ namespace table_glue
 }
 )json";
 
-    inline void init_model(ui_table::table_data &d, ui_table::prefs &p)
+    inline void init_model(table::model::Table &d, table::intent::Theme &p)
     {
         auto j = nlohmann::json::parse(kTableJson);
         static constexpr const char *kStatus[3] = {"ready", "busy", "error"};
@@ -11176,7 +11089,7 @@ namespace table_glue
         d = {};
         for (const auto &c : j.at("columns"))
         {
-            ui_table::column col;
+            table::model::Column col;
             col.key = c.value("key", std::string{});
             col.title = c.value("title", col.key);
             col.w = c.value("width", 140.0F);
@@ -11184,22 +11097,22 @@ namespace table_glue
             col.max_w = c.value("max", 640.0F);
             col.weight = c.value("weight", 0.0F);
             const auto a = c.value("align", std::string{"left"});
-            col.a = a == "center"  ? ui_table::align::center
-                    : a == "right" ? ui_table::align::right
-                                   : ui_table::align::left;
+            col.a = a == "center"  ? table::Align::center
+                    : a == "right" ? table::Align::right
+                                   : table::Align::left;
             col.filterable = c.value("filterable", true);
             col.wrap = c.value("wrap", false);
             col.group = c.value("group", std::string{});
             const auto rd = c.value("render", std::string{"text"});
-            col.render = rd == "tag"   ? ui_table::render_kind::tag
-                         : rd == "bar" ? ui_table::render_kind::bar
-                         : rd == "dot" ? ui_table::render_kind::dot
-                                       : ui_table::render_kind::text;
+            col.render = rd == "tag"   ? table::RenderKind::tag
+                         : rd == "bar" ? table::RenderKind::bar
+                         : rd == "dot" ? table::RenderKind::dot
+                                       : table::RenderKind::text;
             if (c.contains("tags") && c["tags"].is_object())
                 for (const auto &[k, v] : c["tags"].items())
                     if (v.is_string())
                         col.tags.emplace_back(
-                            k, ui_table::hex_color(v.get<std::string>(),
+                            k, table::hex_color(v.get<std::string>(),
                                                    {0.5F, 0.5F, 0.5F, 1.0F}));
             d.cols.push_back(std::move(col));
         }
@@ -11219,7 +11132,7 @@ namespace table_glue
                     text = cell_text(r.at(d.cols[c].key));
                 d.cells[c].push_back({std::move(text), {}});
             }
-            d.ids.push_back(ui_table::row_id{next_id++});
+            d.ids.push_back(table::RowId{next_id++});
         }
 
         if (j.contains("style"))
@@ -11243,6 +11156,15 @@ namespace table_glue
 
 namespace table_ui
 {
+    // 诊断开关（环境变量）留在 app 层：核心不读环境变量、不做 I/O
+    template <class... A>
+    inline void trace(std::format_string<A...> fmt, A &&...a)
+    {
+        static const bool on = std::getenv("TABLE_TRACE") != nullptr;
+        if (on)
+            std::println(fmt, std::forward<A>(a)...);
+    }
+
     namespace ev = mcs::vulkan::event;
 
     // =====================================================================
@@ -11257,7 +11179,7 @@ namespace table_ui
     //        on_key / on_char            （唯一副作用入口）
     //
     //   之前按事件类型手写的一排 input_event 重载全部删除；现在只有
-    //   table_arena::handle_event<E> 一个模板入口。
+    //   Binding::handle_event<E> 一个模板入口。
     // =====================================================================
     namespace arena_input
     {
@@ -11388,29 +11310,19 @@ namespace table_ui
     using table_arbiter = arena_input::table_arbiter;
 
     // =====================================================================
-    // table_arena: all mutable state of one table.
+    // Binding: all mutable state of one table.
     // No static, no globals: the host owns the single instance (Table node).
     // =====================================================================
-    struct table_arena
+    // 窗口绑定：一张表在窗口里的呈现。
+    //   真值/意图/派生缓存全部在 Session（基类）：data / view / ix / prefs /
+    //   font / sys / pipe / geom / frame 都是 Session 的字段，不是第二份数据。
+    //   这里只加窗口层需要的东西：owner / win / 缩放 / 指针 / GPU 回读 / 统计。
+    struct Binding : table::session::Session
     {
-        // ---- data (input writes, draw reads)
-        ui_table::table_data data;
-        ui_table::prefs prefs{};
-        ui_table::font font{};
-        ui_table::table_id id{};
-
-        // ---- derived (intermediate results of the draw chain)
-        ui_table::view view{};
-        ui_table::geometry geom{};
-        ui_table::row_pipeline pipe{};
-        ui_table::systems sys{};
-        ui_table::frame_data frame{};
-
-        // ---- input/draw merge point
-        ui_table::target pointer{}; // current pointer target (from hit_target)
-        picking_result pick{};      // GPU readback (verification only)
+        // ---- input/draw merge point (window side)
+        table::Target pointer{}; // current pointer target (from session::hit)
+        picking_result pick{};   // GPU readback (verification only)
         std::uint32_t pick_version{0};
-        std::vector<ui_table::effect> fx; // host effects produced by input
 
         // ---- input arena：input_frame -> arbiter -> gesture -> on_*
         arena_input::table_arbiter arbiter{};
@@ -11441,7 +11353,7 @@ namespace table_ui
         template <static_string Name, class... A>
         constexpr decltype(auto) invoke(A &&...a)
         {
-            constexpr auto m = *type_erased_invoker<>::find_function(^^table_arena, Name);
+            constexpr auto m = *type_erased_invoker<>::find_function(^^Binding, Name);
             return (this->[:m:])(std::forward<A>(a)...);
         }
 
@@ -11465,18 +11377,18 @@ namespace table_ui
 
         // ---- window host wiring (host lives as long as the window; a table
         // may be destroyed before the window)
-        table_host *host{nullptr};   // only for ~table_arena / detach
+        Host *host{nullptr};   // only for ~Binding / detach
         bool keyboard_focus{true};   // set by the host; headless default true
         std::uint64_t draw_serial{}; // mark_drawn dedup: drawn this frame?
 
-        // ~table_arena is only declared here: table_host is still incomplete.
-        // The definition follows table_host (see ~table_arena below).
-        ~table_arena();
-        table_arena() = default;
-        table_arena(const table_arena &) = delete;
-        table_arena &operator=(const table_arena &) = delete;
-        table_arena(table_arena &&) = default;
-        table_arena &operator=(table_arena &&) = default;
+        // ~Binding is only declared here: Host is still incomplete.
+        // The definition follows Host (see ~Binding below).
+        ~Binding();
+        Binding() = default;
+        Binding(const Binding &) = delete;
+        Binding &operator=(const Binding &) = delete;
+        Binding(Binding &&) = default;
+        Binding &operator=(Binding &&) = default;
 
         // ---- draw statistics (tests / verification)
         struct draw_info
@@ -11500,7 +11412,7 @@ namespace table_ui
     };
 
     // The single-table "current arena" global is gone: window state lives in
-    // table_host, table state lives in table_arena. No production path uses a
+    // Host, table state lives in Binding. No production path uses a
     // process-level current table any more.
 
     // =====================================================================
@@ -11508,14 +11420,15 @@ namespace table_ui
     // =====================================================================
 
     // 1) data + view -> geometry
-    inline void draw_sync(table_arena &s, const ui_table::rect &box)
+    inline void draw_sync(Binding &s, const table::Rect &box)
     {
         const float m = 48.0F;
-        const ui_table::rect vp{box.x + m, box.y + m, std::max(box.w - 2.0F * m, 1.0F),
+        const table::Rect vp{box.x + m, box.y + m, std::max(box.w - 2.0F * m, 1.0F),
                                 std::max(box.h - 2.0F * m, 1.0F)};
         s.vw = vp.w;
         s.vh = vp.h;
-        ui_table::sync(s.data, s.view, s.prefs, s.geom, vp, s.font, s.sys, s.pipe);
+        // 门：compose = layout passes + paint passes（唯一派生入口）
+        table::session::compose(s, vp);
         if (std::getenv("TABLE_GEOMLOG") != nullptr)
         {
             static std::uint32_t last_ver = ~0U;
@@ -11542,22 +11455,22 @@ namespace table_ui
     }
 
     // 2) data + view + geometry -> frame_data (DL, every op carries zone)
-    inline void draw_build(table_arena &s)
+    inline void draw_build(Binding &s)
     {
-        ui_table::build_frame(s.data, s.view, s.prefs, s.geom, s.font, s.sys, s.frame,
-                              s.id);
+        // compose 已经产出 DrawList（s.frame 是 Session 的派生缓存）
         s.frame.table = s.id;
     }
 
     // 3) frame_data -> shader instances (entity_index = zone_key)
     template <class Sink>
-    inline void draw_encode(const table_arena &s, const ui_dao::view &view, Sink &&sink)
+    inline void draw_encode(const Binding &s, const ui_dao::view &view, Sink &&sink)
     {
-        table_glue::encode(s.frame, s.font, view, std::forward<Sink>(sink));
+        table::platform::encode(s.frame, s.font, view, std::forward<Sink>(sink),
+                            s.host != nullptr ? s.host->hover_fn : ~0U);
     }
 
     // full draw chain: sync -> build -> encode
-    inline const table_arena::draw_info &draw(table_arena &s, const ui_table::rect &box,
+    inline const Binding::draw_info &draw(Binding &s, const table::Rect &box,
                                               const ui_dao::view &view,
                                               command::record_builder &rb)
     {
@@ -11566,14 +11479,14 @@ namespace table_ui
 
         auto &info = s.info;
         info = {};
-        info.version = s.view.ui.version;
+        info.version = s.view.revision;
         for (const auto &ops : s.frame.draw.shapes)
             info.shapes += static_cast<std::uint32_t>(ops.size());
         for (const auto &ops : s.frame.draw.texts)
             info.texts += static_cast<std::uint32_t>(ops.size());
         for (const auto &ops : s.frame.draw.shapes)
             for (const auto &o : ops)
-                info.zoned += o.zone != 0 ? 1U : 0U;
+                info.zoned += o.key != 0 ? 1U : 0U;
 
         draw_encode(s, view, [&](auto &&inst) {
             ++info.instances;
@@ -11583,29 +11496,29 @@ namespace table_ui
     }
 
     // 六个接口的显式名字（内部实现仍是上面三条；命名对齐 HANDOFF_table_arena）
-    inline void on_pick(table_arena &s, const picking_result &r);
-    inline void sync(table_arena &s, const ui_table::rect &box)
+    inline void on_pick(Binding &s, const picking_result &r);
+    inline void sync(Binding &s, const table::Rect &box)
     {
         draw_sync(s, box);
     }
-    inline void build_frame(table_arena &s)
+    inline void build_frame(Binding &s)
     {
         draw_build(s);
     }
     template <class Sink>
-    inline void encode(const table_arena &s, const ui_dao::view &view, Sink &&sink)
+    inline void encode(const Binding &s, const ui_dao::view &view, Sink &&sink)
     {
         draw_encode(s, view, std::forward<Sink>(sink));
     }
-    inline void picking(table_arena &s, const picking_result &r)
+    inline void picking(Binding &s, const picking_result &r)
     {
         on_pick(s, r);
     }
 
     // =====================================================================
-    // table_host: window-level router for one window with N tables.
+    // Host: window-level router for one window with N tables.
     //
-    //   * holds pointers only, never owns table_arena;
+    //   * holds pointers only, never owns Binding;
     //   * input: glfw_input_translation attaches once per window, then
     //     routes by focused / table_at / pressed;
     //   * picking: the frame-level renderVersion is compared only in
@@ -11613,31 +11526,40 @@ namespace table_ui
     //   * hover: CPU path is gated by host.hovered; GPU on_hover only
     //     updates pick/last_pick.
     // =====================================================================
-    struct table_host
+    struct Host
     {
-        std::vector<table_arena *> tables;     // attach order (focused etc.)
-        std::vector<table_arena *> draw_order; // this frame's draw order (z)
-        table_arena *focused{};
-        table_arena *pressed{};
-        table_arena *hovered{};
+        std::vector<Binding *> tables;     // attach order (focused etc.)
+        std::vector<Binding *> draw_order; // this frame's draw order (z)
+        Binding *focused{};
+        Binding *pressed{};
+        Binding *hovered{};
         glfw_input_translation::scoped_binding binding{};
         bool input_attached{};
         double pointer_x{}, pointer_y{};
         bool pointer_inside{true};
         std::uint64_t frame_serial{0};
         picking_result last_pick{};
+        // 诊断/ABI 配置：环境变量与全局计数器都只活在这里（核心不认识）
+        std::uint32_t hover_fn{~0U};
+        std::uint32_t next_table_id{1};
+        bool trace{false};
 
-        ~table_host();
+        std::uint32_t allocate_table_id() noexcept
+        {
+            return next_table_id++;
+        }
+
+        ~Host();
 
         // Construction-time attach: id must be 1..31 (target_key holds 5 bits)
-        void attach(table_arena &a)
+        void attach(Binding &a)
         {
             if (a.id.value == 0 || a.id.value > 31)
                 throw std::runtime_error(std::format(
-                    "table_host::attach: table_id {} out of range 1..31", a.id.value));
+                    "Host::attach: table_id {} out of range 1..31", a.id.value));
             if (find(a.id) != nullptr)
                 throw std::runtime_error(
-                    std::format("table_host::attach: duplicate table_id {}", a.id.value));
+                    std::format("Host::attach: duplicate table_id {}", a.id.value));
             a.host = this;
             tables.push_back(&a);
             if (!input_attached)
@@ -11658,7 +11580,7 @@ namespace table_ui
                 draw_order.push_back(&a);
         }
 
-        void detach(table_arena &a) noexcept
+        void detach(Binding &a) noexcept
         {
             std::erase(tables, &a);
             std::erase(draw_order, &a);
@@ -11679,7 +11601,7 @@ namespace table_ui
             a.keyboard_focus = true;
         }
 
-        table_arena *find(ui_table::table_id id) const noexcept
+        Binding *find(table::TableId id) const noexcept
         {
             for (auto *a : tables)
                 if (a != nullptr && a->id == id)
@@ -11690,11 +11612,11 @@ namespace table_ui
         // window logical -> screen (same scale set_pointer applies), then hit
         // the last frame's draw_order from top to bottom. geom.box already
         // includes the owner's offset, so no extra offset is added here.
-        table_arena *table_at(double wx, double wy) const noexcept
+        Binding *table_at(double wx, double wy) const noexcept
         {
             for (auto it = draw_order.rbegin(); it != draw_order.rend(); ++it)
             {
-                table_arena *a = *it;
+                Binding *a = *it;
                 if (a == nullptr)
                     continue;
                 const float lx = static_cast<float>(wx) * a->sx;
@@ -11707,7 +11629,7 @@ namespace table_ui
             return nullptr;
         }
 
-        void set_focus(table_arena *a) noexcept
+        void set_focus(Binding *a) noexcept
         {
             focused = a;
             for (auto *t : tables)
@@ -11722,7 +11644,7 @@ namespace table_ui
             draw_order.clear();
         }
 
-        void mark_drawn(table_arena *a) noexcept
+        void mark_drawn(Binding *a) noexcept
         {
             if (a == nullptr)
                 return;
@@ -11749,8 +11671,8 @@ namespace table_ui
         // Picking already accepted by accept_pick: route by entity_index.table
         void on_pick(const picking_result &r)
         {
-            const auto z = ui_table::zone_from(r.key.entity_index);
-            table_arena *t = find(z.table);
+            const auto z = table::zone_from(r.key.entity_index);
+            Binding *t = find(z.table);
             if (t != nullptr)
                 table_ui::on_pick(*t, r); // version already filtered by accept_pick
         }
@@ -11759,7 +11681,7 @@ namespace table_ui
         {
             pointer_inside = false;
             if (hovered != nullptr)
-                ui_table::system_hover(hovered->view, {});
+                table::session::update_hover(*hovered, {});
             hovered = nullptr;
         }
 
@@ -11770,9 +11692,9 @@ namespace table_ui
                 return;
             if (hovered != nullptr)
                 table_glue::apply_cursor(
-                    win, ui_table::cursor_for(hovered->view.ui.hover.to_zone()));
+                    win, table::cursor_for(hovered->ix.hover.to_zone()));
             else
-                table_glue::apply_cursor(win, ui_table::cursor::arrow);
+                table_glue::apply_cursor(win, table::Cursor::arrow);
         }
 
         template <class E>
@@ -11794,7 +11716,7 @@ namespace table_ui
             {
                 if (e.press() || e.repeat())
                 {
-                    table_arena *t = table_at(pointer_x, pointer_y);
+                    Binding *t = table_at(pointer_x, pointer_y);
                     if (t != nullptr)
                     {
                         set_focus(t);
@@ -11805,7 +11727,7 @@ namespace table_ui
                 else
                 {
                     // releasing outside still goes back to the pressed table
-                    table_arena *t =
+                    Binding *t =
                         pressed != nullptr ? pressed : table_at(pointer_x, pointer_y);
                     if (t != nullptr)
                         t->handle_event(e);
@@ -11814,7 +11736,7 @@ namespace table_ui
             }
             else if constexpr (std::same_as<T, ev::scroll_event>)
             {
-                if (table_arena *t = table_at(pointer_x, pointer_y))
+                if (Binding *t = table_at(pointer_x, pointer_y))
                     t->handle_event(e);
             }
             else if constexpr (std::same_as<T, ev::keyboard_event> ||
@@ -11848,15 +11770,15 @@ namespace table_ui
         }
     };
 
-    // Order: ~table_arena declared -> table_host complete -> ~table_arena ->
-    // ~table_host. Do not inline host->detach inside the arena class: the type
+    // Order: ~Binding declared -> Host complete -> ~Binding ->
+    // ~Host. Do not inline host->detach inside the arena class: the type
     // would be incomplete there.
-    inline table_arena::~table_arena()
+    inline Binding::~Binding()
     {
         if (host != nullptr)
             host->detach(*this);
     }
-    inline table_host::~table_host()
+    inline Host::~Host()
     {
         // host dies before its arenas: clear residual arena->host first, so a
         // later arena destructor does not call back into a dead host.
@@ -11866,14 +11788,14 @@ namespace table_ui
     }
 
     // One host per window: idempotent, make_screen must not replace it
-    inline table_host &window_tables() noexcept
+    inline Host &window_tables() noexcept
     {
         // Construct the process-wide input system first so it outlives the
         // host: the host binding calls back into the sink when it is destroyed.
         (void)inputTranslation();
         auto &slot = named_resource::frameState().tableHost;
         if (!slot)
-            slot = std::make_shared<table_host>();
+            slot = std::make_shared<Host>();
         return *slot;
     }
 
@@ -11882,32 +11804,26 @@ namespace table_ui
     // =====================================================================
 
     // input/draw merge point: pointer -> target (same zone_key protocol as draw)
-    inline ui_table::target pointer_target(table_arena &s, float x, float y)
+    inline table::Target pointer_target(Binding &s, float x, float y)
     {
-        s.pointer = ui_table::hit_target(s.data, s.geom, s.view, x, y, s.id);
+        s.pointer = table::session::hit(s, x, y);
         return s.pointer;
     }
 
     // host effects produced by input: write data / clipboard, then bump version
-    inline void apply_effects(table_arena &s)
+    // dispatch 已经应用模型 effect（唯一 Model 写入口）；宿主只做平台 side：
+    //   clipboard 需要窗口；回调/重绘由 changes 标志通知。
+    // 写入口口径（HANDOFF §4.2 + §5.7 补充）：
+    //   dispatch 只写 State/Interaction（末尾已做一次 blanket touch）
+    //   session::apply_effects 只写 Model（Host 在这里调用）
+    //   Host 只做平台 side：剪贴板 / 回调 / 重绘标记，不自己写 Session 数据
+    inline void apply_effects(Binding &s, const table::command::Outcome &out)
     {
-        bool model_changed = false;
-        for (auto &e : s.fx)
-        {
-            if (auto *p = std::get_if<ui_table::fx_set_cell>(&e))
-            {
-                const int r = s.data.index_of(p->id);
-                if (r >= 0)
-                {
-                    s.data.set_cell(r, p->col, std::move(p->text));
-                    model_changed = true;
-                }
-            }
-            else if (auto *p = std::get_if<ui_table::fx_clipboard>(&e))
+        // P0：Binding 继承 Session，直接传基类引用；P1 改组合后会是 s.session
+        const bool model_changed = table::session::apply_effects(s, out);
+        for (const auto &e : out.effects)
+            if (const auto *p = std::get_if<table::command::WriteClipboard>(&e))
                 table_glue::write_clipboard(s.win, p->text);
-        }
-        s.fx.clear();
-        s.view.ui.touch();
         if (model_changed)
         {
             s.changes.model = true;
@@ -11923,7 +11839,7 @@ namespace table_ui
         std::uint64_t checks{};
         friend bool operator==(const ui_signature &, const ui_signature &) = default;
     };
-    inline ui_signature signature_of(const table_arena &s) noexcept
+    inline ui_signature signature_of(const Binding &s) noexcept
     {
         ui_signature g{s.view.sel.r0,
                        s.view.sel.c0,
@@ -11940,7 +11856,7 @@ namespace table_ui
     }
 
     // 选区/勾选变化的唯一通知点：输入、筛选、模型对齐都走这里（去重）
-    inline void notify_change(table_arena &s)
+    inline void notify_change(Binding &s)
     {
         const auto sig = signature_of(s);
         const bool sel = !s.cb_valid || sig.r0 != s.cb_r0 || sig.c0 != s.cb_c0 ||
@@ -11970,65 +11886,65 @@ namespace table_ui
     }
 
     template <class Cmd>
-    inline void input_dispatch(table_arena &s, const Cmd &cmd)
+    inline void input_dispatch(Binding &s, const Cmd &cmd)
     {
-        ui_table::system_event(s.data, s.view, s.prefs, s.geom, s.sys, s.font, cmd, s.fx);
-        apply_effects(s);
+        const auto out = table::session::dispatch(s, table::command::Command{cmd});
+        apply_effects(s, out);
         notify_change(s);
         ++s.inputs;
     }
 
-    // Keyboard focus is synced by table_host::set_focus into every table's
+    // Keyboard focus is synced by Host::set_focus into every table's
     // keyboard_focus flag; headless single table defaults to true.
 
-    inline std::optional<ui_table::key> map_key(ev::Key k) noexcept
+    inline std::optional<table::command::Key> map_key(ev::Key k) noexcept
     {
         switch (k)
         {
         case ev::Key::eUP:
-            return ui_table::key::up;
+            return table::command::Key::up;
         case ev::Key::eDOWN:
-            return ui_table::key::down;
+            return table::command::Key::down;
         case ev::Key::eLEFT:
-            return ui_table::key::left;
+            return table::command::Key::left;
         case ev::Key::eRIGHT:
-            return ui_table::key::right;
+            return table::command::Key::right;
         case ev::Key::eHOME:
-            return ui_table::key::home;
+            return table::command::Key::home;
         case ev::Key::eEND:
-            return ui_table::key::end;
+            return table::command::Key::end;
         case ev::Key::ePAGE_UP:
-            return ui_table::key::pgup;
+            return table::command::Key::pgup;
         case ev::Key::ePAGE_DOWN:
-            return ui_table::key::pgdn;
+            return table::command::Key::pgdn;
         case ev::Key::eENTER:
-            return ui_table::key::enter;
+            return table::command::Key::enter;
         case ev::Key::eESCAPE:
-            return ui_table::key::esc;
+            return table::command::Key::esc;
         case ev::Key::eTAB:
-            return ui_table::key::tab;
+            return table::command::Key::tab;
         case ev::Key::eBACKSPACE:
-            return ui_table::key::backspace;
+            return table::command::Key::backspace;
         case ev::Key::eDELETE:
-            return ui_table::key::del;
+            return table::command::Key::del;
         case ev::Key::eSPACE:
-            return ui_table::key::space;
+            return table::command::Key::space;
         case ev::Key::eF2:
-            return ui_table::key::f2;
+            return table::command::Key::f2;
         case ev::Key::eA:
-            return ui_table::key::a;
+            return table::command::Key::a;
         case ev::Key::eC:
-            return ui_table::key::c;
+            return table::command::Key::c;
         case ev::Key::eV:
-            return ui_table::key::v;
+            return table::command::Key::v;
         case ev::Key::eX:
-            return ui_table::key::x;
+            return table::command::Key::x;
         case ev::Key::eZ:
-            return ui_table::key::z;
+            return table::command::Key::z;
         case ev::Key::eY:
-            return ui_table::key::y;
+            return table::command::Key::y;
         case ev::Key::eF:
-            return ui_table::key::f;
+            return table::command::Key::f;
         default:
             return std::nullopt;
         }
@@ -12061,7 +11977,7 @@ namespace table_ui
     // window logical -> framebuffer pixels (DPI scale applied once). mx/my use
     // the same space as geom.box (layout already encodes the owner offset), so
     // multi-table sub-rects need no extra owner offset here.
-    inline void set_pointer(table_arena &s, double wx, double wy) noexcept
+    inline void set_pointer(Binding &s, double wx, double wy) noexcept
     {
         s.wx = static_cast<float>(wx);
         s.wy = static_cast<float>(wy);
@@ -12072,11 +11988,11 @@ namespace table_ui
     // =====================================================================
     // arena 的 on_*：唯一副作用入口（识别器 win 通过反射调到这里）
     // =====================================================================
-    inline bool cancel_modal(table_arena &s) noexcept; // 定义在 input 链末尾
+    inline bool cancel_modal(Binding &s) noexcept; // 定义在 input 链末尾
 
     // 单击（含双击/三击的每一击）：press + release 一起发；
     // 双击/三击的判定由 core 的 note_click 按时间/位置完成。
-    inline void click_dispatch(table_arena &s, double x, double y)
+    inline void click_dispatch(Binding &s, double x, double y)
     {
         if (!s.input_state.pointer_position_valid && s.win != nullptr)
         {
@@ -12089,55 +12005,54 @@ namespace table_ui
         const auto tgt = pointer_target(s, s.mx, s.my);
         if (std::getenv("TABLE_INPUTLOG") != nullptr)
             std::println("[click] at=({:.1f},{:.1f}) kind={} row={} col={}", s.mx, s.my,
-                         ui_table::part_name(tgt.kind), tgt.row_index, tgt.col_index);
+                         table::part_name(tgt.kind), tgt.row_index, tgt.col_index);
         const bool shift = s.input_state.modifier.shift();
         const bool ctrl = s.input_state.modifier.control();
         input_dispatch(
-            s, ui_table::cmd_press{s.mx, s.my, tgt.to_zone(), false, shift, ctrl, tgt});
-        input_dispatch(s, ui_table::cmd_release{s.mx, s.my, s.view.ui.drag_target});
+            s, table::command::Press{s.mx, s.my, tgt.to_zone(), false, shift, ctrl, tgt});
+        input_dispatch(s, table::command::Release{s.mx, s.my, s.ix.drag_target});
     }
 
-    inline void table_arena::on_press(const arena_input::click_payload &e)
+    inline void Binding::on_press(const arena_input::click_payload &e)
     {
         click_dispatch(*this, e.x, e.y);
     }
 
-    inline void table_arena::on_right_click(const arena_input::click_payload &e)
+    inline void Binding::on_right_click(const arena_input::click_payload &e)
     {
         set_pointer(*this, e.x, e.y);
         const auto tgt = pointer_target(*this, mx, my);
-        ui_table::table_ctx tc{data, view, prefs, geom, font, &fx, nullptr, id};
-        sys.menu.open(tc, tgt.to_zone().col, mx, my);
+        table::session::open_menu(*this, tgt.to_zone().col, mx, my);
     }
 
-    inline void table_arena::on_drag(const arena_input::drag_payload &e)
+    inline void Binding::on_drag(const arena_input::drag_payload &e)
     {
         switch (e.phase)
         {
         case gesture::drag_phase::begin: {
             // 按下点 = 当前点 - 总位移：先补一发 press，再发 drag
             set_pointer(*this, e.x - e.total_dx, e.y - e.total_dy);
-            view.ui.last_click_t = -1.0e9; // 拖拽的 press 不参与双击判定
+            ix.last_click_t = -1.0e9; // 拖拽的 press 不参与双击判定
             const auto tgt = pointer_target(*this, mx, my);
-            input_dispatch(*this, ui_table::cmd_press{mx, my, tgt.to_zone(), false,
+            input_dispatch(*this, table::command::Press{mx, my, tgt.to_zone(), false,
                                                       e.modifier.shift(),
                                                       e.modifier.control(), tgt});
             set_pointer(*this, e.x, e.y);
-            input_dispatch(*this, ui_table::cmd_drag{mx, my, view.ui.drag_target});
+            input_dispatch(*this, table::command::Drag{mx, my, ix.drag_target});
             break;
         }
         case gesture::drag_phase::move:
             set_pointer(*this, e.x, e.y);
-            input_dispatch(*this, ui_table::cmd_drag{mx, my, view.ui.drag_target});
+            input_dispatch(*this, table::command::Drag{mx, my, ix.drag_target});
             break;
         case gesture::drag_phase::end:
             set_pointer(*this, e.x, e.y);
-            input_dispatch(*this, ui_table::cmd_release{mx, my, view.ui.drag_target});
+            input_dispatch(*this, table::command::Release{mx, my, ix.drag_target});
             break;
         }
     }
 
-    inline void table_arena::on_wheel(const arena_input::wheel_payload &e)
+    inline void Binding::on_wheel(const arena_input::wheel_payload &e)
     {
         if (!input_state.pointer_position_valid && win != nullptr)
         {
@@ -12153,12 +12068,12 @@ namespace table_ui
         if (mx < geom.box.x || mx >= geom.box.x1() || my < geom.box.y ||
             my >= geom.box.y1())
             return;
-        ui_table::system_wheel(view, prefs, 0.0F, static_cast<float>(e.delta),
-                               input_state.modifier.shift(), &geom);
+        table::session::wheel(*this, 0.0F, static_cast<float>(e.delta),
+                              input_state.modifier.shift());
         ++inputs;
     }
 
-    inline void table_arena::on_key(const arena_input::key_payload &e)
+    inline void Binding::on_key(const arena_input::key_payload &e)
     {
         if (e.transition != input_frame::Transition::Press)
             return;
@@ -12185,9 +12100,9 @@ namespace table_ui
                          view.sel.cur_r, view.sel.cur_c);
         if (e.key == ev::Key::eV && ctrl)
         {
-            ui_table::table_ctx c{data, view, prefs, geom, font, &fx, nullptr, id};
-            sys.edit.paste(c, table_glue::read_clipboard(win));
-            apply_effects(*this);
+            const auto out =
+                table::session::paste_text(*this, table_glue::read_clipboard(win));
+            apply_effects(*this, out);
             ++inputs;
             return;
         }
@@ -12200,29 +12115,28 @@ namespace table_ui
         if (const auto k = map_key(e.key))
             input_dispatch(
                 *this,
-                ui_table::cmd_key{*k, shift, ctrl,
-                                  ui_table::target_of(
+                table::command::KeyPress{*k, shift, ctrl,
+                                  table::model::target_of(
                                       data, id,
-                                      ui_table::zone{ui_table::part::cell, view.sel.cur_r,
+                                      table::Zone{table::Part::cell, view.sel.cur_r,
                                                      view.sel.cur_c, id})});
     }
 
-    inline void table_arena::on_char(const arena_input::char_payload &e)
+    inline void Binding::on_char(const arena_input::char_payload &e)
     {
         std::string text;
         encode_utf8(e.codepoint, text);
         if (std::getenv("TABLE_INPUTLOG") != nullptr)
             std::println("[char] cp={:#x} filter={} find={} edit={}", e.codepoint,
                          view.filter.edit, view.find.mode, view.edit.active());
-        ui_table::table_ctx tc{data, view, prefs, geom, font, &fx, nullptr, id};
-        ui_table::system_text(tc, sys, text);
-        apply_effects(*this);
+        const auto out = table::session::feed_text(*this, text);
+        apply_effects(*this, out);
     }
 
-    inline void table_arena::handle_key_event(const ev::keyboard_event &e)
+    inline void Binding::handle_key_event(const ev::keyboard_event &e)
     {
         now = mcs::app::now_ms();
-        view.ui.now = static_cast<double>(now.count()) / 1000.0;
+        ix.now = static_cast<double>(now.count()) / 1000.0;
         auto f = input_frame::build_change(input_state, e);
         arbiter.feed(*this, f, now);
         input_frame::apply_change(input_state, f);
@@ -12232,23 +12146,23 @@ namespace table_ui
     // 唯一输入入口：event -> input_frame -> arbiter -> gesture -> on_*
     // =====================================================================
     template <class E>
-    inline void table_arena::handle_event(const E &e)
+    inline void Binding::handle_event(const E &e)
     {
         if constexpr (std::same_as<E, ev::window_focus_event>)
         {
             if (!e.focused)
             {
-                view.ui.left = false;
-                view.ui.drag = ui_table::drag_mode::none;
+                ix.left = false;
+                ix.drag = table::intent::DragMode::none;
                 view.menu.open = false;
-                view.ui.touch();
+                view.touch();
             }
             return;
         }
         else
         {
             now = mcs::app::now_ms();
-            view.ui.now = static_cast<double>(now.count()) / 1000.0;
+            ix.now = static_cast<double>(now.count()) / 1000.0;
             if constexpr (std::same_as<E, ev::char_event>)
             {
                 // 文本不是手势：直接进 on_char（不经过 arbiter）
@@ -12270,12 +12184,12 @@ namespace table_ui
         }
     }
 
-    inline void table_arena::advance(double /*seconds*/)
+    inline void Binding::advance(double /*seconds*/)
     {
         // 表的输入/悬停/双击全部用同一个时钟（now_ms），不混 GLFW elapsed
         now = mcs::app::now_ms();
-        view.ui.now = static_cast<double>(now.count()) / 1000.0;
-        if (!view.ui.left)
+        ix.now = static_cast<double>(now.count()) / 1000.0;
+        if (!ix.left)
         {
             // Pointer coordinates stay current for every table (picking
             // diagnostics need them); only hover writes are gated below.
@@ -12284,23 +12198,23 @@ namespace table_ui
             if (host != nullptr)
             {
                 // CPU hover z-order gate: only host.hovered may write
-                // view.ui.hover; all other tables are cleared. Overlap is
+                // ix.hover; all other tables are cleared. Overlap is
                 // resolved by the topmost entry of draw_order.
                 if (host->hovered == this)
                 {
-                    view.ui.pointer = {mx, my};
-                    ui_table::system_hover(view, pointer_target(*this, mx, my));
+                    ix.pointer = {mx, my};
+                    table::session::update_hover(*this, pointer_target(*this, mx, my));
                 }
                 else
                 {
-                    ui_table::system_hover(view, {}); // clear old hover/tooltip
+                    table::session::update_hover(*this, {}); // clear old hover/tooltip
                 }
             }
             else
             {
                 // headless single table: keep pointer -> hit -> hover
-                view.ui.pointer = {mx, my};
-                ui_table::system_hover(view, pointer_target(*this, mx, my));
+                ix.pointer = {mx, my};
+                table::session::update_hover(*this, pointer_target(*this, mx, my));
             }
         }
         arbiter.tick(*this, now);
@@ -12308,7 +12222,7 @@ namespace table_ui
     }
 
     // IME preedit is polled, not event driven: sync once per frame on the input side
-    inline void input_ime(table_arena &s)
+    inline void input_ime(Binding &s)
     {
         if (s.win == nullptr)
             return;
@@ -12323,7 +12237,7 @@ namespace table_ui
             if (pre != s.view.filter.compose)
             {
                 s.view.filter.compose = std::move(pre);
-                s.view.ui.touch();
+                s.view.touch();
             }
             return;
         }
@@ -12332,26 +12246,24 @@ namespace table_ui
             if (pre != s.view.find.compose)
             {
                 s.view.find.compose = std::move(pre);
-                s.view.ui.touch();
+                s.view.touch();
             }
             return;
         }
         if (pre == s.view.edit.compose)
             return;
-        ui_table::table_ctx tc{s.data, s.view, s.prefs, s.geom,
-                               s.font, &s.fx,  nullptr, s.id};
-        s.sys.edit.compose(tc, std::move(pre));
+        table::session::ime_compose(s, std::move(pre));
     }
 
     // Esc 取消：编辑/筛选/查找/菜单任一打开时，优先取消它而不是关窗口
     // Reads only the focused table; a null focused means there is no modal.
-    inline bool modal_open(const table_host *h) noexcept
+    inline bool modal_open(const Host *h) noexcept
     {
-        const table_arena *s = (h != nullptr) ? h->focused : nullptr;
+        const Binding *s = (h != nullptr) ? h->focused : nullptr;
         return s != nullptr && (s->view.filter.edit >= 0 || s->view.find.mode ||
                                 s->view.edit.active() || s->view.menu.open);
     }
-    inline bool cancel_modal(table_arena &st) noexcept
+    inline bool cancel_modal(Binding &st) noexcept
     {
         auto &v = st.view;
         if (v.filter.edit >= 0)
@@ -12363,32 +12275,32 @@ namespace table_ui
             v.filter.orig.clear();
             v.filter.compose.clear();
             v.filter.edit = -1;
-            v.ui.touch();
+            v.touch();
             return true;
         }
         if (v.find.mode)
         {
             v.find.mode = false;
             v.find.compose.clear();
-            v.ui.touch();
+            v.touch();
             return true;
         }
         if (v.edit.active())
         {
             v.edit = {};
-            v.ui.touch();
+            v.touch();
             return true;
         }
         if (v.menu.open)
         {
             v.menu.open = false;
-            v.ui.touch();
+            v.touch();
             return true;
         }
         return false;
     }
 
-    inline bool cancel_modal(table_host &h) noexcept
+    inline bool cancel_modal(Host &h) noexcept
     {
         return h.focused != nullptr && cancel_modal(*h.focused);
     }
@@ -12396,22 +12308,22 @@ namespace table_ui
     // =====================================================================
     // 模型 API：数据变更 + view 对齐 + 回调，一站式
     // =====================================================================
-    inline void notify_model(table_arena &s)
+    inline void notify_model(Binding &s)
     {
         s.changes.model = true;
-        s.view.ui.touch();
+        s.view.touch();
         if (s.cb.on_model_changed)
             s.cb.on_model_changed();
     }
 
-    inline ui_table::row_id insert_row(table_arena &s, int at = -1)
+    inline table::RowId insert_row(Binding &s, int at = -1)
     {
         const auto id = s.data.insert_row(at);
         s.view.reconcile(s.data);
         notify_model(s);
         return id;
     }
-    inline bool remove_row(table_arena &s, int at)
+    inline bool remove_row(Binding &s, int at)
     {
         if (!s.data.remove_row(at))
             return false;
@@ -12419,14 +12331,14 @@ namespace table_ui
         notify_model(s);
         return true;
     }
-    inline ui_table::column_id insert_column(table_arena &s, int at, ui_table::column c)
+    inline table::ColumnId insert_column(Binding &s, int at, table::model::Column c)
     {
         const auto id = s.data.insert_column(at, std::move(c));
         s.view.reconcile(s.data);
         notify_model(s);
         return id;
     }
-    inline bool remove_column(table_arena &s, int at)
+    inline bool remove_column(Binding &s, int at)
     {
         if (!s.data.remove_column(at))
             return false;
@@ -12434,34 +12346,33 @@ namespace table_ui
         notify_model(s);
         return true;
     }
-    inline void set_cell(table_arena &s, int row, int col, std::string text)
+    inline void set_cell(Binding &s, int row, int col, std::string text)
     {
         s.data.set_cell(row, col, std::move(text));
         notify_model(s);
     }
-    inline void on_pick(table_arena &s, const picking_result &r)
+    inline void on_pick(Binding &s, const picking_result &r)
     {
         s.pick = r;
-        s.pick_version = s.view.ui.version;
+        s.pick_version = s.view.revision;
         if (std::getenv("TABLE_PICKCHECK") == nullptr || r.key.object_type == 0xFFFFFFFF)
             return;
-        const auto from_gpu = ui_table::resolve(s.data, r.key.entity_index);
-        const auto from_hit =
-            ui_table::hit_target(s.data, s.geom, s.view, s.mx, s.my, s.id);
+        const auto from_gpu = table::model::resolve(s.data, r.key.entity_index);
+        const auto from_hit = table::session::hit(s, s.mx, s.my);
         if (from_gpu.to_zone() != from_hit.to_zone())
             std::println("[pick] MISMATCH gpu=({}, {}, {}) hit=({}, {}, {})",
-                         ui_table::part_name(from_gpu.kind), from_gpu.row_index,
-                         from_gpu.col_index, ui_table::part_name(from_hit.kind),
+                         table::part_name(from_gpu.kind), from_gpu.row_index,
+                         from_gpu.col_index, table::part_name(from_hit.kind),
                          from_hit.row_index, from_hit.col_index);
         else
             std::println("[pick] ok {} row={} col={} entity={:#x}",
-                         ui_table::part_name(from_gpu.kind), from_gpu.row_index,
+                         table::part_name(from_gpu.kind), from_gpu.row_index,
                          from_gpu.col_index, r.key.entity_index);
     }
 
     // hover pool callback: diagnostics only (TABLE_PICKCHECK / TABLE_MULTITEST).
     // Production hover is the CPU path: host forwards position -> advance ->
-    // system_hover -> view.ui.hover. This is a stateless router; instance
+    // system_hover -> ix.hover. This is a stateless router; instance
     // identity comes from the table bits in picking_result.entity_index, so no
     // per-table hover_fn is needed.
     inline void on_hover(picking_result r, bool enter, InputCtx &,
@@ -12469,14 +12380,14 @@ namespace table_ui
     {
         if (screen == nullptr || screen->table_host_ctx == nullptr)
         {
-            ui_table::trace("[hover] dropped: no screen/host");
+            table_ui::trace("[hover] dropped: no screen/host");
             return;
         }
         auto &h = *screen->table_host_ctx;
         if (!h.accept_pick(r))
             return;   // the only frame-level renderVersion comparison
         h.on_pick(r); // diagnostics: update pick/last_pick only
-        ui_table::trace("[hover] {} key={:#x}", enter ? "ENTER" : "LEAVE",
+        table_ui::trace("[hover] {} key={:#x}", enter ? "ENTER" : "LEAVE",
                         r.key.entity_index);
     }
     inline std::uint32_t hover_index()
@@ -12486,18 +12397,18 @@ namespace table_ui
     }
 
     // =====================================================================
-    // widget adapter: table_arena <-> ui_new tree
+    // widget adapter: Binding <-> ui_new tree
     // Three jobs only: own the state, give the owner box to draw, and mark
-    // the draw order for the window host. Input binding lives in table_host.
+    // the draw order for the window host. Input binding lives in Host.
     // =====================================================================
-    inline auto make_table(ui_table::table_data data, ui_table::prefs p, ui_table::font f)
+    inline auto make_table(table::model::Table data, table::intent::Theme p, table::Font f)
     {
         data.finalize();
-        table_arena st;
+        Binding st;
         st.data = std::move(data);
         st.prefs = p;
         st.font = std::move(f);
-        st.id = ui_table::next_table_id();
+        st.id = table::TableId{window_tables().allocate_table_id()};
         st.view.reset(st.data);
         return make_aggregate<"Table">(
             field<"arena">(std::move(st)),
@@ -12549,7 +12460,7 @@ namespace table_ui
                         }
                     }
                 }
-                const ui_table::rect box{
+                const table::Rect box{
                     owner ? static_cast<float>(owner->offset.x) : 0.0F,
                     owner ? static_cast<float>(owner->offset.y) : 0.0F,
                     owner ? static_cast<float>(owner->size.width) : 1.0F,
@@ -12559,25 +12470,25 @@ namespace table_ui
             }));
     }
 
-    using table_agg = decltype(make_table(std::declval<ui_table::table_data>(),
-                                          std::declval<ui_table::prefs>(),
-                                          std::declval<ui_table::font>()));
+    using table_agg = decltype(make_table(std::declval<table::model::Table>(),
+                                          std::declval<table::intent::Theme>(),
+                                          std::declval<table::Font>()));
 
     // Build N tables at construction time: N Table nodes in one screen,
     // laid out by a Row. Runtime add_table is NOT supported (it would need a
     // relayoutable Flex root and is out of scope for this task).
     struct table_spec
     {
-        ui_table::table_data data;
-        ui_table::prefs prefs;
-        ui_table::font font;
+        table::model::Table data;
+        table::intent::Theme prefs;
+        table::Font font;
         float flex{1.0F}; // share of the Row
     };
 
     inline ui_new::ScreenWidget make_table_screen(double w, double h,
                                                   std::vector<table_spec> specs)
     {
-        ui_table::hover_fn_ref() = hover_index();
+        table_ui::window_tables().hover_fn = hover_index();
         auto &hs = window_tables();
         if (specs.empty())
             specs.push_back(table_spec{});
@@ -12659,9 +12570,9 @@ namespace table_ui
                 std::println("[chain] ok: {}", what);
         };
 
-        table_arena s;
+        Binding s;
         {
-            ui_table::column c;
+            table::model::Column c;
             c.key = "v";
             c.title = "V";
             c.w = 200;
@@ -12672,18 +12583,18 @@ namespace table_ui
         for (int i = 0; i < 50; ++i)
         {
             s.data.cells[0].push_back({std::format("r{}", i), {}});
-            s.data.ids.push_back(ui_table::row_id{static_cast<std::uint64_t>(i + 1)});
+            s.data.ids.push_back(table::RowId{static_cast<std::uint64_t>(i + 1)});
         }
-        s.id = ui_table::next_table_id();
+        s.id = table::TableId{window_tables().allocate_table_id()};
         s.view.reset(s.data);
         s.prefs.row_h = 30.0F;
         s.font.px = 15.0F;
-        ui_table::glyph_metrics gm;
+        table::GlyphMetrics gm;
         gm.advance = 0.5F;
         for (int c = 32; c < 127; ++c)
             s.font.put(static_cast<char32_t>(c), gm);
 
-        const ui_table::rect box{0, 0, 500, 220};
+        const table::Rect box{0, 0, 500, 220};
         const ui_dao::view view{500.0F, 220.0F};
 
         // ---- draw chain: sync -> build -> encode
@@ -12697,17 +12608,17 @@ namespace table_ui
             for (const auto &stream_shapes : s.frame.draw.shapes)
                 for (const auto &o : stream_shapes)
                 {
-                    if (o.zone == 0)
+                    if (o.key == 0)
                         ++zero_ops;
-                    else if (std::holds_alternative<ui_table::none_owner>(o.who))
+                    else if (std::holds_alternative<table::none_owner>(o.who))
                         ++no_owner;
                 }
             for (const auto &stream_texts : s.frame.draw.texts)
                 for (const auto &o : stream_texts)
                 {
-                    if (o.zone == 0)
+                    if (o.key == 0)
                         ++zero_ops;
-                    else if (std::holds_alternative<ui_table::none_owner>(o.who))
+                    else if (std::holds_alternative<table::none_owner>(o.who))
                         ++no_owner;
                 }
             check(zero_ops == 0, "dl: every op carries target_key");
@@ -12719,8 +12630,8 @@ namespace table_ui
             if (inst.entity_index != 0)
             {
                 ++zoned;
-                const auto t = ui_table::resolve(s.data, inst.entity_index);
-                owners += t.kind != ui_table::part::none ? 1U : 0U;
+                const auto t = table::model::resolve(s.data, inst.entity_index);
+                owners += t.kind != table::Part::none ? 1U : 0U;
             }
         });
         check(instances > 0, "draw.encode: frame_data -> shader instances");
@@ -12732,12 +12643,12 @@ namespace table_ui
             const float x = s.geom.col_x_at(0) + 10.0F;
             const float y = s.geom.row_index.empty() ? s.geom.body.y + 5.0F
                                                      : s.geom.row_y.front() + 5.0F;
-            const auto hit = ui_table::hit_target(s.data, s.geom, s.view, x, y, s.id);
-            const auto key = ui_table::zone_key(hit.to_zone());
+            const auto hit = table::session::hit(s, x, y);
+            const auto key = table::zone_key(hit.to_zone());
             bool found = false;
             for (const auto &ops : s.frame.draw.shapes)
                 for (const auto &o : ops)
-                    if (o.zone == key)
+                    if (o.key == key)
                         found = true;
             check(found, "merge: frame op.zone == input target_key");
             check(hit.row_index == r && hit.col_index == 0,
@@ -12745,24 +12656,24 @@ namespace table_ui
         }
 
         // ---- input chain: cmd -> systems/visit_owner -> view/data
-        const std::uint32_t v0 = s.view.ui.version;
+        const std::uint32_t v0 = s.view.revision;
         const int r0 = s.geom.view_rows.front();
-        input_dispatch(s, ui_table::cmd_press{
+        input_dispatch(s, table::command::Press{
                               s.geom.col_x_at(0) + 10.0F,
                               s.geom.row_y.front() + 5.0F,
-                              {ui_table::part::cell, r0, 0, s.id},
+                              {table::Part::cell, r0, 0, s.id},
                               false,
                               false,
                               false,
-                              ui_table::make_target(ui_table::part::cell, r0, 0, s.id)});
+                              table::model::make_target(table::Part::cell, r0, 0, s.id)});
         check(s.view.sel.cur_r == r0 && s.view.sel.cur_c == 0,
               "input: press -> selection");
-        check(s.view.ui.version > v0, "input: press bumps draw version");
+        check(s.view.revision > v0, "input: press bumps draw version");
         check(s.changes.selection, "input: selection change is reported");
         s.changes = {};
-        input_dispatch(s, ui_table::cmd_key{ui_table::key::space, false, false});
+        input_dispatch(s, table::command::KeyPress{table::command::Key::space, false, false});
         check(s.changes.checks, "input: row-check change is reported");
-        input_dispatch(s, ui_table::cmd_key{ui_table::key::down, false, false});
+        input_dispatch(s, table::command::KeyPress{table::command::Key::down, false, false});
         check(s.view.sel.cur_r > r0, "input: key down -> selection moves");
 
         // ---- arena 入口：event -> input_frame -> arbiter -> gesture -> on_*
@@ -12790,7 +12701,7 @@ namespace table_ui
                                                      .modifier_key = ev::ModifierKey{}});
             };
 
-            s.view.ui.last_click_t = -1.0e9;
+            s.ix.last_click_t = -1.0e9;
             s.view.edit = {};
             s.handle_event(ev::position2d_event{.xpos = px, .ypos = py});
             press(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
@@ -12799,11 +12710,11 @@ namespace table_ui
             check(sel_cb > 0, "callback: selection_changed fires");
             {
                 const int chk0 = chk_cb;
-                input_dispatch(s, ui_table::cmd_key{ui_table::key::space, false, false});
+                input_dispatch(s, table::command::KeyPress{table::command::Key::space, false, false});
                 check(chk_cb > chk0, "callback: checks_changed fires");
             }
 
-            s.view.ui.last_click_t = -1.0e9;
+            s.ix.last_click_t = -1.0e9;
             s.view.edit = {};
             s.handle_event(ev::keyboard_event{.key = ev::Key::eDOWN,
                                               .action = ev::Action::ePRESS,
@@ -12827,7 +12738,7 @@ namespace table_ui
             check(s.view.scroll.y > scroll_before, "arena: wheel event -> scroll");
 
             // 拖拽：press -> move 超过 slop -> release
-            s.view.ui.last_click_t = -1.0e9;
+            s.ix.last_click_t = -1.0e9;
             s.view.edit = {};
             s.view.scroll.y = 0.0F;
             s.handle_event(ev::position2d_event{.xpos = px, .ypos = py});
@@ -12838,7 +12749,7 @@ namespace table_ui
             release(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
 
             // 双击：两次 click 落在同一格 -> core 进编辑并选词
-            s.view.ui.last_click_t = -1.0e9;
+            s.ix.last_click_t = -1.0e9;
             s.view.edit = {};
             s.handle_event(ev::position2d_event{.xpos = px, .ypos = py});
             press(ev::MouseButtons::eMOUSE_BUTTON_LEFT);
@@ -12856,7 +12767,7 @@ namespace table_ui
                                               .scancode = 0});
 
             // 字符：F2 进编辑，char 进 system_text
-            s.view.ui.last_click_t = -1.0e9;
+            s.ix.last_click_t = -1.0e9;
             s.view.edit = {};
             s.handle_event(ev::keyboard_event{.key = ev::Key::eF2,
                                               .action = ev::Action::ePRESS,
@@ -12885,24 +12796,24 @@ namespace table_ui
                 ev::position2d_event{.xpos = px, .ypos = s.geom.col_header.y + 10.0F});
             press(ev::MouseButtons::eMOUSE_BUTTON_RIGHT);
             release(ev::MouseButtons::eMOUSE_BUTTON_RIGHT);
-            s.view.tip.hover_t = s.view.ui.now - 1.0;
-            s.view.ui.hover = ui_table::make_target(ui_table::part::cell, r0, 0, s.id);
+            s.view.tip.hover_t = s.ix.now - 1.0;
+            s.ix.hover = table::model::make_target(table::Part::cell, r0, 0, s.id);
             table_ui::draw_build(s);
             {
                 std::size_t zero_ops = 0, no_owner = 0;
                 for (const auto &ss : s.frame.draw.shapes)
                     for (const auto &o : ss)
                     {
-                        zero_ops += o.zone == 0;
-                        no_owner += o.zone != 0 &&
-                                    std::holds_alternative<ui_table::none_owner>(o.who);
+                        zero_ops += o.key == 0;
+                        no_owner += o.key != 0 &&
+                                    std::holds_alternative<table::none_owner>(o.who);
                     }
                 for (const auto &tt : s.frame.draw.texts)
                     for (const auto &o : tt)
                     {
-                        zero_ops += o.zone == 0;
-                        no_owner += o.zone != 0 &&
-                                    std::holds_alternative<ui_table::none_owner>(o.who);
+                        zero_ops += o.key == 0;
+                        no_owner += o.key != 0 &&
+                                    std::holds_alternative<table::none_owner>(o.who);
                     }
                 check(zero_ops == 0 && no_owner == 0,
                       "dl: overlay ops also carry target_key + owner");
@@ -12938,7 +12849,7 @@ namespace table_ui
         }
 
         // redraw after input: the same draw chain sees the new view
-        const std::uint32_t v1 = s.view.ui.version;
+        const std::uint32_t v1 = s.view.revision;
         table_ui::draw_sync(s, box);
         table_ui::draw_build(s);
         check(s.geom.version == v1, "loop: input version -> geometry version");
@@ -12954,9 +12865,9 @@ namespace table_ui
     //   CPU hover: host.input_event(position) -> advance -> system_hover
     //   GPU pick : table_ui::on_hover(picking, ..., &screen) -> accept_pick
     // =====================================================================
-    inline void init_multi_table(table_arena &s, std::uint32_t id, int rows)
+    inline void init_multi_table(Binding &s, std::uint32_t id, int rows)
     {
-        ui_table::column c;
+        table::model::Column c;
         c.key = "v";
         c.title = "V";
         c.w = 200.0F;
@@ -12966,13 +12877,13 @@ namespace table_ui
         for (int i = 0; i < rows; ++i)
         {
             s.data.cells[0].push_back({std::format("r{}", i), {}});
-            s.data.ids.push_back(ui_table::row_id{static_cast<std::uint64_t>(i + 1)});
+            s.data.ids.push_back(table::RowId{static_cast<std::uint64_t>(i + 1)});
         }
-        s.id = ui_table::table_id{id};
+        s.id = table::TableId{id};
         s.view.reset(s.data);
         s.prefs.row_h = 30.0F;
         s.font.px = 15.0F;
-        ui_table::glyph_metrics gm;
+        table::GlyphMetrics gm;
         gm.advance = 0.5F;
         for (int ch = 32; ch < 127; ++ch)
             s.font.put(static_cast<char32_t>(ch), gm);
@@ -13001,41 +12912,41 @@ namespace table_ui
         auto inputData = inputInit(16.0F / 9.0F);
         auto inputCtx = InputCtx(inputData);
 
-        table_arena a;
-        table_arena b;
+        Binding a;
+        Binding b;
         init_multi_table(a, 1, 10);
         init_multi_table(b, 2, 10);
         draw_sync(a, {0.0F, 0.0F, 400.0F, 300.0F});
         draw_sync(b, {500.0F, 0.0F, 400.0F, 300.0F});
 
-        table_host h;
+        Host h;
         ui_new::ScreenWidget screen{}; // only used as the host binding
         screen.table_host_ctx = &h;
         h.attach(a);
         h.attach(b);
 
-        const auto make_pick = [](const table_arena &t, std::uint32_t version) {
+        const auto make_pick = [](const Binding &t, std::uint32_t version) {
             return picking_result{
-                object_key{1U, ui_table::zone_key({ui_table::part::cell, 0, 0, t.id})},
+                object_key{1U, table::zone_key({table::Part::cell, 0, 0, t.id})},
                 picking_result::pack(render_version_t{version}, 0), ~0U};
         };
 
         // 1. initial focus
         check(h.focused == &a, "init: focused == A");
-        check(a.view.ui.hover.kind == ui_table::part::none &&
-                  b.view.ui.hover.kind == ui_table::part::none,
+        check(a.ix.hover.kind == table::Part::none &&
+                  b.ix.hover.kind == table::Part::none,
               "init: A/B hover empty");
 
-        // 2a. CPU hover: position -> advance -> only B writes view.ui.hover
+        // 2a. CPU hover: position -> advance -> only B writes ix.hover
         h.input_event(ev::position2d_event{.xpos = 620.0, .ypos = 100.0});
         a.advance(0.0);
         b.advance(0.0);
         check(h.hovered == &b, "cpu-hover: host.hovered == B");
-        check(b.view.ui.hover.kind == ui_table::part::cell &&
-                  b.view.ui.hover.row_index >= 0,
-              "cpu-hover: B view.ui.hover is a B cell");
-        check(a.view.ui.hover.kind == ui_table::part::none,
-              "cpu-hover: A view.ui.hover stays empty");
+        check(b.ix.hover.kind == table::Part::cell &&
+                  b.ix.hover.row_index >= 0,
+              "cpu-hover: B ix.hover is a B cell");
+        check(a.ix.hover.kind == table::Part::none,
+              "cpu-hover: A ix.hover stays empty");
 
         // 2b. GPU pick: real on_hover routed through ScreenWidget::table_host_ctx
         {
@@ -13176,9 +13087,9 @@ namespace table_ui
 
         // 6d. duplicate table_id is rejected before it corrupts routing
         {
-            table_host hd;
-            table_arena d1;
-            table_arena d2;
+            Host hd;
+            Binding d1;
+            Binding d2;
             init_multi_table(d1, 7, 3);
             init_multi_table(d2, 7, 3);
             hd.attach(d1);
@@ -13192,7 +13103,7 @@ namespace table_ui
                 threw = true;
             }
             check(threw, "attach: duplicate table_id rejected");
-            check(hd.tables.size() == 1 && hd.find(ui_table::table_id{7}) == &d1,
+            check(hd.tables.size() == 1 && hd.find(table::TableId{7}) == &d1,
                   "attach: duplicate does not corrupt the host");
             check(d2.host == nullptr, "attach: rejected arena keeps host == nullptr");
         }
@@ -13209,9 +13120,9 @@ namespace table_ui
             a.advance(0.0);
             b.advance(0.0);
             check(h.table_at(120.0, 100.0) == &a, "zorder: table_at top == A");
-            check(a.view.ui.hover.kind == ui_table::part::cell,
+            check(a.ix.hover.kind == table::Part::cell,
                   "zorder: only A hovers (B drawn first)");
-            check(b.view.ui.hover.kind == ui_table::part::none,
+            check(b.ix.hover.kind == table::Part::none,
                   "zorder: B hover cleared");
 
             // swap draw order: only B
@@ -13222,9 +13133,9 @@ namespace table_ui
             a.advance(0.0);
             b.advance(0.0);
             check(h.table_at(120.0, 100.0) == &b, "zorder: table_at top == B");
-            check(b.view.ui.hover.kind == ui_table::part::cell,
+            check(b.ix.hover.kind == table::Part::cell,
                   "zorder: only B hovers (A drawn first)");
-            check(a.view.ui.hover.kind == ui_table::part::none,
+            check(a.ix.hover.kind == table::Part::none,
                   "zorder: A hover cleared");
 
             // pointer outside every table: both hovers are cleared
@@ -13235,8 +13146,8 @@ namespace table_ui
             a.advance(0.0);
             b.advance(0.0);
             check(h.hovered == nullptr, "zorder: pointer outside -> no hovered");
-            check(a.view.ui.hover.kind == ui_table::part::none &&
-                      b.view.ui.hover.kind == ui_table::part::none,
+            check(a.ix.hover.kind == table::Part::none &&
+                      b.ix.hover.kind == table::Part::none,
                   "zorder: both hovers cleared outside");
         }
 
@@ -13249,9 +13160,9 @@ namespace table_ui
             table_ui::on_hover(good, true, inputCtx, &screen);
             check(b.pick.key == good.key, "version: same-frame updates B");
 
-            // differing per-table view.ui.version must not filter picking
-            b.view.ui.touch();
-            a.view.ui.touch();
+            // differing per-table ix.version must not filter picking
+            b.view.touch();
+            a.view.touch();
             table_ui::on_hover(good, true, inputCtx, &screen);
             check(b.pick.key == good.key,
                   "version: per-table view version does not filter picking");
@@ -13320,7 +13231,7 @@ namespace table_ui
 
         // 10. empty focused: main-loop guards do not crash
         {
-            table_host empty;
+            Host empty;
             check(empty.focused == nullptr, "empty: focused == nullptr");
             check(!modal_open(&empty), "empty: modal_open false");
             check(!cancel_modal(empty), "empty: cancel_modal false");
@@ -13375,14 +13286,14 @@ namespace table_ui
         }
         check(window_tables().tables.empty(), "screen: scope exit detaches both tables");
 
-        // 12. arena destroyed while the host is still alive: ~table_arena must
+        // 12. arena destroyed while the host is still alive: ~Binding must
         //     detach, and the host must never access the destroyed arena again.
         {
-            table_host h3;
+            Host h3;
             ui_new::ScreenWidget s3{}; // only for on_hover routing
             s3.table_host_ctx = &h3;
             {
-                table_arena c;
+                Binding c;
                 init_multi_table(c, 3, 5);
                 draw_sync(c, {0.0F, 0.0F, 400.0F, 300.0F});
                 h3.attach(c);
@@ -13391,20 +13302,20 @@ namespace table_ui
                 check(h3.tables.size() == 1 && h3.find(c.id) != nullptr,
                       "life: arena attached before destruction");
             }
-            check(h3.tables.empty() && h3.find(ui_table::table_id{3}) == nullptr,
-                  "life: ~table_arena detaches from the host");
+            check(h3.tables.empty() && h3.find(table::TableId{3}) == nullptr,
+                  "life: ~Binding detaches from the host");
             check(h3.focused == nullptr && h3.pressed == nullptr && h3.hovered == nullptr,
                   "life: destruction clears host pointers");
             check(h3.table_at(120.0, 100.0) == nullptr,
                   "life: host does not return the destroyed arena");
             const auto r3 = picking_result{
-                object_key{1U, ui_table::zone_key(
-                                   {ui_table::part::cell, 0, 0, ui_table::table_id{3}})},
+                object_key{1U, table::zone_key(
+                                   {table::Part::cell, 0, 0, table::TableId{3}})},
                 picking_result::pack(
                     render_version_t{static_cast<std::uint32_t>(h3.frame_serial)}, 0),
                 ~0U};
             table_ui::on_hover(r3, true, inputCtx, &s3); // must be a safe no-op
-            check(h3.find(ui_table::table_id{3}) == nullptr,
+            check(h3.find(table::TableId{3}) == nullptr,
                   "life: on_hover for a destroyed table is a safe no-op");
         }
 
@@ -13413,6 +13324,8 @@ namespace table_ui
     }
 
 } // namespace table_ui
+
+#include "table12_app/host.hpp"
 
 int main()
 try
@@ -13431,7 +13344,7 @@ try
         return table_ui::event_probe();
     if (std::getenv("TABLE_SELFTEST") != nullptr)
     {
-        const int fails = ui_table::selftest();
+        const int fails = table::test::core_selftest();
         return fails == 0 ? 0 : 1;
     }
     auto hardwareCtx = init();
@@ -13699,7 +13612,7 @@ try
 
     auto screen = table_ui::make_screen(WIDTH, HEIGHT);
     shader_data::hover_manager hoverManager{.screen = &screen};
-    std::println("[table] hover_fn = {}", ui_table::hover_fn_ref());
+    std::println("[table] hover_fn = {}", table_ui::window_tables().hover_fn);
     // 新的 soaCtx 仅包含 uiRects 和 uiWireRects
     auto soaCtx = make_aggregate_ref<"soaCtx", "screen">(screen);
 
