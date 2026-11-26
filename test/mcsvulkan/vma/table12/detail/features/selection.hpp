@@ -40,14 +40,14 @@ namespace table::detail
             }
             void set(Context &c, int r, int col)
             {
-                anchor(c.v, r, col);
-                sync_cells(c.d, c.v);
+                anchor(c.state, r, col);
+                sync_cells(c.model, c.state);
             }
 
             // 单击 = anchor；Shift+单击 = 从 anchor 扩到目标（Excel/Finder 语义）
             void set_or_extend(Context &c, const Target &t, bool shift)
             {
-                if (shift && c.v.sel.r0 >= 0)
+                if (shift && c.state.sel.r0 >= 0)
                     extend(c, t.row_index, t.col_index);
                 else
                     set(c, t);
@@ -56,8 +56,8 @@ namespace table::detail
             // 拖拽框选：指针出体区时按一行步长自动滚，并把目标夹到首/末可见行列
             void drag_extend(Context &c, float x, float y)
             {
-                auto &v = c.v;
-                const auto &g = c.g;
+                auto &v = c.state;
+                const auto &g = c.layout;
                 const float max_sy = std::max(0.0F, g.content_h - g.body.h);
                 if (y < g.body.y && v.scroll.y > 0.0F)
                     v.scroll.y = std::max(0.0F, v.scroll.y - g.step);
@@ -83,20 +83,20 @@ namespace table::detail
             // 点分组头 = 选中这一组的全部行
             void all_of_group(Context &c, int first_col)
             {
-                auto &v = c.v;
-                for (const auto &sp : c.g.groups)
+                auto &v = c.state;
+                for (const auto &sp : c.layout.groups)
                 {
                     if (sp.first_col != first_col)
                         continue;
-                    if (c.g.view_rows.empty())
+                    if (c.layout.view_rows.empty())
                         return;
-                    v.sel.r0 = c.g.view_rows.front();
-                    v.sel.r1 = c.g.view_rows.back();
+                    v.sel.r0 = c.layout.view_rows.front();
+                    v.sel.r1 = c.layout.view_rows.back();
                     v.sel.c0 = sp.first_col;
                     v.sel.c1 = sp.last_col;
                     v.sel.cur_r = v.sel.r1;
                     v.sel.cur_c = v.sel.c1;
-                    sync_cells(c.d, v);
+                    sync_cells(c.model, v);
                     v.touch();
                     return;
                 }
@@ -104,7 +104,7 @@ namespace table::detail
 
             void extend(Context &c, int r, int cc)
             {
-                auto &v = c.v;
+                auto &v = c.state;
                 if (v.sel.r0 < 0)
                     anchor(v, r, cc);
                 else
@@ -115,16 +115,16 @@ namespace table::detail
                     v.sel.cur_c = cc;
                     v.touch();
                 }
-                sync_cells(c.d, v);
+                sync_cells(c.model, v);
             }
 
             void move(Context &c, int dr, int dc, bool extend_sel)
             {
-                auto &v = c.v;
+                auto &v = c.state;
                 if (v.sel.cur_r < 0)
                 {
-                    if (!c.g.view_rows.empty())
-                        anchor(v, c.g.view_rows.front(), 0);
+                    if (!c.layout.view_rows.empty())
+                        anchor(v, c.layout.view_rows.front(), 0);
                     return;
                 }
                 int nr = v.sel.cur_r;
@@ -132,26 +132,26 @@ namespace table::detail
                 if (dc != 0)
                 {
                     // 横向只走可见列（隐藏列不参与键盘导航）
-                    int cp = c.g.pos_of_col(nc);
+                    int cp = c.layout.pos_of_col(nc);
                     if (cp < 0)
                         cp = 0;
                     const int np =
-                        std::clamp(cp + dc, 0, std::max(c.g.col_count() - 1, 0));
-                    if (c.g.col_count() > 0)
-                        nc = c.g.col_index[static_cast<std::size_t>(np)];
+                        std::clamp(cp + dc, 0, std::max(c.layout.col_count() - 1, 0));
+                    if (c.layout.col_count() > 0)
+                        nc = c.layout.col_index[static_cast<std::size_t>(np)];
                 }
                 else
                 {
                     int pos = 0;
-                    for (int i = 0; i < static_cast<int>(c.g.view_rows.size()); ++i)
-                        if (c.g.view_rows[static_cast<std::size_t>(i)] == nr)
+                    for (int i = 0; i < static_cast<int>(c.layout.view_rows.size()); ++i)
+                        if (c.layout.view_rows[static_cast<std::size_t>(i)] == nr)
                         {
                             pos = i;
                             break;
                         }
                     const int np = std::clamp(pos + dr, 0,
-                                              static_cast<int>(c.g.view_rows.size()) - 1);
-                    nr = c.g.view_rows[static_cast<std::size_t>(np)];
+                                              static_cast<int>(c.layout.view_rows.size()) - 1);
+                    nr = c.layout.view_rows[static_cast<std::size_t>(np)];
                 }
                 if (!extend_sel)
                     anchor(v, nr, nc);
@@ -163,20 +163,20 @@ namespace table::detail
                     v.sel.cur_c = nc;
                     v.touch();
                 }
-                sync_cells(c.d, v);
-                ensure_visible(v, c.g, c.p, nr, nc);
+                sync_cells(c.model, v);
+                ensure_visible(v, c.layout, c.theme, nr, nc);
             }
 
             void to(Context &c, int r, int cc, bool extend_sel)
             {
-                auto &v = c.v;
+                auto &v = c.state;
                 // Home/End 落在可见列的首/末列，而不是可能被隐藏的数据列
-                if (c.g.col_count() > 0)
+                if (c.layout.col_count() > 0)
                 {
                     if (cc <= 0)
-                        cc = c.g.col_index.front();
-                    else if (cc >= c.d.cols_count() - 1)
-                        cc = c.g.col_index.back();
+                        cc = c.layout.col_index.front();
+                    else if (cc >= c.model.cols_count() - 1)
+                        cc = c.layout.col_index.back();
                 }
                 if (!extend_sel)
                     anchor(v, r, cc);
@@ -188,29 +188,29 @@ namespace table::detail
                     v.sel.cur_c = cc;
                     v.touch();
                 }
-                sync_cells(c.d, v);
-                ensure_visible(v, c.g, c.p, r, cc);
+                sync_cells(c.model, v);
+                ensure_visible(v, c.layout, c.theme, r, cc);
             }
 
             void all(Context &c)
             {
-                auto &v = c.v;
-                if (c.g.view_rows.empty())
+                auto &v = c.state;
+                if (c.layout.view_rows.empty())
                     return;
-                v.sel.r0 = c.g.view_rows.front();
-                v.sel.r1 = c.g.view_rows.back();
-                v.sel.c0 = c.g.col_count() > 0 ? c.g.col_index.front() : 0;
+                v.sel.r0 = c.layout.view_rows.front();
+                v.sel.r1 = c.layout.view_rows.back();
+                v.sel.c0 = c.layout.col_count() > 0 ? c.layout.col_index.front() : 0;
                 v.sel.c1 =
-                    c.g.col_count() > 0 ? c.g.col_index.back() : c.d.cols_count() - 1;
+                    c.layout.col_count() > 0 ? c.layout.col_index.back() : c.model.cols_count() - 1;
                 v.sel.cur_r = v.sel.r1;
                 v.sel.cur_c = v.sel.c1;
-                sync_cells(c.d, v);
+                sync_cells(c.model, v);
                 v.touch();
             }
 
             void clear(Context &c)
             {
-                auto &v = c.v;
+                auto &v = c.state;
                 v.sel.r0 = v.sel.c0 = v.sel.r1 = v.sel.c1 = -1;
                 v.sel.cur_r = v.sel.cur_c = -1;
                 v.sel.cur_cell = v.sel.r0_cell = v.sel.r1_cell = {};
@@ -226,77 +226,77 @@ namespace table::detail
 
             void paint(const PaintContext &c, DrawList &fr) const
             {
-                if (c.v.sel.r0 < 0)
+                if (c.state.sel.r0 < 0)
                     return;
-                const int r0 = std::min(c.v.sel.r0, c.v.sel.r1);
-                const int r1 = std::max(c.v.sel.r0, c.v.sel.r1);
-                const int c0 = std::min(c.v.sel.c0, c.v.sel.c1);
-                const int c1 = std::max(c.v.sel.c0, c.v.sel.c1);
+                const int r0 = std::min(c.state.sel.r0, c.state.sel.r1);
+                const int r1 = std::max(c.state.sel.r0, c.state.sel.r1);
+                const int c0 = std::min(c.state.sel.c0, c.state.sel.c1);
+                const int c1 = std::max(c.state.sel.c0, c.state.sel.c1);
 
                 // 列头高亮
-                for (int i = 0; i < c.g.col_count(); ++i)
+                for (int i = 0; i < c.layout.col_count(); ++i)
                 {
-                    const int dc = c.g.col_index[static_cast<std::size_t>(i)];
+                    const int dc = c.layout.col_index[static_cast<std::size_t>(i)];
                     if (dc < c0 || dc > c1)
                         continue;
                     const Rect hr =
-                        clip_x({c.g.col_x_at(i), c.g.col_header.y,
-                                c.g.col_w[static_cast<std::size_t>(i)], c.g.col_header.h},
-                               c.g.clip_x0(i), c.g.clip_x1(i));
+                        clip_x({c.layout.col_x_at(i), c.layout.col_header.y,
+                                c.layout.col_w[static_cast<std::size_t>(i)], c.layout.col_header.h},
+                               c.layout.clip_x0(i), c.layout.clip_x1(i));
                     if (!hr.empty())
                         fr.draw.add_shape(Stream::content, hr, {1, 1, 1, 0.05F}, 0, {}, 0,
                                           0);
                 }
 
-                for (int ri = 0; ri < c.g.row_count(); ++ri)
+                for (int ri = 0; ri < c.layout.row_count(); ++ri)
                 {
-                    const int dr = c.g.row_index[static_cast<std::size_t>(ri)];
+                    const int dr = c.layout.row_index[static_cast<std::size_t>(ri)];
                     if (dr < r0 || dr > r1)
                         continue;
-                    for (int ci = 0; ci < c.g.col_count(); ++ci)
+                    for (int ci = 0; ci < c.layout.col_count(); ++ci)
                     {
-                        const int dc = c.g.col_index[static_cast<std::size_t>(ci)];
+                        const int dc = c.layout.col_index[static_cast<std::size_t>(ci)];
                         if (dc < c0 || dc > c1)
                             continue;
-                        if (c.v.edit.active() && c.v.edit.row == dr && c.v.edit.col == dc)
+                        if (c.state.edit.active() && c.state.edit.row == dr && c.state.edit.col == dc)
                             continue;
-                        Rect cr = clip_x({c.g.col_x_at(ci),
-                                          c.g.row_y[static_cast<std::size_t>(ri)],
-                                          c.g.col_w[static_cast<std::size_t>(ci)],
-                                          c.g.row_h[static_cast<std::size_t>(ri)]},
-                                         c.g.clip_x0(ci), c.g.clip_x1(ci));
-                        cr = intersect(cr, c.g.body);
+                        Rect cr = clip_x({c.layout.col_x_at(ci),
+                                          c.layout.row_y[static_cast<std::size_t>(ri)],
+                                          c.layout.col_w[static_cast<std::size_t>(ci)],
+                                          c.layout.row_h[static_cast<std::size_t>(ri)]},
+                                         c.layout.clip_x0(ci), c.layout.clip_x1(ci));
+                        cr = intersect(cr, c.layout.body);
                         if (cr.empty())
                             continue;
-                        fr.draw.add_shape(Stream::content, cr, c.p.sel, c.p.cell_radius,
+                        fr.draw.add_shape(Stream::content, cr, c.theme.sel, c.theme.cell_radius,
                                           {}, 0, 0);
-                        if (dr == c.v.sel.cur_r && dc == c.v.sel.cur_c)
+                        if (dr == c.state.sel.cur_r && dc == c.state.sel.cur_c)
                             fr.draw.add_shape(Stream::content, cr, {0, 0, 0, 0}, 0,
-                                              c.p.accent, 1.5F, 0);
+                                              c.theme.accent, 1.5F, 0);
                     }
                 }
 
                 // 选区外框
                 float y0 = 1e30F, y1 = -1e30F, x0 = 1e30F, x1 = -1e30F;
-                for (int ri = 0; ri < c.g.row_count(); ++ri)
+                for (int ri = 0; ri < c.layout.row_count(); ++ri)
                 {
-                    const int dr = c.g.row_index[static_cast<std::size_t>(ri)];
+                    const int dr = c.layout.row_index[static_cast<std::size_t>(ri)];
                     if (dr >= r0 && dr <= r1)
                     {
-                        y0 = std::min(y0, c.g.row_y[static_cast<std::size_t>(ri)]);
-                        y1 = std::max(y1, c.g.row_y[static_cast<std::size_t>(ri)] +
-                                              c.g.row_h[static_cast<std::size_t>(ri)]);
+                        y0 = std::min(y0, c.layout.row_y[static_cast<std::size_t>(ri)]);
+                        y1 = std::max(y1, c.layout.row_y[static_cast<std::size_t>(ri)] +
+                                              c.layout.row_h[static_cast<std::size_t>(ri)]);
                     }
                 }
-                for (int i = 0; i < c.g.col_count(); ++i)
+                for (int i = 0; i < c.layout.col_count(); ++i)
                 {
-                    const int dc = c.g.col_index[static_cast<std::size_t>(i)];
+                    const int dc = c.layout.col_index[static_cast<std::size_t>(i)];
                     if (dc < c0 || dc > c1)
                         continue;
-                    const float l = std::max(c.g.col_x_at(i), c.g.clip_x0(i));
+                    const float l = std::max(c.layout.col_x_at(i), c.layout.clip_x0(i));
                     const float r =
-                        std::min(c.g.col_x_at(i) + c.g.col_w[static_cast<std::size_t>(i)],
-                                 c.g.clip_x1(i));
+                        std::min(c.layout.col_x_at(i) + c.layout.col_w[static_cast<std::size_t>(i)],
+                                 c.layout.clip_x1(i));
                     if (r > l)
                     {
                         x0 = std::min(x0, l);
@@ -305,18 +305,18 @@ namespace table::detail
                 }
                 if (y1 > y0 && x1 > x0)
                 {
-                    x0 = std::max(x0, c.g.body.x);
-                    x1 = std::min(x1, c.g.body.x1());
-                    y0 = std::max(y0, c.g.body.y);
-                    y1 = std::min(y1, c.g.body.y1());
-                    fr.draw.add_shape(Stream::content, {x0, y0, x1 - x0, 2}, c.p.accent,
+                    x0 = std::max(x0, c.layout.body.x);
+                    x1 = std::min(x1, c.layout.body.x1());
+                    y0 = std::max(y0, c.layout.body.y);
+                    y1 = std::min(y1, c.layout.body.y1());
+                    fr.draw.add_shape(Stream::content, {x0, y0, x1 - x0, 2}, c.theme.accent,
                                       0, {}, 0, 0);
                     fr.draw.add_shape(Stream::content, {x0, y1 - 2, x1 - x0, 2},
-                                      c.p.accent, 0, {}, 0, 0);
-                    fr.draw.add_shape(Stream::content, {x0, y0, 2, y1 - y0}, c.p.accent,
+                                      c.theme.accent, 0, {}, 0, 0);
+                    fr.draw.add_shape(Stream::content, {x0, y0, 2, y1 - y0}, c.theme.accent,
                                       0, {}, 0, 0);
                     fr.draw.add_shape(Stream::content, {x1 - 2, y0, 2, y1 - y0},
-                                      c.p.accent, 0, {}, 0, 0);
+                                      c.theme.accent, 0, {}, 0, 0);
                 }
             }
         };
@@ -330,39 +330,39 @@ namespace table::detail
             }
             bool toggle(Context &c, int row, bool shift)
             {
-                auto &v = c.v;
+                auto &v = c.state;
                 if (row < 0 || static_cast<std::size_t>(row) >= v.checks.on.size())
                     return true;
                 const bool on = v.checks.on[static_cast<std::size_t>(row)] == 0;
                 if (shift && v.checks.last >= 0)
                 {
                     // 区间按“可见顺序”走：排序/筛选后也只勾选当前看得到的行
-                    const int pl = c.g.order_pos(v.checks.last);
-                    const int pr = c.g.order_pos(row);
+                    const int pl = c.layout.order_pos(v.checks.last);
+                    const int pr = c.layout.order_pos(row);
                     if (pl >= 0 && pr >= 0)
                     {
                         const int lo = std::min(pl, pr);
                         const int hi = std::max(pl, pr);
                         for (int i = lo; i <= hi; ++i)
                         {
-                            const int r = c.g.view_rows[static_cast<std::size_t>(i)];
+                            const int r = c.layout.view_rows[static_cast<std::size_t>(i)];
                             v.checks.on[static_cast<std::size_t>(r)] = on ? 1 : 0;
                             v.checks.ids[static_cast<std::size_t>(r)] =
-                                c.d.ids[static_cast<std::size_t>(r)];
+                                c.model.ids[static_cast<std::size_t>(r)];
                         }
                     }
                     else
                     {
                         v.checks.on[static_cast<std::size_t>(row)] = on ? 1 : 0;
                         v.checks.ids[static_cast<std::size_t>(row)] =
-                            c.d.ids[static_cast<std::size_t>(row)];
+                            c.model.ids[static_cast<std::size_t>(row)];
                     }
                 }
                 else
                 {
                     v.checks.on[static_cast<std::size_t>(row)] = on ? 1 : 0;
                     v.checks.ids[static_cast<std::size_t>(row)] =
-                        c.d.ids[static_cast<std::size_t>(row)];
+                        c.model.ids[static_cast<std::size_t>(row)];
                 }
                 v.checks.last = row;
                 v.touch();
@@ -370,17 +370,17 @@ namespace table::detail
             }
             bool toggle_all(Context &c)
             {
-                auto &v = c.v;
+                auto &v = c.state;
                 int on = 0;
-                for (const int r : c.g.view_rows)
+                for (const int r : c.layout.view_rows)
                     on += v.checks.on[static_cast<std::size_t>(r)] != 0;
-                const bool all = !c.g.view_rows.empty() &&
-                                 on == static_cast<int>(c.g.view_rows.size());
-                for (const int r : c.g.view_rows)
+                const bool all = !c.layout.view_rows.empty() &&
+                                 on == static_cast<int>(c.layout.view_rows.size());
+                for (const int r : c.layout.view_rows)
                 {
                     v.checks.on[static_cast<std::size_t>(r)] = all ? 0 : 1;
                     v.checks.ids[static_cast<std::size_t>(r)] =
-                        c.d.ids[static_cast<std::size_t>(r)];
+                        c.model.ids[static_cast<std::size_t>(r)];
                 }
                 v.touch();
                 return true;
@@ -393,47 +393,47 @@ namespace table::detail
             void rows(Context &, std::vector<row_idx> &) {}
             void paint(const PaintContext &c, DrawList &fr) const
             {
-                if (c.g.gutter_w <= 0)
+                if (c.layout.gutter_w <= 0)
                     return;
-                fr.draw.add_shape(Stream::chrome, c.g.gutter_head, c.p.header_bg, {},
+                fr.draw.add_shape(Stream::chrome, c.layout.gutter_head, c.theme.header_bg, {},
                                   {1, 1, 1, 0.08F}, 1.0F, zone_key({Part::check_head}));
                 int total = 0, on = 0;
-                for (const int r : c.g.view_rows)
+                for (const int r : c.layout.view_rows)
                 {
                     ++total;
-                    on += c.v.checks.on[static_cast<std::size_t>(r)] != 0;
+                    on += c.state.checks.on[static_cast<std::size_t>(r)] != 0;
                 }
                 const bool all = total > 0 && on == total;
                 const bool Part = on > 0 && !all;
-                const Rect hb{c.g.gutter_head.x + (c.g.gutter_head.w - 14) * 0.5F,
-                              c.g.gutter_head.y + (c.g.gutter_head.h - 14) * 0.5F, 14,
+                const Rect hb{c.layout.gutter_head.x + (c.layout.gutter_head.w - 14) * 0.5F,
+                              c.layout.gutter_head.y + (c.layout.gutter_head.h - 14) * 0.5F, 14,
                               14};
                 if (all)
-                    fr.draw.add_shape(Stream::chrome, hb, c.p.accent, 3, {}, 0,
+                    fr.draw.add_shape(Stream::chrome, hb, c.theme.accent, 3, {}, 0,
                                       zone_key({Part::check_head}));
                 else
                     fr.draw.add_shape(Stream::chrome, hb, {0, 0, 0, 0}, 3,
-                                      {glm::vec3(c.p.accent), 0.55F}, 1.2F,
+                                      {glm::vec3(c.theme.accent), 0.55F}, 1.2F,
                                       zone_key({Part::check_head}));
                 if (Part)
                     fr.draw.add_shape(Stream::chrome,
                                       {hb.x + 3, hb.y + hb.h * 0.5F - 1, hb.w - 6, 2},
-                                      c.p.accent, 1, {}, 0, zone_key({Part::check_head}));
+                                      c.theme.accent, 1, {}, 0, zone_key({Part::check_head}));
 
-                for (int ri = 0; ri < c.g.row_count(); ++ri)
+                for (int ri = 0; ri < c.layout.row_count(); ++ri)
                 {
-                    const int dr = c.g.row_index[static_cast<std::size_t>(ri)];
-                    const Rect gr{c.g.gutter_body.x,
-                                  c.g.row_y[static_cast<std::size_t>(ri)], c.g.gutter_w,
-                                  c.g.row_h[static_cast<std::size_t>(ri)]};
+                    const int dr = c.layout.row_index[static_cast<std::size_t>(ri)];
+                    const Rect gr{c.layout.gutter_body.x,
+                                  c.layout.row_y[static_cast<std::size_t>(ri)], c.layout.gutter_w,
+                                  c.layout.row_h[static_cast<std::size_t>(ri)]};
                     const Rect bx{gr.x + (gr.w - 14) * 0.5F, gr.y + (gr.h - 14) * 0.5F,
                                   14, 14};
                     const auto zk = zone_key({Part::check, dr, -1});
-                    if (c.v.checks.on[static_cast<std::size_t>(dr)] != 0)
-                        fr.draw.add_shape(Stream::chrome, bx, c.p.accent, 3, {}, 0, zk);
+                    if (c.state.checks.on[static_cast<std::size_t>(dr)] != 0)
+                        fr.draw.add_shape(Stream::chrome, bx, c.theme.accent, 3, {}, 0, zk);
                     else
                         fr.draw.add_shape(Stream::chrome, bx, {0, 0, 0, 0}, 3,
-                                          {glm::vec3(c.p.accent), 0.45F}, 1.2F, zk);
+                                          {glm::vec3(c.theme.accent), 0.45F}, 1.2F, zk);
                 }
             }
         };
@@ -443,19 +443,19 @@ namespace table::detail
         {
             bool begin(Context &c, int axis, float base, float pos)
             {
-                c.v.scroll.axis = axis;
-                c.v.scroll.base = base;
-                c.v.scroll.pos0 = pos;
-                c.v.touch();
+                c.state.scroll.axis = axis;
+                c.state.scroll.base = base;
+                c.state.scroll.pos0 = pos;
+                c.state.touch();
                 return true;
             }
             bool move(Context &c, float pos)
             {
-                auto &v = c.v;
+                auto &v = c.state;
                 if (v.scroll.axis == 0)
                 {
-                    const float max_sy = std::max(0.0F, c.g.content_h - c.g.body.h);
-                    const float travel = std::max(c.g.vtrack.h - c.g.vthumb.h, 1.0F);
+                    const float max_sy = std::max(0.0F, c.layout.content_h - c.layout.body.h);
+                    const float travel = std::max(c.layout.vtrack.h - c.layout.vthumb.h, 1.0F);
                     v.scroll.y = std::clamp(v.scroll.base +
                                                 (pos - v.scroll.pos0) * (max_sy / travel),
                                             0.0F, max_sy);
@@ -463,8 +463,8 @@ namespace table::detail
                 else
                 {
                     const float max_sx =
-                        std::max(0.0F, c.g.content_w - c.g.frozen_w - c.g.scrollv.w);
-                    const float travel = std::max(c.g.htrack.w - c.g.hthumb.w, 1.0F);
+                        std::max(0.0F, c.layout.content_w - c.layout.frozen_w - c.layout.scrollv.w);
+                    const float travel = std::max(c.layout.htrack.w - c.layout.hthumb.w, 1.0F);
                     v.scroll.x = std::clamp(v.scroll.base +
                                                 (pos - v.scroll.pos0) * (max_sx / travel),
                                             0.0F, max_sx);
@@ -474,8 +474,8 @@ namespace table::detail
             }
             bool end(Context &c)
             {
-                c.v.scroll.axis = 0;
-                c.v.touch();
+                c.state.scroll.axis = 0;
+                c.state.touch();
                 return true;
             }
             template <class E>
@@ -486,28 +486,28 @@ namespace table::detail
             void rows(Context &, std::vector<row_idx> &) {}
             void paint(const PaintContext &c, DrawList &fr) const
             {
-                if (c.g.vbar)
+                if (c.layout.vbar)
                 {
-                    fr.draw.add_shape(Stream::chrome, c.g.vtrack, c.p.bar_track,
-                                      c.p.bar * 0.5F, {}, 0,
+                    fr.draw.add_shape(Stream::chrome, c.layout.vtrack, c.theme.bar_track,
+                                      c.theme.bar * 0.5F, {}, 0,
                                       zone_key({Part::vbar_track}));
-                    const bool hot = c.ix.hover.kind == Part::vbar_thumb ||
-                                     c.ix.drag == DragMode::vthumb;
-                    fr.draw.add_shape(Stream::chrome, c.g.vthumb,
-                                      hot ? c.p.bar_thumb_hot : c.p.bar_thumb,
-                                      c.p.bar * 0.5F, {}, 0,
+                    const bool hot = c.interaction.hover.kind == Part::vbar_thumb ||
+                                     c.interaction.drag == DragMode::vthumb;
+                    fr.draw.add_shape(Stream::chrome, c.layout.vthumb,
+                                      hot ? c.theme.bar_thumb_hot : c.theme.bar_thumb,
+                                      c.theme.bar * 0.5F, {}, 0,
                                       zone_key({Part::vbar_thumb}));
                 }
-                if (c.g.hbar)
+                if (c.layout.hbar)
                 {
-                    fr.draw.add_shape(Stream::chrome, c.g.htrack, c.p.bar_track,
-                                      c.p.bar * 0.5F, {}, 0,
+                    fr.draw.add_shape(Stream::chrome, c.layout.htrack, c.theme.bar_track,
+                                      c.theme.bar * 0.5F, {}, 0,
                                       zone_key({Part::hbar_track}));
-                    const bool hot = c.ix.hover.kind == Part::hbar_thumb ||
-                                     c.ix.drag == DragMode::hthumb;
-                    fr.draw.add_shape(Stream::chrome, c.g.hthumb,
-                                      hot ? c.p.bar_thumb_hot : c.p.bar_thumb,
-                                      c.p.bar * 0.5F, {}, 0,
+                    const bool hot = c.interaction.hover.kind == Part::hbar_thumb ||
+                                     c.interaction.drag == DragMode::hthumb;
+                    fr.draw.add_shape(Stream::chrome, c.layout.hthumb,
+                                      hot ? c.theme.bar_thumb_hot : c.theme.bar_thumb,
+                                      c.theme.bar * 0.5F, {}, 0,
                                       zone_key({Part::hbar_thumb}));
                 }
             }

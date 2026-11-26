@@ -18,7 +18,7 @@ namespace table::detail
             }
             bool begin(Context &c, int col)
             {
-                auto &v = c.v;
+                auto &v = c.state;
                 v.filter.edit = col;
                 v.filter.compose.clear();
                 v.filter.input = static_cast<std::size_t>(col) < v.filter.text.size()
@@ -30,22 +30,22 @@ namespace table::detail
             }
             bool set(Context &c, int col, std::string text)
             {
-                auto &f = c.v.filter.text;
-                if (static_cast<std::size_t>(c.d.cols_count()) > f.size())
-                    f.resize(static_cast<std::size_t>(c.d.cols_count()));
+                auto &f = c.state.filter.text;
+                if (static_cast<std::size_t>(c.model.cols_count()) > f.size())
+                    f.resize(static_cast<std::size_t>(c.model.cols_count()));
                 if (col >= 0 && static_cast<std::size_t>(col) < f.size())
                     f[static_cast<std::size_t>(col)] = std::move(text);
-                c.v.touch();
+                c.state.touch();
                 return true;
             }
             bool clear(Context &c, int col)
             {
-                auto &f = c.v.filter.text;
+                auto &f = c.state.filter.text;
                 if (col < 0)
-                    f.assign(static_cast<std::size_t>(c.d.cols_count()), {});
+                    f.assign(static_cast<std::size_t>(c.model.cols_count()), {});
                 else if (static_cast<std::size_t>(col) < f.size())
                     f[static_cast<std::size_t>(col)].clear();
-                c.v.touch();
+                c.state.touch();
                 return true;
             }
             static void sync_live(State &v) noexcept
@@ -58,12 +58,12 @@ namespace table::detail
             }
             bool text(Context &c, std::string_view s)
             {
-                if (c.v.filter.edit < 0)
+                if (c.state.filter.edit < 0)
                     return false;
-                c.v.filter.input.append(s);
-                c.v.filter.compose.clear();
-                sync_live(c.v); // 边打边过滤，而不是等 Enter
-                c.v.touch();
+                c.state.filter.input.append(s);
+                c.state.filter.compose.clear();
+                sync_live(c.state); // 边打边过滤，而不是等 Enter
+                c.state.touch();
                 return true;
             }
             [[nodiscard]] static bool active(const State &v, int col) noexcept
@@ -83,7 +83,7 @@ namespace table::detail
             }
             bool press(Context &c, const Press &pr)
             {
-                auto &v = c.v;
+                auto &v = c.state;
                 if (v.filter.edit < 0)
                     return false;
                 if (pr.z.kind != Part::filter_btn)
@@ -99,7 +99,7 @@ namespace table::detail
             }
             bool key(Context &c, const KeyPress &k)
             {
-                auto &v = c.v;
+                auto &v = c.state;
                 if (v.filter.edit < 0)
                     return false;
                 v.filter.compose.clear();
@@ -139,7 +139,7 @@ namespace table::detail
 
             void rows(Context &c, std::vector<row_idx> &r)
             {
-                const auto &f = c.v.filter.text;
+                const auto &f = c.state.filter.text;
                 if (f.empty())
                     return;
                 std::vector<row_idx> keep;
@@ -149,7 +149,7 @@ namespace table::detail
                     bool ok = true;
                     for (std::size_t col = 0; col < f.size() && ok; ++col)
                         if (!f[col].empty())
-                            ok = contains(c.d.text(row, static_cast<int>(col)), f[col]);
+                            ok = contains(c.model.text(row, static_cast<int>(col)), f[col]);
                     if (ok)
                         keep.push_back(row);
                 }
@@ -158,54 +158,54 @@ namespace table::detail
 
             void paint(const PaintContext &c, DrawList &fr) const
             {
-                if (c.v.filter.edit >= 0)
+                if (c.state.filter.edit >= 0)
                 {
-                    const int pos = c.g.pos_of_col(c.v.filter.edit);
+                    const int pos = c.layout.pos_of_col(c.state.filter.edit);
                     if (pos >= 0)
                     {
-                        Rect hr = clip_x({c.g.col_x_at(pos), c.g.col_header.y,
-                                          c.g.col_w[static_cast<std::size_t>(pos)],
-                                          c.g.col_header.h},
-                                         c.g.clip_x0(pos), c.g.clip_x1(pos));
+                        Rect hr = clip_x({c.layout.col_x_at(pos), c.layout.col_header.y,
+                                          c.layout.col_w[static_cast<std::size_t>(pos)],
+                                          c.layout.col_header.h},
+                                         c.layout.clip_x0(pos), c.layout.clip_x1(pos));
                         if (!hr.empty())
                         {
                             const std::string shown =
-                                c.v.filter.input + c.v.filter.compose;
+                                c.state.filter.input + c.state.filter.compose;
                             fr.draw.add_shape(
                                 Stream::overlay, hr, {0.06F, 0.08F, 0.12F, 1.0F},
-                                c.p.cell_radius, c.p.accent, 1.2F,
-                                zone_key({Part::filter_btn, -1, c.v.filter.edit}));
+                                c.theme.cell_radius, c.theme.accent, 1.2F,
+                                zone_key({Part::filter_btn, -1, c.state.filter.edit}));
                             fr.draw.add_text(
                                 Stream::overlay,
                                 {hr.x + 6, hr.y, std::max(hr.w - 12, 1.0F), hr.h},
-                                c.p.text, hr.y + hr.h * 0.5F + c.ft.px * 0.30F, shown, 0);
-                            const float tw = text_width(c.ft, shown);
+                                c.theme.text, hr.y + hr.h * 0.5F + c.font.px * 0.30F, shown, 0);
+                            const float tw = text_width(c.font, shown);
                             fr.draw.add_shape(Stream::overlay,
                                               {hr.x + 6 + tw, hr.y + 6, 1.5F,
                                                std::max(hr.h - 12, 1.0F)},
-                                              c.p.accent, 0, {}, 0, 0);
+                                              c.theme.accent, 0, {}, 0, 0);
                         }
                     }
                     return;
                 }
-                for (int i = 0; i < c.g.col_count(); ++i)
+                for (int i = 0; i < c.layout.col_count(); ++i)
                 {
-                    const int dc = c.g.col_index[static_cast<std::size_t>(i)];
-                    if (dc < 0 || dc >= c.d.cols_count() ||
-                        !c.d.cols[static_cast<std::size_t>(dc)].filterable)
+                    const int dc = c.layout.col_index[static_cast<std::size_t>(i)];
+                    if (dc < 0 || dc >= c.model.cols_count() ||
+                        !c.model.cols[static_cast<std::size_t>(dc)].filterable)
                         continue;
                     const Rect hr =
-                        clip_x({c.g.col_x_at(i), c.g.col_header.y,
-                                c.g.col_w[static_cast<std::size_t>(i)], c.g.col_header.h},
-                               c.g.clip_x0(i), c.g.clip_x1(i));
+                        clip_x({c.layout.col_x_at(i), c.layout.col_header.y,
+                                c.layout.col_w[static_cast<std::size_t>(i)], c.layout.col_header.h},
+                               c.layout.clip_x0(i), c.layout.clip_x1(i));
                     if (hr.w < 30)
                         continue;
                     const float x = hr.x1() - 16;
                     const float y = hr.y + hr.h * 0.5F - 4;
                     const auto color =
-                        active(c.v, dc) ? c.p.accent
-                                        : glm::vec4(c.p.header_text.r, c.p.header_text.g,
-                                                    c.p.header_text.b, 0.5F);
+                        active(c.state, dc) ? c.theme.accent
+                                        : glm::vec4(c.theme.header_text.r, c.theme.header_text.g,
+                                                    c.theme.header_text.b, 0.5F);
                     fr.draw.add_shape(Stream::chrome, {x, y, 10, 2}, color, 1, {}, 0,
                                       zone_key({Part::header, -1, dc}));
                     fr.draw.add_shape(Stream::chrome, {x + 2, y + 3, 6, 2}, color, 1, {},
@@ -245,7 +245,7 @@ namespace table::detail
         {
             bool toggle(Context &c)
             {
-                auto &v = c.v;
+                auto &v = c.state;
                 v.find.mode = !v.find.mode;
                 v.find.buf.clear();
                 v.find.hit = -1;
@@ -254,26 +254,26 @@ namespace table::detail
             }
             bool close(Context &c)
             {
-                c.v.find.mode = false;
-                c.v.touch();
+                c.state.find.mode = false;
+                c.state.touch();
                 return true;
             }
             bool next(Context &c)
             {
-                c.v.find.hit = next_hit(c.d, c.g, c.v);
-                c.v.touch();
+                c.state.find.hit = next_hit(c.model, c.layout, c.state);
+                c.state.touch();
                 return true;
             }
             bool text(Context &c, std::string_view s)
             {
-                if (!c.v.find.mode)
+                if (!c.state.find.mode)
                     return false;
-                c.v.find.buf.append(s);
-                c.v.find.compose.clear();
-                c.v.find.hit = first_hit(c.d, c.g, c.v);
-                if (c.v.find.hit >= 0)
-                    ensure_visible(c.v, c.g, c.p, c.v.find.hit, 0);
-                c.v.touch();
+                c.state.find.buf.append(s);
+                c.state.find.compose.clear();
+                c.state.find.hit = first_hit(c.model, c.layout, c.state);
+                if (c.state.find.hit >= 0)
+                    ensure_visible(c.state, c.layout, c.theme, c.state.find.hit, 0);
+                c.state.touch();
                 return true;
             }
             static bool match(const Table &d, int r, int c,
@@ -323,17 +323,17 @@ namespace table::detail
                 else if constexpr (std::is_same_v<E, Press>)
                 {
                     // 点别处 = 退出查找（让这次点击继续走正常的表内分派）
-                    if (c.v.find.mode)
+                    if (c.state.find.mode)
                     {
-                        c.v.find.mode = false;
-                        c.v.touch();
+                        c.state.find.mode = false;
+                        c.state.touch();
                     }
                 }
                 return command::handled({});
             }
             bool key(Context &c, const KeyPress &k)
             {
-                auto &v = c.v;
+                auto &v = c.state;
                 if (!v.find.mode)
                     return false;
                 v.find.compose.clear();
@@ -344,18 +344,18 @@ namespace table::detail
                     const std::size_t q =
                         utf8_prev(std::string_view(v.find.buf), v.find.buf.size());
                     v.find.buf.erase(q);
-                    v.find.hit = first_hit(c.d, c.g, v);
+                    v.find.hit = first_hit(c.model, c.layout, v);
                     if (v.find.hit >= 0)
-                        ensure_visible(v, c.g, c.p, v.find.hit, 0);
+                        ensure_visible(v, c.layout, c.theme, v.find.hit, 0);
                 }
                 else if (k.k == Key::enter)
                 {
-                    v.find.hit = next_hit(c.d, c.g, v);
+                    v.find.hit = next_hit(c.model, c.layout, v);
                     if (v.find.hit >= 0)
                     {
                         v.sel.r0 = v.sel.r1 = v.sel.cur_r = v.find.hit;
                         v.sel.c0 = v.sel.c1 = v.sel.cur_c = 0;
-                        ensure_visible(v, c.g, c.p, v.find.hit, 0);
+                        ensure_visible(v, c.layout, c.theme, v.find.hit, 0);
                         v.touch();
                     }
                 }
@@ -365,42 +365,42 @@ namespace table::detail
             void rows(Context &, std::vector<row_idx> &) {}
             void paint(const PaintContext &c, DrawList &fr) const
             {
-                if (c.v.find.mode)
+                if (c.state.find.mode)
                 {
                     const float fy =
-                        c.g.box.y >= 32.0F ? c.g.box.y - 28.0F : c.g.box.y + 4.0F;
-                    const Rect bar{c.g.box.x + 8, fy, c.g.box.w - 16, 22};
+                        c.layout.box.y >= 32.0F ? c.layout.box.y - 28.0F : c.layout.box.y + 4.0F;
+                    const Rect bar{c.layout.box.x + 8, fy, c.layout.box.w - 16, 22};
                     fr.draw.add_shape(Stream::overlay, bar, {0.06F, 0.08F, 0.12F, 0.95F},
-                                      4, c.p.accent, 1.0F, 0);
-                    const std::string shown = c.v.find.buf + c.v.find.compose;
+                                      4, c.theme.accent, 1.0F, 0);
+                    const std::string shown = c.state.find.buf + c.state.find.compose;
                     fr.draw.add_text(Stream::overlay,
-                                     {bar.x + 8, bar.y, bar.w - 16, bar.h}, c.p.text,
-                                     bar.y + bar.h * 0.5F + c.ft.px * 0.30F,
+                                     {bar.x + 8, bar.y, bar.w - 16, bar.h}, c.theme.text,
+                                     bar.y + bar.h * 0.5F + c.font.px * 0.30F,
                                      shown.empty() ? std::string_view{"Find..."}
                                                    : std::string_view{shown},
                                      0);
                 }
-                if (c.v.find.buf.empty())
+                if (c.state.find.buf.empty())
                     return;
-                for (int ri = 0; ri < c.g.row_count(); ++ri)
+                for (int ri = 0; ri < c.layout.row_count(); ++ri)
                 {
-                    const int dr = c.g.row_index[static_cast<std::size_t>(ri)];
-                    for (int ci = 0; ci < c.g.col_count(); ++ci)
+                    const int dr = c.layout.row_index[static_cast<std::size_t>(ri)];
+                    for (int ci = 0; ci < c.layout.col_count(); ++ci)
                     {
-                        const int dc = c.g.col_index[static_cast<std::size_t>(ci)];
-                        if (!match(c.d, dr, dc, c.v.find.buf))
+                        const int dc = c.layout.col_index[static_cast<std::size_t>(ci)];
+                        if (!match(c.model, dr, dc, c.state.find.buf))
                             continue;
-                        Rect cr = clip_x({c.g.col_x_at(ci),
-                                          c.g.row_y[static_cast<std::size_t>(ri)],
-                                          c.g.col_w[static_cast<std::size_t>(ci)],
-                                          c.g.row_h[static_cast<std::size_t>(ri)]},
-                                         c.g.clip_x0(ci), c.g.clip_x1(ci));
-                        cr = intersect(cr, c.g.body);
+                        Rect cr = clip_x({c.layout.col_x_at(ci),
+                                          c.layout.row_y[static_cast<std::size_t>(ri)],
+                                          c.layout.col_w[static_cast<std::size_t>(ci)],
+                                          c.layout.row_h[static_cast<std::size_t>(ri)]},
+                                         c.layout.clip_x0(ci), c.layout.clip_x1(ci));
+                        cr = intersect(cr, c.layout.body);
                         if (cr.empty())
                             continue;
-                        const float a = dr == c.v.find.hit ? 0.32F : 0.16F;
+                        const float a = dr == c.state.find.hit ? 0.32F : 0.16F;
                         fr.draw.add_shape(Stream::content, cr,
-                                          {c.p.accent.r, c.p.accent.g, c.p.accent.b, a},
+                                          {c.theme.accent.r, c.theme.accent.g, c.theme.accent.b, a},
                                           0, {}, 0, 0);
                     }
                 }

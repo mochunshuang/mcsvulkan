@@ -339,12 +339,12 @@ using model::Table;
 //   绘制输出由调用者单独传入（DrawList &），不放进上下文。
 struct PaintContext
 {
-    const model::Table &d;
-    const intent::State &v;
-    const intent::Interaction &ix;
-    const intent::Theme &p;
-    const Layout &g;
-    const Font &ft;
+    const model::Table &model;
+    const intent::State &state;
+    const intent::Interaction &interaction;
+    const intent::Theme &theme;
+    const Layout &layout;
+    const Font &font;
 };
 
 // ── 一帧的完整结果：对 Session 缓存几何/DL 的借用视图（不拷贝） ──────

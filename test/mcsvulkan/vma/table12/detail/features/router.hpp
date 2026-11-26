@@ -62,9 +62,9 @@ namespace table::detail
             // char 路径：按当前焦点分发给 filter / find / edit
             bool text(Context &c, std::string_view s)
             {
-                if (c.v.filter.edit >= 0)
+                if (c.state.filter.edit >= 0)
                     return get<FilterFeature>().text(c, s);
-                if (c.v.find.mode)
+                if (c.state.find.mode)
                     return get<FindFeature>().text(c, s);
                 return get<EditFeature>().text(c, s);
             }

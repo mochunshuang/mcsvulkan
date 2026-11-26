@@ -119,80 +119,80 @@ namespace table::detail
 // ── LayoutContext：layout pass 的唯一上下文 ───────────────────────────
 struct LayoutContext
 {
-    const Table &d;
-    State &v;
-    Interaction &ix;
-    const Theme &p;
+    const Table &model;
+    State &state;
+    Interaction &interaction;
+    const Theme &theme;
     const Rect &viewport;
-    const Font &ft;
+    const Font &font;
     AppRouter &sy;
     RowPipeline &pipe;
-    Layout &g;
+    Layout &layout;
 };
 
 // ── pass_reconcile：State 与模型对齐：列/行增删后只补差量，不整份 reset
 
 inline void pass_reconcile(LayoutContext &c)
 {
-            if (c.v.cols.order.size() != static_cast<std::size_t>(c.d.cols_count()) ||
-                c.v.checks.on.size() != static_cast<std::size_t>(c.d.rows()))
-                c.v.reconcile(c.d);
-            c.g = Layout{};
-            c.g.version = c.v.revision;
+            if (c.state.cols.order.size() != static_cast<std::size_t>(c.model.cols_count()) ||
+                c.state.checks.on.size() != static_cast<std::size_t>(c.model.rows()))
+                c.state.reconcile(c.model);
+            c.layout = Layout{};
+            c.layout.version = c.state.revision;
 }
 
 // ── pass_frame：外框：box/header/body/group/col_header/gutter（bar 由 Theme 决定）
 
 inline void pass_frame(LayoutContext &c)
 {
-            float w = c.v.cols.user_w > 0 ? c.v.cols.user_w : c.viewport.w;
-            float h = c.v.cols.user_h > 0 ? c.v.cols.user_h : c.viewport.h;
-            const float maxw = std::max(c.p.min_w, std::min(c.p.max_w, c.viewport.w));
-            const float maxh = std::max(c.p.min_h, std::min(c.p.max_h, c.viewport.h));
-            w = std::clamp(w, c.p.min_w, maxw);
-            h = std::clamp(h, c.p.min_h, maxh);
-            c.g.box = {c.viewport.x, c.viewport.y, w, h};
-            c.g.step = c.p.row_h + c.p.row_gap;
+            float w = c.state.cols.user_w > 0 ? c.state.cols.user_w : c.viewport.w;
+            float h = c.state.cols.user_h > 0 ? c.state.cols.user_h : c.viewport.h;
+            const float maxw = std::max(c.theme.min_w, std::min(c.theme.max_w, c.viewport.w));
+            const float maxh = std::max(c.theme.min_h, std::min(c.theme.max_h, c.viewport.h));
+            w = std::clamp(w, c.theme.min_w, maxw);
+            h = std::clamp(h, c.theme.min_h, maxh);
+            c.layout.box = {c.viewport.x, c.viewport.y, w, h};
+            c.layout.step = c.theme.row_h + c.theme.row_gap;
 
-            const float bar = std::max(c.p.bar, 0.0F);
-            c.g.group_h = c.d.any_group() ? std::max(c.p.group_h, 0.0F) : 0.0F;
-            const float header_h = c.g.group_h + c.p.header_h;
-            c.g.header = {c.g.box.x + 1, c.g.box.y + 1, c.g.box.w - 2 - bar, header_h};
-            c.g.body = {c.g.header.x, c.g.header.y + header_h, c.g.header.w,
-                      c.g.box.h - 2 - header_h - bar};
-            if (c.g.body.h < 0)
-                c.g.body.h = 0;
-            c.g.group = {c.g.header.x, c.g.header.y, c.g.header.w, c.g.group_h};
-            c.g.col_header = {c.g.header.x, c.g.header.y + c.g.group_h, c.g.header.w, c.p.header_h};
+            const float bar = std::max(c.theme.bar, 0.0F);
+            c.layout.group_h = c.model.any_group() ? std::max(c.theme.group_h, 0.0F) : 0.0F;
+            const float header_h = c.layout.group_h + c.theme.header_h;
+            c.layout.header = {c.layout.box.x + 1, c.layout.box.y + 1, c.layout.box.w - 2 - bar, header_h};
+            c.layout.body = {c.layout.header.x, c.layout.header.y + header_h, c.layout.header.w,
+                      c.layout.box.h - 2 - header_h - bar};
+            if (c.layout.body.h < 0)
+                c.layout.body.h = 0;
+            c.layout.group = {c.layout.header.x, c.layout.header.y, c.layout.header.w, c.layout.group_h};
+            c.layout.col_header = {c.layout.header.x, c.layout.header.y + c.layout.group_h, c.layout.header.w, c.theme.header_h};
 
-            c.g.gutter_w = c.p.row_select ? std::max(c.p.select_w, 0.0F) : 0.0F;
-            if (c.g.gutter_w > c.g.body.w * 0.5F)
-                c.g.gutter_w = 0;
-            c.g.gutter_head = {c.g.col_header.x, c.g.col_header.y, c.g.gutter_w, c.g.col_header.h};
-            c.g.gutter_body = {c.g.body.x, c.g.body.y, c.g.gutter_w, c.g.body.h};
+            c.layout.gutter_w = c.theme.row_select ? std::max(c.theme.select_w, 0.0F) : 0.0F;
+            if (c.layout.gutter_w > c.layout.body.w * 0.5F)
+                c.layout.gutter_w = 0;
+            c.layout.gutter_head = {c.layout.col_header.x, c.layout.col_header.y, c.layout.gutter_w, c.layout.col_header.h};
+            c.layout.gutter_body = {c.layout.body.x, c.layout.body.y, c.layout.gutter_w, c.layout.body.h};
 }
 
 // ── pass_columns：列：可见列序 + 宽度（solve_columns）+ 分组带 + content_w
 
 inline void pass_columns(LayoutContext &c)
 {
-            solve_columns(c.d, c.v, c.p, std::max(c.g.body.w - c.g.gutter_w, 1.0F), c.g);
+            solve_columns(c.model, c.state, c.theme, std::max(c.layout.body.w - c.layout.gutter_w, 1.0F), c.layout);
             // 分组带：连续、同名 group 的可见列算一段；命中/整组选择都读这张表
-            c.g.groups.clear();
+            c.layout.groups.clear();
             {
                 int start = -1;
                 std::string_view cur;
                 const auto flush = [&](int end) {
                     if (start >= 0 && end >= start)
-                        c.g.groups.push_back({start, end,
-                                            c.g.col_index[static_cast<std::size_t>(start)],
-                                            c.g.col_index[static_cast<std::size_t>(end)]});
+                        c.layout.groups.push_back({start, end,
+                                            c.layout.col_index[static_cast<std::size_t>(start)],
+                                            c.layout.col_index[static_cast<std::size_t>(end)]});
                 };
-                for (int i = 0; i < c.g.col_count(); ++i)
+                for (int i = 0; i < c.layout.col_count(); ++i)
                 {
                     const auto &name =
-                        c.d.cols[static_cast<std::size_t>(
-                                   c.g.col_index[static_cast<std::size_t>(i)])]
+                        c.model.cols[static_cast<std::size_t>(
+                                   c.layout.col_index[static_cast<std::size_t>(i)])]
                             .group;
                     if (name.empty())
                     {
@@ -208,10 +208,10 @@ inline void pass_columns(LayoutContext &c)
                         cur = name;
                     }
                 }
-                flush(c.g.col_count() - 1);
+                flush(c.layout.col_count() - 1);
             }
-            c.g.content_w = c.g.col_count() > 0
-                              ? c.g.col_x.back() + c.g.col_w.back() - c.g.col_x.front()
+            c.layout.content_w = c.layout.col_count() > 0
+                              ? c.layout.col_x.back() + c.layout.col_w.back() - c.layout.col_x.front()
                               : 0.0F;
 }
 
@@ -219,60 +219,60 @@ inline void pass_columns(LayoutContext &c)
 
 inline void pass_metrics(LayoutContext &c)
 {
-            ensure_metrics(c.d, c.v, c.p, c.g, c.ft);
+            ensure_metrics(c.model, c.state, c.theme, c.layout, c.font);
 }
 
 // ── pass_rows：行 stage：filter → sort 得到 view_rows/row_off/content_h
 
 inline void pass_rows(LayoutContext &c)
 {
-            c.pipe.base(c.d);
+            c.pipe.base(c.model);
             {
-                Context ctx{c.d, c.v, c.ix, c.p, c.g, c.ft, false, {}};
+                Context ctx{c.model, c.state, c.interaction, c.theme, c.layout, c.font, false, {}};
                 c.sy.rows(ctx, c.pipe.buf);
             }
-            c.g.view_rows.assign(c.pipe.buf.begin(), c.pipe.buf.end());
+            c.layout.view_rows.assign(c.pipe.buf.begin(), c.pipe.buf.end());
             // 当前格被筛掉：清选区（ability7 语义），避免编辑/勾选落到不可见行
-            if (c.v.sel.cur_r >= 0 && std::find(c.g.view_rows.begin(), c.g.view_rows.end(),
-                                              c.v.sel.cur_r) == c.g.view_rows.end())
+            if (c.state.sel.cur_r >= 0 && std::find(c.layout.view_rows.begin(), c.layout.view_rows.end(),
+                                              c.state.sel.cur_r) == c.layout.view_rows.end())
             {
-                c.v.sel = {};
-                c.v.touch();
+                c.state.sel = {};
+                c.state.touch();
             }
-            c.g.row_off.assign(c.g.view_rows.size() + 1, 0.0F);
+            c.layout.row_off.assign(c.layout.view_rows.size() + 1, 0.0F);
             float acc = 0;
-            for (std::size_t i = 0; i < c.g.view_rows.size(); ++i)
+            for (std::size_t i = 0; i < c.layout.view_rows.size(); ++i)
             {
-                c.g.row_off[i] = acc;
-                acc += c.g.row_h_data[static_cast<std::size_t>(c.g.view_rows[i])] + c.p.row_gap;
+                c.layout.row_off[i] = acc;
+                acc += c.layout.row_h_data[static_cast<std::size_t>(c.layout.view_rows[i])] + c.theme.row_gap;
             }
-            c.g.row_off.back() = acc;
-            c.g.content_h = c.g.view_rows.empty() ? 0.0F : acc - c.p.row_gap;
+            c.layout.row_off.back() = acc;
+            c.layout.content_h = c.layout.view_rows.empty() ? 0.0F : acc - c.theme.row_gap;
 }
 
 // ── pass_frozen：冻结列：frozen_view / scrollv（水平滚动只在 scrollv 里）
 
 inline void pass_frozen(LayoutContext &c)
 {
-            const float bx = c.g.body.x + c.g.gutter_w;
-            const float bw = std::max(c.g.body.w - c.g.gutter_w, 0.0F);
-            c.g.frozen = std::clamp(c.v.cols.frozen >= 0 ? c.v.cols.frozen : c.p.frozen, 0,
-                                  c.g.col_count());
-            if (c.g.frozen > 0)
+            const float bx = c.layout.body.x + c.layout.gutter_w;
+            const float bw = std::max(c.layout.body.w - c.layout.gutter_w, 0.0F);
+            c.layout.frozen = std::clamp(c.state.cols.frozen >= 0 ? c.state.cols.frozen : c.theme.frozen, 0,
+                                  c.layout.col_count());
+            if (c.layout.frozen > 0)
             {
-                c.g.frozen_w = std::min(
-                    c.g.col_x[static_cast<std::size_t>(c.g.frozen - 1)] +
-                        c.g.col_w[static_cast<std::size_t>(c.g.frozen - 1)] - c.g.col_x.front(),
+                c.layout.frozen_w = std::min(
+                    c.layout.col_x[static_cast<std::size_t>(c.layout.frozen - 1)] +
+                        c.layout.col_w[static_cast<std::size_t>(c.layout.frozen - 1)] - c.layout.col_x.front(),
                     bw * 0.8F);
-                c.g.frozen_view = {bx, c.g.body.y, c.g.frozen_w, c.g.body.h};
-                c.g.scrollv = {bx + c.g.frozen_w, c.g.body.y, std::max(bw - c.g.frozen_w, 0.0F),
-                             c.g.body.h};
+                c.layout.frozen_view = {bx, c.layout.body.y, c.layout.frozen_w, c.layout.body.h};
+                c.layout.scrollv = {bx + c.layout.frozen_w, c.layout.body.y, std::max(bw - c.layout.frozen_w, 0.0F),
+                             c.layout.body.h};
             }
             else
             {
-                c.g.frozen_w = 0;
-                c.g.frozen_view = {bx, c.g.body.y, 0, c.g.body.h};
-                c.g.scrollv = {bx, c.g.body.y, bw, c.g.body.h};
+                c.layout.frozen_w = 0;
+                c.layout.frozen_view = {bx, c.layout.body.y, 0, c.layout.body.h};
+                c.layout.scrollv = {bx, c.layout.body.y, bw, c.layout.body.h};
             }
 }
 
@@ -280,40 +280,40 @@ inline void pass_frozen(LayoutContext &c)
 
 inline void pass_visible(LayoutContext &c)
 {
-    const float bar = std::max(c.p.bar, 0.0F);
-            c.g.vbar = bar > 0 && c.g.content_h > c.g.body.h + 0.5F;
-            c.g.hbar = bar > 0 && c.g.content_w - c.g.frozen_w > c.g.scrollv.w + 0.5F;
-            const float max_sy = std::max(0.0F, c.g.content_h - c.g.body.h);
-            const float max_sx = std::max(0.0F, c.g.content_w - c.g.frozen_w - c.g.scrollv.w);
-            c.v.scroll.y = std::clamp(c.v.scroll.y, 0.0F, max_sy);
-            c.v.scroll.x = std::clamp(c.v.scroll.x, 0.0F, max_sx);
-            c.g.sx = c.v.scroll.x;
-            c.g.sy = c.v.scroll.y;
+    const float bar = std::max(c.theme.bar, 0.0F);
+            c.layout.vbar = bar > 0 && c.layout.content_h > c.layout.body.h + 0.5F;
+            c.layout.hbar = bar > 0 && c.layout.content_w - c.layout.frozen_w > c.layout.scrollv.w + 0.5F;
+            const float max_sy = std::max(0.0F, c.layout.content_h - c.layout.body.h);
+            const float max_sx = std::max(0.0F, c.layout.content_w - c.layout.frozen_w - c.layout.scrollv.w);
+            c.state.scroll.y = std::clamp(c.state.scroll.y, 0.0F, max_sy);
+            c.state.scroll.x = std::clamp(c.state.scroll.x, 0.0F, max_sx);
+            c.layout.sx = c.state.scroll.x;
+            c.layout.sy = c.state.scroll.y;
 
-            if (!c.g.view_rows.empty() && c.g.body.h > 0)
+            if (!c.layout.view_rows.empty() && c.layout.body.h > 0)
             {
                 const auto it =
-                    std::upper_bound(c.g.row_off.begin(), c.g.row_off.end(), c.g.sy);
-                int first = std::clamp(static_cast<int>(it - c.g.row_off.begin()) - 1, 0,
-                                       static_cast<int>(c.g.view_rows.size()) - 1);
-                float y = c.g.body.y + c.g.row_off[static_cast<std::size_t>(first)] - c.g.sy;
-                for (int i = first; i < static_cast<int>(c.g.view_rows.size()); ++i)
+                    std::upper_bound(c.layout.row_off.begin(), c.layout.row_off.end(), c.layout.sy);
+                int first = std::clamp(static_cast<int>(it - c.layout.row_off.begin()) - 1, 0,
+                                       static_cast<int>(c.layout.view_rows.size()) - 1);
+                float y = c.layout.body.y + c.layout.row_off[static_cast<std::size_t>(first)] - c.layout.sy;
+                for (int i = first; i < static_cast<int>(c.layout.view_rows.size()); ++i)
                 {
-                    const int dr = c.g.view_rows[static_cast<std::size_t>(i)];
-                    const float rh = c.g.row_h_data[static_cast<std::size_t>(dr)];
-                    if (y + rh > c.g.body.y && y < c.g.body.y1())
+                    const int dr = c.layout.view_rows[static_cast<std::size_t>(i)];
+                    const float rh = c.layout.row_h_data[static_cast<std::size_t>(dr)];
+                    if (y + rh > c.layout.body.y && y < c.layout.body.y1())
                     {
-                        const float y0 = std::max(y, c.g.body.y);
-                        const float y1 = std::min(y + rh, c.g.body.y1());
+                        const float y0 = std::max(y, c.layout.body.y);
+                        const float y1 = std::min(y + rh, c.layout.body.y1());
                         if (y1 - y0 > 0.5F)
                         {
-                            c.g.row_index.push_back(dr);
-                            c.g.row_y.push_back(y0);
-                            c.g.row_h.push_back(y1 - y0);
+                            c.layout.row_index.push_back(dr);
+                            c.layout.row_y.push_back(y0);
+                            c.layout.row_h.push_back(y1 - y0);
                         }
                     }
-                    y += rh + c.p.row_gap;
-                    if (y >= c.g.body.y1())
+                    y += rh + c.theme.row_gap;
+                    if (y >= c.layout.body.y1())
                         break;
                 }
             }
@@ -324,38 +324,38 @@ inline void pass_visible(LayoutContext &c)
 inline void pass_bars(LayoutContext &c)
 {
     // bar / max_sy / max_sx 是 Theme+几何的纯函数：就地重算，不跨 pass 共享状态
-    const float bar = std::max(c.p.bar, 0.0F);
-    const float max_sy = std::max(0.0F, c.g.content_h - c.g.body.h);
+    const float bar = std::max(c.theme.bar, 0.0F);
+    const float max_sy = std::max(0.0F, c.layout.content_h - c.layout.body.h);
     const float max_sx =
-        std::max(0.0F, c.g.content_w - c.g.frozen_w - c.g.scrollv.w);
+        std::max(0.0F, c.layout.content_w - c.layout.frozen_w - c.layout.scrollv.w);
             if (bar > 0)
             {
-                const float tx = c.g.box.x1() - bar - 1;
-                const float ty = c.g.body.y + 2;
-                const float th = std::max(c.g.body.h - 4, 1.0F);
-                c.g.vtrack = {tx, ty, bar, th};
-                if (c.g.vbar)
+                const float tx = c.layout.box.x1() - bar - 1;
+                const float ty = c.layout.body.y + 2;
+                const float th = std::max(c.layout.body.h - 4, 1.0F);
+                c.layout.vtrack = {tx, ty, bar, th};
+                if (c.layout.vbar)
                 {
                     const float ratio =
-                        std::clamp(c.g.body.h / std::max(c.g.content_h, 1.0F), 0.06F, 1.0F);
+                        std::clamp(c.layout.body.h / std::max(c.layout.content_h, 1.0F), 0.06F, 1.0F);
                     const float hgt = std::max(th * ratio, 18.0F);
-                    const float t = max_sy > 0 ? c.g.sy / max_sy : 0.0F;
-                    c.g.vthumb = {tx, ty + (th - hgt) * t, bar, hgt};
+                    const float t = max_sy > 0 ? c.layout.sy / max_sy : 0.0F;
+                    c.layout.vthumb = {tx, ty + (th - hgt) * t, bar, hgt};
                 }
-                const float hx = c.g.body.x + 2;
-                const float hy = c.g.box.y1() - bar - 1;
-                const float hw = std::max(c.g.body.w - 4, 1.0F);
-                c.g.htrack = {hx, hy, hw, bar};
-                if (c.g.hbar)
+                const float hx = c.layout.body.x + 2;
+                const float hy = c.layout.box.y1() - bar - 1;
+                const float hw = std::max(c.layout.body.w - 4, 1.0F);
+                c.layout.htrack = {hx, hy, hw, bar};
+                if (c.layout.hbar)
                 {
                     const float ratio =
-                        std::clamp(c.g.scrollv.w / std::max(c.g.content_w - c.g.frozen_w, 1.0F),
+                        std::clamp(c.layout.scrollv.w / std::max(c.layout.content_w - c.layout.frozen_w, 1.0F),
                                    0.06F, 1.0F);
                     const float wid = std::max(hw * ratio, 18.0F);
-                    const float t = max_sx > 0 ? c.g.sx / max_sx : 0.0F;
-                    c.g.hthumb = {hx + (hw - wid) * t, hy, wid, bar};
+                    const float t = max_sx > 0 ? c.layout.sx / max_sx : 0.0F;
+                    c.layout.hthumb = {hx + (hw - wid) * t, hy, wid, bar};
                 }
-                c.g.corner = {c.g.htrack.x1(), c.g.vtrack.y, bar, bar};
+                c.layout.corner = {c.layout.htrack.x1(), c.layout.vtrack.y, bar, bar};
             }
 }
 
@@ -363,23 +363,23 @@ inline void pass_bars(LayoutContext &c)
 
 inline void pass_edges(LayoutContext &c)
 {
-    const float bar = std::max(c.p.bar, 0.0F);
-            const float e = c.p.edge_hit;
+    const float bar = std::max(c.theme.bar, 0.0F);
+            const float e = c.theme.edge_hit;
             const float C = std::max(bar + 2.0F, e + 4.0F);
-            const auto &fr = c.g.box;
-            c.g.edge_n = {fr.x + C, fr.y - e, std::max(fr.w - 2 * C, 1.0F), 2 * e};
+            const auto &fr = c.layout.box;
+            c.layout.edge_n = {fr.x + C, fr.y - e, std::max(fr.w - 2 * C, 1.0F), 2 * e};
             float wh = fr.h - 2 * C;
-            if (c.g.hbar)
-                wh = std::min(wh, c.g.htrack.y - (fr.y + C));
-            c.g.edge_w = {fr.x - e, fr.y + C, 2 * e, std::max(wh, 1.0F)};
-            c.g.edge_nw = {fr.x - e, fr.y - e, C, C};
-            c.g.edge_ne = {fr.x1() - C, fr.y - e, C, C};
-            c.g.edge_sw = {fr.x - e, fr.y1() - C, C, C};
-            c.g.edge_se = {fr.x1() - C, fr.y1() - C, C, C};
+            if (c.layout.hbar)
+                wh = std::min(wh, c.layout.htrack.y - (fr.y + C));
+            c.layout.edge_w = {fr.x - e, fr.y + C, 2 * e, std::max(wh, 1.0F)};
+            c.layout.edge_nw = {fr.x - e, fr.y - e, C, C};
+            c.layout.edge_ne = {fr.x1() - C, fr.y - e, C, C};
+            c.layout.edge_sw = {fr.x - e, fr.y1() - C, C, C};
+            c.layout.edge_se = {fr.x1() - C, fr.y1() - C, C, C};
 
-            assert(c.g.header.x == c.g.body.x && c.g.header.w == c.g.body.w);
-            assert(c.g.col_header.h == c.p.header_h);
-            assert(c.g.header.h == c.g.group_h + c.p.header_h);
+            assert(c.layout.header.x == c.layout.body.x && c.layout.header.w == c.layout.body.w);
+            assert(c.layout.col_header.h == c.theme.header_h);
+            assert(c.layout.header.h == c.layout.group_h + c.theme.header_h);
 }
 
 // 编译期 pass 列表：每个元素是独立 lambda 类型（无函数指针、无运行时 type-erasure）

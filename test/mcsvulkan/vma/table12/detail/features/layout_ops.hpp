@@ -14,8 +14,8 @@ namespace table::detail
         {
             bool toggle(Context &c, int col)
             {
-                c.v.sort.toggle(col);
-                c.v.touch();
+                c.state.sort.toggle(col);
+                c.state.touch();
                 return true;
             }
             template <class E>
@@ -25,34 +25,34 @@ namespace table::detail
             }
             void rows(Context &c, std::vector<row_idx> &r)
             {
-                if (c.v.sort.dir == 0 || c.v.sort.col < 0)
+                if (c.state.sort.dir == 0 || c.state.sort.col < 0)
                     return;
-                const int cc = c.v.sort.col;
-                const bool desc = c.v.sort.dir == 2;
+                const int cc = c.state.sort.col;
+                const bool desc = c.state.sort.dir == 2;
                 std::stable_sort(r.begin(), r.end(), [&](int a, int b) {
-                    const auto x = c.d.text(a, cc);
-                    const auto y = c.d.text(b, cc);
+                    const auto x = c.model.text(a, cc);
+                    const auto y = c.model.text(b, cc);
                     return desc ? x > y : x < y;
                 });
             }
 
             void paint(const PaintContext &c, DrawList &fr) const
             {
-                if (c.v.sort.dir == 0 || c.v.sort.col < 0)
+                if (c.state.sort.dir == 0 || c.state.sort.col < 0)
                     return;
-                const int pos = c.g.pos_of_col(c.v.sort.col);
+                const int pos = c.layout.pos_of_col(c.state.sort.col);
                 if (pos < 0)
                     return;
                 const Rect hr =
-                    clip_x({c.g.col_x_at(pos), c.g.col_header.y,
-                            c.g.col_w[static_cast<std::size_t>(pos)], c.g.col_header.h},
-                           c.g.clip_x0(pos), c.g.clip_x1(pos));
+                    clip_x({c.layout.col_x_at(pos), c.layout.col_header.y,
+                            c.layout.col_w[static_cast<std::size_t>(pos)], c.layout.col_header.h},
+                           c.layout.clip_x0(pos), c.layout.clip_x1(pos));
                 if (hr.empty())
                     return;
                 fr.draw.add_shape(Stream::chrome,
                                   {hr.x1() - 12, hr.y + hr.h * 0.5F - 3, 8, 6},
-                                  c.p.header_text, 1, {}, 0,
-                                  zone_key({Part::header, -1, c.v.sort.col}));
+                                  c.theme.header_text, 1, {}, 0,
+                                  zone_key({Part::header, -1, c.state.sort.col}));
             }
         };
 
@@ -63,27 +63,27 @@ namespace table::detail
             {
                 const int col = t.col_index;
                 const float base =
-                    col >= 0 && static_cast<std::size_t>(col) < c.v.cols.w.size()
-                        ? c.v.cols.w[static_cast<std::size_t>(col)]
+                    col >= 0 && static_cast<std::size_t>(col) < c.state.cols.w.size()
+                        ? c.state.cols.w[static_cast<std::size_t>(col)]
                         : 0.0F;
                 return begin(c, col, x, base);
             }
             bool begin(Context &c, int col, float x, float base)
             {
-                c.v.cols.resize_col = col;
-                c.v.cols.resize_x0 = x;
-                c.v.cols.resize_base = base;
-                c.v.touch();
+                c.state.cols.resize_col = col;
+                c.state.cols.resize_x0 = x;
+                c.state.cols.resize_base = base;
+                c.state.touch();
                 return true;
             }
             bool move(Context &c, float x)
             {
-                auto &v = c.v;
+                auto &v = c.state;
                 if (v.cols.resize_col >= 0 &&
                     static_cast<std::size_t>(v.cols.resize_col) < v.cols.w.size())
                 {
                     const auto &def =
-                        c.d.cols[static_cast<std::size_t>(v.cols.resize_col)];
+                        c.model.cols[static_cast<std::size_t>(v.cols.resize_col)];
                     v.cols.w[static_cast<std::size_t>(v.cols.resize_col)] =
                         std::clamp(v.cols.resize_base + (x - v.cols.resize_x0), def.min_w,
                                    def.max_w);
@@ -94,8 +94,8 @@ namespace table::detail
             }
             bool end(Context &c)
             {
-                c.v.cols.resize_col = -1;
-                c.v.touch();
+                c.state.cols.resize_col = -1;
+                c.state.touch();
                 return true;
             }
             template <class E>
@@ -116,9 +116,9 @@ namespace table::detail
             }
             bool begin(Context &c, int col, float x)
             {
-                auto &v = c.v;
-                auto &ix = c.ix;
-                v.cols.reorder_from = c.g.pos_of_col(col);
+                auto &v = c.state;
+                auto &ix = c.interaction;
+                v.cols.reorder_from = c.layout.pos_of_col(col);
                 v.cols.reorder_to = v.cols.reorder_from;
                 v.cols.reorder_col = col;
                 v.cols.reorder_x0 = x;
@@ -128,13 +128,13 @@ namespace table::detail
             }
             bool move(Context &c, float x)
             {
-                auto &v = c.v;
-                auto &ix = c.ix;
+                auto &v = c.state;
+                auto &ix = c.interaction;
                 if (v.cols.reorder_from >= 0)
                 {
                     if (std::abs(x - v.cols.reorder_x0) > 4.0F)
                         ix.header_moved = true;
-                    const int to = c.g.pos_at(x);
+                    const int to = c.layout.pos_at(x);
                     if (to >= 0)
                         v.cols.reorder_to = to;
                     v.touch();
@@ -143,8 +143,8 @@ namespace table::detail
             }
             int end(Context &c)
             {
-                auto &v = c.v;
-                auto &ix = c.ix;
+                auto &v = c.state;
+                auto &ix = c.interaction;
                 int clicked = -1;
                 if (ix.header_moved)
                     v.cols.move(v.cols.reorder_from, v.cols.reorder_to);
@@ -164,39 +164,39 @@ namespace table::detail
 
             void paint(const PaintContext &c, DrawList &fr) const
             {
-                if (c.ix.drag != DragMode::header || c.v.cols.reorder_from < 0)
+                if (c.interaction.drag != DragMode::header || c.state.cols.reorder_from < 0)
                     return;
-                const int from = c.v.cols.reorder_from;
-                if (from >= static_cast<int>(c.v.cols.order.size()))
+                const int from = c.state.cols.reorder_from;
+                if (from >= static_cast<int>(c.state.cols.order.size()))
                     return;
-                const int col = c.v.cols.order[static_cast<std::size_t>(from)];
-                const int pos = c.g.pos_of_col(col);
+                const int col = c.state.cols.order[static_cast<std::size_t>(from)];
+                const int pos = c.layout.pos_of_col(col);
                 if (pos < 0)
                     return;
-                const float gw = c.g.col_w[static_cast<std::size_t>(pos)];
-                const float gx = c.ix.pointer.x - gw * 0.5F;
-                const Rect ghost{gx, c.g.col_header.y, gw, c.g.col_header.h};
+                const float gw = c.layout.col_w[static_cast<std::size_t>(pos)];
+                const float gx = c.interaction.pointer.x - gw * 0.5F;
+                const Rect ghost{gx, c.layout.col_header.y, gw, c.layout.col_header.h};
                 fr.draw.add_shape(
                     Stream::overlay, ghost,
-                    {c.p.header_bg.r, c.p.header_bg.g, c.p.header_bg.b, 0.85F},
-                    c.p.cell_radius, c.p.accent, 1.5F, 0);
-                if (col < c.d.cols_count())
+                    {c.theme.header_bg.r, c.theme.header_bg.g, c.theme.header_bg.b, 0.85F},
+                    c.theme.cell_radius, c.theme.accent, 1.5F, 0);
+                if (col < c.model.cols_count())
                     fr.draw.add_text(
                         Stream::overlay,
-                        {ghost.x + c.p.cell_pad, ghost.y, gw - 2 * c.p.cell_pad, ghost.h},
-                        c.p.header_text, ghost.y + ghost.h * 0.5F + c.ft.px * 0.30F,
-                        c.d.cols[static_cast<std::size_t>(col)].title, 0);
-                if (c.v.cols.reorder_to >= 0)
+                        {ghost.x + c.theme.cell_pad, ghost.y, gw - 2 * c.theme.cell_pad, ghost.h},
+                        c.theme.header_text, ghost.y + ghost.h * 0.5F + c.font.px * 0.30F,
+                        c.model.cols[static_cast<std::size_t>(col)].title, 0);
+                if (c.state.cols.reorder_to >= 0)
                 {
-                    const int to = c.v.cols.reorder_to;
+                    const int to = c.state.cols.reorder_to;
                     const float xt =
-                        to < c.g.col_count()
-                            ? c.g.col_x_at(to)
-                            : c.g.col_x_at(c.g.col_count() - 1) + c.g.col_w.back();
+                        to < c.layout.col_count()
+                            ? c.layout.col_x_at(to)
+                            : c.layout.col_x_at(c.layout.col_count() - 1) + c.layout.col_w.back();
                     fr.draw.add_shape(
                         Stream::overlay,
-                        {xt - 1, c.g.col_header.y, 2, c.g.body.y1() - c.g.col_header.y},
-                        c.p.accent, 0, {}, 0, 0);
+                        {xt - 1, c.layout.col_header.y, 2, c.layout.body.y1() - c.layout.col_header.y},
+                        c.theme.accent, 0, {}, 0, 0);
                 }
             }
         };
@@ -206,8 +206,8 @@ namespace table::detail
         {
             bool set(Context &c, int n)
             {
-                c.v.cols.frozen = n;
-                c.v.touch();
+                c.state.cols.frozen = n;
+                c.state.touch();
                 return true;
             }
             template <class E>
@@ -224,17 +224,17 @@ namespace table::detail
         {
             bool begin(Context &c, float x, float y, float w, float h)
             {
-                c.ix.trs_x0 = x;
-                c.ix.trs_y0 = y;
-                c.ix.trs_w = w;
-                c.ix.trs_h = h;
-                c.v.touch();
+                c.interaction.trs_x0 = x;
+                c.interaction.trs_y0 = y;
+                c.interaction.trs_w = w;
+                c.interaction.trs_h = h;
+                c.state.touch();
                 return true;
             }
             bool move(Context &c, float x, float y)
             {
-                auto &v = c.v;
-                auto &ix = c.ix;
+                auto &v = c.state;
+                auto &ix = c.interaction;
                 // 左/上把手：往左/上拖是放大，所以位移取反
                 const Part e = ix.trs_edge;
                 const bool left =
@@ -249,14 +249,14 @@ namespace table::detail
                     dx = -dx;
                 if (top)
                     dy = -dy;
-                v.cols.user_w = std::max(ix.trs_w + (use_x ? dx : 0.0F), c.p.min_w);
-                v.cols.user_h = std::max(ix.trs_h + (use_y ? dy : 0.0F), c.p.min_h);
+                v.cols.user_w = std::max(ix.trs_w + (use_x ? dx : 0.0F), c.theme.min_w);
+                v.cols.user_h = std::max(ix.trs_h + (use_y ? dy : 0.0F), c.theme.min_h);
                 v.touch();
                 return true;
             }
             bool end(Context &c)
             {
-                c.v.touch();
+                c.state.touch();
                 return true;
             }
             template <class E>

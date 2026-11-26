@@ -172,12 +172,12 @@ namespace table::command
     // ── Context：feature 的唯一入口参数（没有 fx：Outcome 是唯一结果） ──────
     struct Context
     {
-        const model::Table &d;
-        intent::State &v;
-        intent::Interaction &ix;
-        const intent::Theme &p;
-        const frame::Layout &g;
-        const Font &ft;
+        const model::Table &model;
+        intent::State &state;
+        intent::Interaction &interaction;
+        const intent::Theme &theme;
+        const frame::Layout &layout;
+        const Font &font;
         bool trace{false};
         TableId id{};
     };

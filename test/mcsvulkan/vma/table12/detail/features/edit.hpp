@@ -40,7 +40,7 @@ namespace table::detail
             static Outcome commit(Context &c)
             {
         Outcome o;
-                auto &e = c.v.edit;
+                auto &e = c.state.edit;
                 if (!e.active())
                 return o;
                 if (e.buf != e.orig)
@@ -51,11 +51,11 @@ namespace table::detail
                                      e.col, id.v, e.buf);
                     if (true)
                         command::push_effect(o.effects, SetCell{id, e.col, e.buf});
-                    c.v.history.undo.push_back({{id, e.col, e.orig, e.buf}});
-                    c.v.history.redo.clear();
+                    c.state.history.undo.push_back({{id, e.col, e.orig, e.buf}});
+                    c.state.history.redo.clear();
                 }
                 e = {};
-                c.v.touch();
+                c.state.touch();
             return o;
             }
 
@@ -71,18 +71,18 @@ namespace table::detail
 
             static int caret_at(const Context &c, float x)
             {
-                const auto &e = c.v.edit;
-                const int pos = c.g.pos_of_col(e.col);
+                const auto &e = c.state.edit;
+                const int pos = c.layout.pos_of_col(e.col);
                 if (pos < 0)
                     return 0;
-                const float left = c.g.col_x_at(pos) + c.p.cell_pad;
+                const float left = c.layout.col_x_at(pos) + c.theme.cell_pad;
                 int best = 0;
                 float bestd = 1.0e30F;
                 std::size_t i = 0;
                 while (true)
                 {
                     const float w =
-                        text_width(c.ft, std::string_view(e.buf).substr(0, i));
+                        text_width(c.font, std::string_view(e.buf).substr(0, i));
                     const float d = std::abs((left + w) - x);
                     if (d < bestd)
                     {
@@ -101,10 +101,10 @@ namespace table::detail
             Outcome paste(Context &c, std::string text)
             {
         Outcome o;
-                auto &v = c.v;
+                auto &v = c.state;
                 if (v.edit.active())
                 {
-                    snapshot(v, c.ix, false);
+                    snapshot(v, c.interaction, false);
                     for (char &ch : text)
                         if (ch == '\n' || ch == '\r' || ch == '\t')
                             ch = ' ';
@@ -132,11 +132,11 @@ namespace table::detail
                                 tab == std::string_view::npos ? ln.size() : tab;
                             const int rr = r + dr;
                             const int cc = col + dc;
-                            if (rr >= 0 && rr < c.d.rows() && cc >= 0 &&
-                                cc < c.d.cols_count())
+                            if (rr >= 0 && rr < c.model.rows() && cc >= 0 &&
+                                cc < c.model.cols_count())
                             {
-                                const auto old = c.d.text(rr, cc);
-                                const auto id = c.d.ids[static_cast<std::size_t>(rr)];
+                                const auto old = c.model.text(rr, cc);
+                                const auto id = c.model.ids[static_cast<std::size_t>(rr)];
                                 std::string val{ln.substr(p, e2 - p)};
                                 command::push_effect(o.effects, SetCell{id, cc, val});
                                 batch.push_back({id, cc, std::string(old), val});
@@ -169,31 +169,31 @@ namespace table::detail
             }
             bool begin(Context &c, int r, int col)
             {
-                start(c.d, c.v, r, col);
+                start(c.model, c.state, r, col);
                 return true;
             }
 
             bool compose(Context &c, std::string text)
             {
-                if (c.v.edit.active())
+                if (c.state.edit.active())
                 {
-                    c.v.edit.compose = std::move(text);
-                    c.v.touch();
+                    c.state.edit.compose = std::move(text);
+                    c.state.touch();
                 }
                 return true;
             }
 
             bool text(Context &c, std::string_view s)
             {
-                auto &v = c.v;
+                auto &v = c.state;
                 if (v.edit.active())
                 {
-                    snapshot(v, c.ix, true);
+                    snapshot(v, c.interaction, true);
                     replace_sel(v, s);
                 }
                 else if (v.sel.cur_r >= 0 && v.sel.cur_c >= 0)
                 {
-                    start(c.d, v, v.sel.cur_r, v.sel.cur_c);
+                    start(c.model, v, v.sel.cur_r, v.sel.cur_c);
                     v.edit.buf.clear();
                     v.edit.caret = 0;
                     v.edit.anchor = 0;
@@ -227,7 +227,7 @@ namespace table::detail
             }
             void select_word(Context &c, float x)
             {
-                auto &e = c.v.edit;
+                auto &e = c.state.edit;
                 e.caret = caret_at(c, x);
                 const std::string_view sv{e.buf};
                 const auto caret = static_cast<std::size_t>(
@@ -245,15 +245,15 @@ namespace table::detail
                     hi = std::min(sv.size(), utf8_next(sv, lo));
                 e.anchor = static_cast<int>(lo);
                 e.caret = static_cast<int>(hi);
-                c.v.touch();
+                c.state.touch();
             }
 
             template <class E>
             Outcome handle(Context &c, const E &x)
             {
                 Outcome o;
-                auto &v = c.v;
-                auto &ix = c.ix;
+                auto &v = c.state;
+                auto &ix = c.interaction;
                 using T = E;
                 if constexpr (std::is_same_v<T, Press>)
                 {
@@ -289,17 +289,17 @@ namespace table::detail
                     if (!v.edit.active())
                 return o;
                     const Target tgt =
-                        x.t.kind != Part::none ? x.t : target_of(c.d, {}, x.t.to_zone());
+                        x.t.kind != Part::none ? x.t : target_of(c.model, {}, x.t.to_zone());
                     bool in_row = false;
                     if (tgt.kind == Part::cell)
                         in_row = tgt.row_index == v.edit.row;
                     else
-                        for (int i = 0; i < c.g.row_count(); ++i)
+                        for (int i = 0; i < c.layout.row_count(); ++i)
                         {
-                            if (c.g.row_index[static_cast<std::size_t>(i)] != v.edit.row)
+                            if (c.layout.row_index[static_cast<std::size_t>(i)] != v.edit.row)
                                 continue;
-                            const float y0 = c.g.row_y[static_cast<std::size_t>(i)];
-                            const float y1 = y0 + c.g.row_h[static_cast<std::size_t>(i)];
+                            const float y0 = c.layout.row_y[static_cast<std::size_t>(i)];
+                            const float y1 = y0 + c.layout.row_h[static_cast<std::size_t>(i)];
                             in_row = x.y >= y0 && x.y < y1;
                             break;
                         }
@@ -325,29 +325,29 @@ namespace table::detail
                         const int row = e.row;
                         const int col = e.col;
                         o.merge(commit(c));
-                        const int pos = pos_of(c.g, row);
-                        if (pos + 1 < static_cast<int>(c.g.view_rows.size()))
+                        const int pos = pos_of(c.layout, row);
+                        if (pos + 1 < static_cast<int>(c.layout.view_rows.size()))
                         {
                             const int nr =
-                                c.g.view_rows[static_cast<std::size_t>(pos + 1)];
+                                c.layout.view_rows[static_cast<std::size_t>(pos + 1)];
                             v.sel.r0 = v.sel.r1 = v.sel.cur_r = nr;
                             v.sel.c0 = v.sel.c1 = v.sel.cur_c = col;
                             v.touch();
-                            ensure_visible(v, c.g, c.p, nr, col);
+                            ensure_visible(v, c.layout, c.theme, nr, col);
                         }
                         break;
                     }
                     case Key::tab: {
                         o.merge(commit(c));
                         const int nc = std::clamp(v.sel.cur_c + (x.shift ? -1 : 1), 0,
-                                                  c.d.cols_count() - 1);
+                                                  c.model.cols_count() - 1);
                         v.sel.cur_c = v.sel.c0 = v.sel.c1 = nc;
                         v.touch();
-                        ensure_visible(v, c.g, c.p, v.sel.cur_r, nc);
+                        ensure_visible(v, c.layout, c.theme, v.sel.cur_r, nc);
                         break;
                     }
                     case Key::backspace:
-                        snapshot(v, c.ix, true);
+                        snapshot(v, c.interaction, true);
                         if (e.has_sel())
                             replace_sel(v, {});
                         else if (e.caret > 0)
@@ -363,7 +363,7 @@ namespace table::detail
                         }
                         break;
                     case Key::del:
-                        snapshot(v, c.ix, true);
+                        snapshot(v, c.interaction, true);
                         if (e.has_sel())
                             replace_sel(v, {});
                         else if (e.caret < static_cast<int>(e.buf.size()))
@@ -438,7 +438,7 @@ namespace table::detail
                                 command::push_effect(o.effects, WriteClipboard{e.buf.substr(
                                     static_cast<std::size_t>(e.sel_lo()),
                                     static_cast<std::size_t>(e.sel_hi() - e.sel_lo()))});
-                            snapshot(v, c.ix, true);
+                            snapshot(v, c.interaction, true);
                             if (e.has_sel())
                                 replace_sel(v, {});
                         }
@@ -478,68 +478,68 @@ namespace table::detail
 
             void paint(const PaintContext &c, DrawList &fr) const
             {
-                const auto &e = c.v.edit;
+                const auto &e = c.state.edit;
                 if (!e.active())
                     return;
                 int ri = -1, ci = -1;
-                for (int i = 0; i < c.g.row_count(); ++i)
-                    if (c.g.row_index[static_cast<std::size_t>(i)] == e.row)
+                for (int i = 0; i < c.layout.row_count(); ++i)
+                    if (c.layout.row_index[static_cast<std::size_t>(i)] == e.row)
                         ri = i;
-                for (int i = 0; i < c.g.col_count(); ++i)
-                    if (c.g.col_index[static_cast<std::size_t>(i)] == e.col)
+                for (int i = 0; i < c.layout.col_count(); ++i)
+                    if (c.layout.col_index[static_cast<std::size_t>(i)] == e.col)
                         ci = i;
                 if (ri < 0 || ci < 0)
                     return;
                 Rect cr =
-                    clip_x({c.g.col_x_at(ci), c.g.row_y[static_cast<std::size_t>(ri)],
-                            c.g.col_w[static_cast<std::size_t>(ci)],
-                            c.g.row_h[static_cast<std::size_t>(ri)]},
-                           c.g.clip_x0(ci), c.g.clip_x1(ci));
-                cr = intersect(cr, c.g.body);
+                    clip_x({c.layout.col_x_at(ci), c.layout.row_y[static_cast<std::size_t>(ri)],
+                            c.layout.col_w[static_cast<std::size_t>(ci)],
+                            c.layout.row_h[static_cast<std::size_t>(ri)]},
+                           c.layout.clip_x0(ci), c.layout.clip_x1(ci));
+                cr = intersect(cr, c.layout.body);
                 if (cr.empty())
                     return;
                 fr.draw.add_shape(Stream::overlay, cr, {0.06F, 0.08F, 0.12F, 1.0F},
-                                  c.p.cell_radius, {}, 0, 0);
-                const float inner = std::max(cr.w - 2 * c.p.cell_pad, 1.0F);
+                                  c.theme.cell_radius, {}, 0, 0);
+                const float inner = std::max(cr.w - 2 * c.theme.cell_pad, 1.0F);
                 const float pre = text_width(
-                    c.ft,
+                    c.font,
                     std::string_view(e.buf).substr(0, static_cast<std::size_t>(e.caret)));
                 const float off = pre > inner ? pre - inner + 2.0F : 0.0F;
                 if (e.has_sel())
                 {
                     const float lo =
-                        text_width(c.ft, std::string_view(e.buf).substr(0, e.sel_lo()));
+                        text_width(c.font, std::string_view(e.buf).substr(0, e.sel_lo()));
                     const float hi =
-                        text_width(c.ft, std::string_view(e.buf).substr(0, e.sel_hi()));
+                        text_width(c.font, std::string_view(e.buf).substr(0, e.sel_hi()));
                     if (hi > lo)
                         fr.draw.add_shape(
                             Stream::overlay,
-                            {cr.x + c.p.cell_pad + lo - off, cr.y + 4, hi - lo,
+                            {cr.x + c.theme.cell_pad + lo - off, cr.y + 4, hi - lo,
                              std::max(cr.h - 8, 1.0F)},
-                            {c.p.accent.r, c.p.accent.g, c.p.accent.b, 0.35F}, 0, {}, 0,
+                            {c.theme.accent.r, c.theme.accent.g, c.theme.accent.b, 0.35F}, 0, {}, 0,
                             0);
                 }
                 const Rect tx = intersect(
-                    {cr.x + c.p.cell_pad - off, cr.y, inner + off, cr.h}, c.g.body);
-                fr.draw.add_text(Stream::overlay, tx, c.p.text,
-                                 cr.y + cr.h * 0.5F + c.ft.px * 0.30F, e.buf, 0);
-                const float cx = std::clamp(cr.x + c.p.cell_pad + pre - off, cr.x + 1,
+                    {cr.x + c.theme.cell_pad - off, cr.y, inner + off, cr.h}, c.layout.body);
+                fr.draw.add_text(Stream::overlay, tx, c.theme.text,
+                                 cr.y + cr.h * 0.5F + c.font.px * 0.30F, e.buf, 0);
+                const float cx = std::clamp(cr.x + c.theme.cell_pad + pre - off, cr.x + 1,
                                             cr.x + cr.w - 2);
                 fr.draw.add_shape(Stream::overlay,
                                   {cx, cr.y + 4, 1.5F, std::max(cr.h - 8, 1.0F)},
-                                  c.p.accent, 0, {}, 0, 0);
+                                  c.theme.accent, 0, {}, 0, 0);
                 if (!e.compose.empty())
                 {
-                    const float cw = text_width(c.ft, e.compose);
+                    const float cw = text_width(c.font, e.compose);
                     fr.draw.add_text(Stream::overlay,
                                      {cx + 2, cr.y, std::max(cw + 4, 1.0F), cr.h},
-                                     {c.p.accent.r, c.p.accent.g, c.p.accent.b, 0.9F},
-                                     cr.y + cr.h * 0.5F + c.ft.px * 0.30F, e.compose, 0);
+                                     {c.theme.accent.r, c.theme.accent.g, c.theme.accent.b, 0.9F},
+                                     cr.y + cr.h * 0.5F + c.font.px * 0.30F, e.compose, 0);
                     fr.draw.add_shape(Stream::overlay,
                                       {cx + 2, cr.y + cr.h - 4, std::max(cw, 1.0F), 1},
-                                      c.p.accent, 0, {}, 0, 0);
+                                      c.theme.accent, 0, {}, 0, 0);
                 }
-                fr.draw.add_shape(Stream::overlay, cr, {0, 0, 0, 0}, 0, c.p.accent, 1.5F,
+                fr.draw.add_shape(Stream::overlay, cr, {0, 0, 0, 0}, 0, c.theme.accent, 1.5F,
                                   0);
             }
         };
@@ -550,7 +550,7 @@ namespace table::detail
             static Outcome clear_sel(Context &c)
             {
         Outcome o;
-                auto &v = c.v;
+                auto &v = c.state;
                 if (v.sel.r0 < 0)
                 return o;
                 std::vector<State::undo_change> batch;
@@ -559,10 +559,10 @@ namespace table::detail
                     for (int cc = std::min(v.sel.c0, v.sel.c1);
                          cc <= std::max(v.sel.c0, v.sel.c1); ++cc)
                     {
-                        const auto old = c.d.text(r, cc);
+                        const auto old = c.model.text(r, cc);
                         if (old.empty())
                             continue;
-                        const auto id = c.d.ids[static_cast<std::size_t>(r)];
+                        const auto id = c.model.ids[static_cast<std::size_t>(r)];
                         command::push_effect(o.effects, SetCell{id, cc, {}});
                         batch.push_back({id, cc, std::string(old), {}});
                     }
@@ -578,7 +578,7 @@ namespace table::detail
             Outcome copy(Context &c, bool cut)
             {
         Outcome o;
-                auto &v = c.v;
+                auto &v = c.state;
                 if (v.sel.r0 < 0)
                 {
                 o.handled = true;
@@ -593,7 +593,7 @@ namespace table::detail
                     {
                         if (cc > std::min(v.sel.c0, v.sel.c1))
                             tsv += '\t';
-                        tsv += c.d.text(r, cc);
+                        tsv += c.model.text(r, cc);
                     }
                     tsv += '\n';
                 }
@@ -627,7 +627,7 @@ namespace table::detail
             Outcome run(Context &c, bool redo)
             {
         Outcome o;
-                auto &v = c.v;
+                auto &v = c.state;
                 if (false)
                 {
                 o.handled = true;
