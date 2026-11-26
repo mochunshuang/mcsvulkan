@@ -341,6 +341,33 @@ Select-String test_ui_ability12_table.cpp -Pattern 'struct Binding|struct Host|n
 Select-String test_ui_ability12_table.cpp -Pattern 'table12_app/(host|window_draw|window_input|glue|encode|platform)'
 ```
 
+#### G2b-2b 待办（下一轮直接执行）
+
+**已被 `using namespace table_ui` 掩盖、必须一起搬的三处**（bridge 一删就现形）：
+
+| 项 | 位置 | 去向 |
+|---|---|---|
+| `trace(fmt, ...)` | cpp:10824（`on_hover` 里两处 `table_ui::trace`） | `window_input.hpp`（或 glue.hpp），成为 `table::window::trace` |
+| `on_hover(picking_result, bool, InputCtx&, ScreenWidget*)` | cpp:11536（GPU hover 回调，`hoverPool().bind(&on_hover)` + 测试直调） | `window_input.hpp` 末尾 |
+| 测试里的 `table_ui::insert_row / table_ui::on_hover` | cpp:11988/12000 等 | 搬完后改成 `table::window::*` 或在 table_ui 里加 using |
+
+**搬移顺序**（依赖决定）：
+```text
+trace → ui_signature/signature_of → notify_change/notify_model → apply_effects
+→ click_dispatch/set_pointer/map_key/input_dispatch
+→ Binding::on_* / handle_key_event / handle_event / advance
+→ insert_row/remove_row/insert_column/remove_column/set_cell
+→ cancel_modal → on_hover（最后，依赖最少）
+```
+
+**C1 行数风险的既定处置**：搬完若 demo cpp 的 ability12-owned 段 ≥ 400 行，
+**不改验收口径**，直接把 `make_table`/`make_table_screen` 再拆到 `table12_app/scene.hpp`，cpp 只留 main 接线。
+
+**C1 追加审计**：`using namespace table_ui`（cpp）= 0；`table_ui::on_hover / trace / insert_row` = 0；
+`window_input.hpp` 只 include `host.hpp`（ui_dao/InputCtx/hoverPool 由 DAG 提供）；
+`window_draw.hpp` 头注释补全它实际依赖的 ui_dao/`::command::record_builder`。
+
+
 
 ### G3：核心文件切分（P2，纯移动）
 
