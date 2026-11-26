@@ -167,21 +167,34 @@ void on_pick(Binding &binding, const table::platform::PickingResult &r);
         float vw{1}, vh{1};
     };
 
+    // ---- 表：Session + 指针/回读（窗口层的“这张表”）
+    struct TableBinding
+    {
+        table::session::Session session;
+        table::Target pointer{};   // current pointer target (from session::hit)
+        picking_result pick{};     // GPU readback (verification only)
+        std::uint32_t pick_version{0};
+    };
+
+    // ---- 输入：arbiter + 本帧事件上下文 + 时间/取消
+    struct InputState
+    {
+        arena_input::table_arbiter arbiter{};
+        input_frame::event_context frame{}; // 原 input_state（避免 input.input_state）
+        ::intent::time_point now{};
+        bool esc_cancelled{false};
+    };
+
+
     struct Binding
     {
-        // ---- 核心：真值/意图/派生缓存都在 Session（组合，不是继承）
-        table::session::Session session;
+        // ---- 表 / 窗口 / 输入：子结构（不再有散字段）
+        TableBinding table_binding{};
+        WindowSlot window_slot{};
+        InputState input{};
 
-        // ---- input/draw merge point (window side)
-        table::Target pointer{}; // current pointer target (from session::hit)
-        picking_result pick{};   // GPU readback (verification only)
-        std::uint32_t pick_version{0};
 
-        // ---- input arena：input_frame -> arbiter -> gesture -> on_*
-        arena_input::table_arbiter arbiter{};
-        input_frame::event_context input_state{};
-        ::intent::time_point now{};
-        bool esc_cancelled{false}; // on_key 成功取消了 modal，主循环据此吞掉关窗
+
 
         // ---- 宿主回调（模型/选择/勾选变化）
         struct callbacks
@@ -220,7 +233,6 @@ void on_pick(Binding &binding, const table::platform::PickingResult &r);
         void handle_key_event(const ev::keyboard_event &e);
 
         // ---- window slot（窗口侧字段集中在这里）
-        WindowSlot window_slot{};
 
         // ---- window host wiring (host lives as long as the window; a table
         // may be destroyed before the window)
@@ -286,12 +298,12 @@ void on_pick(Binding &binding, const table::platform::PickingResult &r);
         // Construction-time attach: id must be 1..31 (target_key holds 5 bits)
         void attach(Binding &a)
         {
-            if (a.session.id.value == 0 || a.session.id.value > 31)
+            if (a.table_binding.session.id.value == 0 || a.table_binding.session.id.value > 31)
                 throw std::runtime_error(std::format(
-                    "Host::attach: table_id {} out of range 1..31", a.session.id.value));
-            if (find(a.session.id) != nullptr)
+                    "Host::attach: table_id {} out of range 1..31", a.table_binding.session.id.value));
+            if (find(a.table_binding.session.id) != nullptr)
                 throw std::runtime_error(
-                    std::format("Host::attach: duplicate table_id {}", a.session.id.value));
+                    std::format("Host::attach: duplicate table_id {}", a.table_binding.session.id.value));
             a.host = this;
             tables.push_back(&a);
             if (!input_attached)
@@ -336,7 +348,7 @@ void on_pick(Binding &binding, const table::platform::PickingResult &r);
         Binding *find(table::TableId id) const noexcept
         {
             for (auto *a : tables)
-                if (a != nullptr && a->session.id == id)
+                if (a != nullptr && a->table_binding.session.id == id)
                     return a;
             return nullptr;
         }
@@ -353,7 +365,7 @@ void on_pick(Binding &binding, const table::platform::PickingResult &r);
                     continue;
                 const float lx = static_cast<float>(wx) * a->window_slot.sx;
                 const float ly = static_cast<float>(wy) * a->window_slot.sy;
-                const auto &b = a->session.layout.box;
+                const auto &b = a->table_binding.session.layout.box;
                 if (b.w > 0.0F && b.h > 0.0F && lx >= b.x && lx < b.x1() && ly >= b.y &&
                     ly < b.y1())
                     return a;
@@ -413,7 +425,7 @@ void on_pick(Binding &binding, const table::platform::PickingResult &r);
         {
             pointer_inside = false;
             if (hovered != nullptr)
-                table::session::update_hover(hovered->session, {});
+                table::session::update_hover(hovered->table_binding.session, {});
             hovered = nullptr;
         }
 
@@ -424,7 +436,7 @@ void on_pick(Binding &binding, const table::platform::PickingResult &r);
                 return;
             if (hovered != nullptr)
                 table_glue::apply_cursor(
-                    win, table::cursor_for(hovered->session.interaction.hover.to_zone()));
+                    win, table::cursor_for(hovered->table_binding.session.interaction.hover.to_zone()));
             else
                 table_glue::apply_cursor(win, table::Cursor::arrow);
         }

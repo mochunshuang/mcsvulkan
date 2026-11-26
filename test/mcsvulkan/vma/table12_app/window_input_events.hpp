@@ -51,7 +51,7 @@ inline void on_hover(picking_result r, bool enter, InputCtx &,
     template <class Cmd>
     inline void input_dispatch(Binding &s, const Cmd &cmd)
     {
-        const auto out = table::session::dispatch(s.session, table::command::Command{cmd});
+        const auto out = table::session::dispatch(s.table_binding.session, table::command::Command{cmd});
         apply_effects(s, out);
         notify_change(s);
         ++s.inputs;
@@ -59,7 +59,7 @@ inline void on_hover(picking_result r, bool enter, InputCtx &,
 
     inline void click_dispatch(Binding &s, double x, double y)
     {
-        if (!s.input_state.pointer_position_valid && s.window_slot.win != nullptr)
+        if (!s.input.frame.pointer_position_valid && s.window_slot.win != nullptr)
         {
             double cx = 0, cy = 0;
             glfwGetCursorPos(s.window_slot.win, &cx, &cy);
@@ -71,11 +71,11 @@ inline void on_hover(picking_result r, bool enter, InputCtx &,
         if (std::getenv("TABLE_INPUTLOG") != nullptr)
             std::println("[click] at=({:.1f},{:.1f}) kind={} row={} col={}", s.window_slot.mx, s.window_slot.my,
                          table::part_name(tgt.kind), tgt.row_index, tgt.col_index);
-        const bool shift = s.input_state.modifier.shift();
-        const bool ctrl = s.input_state.modifier.control();
+        const bool shift = s.input.frame.modifier.shift();
+        const bool ctrl = s.input.frame.modifier.control();
         input_dispatch(
             s, table::command::Press{s.window_slot.mx, s.window_slot.my, tgt.to_zone(), false, shift, ctrl, tgt});
-        input_dispatch(s, table::command::Release{s.window_slot.mx, s.window_slot.my, s.session.interaction.drag_target});
+        input_dispatch(s, table::command::Release{s.window_slot.mx, s.window_slot.my, s.table_binding.session.interaction.drag_target});
     }
 
 
@@ -88,7 +88,7 @@ inline void Binding::on_right_click(const arena_input::click_payload &e)
     {
         set_pointer(*this, e.x, e.y);
         const auto tgt = pointer_target(*this, window_slot.mx, window_slot.my);
-        table::session::open_menu(session, tgt.to_zone().col, window_slot.mx, window_slot.my);
+        table::session::open_menu(table_binding.session, tgt.to_zone().col, window_slot.mx, window_slot.my);
     }
 
 inline void Binding::on_drag(const arena_input::drag_payload &e)
@@ -98,44 +98,44 @@ inline void Binding::on_drag(const arena_input::drag_payload &e)
         case gesture::drag_phase::begin: {
             // 按下点 = 当前点 - 总位移：先补一发 press，再发 drag
             set_pointer(*this, e.x - e.total_dx, e.y - e.total_dy);
-            session.interaction.last_click_t = -1.0e9; // 拖拽的 press 不参与双击判定
+            table_binding.session.interaction.last_click_t = -1.0e9; // 拖拽的 press 不参与双击判定
             const auto tgt = pointer_target(*this, window_slot.mx, window_slot.my);
             input_dispatch(*this, table::command::Press{window_slot.mx, window_slot.my, tgt.to_zone(), false,
                                                       e.modifier.shift(),
                                                       e.modifier.control(), tgt});
             set_pointer(*this, e.x, e.y);
-            input_dispatch(*this, table::command::Drag{window_slot.mx, window_slot.my, session.interaction.drag_target});
+            input_dispatch(*this, table::command::Drag{window_slot.mx, window_slot.my, table_binding.session.interaction.drag_target});
             break;
         }
         case gesture::drag_phase::move:
             set_pointer(*this, e.x, e.y);
-            input_dispatch(*this, table::command::Drag{window_slot.mx, window_slot.my, session.interaction.drag_target});
+            input_dispatch(*this, table::command::Drag{window_slot.mx, window_slot.my, table_binding.session.interaction.drag_target});
             break;
         case gesture::drag_phase::end:
             set_pointer(*this, e.x, e.y);
-            input_dispatch(*this, table::command::Release{window_slot.mx, window_slot.my, session.interaction.drag_target});
+            input_dispatch(*this, table::command::Release{window_slot.mx, window_slot.my, table_binding.session.interaction.drag_target});
             break;
         }
     }
 
 inline void Binding::on_wheel(const arena_input::wheel_payload &e)
     {
-        if (!input_state.pointer_position_valid && window_slot.win != nullptr)
+        if (!input.frame.pointer_position_valid && window_slot.win != nullptr)
         {
             double cx = 0, cy = 0;
             glfwGetCursorPos(window_slot.win, &cx, &cy);
             set_pointer(*this, cx, cy);
         }
         else
-            set_pointer(*this, input_state.pointer_x, input_state.pointer_y);
+            set_pointer(*this, input.frame.pointer_x, input.frame.pointer_y);
         if (std::getenv("TABLE_INPUTLOG") != nullptr)
             std::println("[wheel] delta={} at=({:.1f},{:.1f})", e.delta, window_slot.mx, window_slot.my);
         // 只滚指针下面的表；Shift 或悬停横向条 = 横向滚动
-        if (window_slot.mx < session.layout.box.x || window_slot.mx >= session.layout.box.x1() || window_slot.my < session.layout.box.y ||
-            window_slot.my >= session.layout.box.y1())
+        if (window_slot.mx < table_binding.session.layout.box.x || window_slot.mx >= table_binding.session.layout.box.x1() || window_slot.my < table_binding.session.layout.box.y ||
+            window_slot.my >= table_binding.session.layout.box.y1())
             return;
-        table::session::wheel(session, 0.0F, static_cast<float>(e.delta),
-                              input_state.modifier.shift());
+        table::session::wheel(table_binding.session, 0.0F, static_cast<float>(e.delta),
+                              input.frame.modifier.shift());
         ++inputs;
     }
 
@@ -153,21 +153,21 @@ inline void Binding::on_key(const arena_input::key_payload &e)
         if (!keyboard_focus)
             return;
         const auto key_down = [&](ev::Key k) {
-            return input_state.get_keyboard_event(k) == input_frame::HeldState::Down;
+            return input.frame.get_keyboard_event(k) == input_frame::HeldState::Down;
         };
-        const bool ctrl = input_state.modifier.control() ||
+        const bool ctrl = input.frame.modifier.control() ||
                           key_down(ev::Key::eLEFT_CONTROL) ||
                           key_down(ev::Key::eRIGHT_CONTROL);
-        const bool shift = input_state.modifier.shift() ||
+        const bool shift = input.frame.modifier.shift() ||
                            key_down(ev::Key::eLEFT_SHIFT) ||
                            key_down(ev::Key::eRIGHT_SHIFT);
         if (std::getenv("TABLE_INPUTLOG") != nullptr)
             std::println("[in] key={} repeat={} sel=({},{})", e.key, e.repeat,
-                         session.state.sel.cur_r, session.state.sel.cur_c);
+                         table_binding.session.state.sel.cur_r, table_binding.session.state.sel.cur_c);
         if (e.key == ev::Key::eV && ctrl)
         {
             const auto out =
-                table::session::paste_text(session, table_glue::read_clipboard(window_slot.win));
+                table::session::paste_text(table_binding.session, table_glue::read_clipboard(window_slot.win));
             apply_effects(*this, out);
             ++inputs;
             return;
@@ -175,7 +175,7 @@ inline void Binding::on_key(const arena_input::key_payload &e)
         if (e.key == ev::Key::eESCAPE)
         {
             if (cancel_modal(*this))
-                esc_cancelled = true;
+                input.esc_cancelled = true;
             return;
         }
         if (const auto k = map_key(e.key))
@@ -183,9 +183,9 @@ inline void Binding::on_key(const arena_input::key_payload &e)
                 *this,
                 table::command::KeyPress{*k, shift, ctrl,
                                   table::model::target_of(
-                                      session.model, session.id,
-                                      table::Zone{table::Part::cell, session.state.sel.cur_r,
-                                                     session.state.sel.cur_c, session.id})});
+                                      table_binding.session.model, table_binding.session.id,
+                                      table::Zone{table::Part::cell, table_binding.session.state.sel.cur_r,
+                                                     table_binding.session.state.sel.cur_c, table_binding.session.id})});
     }
 
 inline void Binding::on_char(const arena_input::char_payload &e)
@@ -194,18 +194,18 @@ inline void Binding::on_char(const arena_input::char_payload &e)
         encode_utf8(e.codepoint, text);
         if (std::getenv("TABLE_INPUTLOG") != nullptr)
             std::println("[char] cp={:#x} filter={} find={} edit={}", e.codepoint,
-                         session.state.filter.edit, session.state.find.mode, session.state.edit.active());
-        const auto out = table::session::feed_text(session, text);
+                         table_binding.session.state.filter.edit, table_binding.session.state.find.mode, table_binding.session.state.edit.active());
+        const auto out = table::session::feed_text(table_binding.session, text);
         apply_effects(*this, out);
     }
 
 inline void Binding::handle_key_event(const ev::keyboard_event &e)
     {
-        now = mcs::app::now_ms();
-        session.interaction.now = static_cast<double>(now.count()) / 1000.0;
-        auto f = input_frame::build_change(input_state, e);
-        arbiter.feed(*this, f, now);
-        input_frame::apply_change(input_state, f);
+        input.now = mcs::app::now_ms();
+        table_binding.session.interaction.now = static_cast<double>(input.now.count()) / 1000.0;
+        auto f = input_frame::build_change(input.frame, e);
+        input.arbiter.feed(*this, f, input.now);
+        input_frame::apply_change(input.frame, f);
     }
 
 template <class E>
@@ -215,21 +215,21 @@ template <class E>
         {
             if (!e.focused)
             {
-                session.interaction.left = false;
-                session.interaction.drag = table::intent::DragMode::none;
-                session.state.menu.open = false;
-                session.state.touch();
+                table_binding.session.interaction.left = false;
+                table_binding.session.interaction.drag = table::intent::DragMode::none;
+                table_binding.session.state.menu.open = false;
+                table_binding.session.state.touch();
             }
             return;
         }
         else
         {
-            now = mcs::app::now_ms();
-            session.interaction.now = static_cast<double>(now.count()) / 1000.0;
+            input.now = mcs::app::now_ms();
+            table_binding.session.interaction.now = static_cast<double>(input.now.count()) / 1000.0;
             if constexpr (std::same_as<E, ev::char_event>)
             {
                 // 文本不是手势：直接进 on_char（不经过 arbiter）
-                on_char(arena_input::char_payload{e.codepoint, now});
+                on_char(arena_input::char_payload{e.codepoint, input.now});
                 return;
             }
             if constexpr (std::same_as<E, ev::keyboard_event>)
@@ -237,12 +237,12 @@ template <class E>
                 handle_key_event(e);
                 return;
             }
-            using frame_t = decltype(input_frame::build_change(input_state, e));
+            using frame_t = decltype(input_frame::build_change(input.frame, e));
             if constexpr (!std::is_void_v<frame_t>)
             {
-                auto f = input_frame::build_change(input_state, e);
-                arbiter.feed(*this, f, now);
-                input_frame::apply_change(input_state, f);
+                auto f = input_frame::build_change(input.frame, e);
+                input.arbiter.feed(*this, f, input.now);
+                input_frame::apply_change(input.frame, f);
             }
         }
     }
@@ -250,13 +250,13 @@ template <class E>
 inline void Binding::advance(double /*seconds*/)
     {
         // 表的输入/悬停/双击全部用同一个时钟（now_ms），不混 GLFW elapsed
-        now = mcs::app::now_ms();
-        session.interaction.now = static_cast<double>(now.count()) / 1000.0;
-        if (!session.interaction.left)
+        input.now = mcs::app::now_ms();
+        table_binding.session.interaction.now = static_cast<double>(input.now.count()) / 1000.0;
+        if (!table_binding.session.interaction.left)
         {
             // Pointer coordinates stay current for every table (picking
             // diagnostics need them); only hover writes are gated below.
-            set_pointer(*this, input_state.pointer_x, input_state.pointer_y);
+            set_pointer(*this, input.frame.pointer_x, input.frame.pointer_y);
             // hover 是帧派生态（pointer + geometry），不是手写输入分支
             if (host != nullptr)
             {
@@ -265,22 +265,22 @@ inline void Binding::advance(double /*seconds*/)
                 // resolved by the topmost entry of draw_order.
                 if (host->hovered == this)
                 {
-                    session.interaction.pointer = {window_slot.mx, window_slot.my};
-                    table::session::update_hover(session, pointer_target(*this, window_slot.mx, window_slot.my));
+                    table_binding.session.interaction.pointer = {window_slot.mx, window_slot.my};
+                    table::session::update_hover(table_binding.session, pointer_target(*this, window_slot.mx, window_slot.my));
                 }
                 else
                 {
-                    table::session::update_hover(session, {}); // clear old hover/tooltip
+                    table::session::update_hover(table_binding.session, {}); // clear old hover/tooltip
                 }
             }
             else
             {
                 // headless single table: keep pointer -> hit -> hover
-                session.interaction.pointer = {window_slot.mx, window_slot.my};
-                table::session::update_hover(session, pointer_target(*this, window_slot.mx, window_slot.my));
+                table_binding.session.interaction.pointer = {window_slot.mx, window_slot.my};
+                table::session::update_hover(table_binding.session, pointer_target(*this, window_slot.mx, window_slot.my));
             }
         }
-        arbiter.tick(*this, now);
+        input.arbiter.tick(*this, input.now);
         notify_change(*this);
     }
 

@@ -23,18 +23,18 @@ namespace table::window
         s.window_slot.vw = vp.w;
         s.window_slot.vh = vp.h;
         // 门：compose = layout passes + paint passes（唯一派生入口）
-        table::session::compose(s.session, vp);
+        table::session::compose(s.table_binding.session, vp);
         if (std::getenv("TABLE_GEOMLOG") != nullptr)
         {
             static std::uint32_t last_ver = ~0U;
             static float last_w = -1, last_h = -1;
-            if (last_ver != s.session.layout.version || last_w != s.session.layout.box.w ||
-                last_h != s.session.layout.box.h)
+            if (last_ver != s.table_binding.session.layout.version || last_w != s.table_binding.session.layout.box.w ||
+                last_h != s.table_binding.session.layout.box.h)
             {
-                last_ver = s.session.layout.version;
-                last_w = s.session.layout.box.w;
-                last_h = s.session.layout.box.h;
-                const auto &g = s.session.layout;
+                last_ver = s.table_binding.session.layout.version;
+                last_w = s.table_binding.session.layout.box.w;
+                last_h = s.table_binding.session.layout.box.h;
+                const auto &g = s.table_binding.session.layout;
                 std::print("[geom] box=({:.1f},{:.1f},{:.1f},{:.1f}) header_y={:.1f} "
                            "body=({:.1f},{:.1f},{:.1f},{:.1f}) scroll=({:.1f},{:.1f}) "
                            "cols=",
@@ -51,14 +51,14 @@ namespace table::window
 
     inline void draw_build(Binding &s)
     {
-        // compose 已经产出 DrawList（s.session.draw 是 Session 的派生缓存）
-        s.session.draw.table = s.session.id;
+        // compose 已经产出 DrawList（s.table_binding.session.draw 是 Session 的派生缓存）
+        s.table_binding.session.draw.table = s.table_binding.session.id;
     }
 
     template <class Sink>
 inline void draw_encode(const Binding &s, const ui_dao::view &view, Sink &&sink)
     {
-        table::platform::encode(s.session.draw, s.session.font, view, std::forward<Sink>(sink),
+        table::platform::encode(s.table_binding.session.draw, s.table_binding.session.font, view, std::forward<Sink>(sink),
                             s.host != nullptr ? s.host->hover_fn : ~0U);
     }
 
@@ -71,12 +71,12 @@ inline void draw_encode(const Binding &s, const ui_dao::view &view, Sink &&sink)
 
         auto &info = s.info;
         info = {};
-        info.version = s.session.state.revision;
-        for (const auto &ops : s.session.draw.draw.shapes)
+        info.version = s.table_binding.session.state.revision;
+        for (const auto &ops : s.table_binding.session.draw.draw.shapes)
             info.shapes += static_cast<std::uint32_t>(ops.size());
-        for (const auto &ops : s.session.draw.draw.texts)
+        for (const auto &ops : s.table_binding.session.draw.draw.texts)
             info.texts += static_cast<std::uint32_t>(ops.size());
-        for (const auto &ops : s.session.draw.draw.shapes)
+        for (const auto &ops : s.table_binding.session.draw.draw.shapes)
             for (const auto &o : ops)
                 info.zoned += o.key != 0 ? 1U : 0U;
 
@@ -89,18 +89,18 @@ inline void draw_encode(const Binding &s, const ui_dao::view &view, Sink &&sink)
 
     inline table::Target pointer_target(Binding &s, float x, float y)
     {
-        s.pointer = table::session::hit(s.session, x, y);
-        return s.pointer;
+        s.table_binding.pointer = table::session::hit(s.table_binding.session, x, y);
+        return s.table_binding.pointer;
     }
 
     inline void on_pick(Binding &s, const picking_result &r)
     {
-        s.pick = r;
-        s.pick_version = s.session.state.revision;
+        s.table_binding.pick = r;
+        s.table_binding.pick_version = s.table_binding.session.state.revision;
         if (std::getenv("TABLE_PICKCHECK") == nullptr || r.key.object_type == 0xFFFFFFFF)
             return;
-        const auto from_gpu = table::platform::resolve(s.session.model, r);
-        const auto from_hit = table::session::hit(s.session, s.window_slot.mx, s.window_slot.my);
+        const auto from_gpu = table::platform::resolve(s.table_binding.session.model, r);
+        const auto from_hit = table::session::hit(s.table_binding.session, s.window_slot.mx, s.window_slot.my);
         if (from_gpu.to_zone() != from_hit.to_zone())
             std::println("[pick] MISMATCH gpu=({}, {}, {}) hit=({}, {}, {})",
                          table::part_name(from_gpu.kind), from_gpu.row_index,

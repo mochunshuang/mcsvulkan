@@ -12440,8 +12440,8 @@ try
             auto &tableHost = table_ui::window_tables();
             if (auto *arena = tableHost.focused)
             {
-                esc = arena->esc_cancelled;
-                arena->esc_cancelled = false;
+                esc = arena->input.esc_cancelled;
+                arena->input.esc_cancelled = false;
             }
             if (esc)
                 glfwSetWindowShouldClose(win, GLFW_FALSE);

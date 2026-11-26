@@ -18,15 +18,15 @@ namespace table::window
 
     inline ui_signature signature_of(const Binding &s) noexcept
     {
-        ui_signature g{s.session.state.sel.r0,
-                       s.session.state.sel.c0,
-                       s.session.state.sel.r1,
-                       s.session.state.sel.c1,
-                       s.session.state.sel.cur_r,
-                       s.session.state.sel.cur_c,
+        ui_signature g{s.table_binding.session.state.sel.r0,
+                       s.table_binding.session.state.sel.c0,
+                       s.table_binding.session.state.sel.r1,
+                       s.table_binding.session.state.sel.c1,
+                       s.table_binding.session.state.sel.cur_r,
+                       s.table_binding.session.state.sel.cur_c,
                        0};
         std::uint64_t h = 1469598103934665603ULL;
-        for (const auto v : s.session.state.checks.on)
+        for (const auto v : s.table_binding.session.state.checks.on)
             h = (h ^ v) * 1099511628211ULL;
         g.checks = h;
         return g;
@@ -66,7 +66,7 @@ namespace table::window
     inline void apply_effects(Binding &s, const table::command::Outcome &out)
     {
         // G2a 起 Binding 组合 Session：传 session 成员（不再有基类继承）
-        const bool model_changed = table::session::apply_effects(s.session, out);
+        const bool model_changed = table::session::apply_effects(s.table_binding.session, out);
         for (const auto &e : out.effects)
             if (const auto *p = std::get_if<table::command::WriteClipboard>(&e))
                 table_glue::write_clipboard(s.window_slot.win, p->text);
@@ -82,7 +82,7 @@ namespace table::window
     inline void notify_model(Binding &s)
     {
         s.changes.model = true;
-        s.session.state.touch();
+        s.table_binding.session.state.touch();
         if (s.cb.on_model_changed)
             s.cb.on_model_changed();
     }
@@ -90,48 +90,48 @@ namespace table::window
 
     inline table::RowId insert_row(Binding &s, int at = -1)
     {
-        const auto id = s.session.model.insert_row(at);
-        s.session.state.reconcile(s.session.model);
+        const auto id = s.table_binding.session.model.insert_row(at);
+        s.table_binding.session.state.reconcile(s.table_binding.session.model);
         notify_model(s);
         return id;
     }
 
     inline bool remove_row(Binding &s, int at)
     {
-        if (!s.session.model.remove_row(at))
+        if (!s.table_binding.session.model.remove_row(at))
             return false;
-        s.session.state.reconcile(s.session.model);
+        s.table_binding.session.state.reconcile(s.table_binding.session.model);
         notify_model(s);
         return true;
     }
 
     inline table::ColumnId insert_column(Binding &s, int at, table::model::Column c)
     {
-        const auto id = s.session.model.insert_column(at, std::move(c));
-        s.session.state.reconcile(s.session.model);
+        const auto id = s.table_binding.session.model.insert_column(at, std::move(c));
+        s.table_binding.session.state.reconcile(s.table_binding.session.model);
         notify_model(s);
         return id;
     }
 
     inline bool remove_column(Binding &s, int at)
     {
-        if (!s.session.model.remove_column(at))
+        if (!s.table_binding.session.model.remove_column(at))
             return false;
-        s.session.state.reconcile(s.session.model);
+        s.table_binding.session.state.reconcile(s.table_binding.session.model);
         notify_model(s);
         return true;
     }
 
     inline void set_cell(Binding &s, int row, int col, std::string text)
     {
-        s.session.model.set_cell(row, col, std::move(text));
+        s.table_binding.session.model.set_cell(row, col, std::move(text));
         notify_model(s);
     }
 
 
     inline bool cancel_modal(Binding &st) noexcept
     {
-        auto &v = st.session.state;
+        auto &v = st.table_binding.session.state;
         if (v.filter.edit >= 0)
         {
             const auto col = static_cast<std::size_t>(v.filter.edit);

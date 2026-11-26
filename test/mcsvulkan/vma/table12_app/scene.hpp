@@ -70,11 +70,11 @@ inline auto make_table(table::model::Table data, table::intent::Theme p, table::
     {
         data.finalize();
         Binding st;
-        st.session.model = std::move(data);
-        st.session.theme = p;
-        st.session.font = std::move(f);
-        st.session.id = table::TableId{window_tables().allocate_table_id()};
-        st.session.state.reset(st.session.model);
+        st.table_binding.session.model = std::move(data);
+        st.table_binding.session.theme = p;
+        st.table_binding.session.font = std::move(f);
+        st.table_binding.session.id = table::TableId{window_tables().allocate_table_id()};
+        st.table_binding.session.state.reset(st.table_binding.session.model);
         return make_aggregate<"Table">(
             field<"arena">(std::move(st)),
 
@@ -217,40 +217,40 @@ inline auto make_table(table::model::Table data, table::intent::Theme p, table::
     {
         if (s.window_slot.win == nullptr)
             return;
-        const bool filter = s.session.state.filter.edit >= 0;
-        const bool find = s.session.state.find.mode;
-        const bool edit = s.session.state.edit.active();
+        const bool filter = s.table_binding.session.state.filter.edit >= 0;
+        const bool find = s.table_binding.session.state.find.mode;
+        const bool edit = s.table_binding.session.state.edit.active();
         if (!filter && !find && !edit)
             return;
         auto pre = table_glue::ime_preedit(s.window_slot.win);
         if (filter)
         {
-            if (pre != s.session.state.filter.compose)
+            if (pre != s.table_binding.session.state.filter.compose)
             {
-                s.session.state.filter.compose = std::move(pre);
-                s.session.state.touch();
+                s.table_binding.session.state.filter.compose = std::move(pre);
+                s.table_binding.session.state.touch();
             }
             return;
         }
         if (find)
         {
-            if (pre != s.session.state.find.compose)
+            if (pre != s.table_binding.session.state.find.compose)
             {
-                s.session.state.find.compose = std::move(pre);
-                s.session.state.touch();
+                s.table_binding.session.state.find.compose = std::move(pre);
+                s.table_binding.session.state.touch();
             }
             return;
         }
-        if (pre == s.session.state.edit.compose)
+        if (pre == s.table_binding.session.state.edit.compose)
             return;
-        table::session::ime_compose(s.session, std::move(pre));
+        table::session::ime_compose(s.table_binding.session, std::move(pre));
     }
 
     inline bool modal_open(const Host *h) noexcept
     {
         const Binding *s = (h != nullptr) ? h->focused : nullptr;
-        return s != nullptr && (s->session.state.filter.edit >= 0 || s->session.state.find.mode ||
-                                s->session.state.edit.active() || s->session.state.menu.open);
+        return s != nullptr && (s->table_binding.session.state.filter.edit >= 0 || s->table_binding.session.state.find.mode ||
+                                s->table_binding.session.state.edit.active() || s->table_binding.session.state.menu.open);
     }
 
     inline std::uint32_t hover_index()
