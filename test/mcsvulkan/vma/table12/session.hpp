@@ -7,6 +7,9 @@
 //     session::apply_effects   唯一 Model 写点（Host 在 dispatch 之后调用）
 //     session::compose         唯一派生入口（layout passes -> paint passes）
 //     session::hit             唯一命中入口（几何 + 语义覆盖，只读）
+//   指针窄门：observe_pointer / update_hover / clear_hover（只写 Interaction）。
+//   其余输入窄门（feed_text/paste_text/ime_compose/open_menu/cancel_modal/wheel/
+//   modal_open）在 table12/narrow.hpp（app 层用，不进核心公共面）。
 //
 //   实现细节（AppRouter / RowPipeline / passes / gestures）全部藏在
 //   Session::Impl（实现见 session.cpp；测试见 test/access.hpp）。
@@ -29,6 +32,11 @@
 namespace table::test
 {
 struct SessionAccess;
+}
+
+namespace table::session
+{
+struct Internals;
 }
 
 namespace table::session
@@ -73,23 +81,16 @@ struct Session
   private:
     struct Impl;
     std::unique_ptr<Impl> impl;
-    friend struct Internals;
+    friend struct Internals; // 门实现通道，定义在 session.cpp
     friend struct table::test::SessionAccess;
 };
 
 // ── 五门（定义在 session.cpp；本头只声明） ──────────────────────────────
 Outcome dispatch(Session &s, const command::Command &cmd);
 bool apply_effects(Session &s, const Outcome &out);
-Outcome feed_text(Session &s, std::string_view text);
-void ime_compose(Session &s, std::string text);
-void open_menu(Session &s, int col, float x, float y);
-Outcome paste_text(Session &s, std::string text);
-[[nodiscard]] bool modal_open(const Session &s) noexcept;
-bool cancel_modal(Session &s) noexcept;
 void observe_pointer(Session &s, Point p, double now) noexcept;
 void update_hover(Session &s, const Target &t);
 void clear_hover(Session &s);
-void wheel(Session &s, float dx, float dy, bool shift);
 Frame compose(Session &s, const Rect &viewport);
 [[nodiscard]] Target hit(const Session &s, float x, float y);
 } // namespace table::session

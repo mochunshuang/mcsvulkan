@@ -14,6 +14,7 @@
 
 #include "../session.hpp"
 #include "access.hpp"
+#include "../narrow.hpp"
 #include "../detail/gestures.hpp"
 #include "../detail/layout_passes.hpp"
 #include "../detail/paint_passes.hpp"

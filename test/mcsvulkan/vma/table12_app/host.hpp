@@ -11,6 +11,7 @@
 // ============================================================================
 
 #include "../table12/session.hpp"
+#include "../table12/narrow.hpp"
 #include "glue.hpp"
 #include "shader_abi.hpp"
 
