@@ -10822,6 +10822,21 @@ namespace table_ui
     using table::window::on_pick;
     using table::window::trace;
     using table::window::on_hover;
+    using table::window::notify_change;
+    using table::window::notify_model;
+    using table::window::apply_effects;
+    using table::window::click_dispatch;
+    using table::window::set_pointer;
+    using table::window::map_key;
+    using table::window::encode_utf8;
+    using table::window::input_dispatch;
+    using table::window::insert_row;
+    using table::window::remove_row;
+    using table::window::insert_column;
+    using table::window::remove_column;
+    using table::window::set_cell;
+    using table::window::cancel_modal;
+    using table::window::signature_of;
 
     namespace ev = mcs::vulkan::event;
 
@@ -10917,201 +10932,27 @@ namespace table_ui
     //   dispatch 只写 State/Interaction（末尾已做一次 blanket touch）
     //   session::apply_effects 只写 Model（Host 在这里调用）
     //   Host 只做平台 side：剪贴板 / 回调 / 重绘标记，不自己写 Session 数据
-    inline void apply_effects(Binding &s, const table::command::Outcome &out)
-    {
-        // G2a 起 Binding 组合 Session：传 session 成员（不再有基类继承）
-        const bool model_changed = table::session::apply_effects(s.session, out);
-        for (const auto &e : out.effects)
-            if (const auto *p = std::get_if<table::command::WriteClipboard>(&e))
-                table_glue::write_clipboard(s.win, p->text);
-        if (model_changed)
-        {
-            s.changes.model = true;
-            if (s.cb.on_model_changed)
-                s.cb.on_model_changed();
-        }
-    }
 
     // the only semantic dispatch: systems first, fallback visit_owner lives in core
-    struct ui_signature
-    {
-        int r0{}, c0{}, r1{}, c1{}, cur_r{}, cur_c{};
-        std::uint64_t checks{};
-        friend bool operator==(const ui_signature &, const ui_signature &) = default;
-    };
-    inline ui_signature signature_of(const Binding &s) noexcept
-    {
-        ui_signature g{s.session.state.sel.r0,
-                       s.session.state.sel.c0,
-                       s.session.state.sel.r1,
-                       s.session.state.sel.c1,
-                       s.session.state.sel.cur_r,
-                       s.session.state.sel.cur_c,
-                       0};
-        std::uint64_t h = 1469598103934665603ULL;
-        for (const auto v : s.session.state.checks.on)
-            h = (h ^ v) * 1099511628211ULL;
-        g.checks = h;
-        return g;
-    }
 
     // 选区/勾选变化的唯一通知点：输入、筛选、模型对齐都走这里（去重）
-    inline void notify_change(Binding &s)
-    {
-        const auto sig = signature_of(s);
-        const bool sel = !s.cb_valid || sig.r0 != s.cb_r0 || sig.c0 != s.cb_c0 ||
-                         sig.r1 != s.cb_r1 || sig.c1 != s.cb_c1 ||
-                         sig.cur_r != s.cb_cur_r || sig.cur_c != s.cb_cur_c;
-        const bool chk = !s.cb_valid || sig.checks != s.cb_checks;
-        if (sel)
-        {
-            s.changes.selection = true;
-            if (s.cb.on_selection_changed)
-                s.cb.on_selection_changed();
-        }
-        if (chk)
-        {
-            s.changes.checks = true;
-            if (s.cb.on_checks_changed)
-                s.cb.on_checks_changed();
-        }
-        s.cb_r0 = sig.r0;
-        s.cb_c0 = sig.c0;
-        s.cb_r1 = sig.r1;
-        s.cb_c1 = sig.c1;
-        s.cb_cur_r = sig.cur_r;
-        s.cb_cur_c = sig.cur_c;
-        s.cb_checks = sig.checks;
-        s.cb_valid = true;
-    }
 
-    template <class Cmd>
-    inline void input_dispatch(Binding &s, const Cmd &cmd)
-    {
-        const auto out = table::session::dispatch(s.session, table::command::Command{cmd});
-        apply_effects(s, out);
-        notify_change(s);
-        ++s.inputs;
-    }
 
     // Keyboard focus is synced by Host::set_focus into every table's
     // keyboard_focus flag; headless single table defaults to true.
 
-    inline std::optional<table::command::Key> map_key(ev::Key k) noexcept
-    {
-        switch (k)
-        {
-        case ev::Key::eUP:
-            return table::command::Key::up;
-        case ev::Key::eDOWN:
-            return table::command::Key::down;
-        case ev::Key::eLEFT:
-            return table::command::Key::left;
-        case ev::Key::eRIGHT:
-            return table::command::Key::right;
-        case ev::Key::eHOME:
-            return table::command::Key::home;
-        case ev::Key::eEND:
-            return table::command::Key::end;
-        case ev::Key::ePAGE_UP:
-            return table::command::Key::pgup;
-        case ev::Key::ePAGE_DOWN:
-            return table::command::Key::pgdn;
-        case ev::Key::eENTER:
-            return table::command::Key::enter;
-        case ev::Key::eESCAPE:
-            return table::command::Key::esc;
-        case ev::Key::eTAB:
-            return table::command::Key::tab;
-        case ev::Key::eBACKSPACE:
-            return table::command::Key::backspace;
-        case ev::Key::eDELETE:
-            return table::command::Key::del;
-        case ev::Key::eSPACE:
-            return table::command::Key::space;
-        case ev::Key::eF2:
-            return table::command::Key::f2;
-        case ev::Key::eA:
-            return table::command::Key::a;
-        case ev::Key::eC:
-            return table::command::Key::c;
-        case ev::Key::eV:
-            return table::command::Key::v;
-        case ev::Key::eX:
-            return table::command::Key::x;
-        case ev::Key::eZ:
-            return table::command::Key::z;
-        case ev::Key::eY:
-            return table::command::Key::y;
-        case ev::Key::eF:
-            return table::command::Key::f;
-        default:
-            return std::nullopt;
-        }
-    }
 
-    inline void encode_utf8(std::uint32_t cp, std::string &out)
-    {
-        if (cp < 0x80)
-            out += static_cast<char>(cp);
-        else if (cp < 0x800)
-        {
-            out += static_cast<char>(0xC0 | (cp >> 6));
-            out += static_cast<char>(0x80 | (cp & 0x3F));
-        }
-        else if (cp < 0x10000)
-        {
-            out += static_cast<char>(0xE0 | (cp >> 12));
-            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-            out += static_cast<char>(0x80 | (cp & 0x3F));
-        }
-        else
-        {
-            out += static_cast<char>(0xF0 | (cp >> 18));
-            out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
-            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-            out += static_cast<char>(0x80 | (cp & 0x3F));
-        }
-    }
 
     // window logical -> framebuffer pixels (DPI scale applied once). mx/my use
     // the same space as geom.box (layout already encodes the owner offset), so
     // multi-table sub-rects need no extra owner offset here.
-    inline void set_pointer(Binding &s, double wx, double wy) noexcept
-    {
-        s.wx = static_cast<float>(wx);
-        s.wy = static_cast<float>(wy);
-        s.mx = s.wx * s.sx;
-        s.my = s.wy * s.sy;
-    }
 
     // =====================================================================
     // arena 的 on_*：唯一副作用入口（识别器 win 通过反射调到这里）
     // =====================================================================
-    inline bool cancel_modal(Binding &s) noexcept; // 定义在 input 链末尾
 
     // 单击（含双击/三击的每一击）：press + release 一起发；
     // 双击/三击的判定由 core 的 note_click 按时间/位置完成。
-    inline void click_dispatch(Binding &s, double x, double y)
-    {
-        if (!s.input_state.pointer_position_valid && s.win != nullptr)
-        {
-            double cx = 0, cy = 0;
-            glfwGetCursorPos(s.win, &cx, &cy);
-            x = cx;
-            y = cy;
-        }
-        set_pointer(s, x, y);
-        const auto tgt = pointer_target(s, s.mx, s.my);
-        if (std::getenv("TABLE_INPUTLOG") != nullptr)
-            std::println("[click] at=({:.1f},{:.1f}) kind={} row={} col={}", s.mx, s.my,
-                         table::part_name(tgt.kind), tgt.row_index, tgt.col_index);
-        const bool shift = s.input_state.modifier.shift();
-        const bool ctrl = s.input_state.modifier.control();
-        input_dispatch(
-            s, table::command::Press{s.mx, s.my, tgt.to_zone(), false, shift, ctrl, tgt});
-        input_dispatch(s, table::command::Release{s.mx, s.my, s.session.interaction.drag_target});
-    }
 
     } // namespace table_ui
     namespace table::window
@@ -11426,94 +11267,12 @@ namespace table_ui
         return s != nullptr && (s->session.state.filter.edit >= 0 || s->session.state.find.mode ||
                                 s->session.state.edit.active() || s->session.state.menu.open);
     }
-    inline bool cancel_modal(Binding &st) noexcept
-    {
-        auto &v = st.session.state;
-        if (v.filter.edit >= 0)
-        {
-            const auto col = static_cast<std::size_t>(v.filter.edit);
-            if (col < v.filter.text.size())
-                v.filter.text[col] = v.filter.orig;
-            v.filter.input = v.filter.orig;
-            v.filter.orig.clear();
-            v.filter.compose.clear();
-            v.filter.edit = -1;
-            v.touch();
-            return true;
-        }
-        if (v.find.mode)
-        {
-            v.find.mode = false;
-            v.find.compose.clear();
-            v.touch();
-            return true;
-        }
-        if (v.edit.active())
-        {
-            v.edit = {};
-            v.touch();
-            return true;
-        }
-        if (v.menu.open)
-        {
-            v.menu.open = false;
-            v.touch();
-            return true;
-        }
-        return false;
-    }
 
-    inline bool cancel_modal(Host &h) noexcept
-    {
-        return h.focused != nullptr && cancel_modal(*h.focused);
-    }
 
     // =====================================================================
     // 模型 API：数据变更 + view 对齐 + 回调，一站式
     // =====================================================================
-    inline void notify_model(Binding &s)
-    {
-        s.changes.model = true;
-        s.session.state.touch();
-        if (s.cb.on_model_changed)
-            s.cb.on_model_changed();
-    }
 
-    inline table::RowId insert_row(Binding &s, int at = -1)
-    {
-        const auto id = s.session.model.insert_row(at);
-        s.session.state.reconcile(s.session.model);
-        notify_model(s);
-        return id;
-    }
-    inline bool remove_row(Binding &s, int at)
-    {
-        if (!s.session.model.remove_row(at))
-            return false;
-        s.session.state.reconcile(s.session.model);
-        notify_model(s);
-        return true;
-    }
-    inline table::ColumnId insert_column(Binding &s, int at, table::model::Column c)
-    {
-        const auto id = s.session.model.insert_column(at, std::move(c));
-        s.session.state.reconcile(s.session.model);
-        notify_model(s);
-        return id;
-    }
-    inline bool remove_column(Binding &s, int at)
-    {
-        if (!s.session.model.remove_column(at))
-            return false;
-        s.session.state.reconcile(s.session.model);
-        notify_model(s);
-        return true;
-    }
-    inline void set_cell(Binding &s, int row, int col, std::string text)
-    {
-        s.session.model.set_cell(row, col, std::move(text));
-        notify_model(s);
-    }
     } // namespace table_ui
     namespace table::window
     {
