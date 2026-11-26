@@ -244,7 +244,7 @@ namespace table::detail
             }
 
             template <class E>
-            bool handle(Context &c, const E &x)
+            Outcome handle(Context &c, const E &x)
             {
                 auto &v = c.v;
                 auto &ix = c.ix;
@@ -275,13 +275,13 @@ namespace table::detail
                         else
                             commit(c);
                     }
-                    return false; // 让 core 继续处理按下
+                    return {}; // 让 core 继续处理按下
                 }
 
                 else if constexpr (std::is_same_v<T, Drag>)
                 {
                     if (!v.edit.active())
-                        return false;
+                return {};
                     const Target tgt =
                         x.t.kind != Part::none ? x.t : target_of(c.d, {}, x.t.to_zone());
                     bool in_row = false;
@@ -301,14 +301,14 @@ namespace table::detail
                     {
                         v.edit.caret = caret_at(c, x.x);
                         v.touch();
-                        return true; // 编辑框内拖动 = 选文本，不是选单元格
+                        return Outcome::handled_now(); // 编辑框内拖动 = 选文本，不是选单元格
                     }
-                    return false;
+                return {};
                 }
                 else if constexpr (std::is_same_v<T, KeyPress>)
                 {
                     if (!v.edit.active())
-                        return false;
+                return {};
                     auto &e = v.edit;
                     switch (x.k)
                     {
@@ -463,9 +463,9 @@ namespace table::detail
                         break;
                     }
                     v.touch();
-                    return true;
+                return Outcome::handled_now();
                 }
-                return false;
+                return command::handled({});
             }
 
             void rows(Context &, std::vector<row_idx> &) {}
@@ -596,9 +596,9 @@ namespace table::detail
                 return true;
             }
             template <class E>
-            bool handle(Context &, const E &)
+            Outcome handle(Context &, const E &)
             {
-                return false;
+                return command::handled({});
             }
             void rows(Context &, std::vector<row_idx> &) {}
             void paint(const PaintContext &, DrawList &) const {}
@@ -626,9 +626,9 @@ namespace table::detail
                 return true;
             }
             template <class E>
-            bool handle(Context &, const E &)
+            Outcome handle(Context &, const E &)
             {
-                return false;
+                return command::handled({});
             }
             void rows(Context &, std::vector<row_idx> &) {}
             void paint(const PaintContext &, DrawList &) const {}

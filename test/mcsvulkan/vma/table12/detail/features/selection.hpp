@@ -218,9 +218,9 @@ namespace table::detail
             }
 
             template <class E>
-            bool handle(Context &, const E &)
+            Outcome handle(Context &, const E &)
             {
-                return false;
+                return command::handled({});
             }
             void rows(Context &, std::vector<row_idx> &) {}
 
@@ -386,9 +386,9 @@ namespace table::detail
                 return true;
             }
             template <class E>
-            bool handle(Context &, const E &)
+            Outcome handle(Context &, const E &)
             {
-                return false;
+                return command::handled({});
             }
             void rows(Context &, std::vector<row_idx> &) {}
             void paint(const PaintContext &c, DrawList &fr) const
@@ -479,9 +479,9 @@ namespace table::detail
                 return true;
             }
             template <class E>
-            bool handle(Context &, const E &)
+            Outcome handle(Context &, const E &)
             {
-                return false;
+                return command::handled({});
             }
             void rows(Context &, std::vector<row_idx> &) {}
             void paint(const PaintContext &c, DrawList &fr) const

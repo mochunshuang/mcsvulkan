@@ -19,9 +19,9 @@ namespace table::detail
                 return true;
             }
             template <class E>
-            bool handle(Context &, const E &)
+            Outcome handle(Context &, const E &)
             {
-                return false;
+                return command::handled({});
             }
             void rows(Context &c, std::vector<row_idx> &r)
             {
@@ -99,9 +99,9 @@ namespace table::detail
                 return true;
             }
             template <class E>
-            bool handle(Context &, const E &)
+            Outcome handle(Context &, const E &)
             {
-                return false;
+                return command::handled({});
             }
             void rows(Context &, std::vector<row_idx> &) {}
             void paint(const PaintContext &, DrawList &) const {}
@@ -156,9 +156,9 @@ namespace table::detail
                 return clicked;
             }
             template <class E>
-            bool handle(Context &, const E &)
+            Outcome handle(Context &, const E &)
             {
-                return false;
+                return command::handled({});
             }
             void rows(Context &, std::vector<row_idx> &) {}
 
@@ -211,9 +211,9 @@ namespace table::detail
                 return true;
             }
             template <class E>
-            bool handle(Context &, const E &)
+            Outcome handle(Context &, const E &)
             {
-                return false;
+                return command::handled({});
             }
             void rows(Context &, std::vector<row_idx> &) {}
             void paint(const PaintContext &, DrawList &) const {}
@@ -260,9 +260,9 @@ namespace table::detail
                 return true;
             }
             template <class E>
-            bool handle(Context &, const E &)
+            Outcome handle(Context &, const E &)
             {
-                return false;
+                return command::handled({});
             }
             void rows(Context &, std::vector<row_idx> &) {}
             void paint(const PaintContext &, DrawList &) const {}

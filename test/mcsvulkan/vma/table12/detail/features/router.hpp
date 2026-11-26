@@ -35,16 +35,20 @@ namespace table::detail
             }
             // 短路：第一个认领的 feature 生效
             template <class E>
-            bool handle(Context &c, const E &cmd)
+            Outcome handle(Context &c, const E &cmd)
             {
-                bool handled = false;
+                Outcome total;
                 std::apply(
                     [&](auto &...f) {
-                        std::initializer_list<int>{
-                            (handled ? 0 : (handled = f.handle(c, cmd), 0))...};
+                        auto run = [&](auto &feat) {
+                            if (total.handled)
+                                return;
+                            total.merge(feat.handle(c, cmd));
+                        };
+                        (run(f), ...);
                     },
                     features);
-                return handled;
+                return total;
             }
             void rows(Context &c, std::vector<row_idx> &r)
             {

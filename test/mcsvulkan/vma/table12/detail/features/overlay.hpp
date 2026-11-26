@@ -56,9 +56,9 @@ namespace table::detail
         struct TooltipFeature
         {
             template <class E>
-            bool handle(Context &c, const E &)
+            Outcome handle(Context &c, const E &)
             {
-                return false;
+                return command::handled({});
             }
             void rows(Context &, std::vector<row_idx> &) {}
             void paint(const PaintContext &c, DrawList &fr) const
@@ -168,32 +168,32 @@ namespace table::detail
             }
 
             template <class E>
-            bool handle(Context &c, const E &x)
+            Outcome handle(Context &c, const E &x)
             {
                 auto &v = c.v;
                 if constexpr (std::is_same_v<E, Press>)
                 {
                     if (!v.menu.open)
-                        return false;
+                return {};
                     if (x.z.kind != Part::menu_item)
                     {
                         v.menu.open = false;
                         v.touch();
                     }
-                    return false;
+                return {};
                 }
                 else if constexpr (std::is_same_v<E, KeyPress>)
                 {
                     if (!v.menu.open)
-                        return false;
+                return {};
                     if (x.k == Key::esc)
                     {
                         v.menu.open = false;
                         v.touch();
                     }
-                    return true;
+                return Outcome::handled_now();
                 }
-                return false;
+                return command::handled({});
             }
             void rows(Context &, std::vector<row_idx> &) {}
             void paint(const PaintContext &c, DrawList &fr) const

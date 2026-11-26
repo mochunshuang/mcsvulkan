@@ -104,9 +104,9 @@ inline Outcome dispatch(Session &s, const command::Command &cmd)
     command::Context ctx{s.model, s.state, s.interaction, s.theme, s.layout, s.font, &fx, s.trace,
                          s.id};
 
-    bool handled = false;
-    std::visit([&](const auto &one) { handled = s.router.handle(ctx, one); }, cmd);
-    if (!handled)
+    command::Outcome routed;
+    std::visit([&](const auto &one) { routed.merge(s.router.handle(ctx, one)); }, cmd);
+    if (!routed.handled)
     {
         // 没人认领 → gesture fallback（选择/拖拽/滚动）
         std::visit(
@@ -117,11 +117,12 @@ inline Outcome dispatch(Session &s, const command::Command &cmd)
             cmd);
     }
 
-    out.handled = handled || !fx.empty();
+    out.merge(routed);
+    out.handled = out.handled || !fx.empty();
     // Model 不在这里写：由 Host 调 apply_effects（Outcome.model_changed 恒 false）
     out.model_changed = false;
     for (auto &e : fx)
-        out.effects.push_back(std::move(e));
+        command::push_effect(out.effects, std::move(e));
 
     // blanket touch：等价 ability11 apply_effects 末尾那次 ui.touch()。
     // feature/gesture 自己的 65 处 touch 全部保留，这里只补一次。

@@ -131,11 +131,11 @@ using model::Table;
         // 和 host 完全相同的分发：命令 → dispatch（feature 短路链 → gesture）
         auto send = [&]<class E>(const E &c) {
             const auto out = session::dispatch(S, command::Command{c});
-            fx = out.effects;
+            fx.assign(out.effects.begin(), out.effects.end());
         };
         auto send_text = [&](std::string_view s) {
             const auto out = session::feed_text(S, s);
-            fx = out.effects;
+            fx.assign(out.effects.begin(), out.effects.end());
         };
         auto send_begin = [&](int r, int col) {
             command::Context tc{d, v, ix, p, g, ft, &fx, false, S.id};

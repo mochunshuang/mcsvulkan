@@ -73,13 +73,13 @@ namespace table::detail
             }
 
             template <class E>
-            bool handle(Context &c, const E &x)
+            Outcome handle(Context &c, const E &x)
             {
                 if constexpr (std::is_same_v<E, Press>)
-                    return press(c, x);
+                return command::handled(press(c, x));
                 else if constexpr (std::is_same_v<E, KeyPress>)
-                    return key(c, x);
-                return false;
+                return command::handled(key(c, x));
+                return command::handled({});
             }
             bool press(Context &c, const Press &pr)
             {
@@ -316,10 +316,10 @@ namespace table::detail
             }
 
             template <class E>
-            bool handle(Context &c, const E &x)
+            Outcome handle(Context &c, const E &x)
             {
                 if constexpr (std::is_same_v<E, KeyPress>)
-                    return key(c, x);
+                return command::handled(key(c, x));
                 else if constexpr (std::is_same_v<E, Press>)
                 {
                     // 点别处 = 退出查找（让这次点击继续走正常的表内分派）
@@ -329,7 +329,7 @@ namespace table::detail
                         c.v.touch();
                     }
                 }
-                return false;
+                return command::handled({});
             }
             bool key(Context &c, const KeyPress &k)
             {
