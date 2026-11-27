@@ -258,8 +258,17 @@ add_std_glsl_target(test_ui_ability10_table test_ui_ability7.vert test_ui_abilit
 ADD_MSDF_DEF(${TARGET_NAME})
 add_std_glsl_target(test_ui_ability11_table test_ui_ability7.vert test_ui_ability7.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
+#  struct ScreenWidget
+# {
+#     // Host of the window this screen lives in (bound by make_table_screen,
+#     // non-owning). ui_new does not own Host: frameState does.
+#     table::window::Host *table_host_ctx{};
+# NOTE: 就是个垃圾。 如何组织千万不要AI来操作。就是个J8；留着作为警告
 add_std_glsl_target(test_ui_ability12_table test_ui_ability7.vert test_ui_ability7.frag)
 target_sources(mcsvulkan-vma-test_ui_ability12_table PRIVATE ${CMAKE_CURRENT_LIST_DIR}/vma/table12/session.cpp)
+ADD_MSDF_DEF(${TARGET_NAME})
+
+add_std_glsl_target(test_ui_ability13_table test_ui_ability7.vert test_ui_ability7.frag)
 ADD_MSDF_DEF(${TARGET_NAME})
 
 # end
