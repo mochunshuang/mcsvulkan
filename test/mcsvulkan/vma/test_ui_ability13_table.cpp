@@ -11143,8 +11143,169 @@ try
 
             const ui_dao::view view{W, H};
 
+#if 0
             // 帧级：record_builder 代理一切；段由 begin/end 自动开闭。
             command::record_builder frame;
+            frame.resources = &r;
+            // UBO：当帧一份；UI 相机（槽 1）用单位矩阵
+            UniformBufferObject ubo{};
+            ubo.cameraInfo[0].view = glm::mat4(1.0F);
+            ubo.cameraInfo[0].proj = glm::mat4(1.0F);
+            ubo.cameraInfo[1].view = glm::mat4(1.0F);
+            ubo.cameraInfo[1].proj = glm::mat4(1.0F);
+            std::memcpy(uniformBuffers[currentFrame].mapPtr(), &ubo, sizeof(ubo));
+
+            // 1) 图像转换：交换链 / MSAA / 拾取 / resolve → COLOR，深度 → DEPTH
+            const bool hasStencil = depthResourcesBuild.hasStencilComponent();
+            const VkImageAspectFlags depthAspect =
+                hasStencil ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                           : VK_IMAGE_ASPECT_DEPTH_BIT;
+            const auto to_color = [](VkImage img) {
+                return my_render::image_info{
+                    .image = img,
+                    .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                    .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                            .access_mask = VK_ACCESS_2_NONE,
+                            .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                    .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            .stage_mask =
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}};
+            };
+            const my_render::image_info depth_transition{
+                .image = depthImage,
+                .aspect_mask = depthAspect,
+                .src = {.layout = VK_IMAGE_LAYOUT_UNDEFINED,
+                        .access_mask = VK_ACCESS_2_NONE,
+                        .stage_mask = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT},
+                .dst = {.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT}};
+            frame.add_transition(to_color(image), to_color(msaaImage),
+                                 to_color(pickingImage), to_color(resolveImage),
+                                 depth_transition);
+
+            // 2) 开始渲染：MSAA → swapchain resolve，拾取附件，深度附件
+            VkRenderingAttachmentInfo color0_clear{
+                .sType = sType<VkRenderingAttachmentInfo>(),
+                .imageView = msaaResource.imageView(),
+                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT,
+                .resolveImageView = swapchain.imageView(imageIndex),
+                .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = {.color = {.float32 = {0.0F, 0.0F, 0.0F, 1.0F}}}};
+            VkRenderingAttachmentInfo color1_clear{
+                .sType = sType<VkRenderingAttachmentInfo>(),
+                .imageView = pickResource.imageView(),
+                .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT,
+                .resolveImageView = resolveResource.imageView(),
+                .resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = {.color = {.uint32 = {0xFFFFFFFF, 0xFFFFFFFF, 0, 0}}}};
+            VkRenderingAttachmentInfo depth_clear{
+                .sType = sType<VkRenderingAttachmentInfo>(),
+                .imageView = depthResource.imageView(),
+                .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                .clearValue = {.depthStencil = {.depth = 1.0F}}};
+            if (hasStencil)
+                depth_clear.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+            const auto to_attach = [](const VkRenderingAttachmentInfo &a) {
+                command::rendering_info::rendering_attachment r;
+                r.imageView = a.imageView;
+                r.imageLayout = a.imageLayout;
+                r.resolveMode = a.resolveMode;
+                r.resolveImageView = a.resolveImageView;
+                r.resolveImageLayout = a.resolveImageLayout;
+                r.loadOp = a.loadOp;
+                r.storeOp = a.storeOp;
+                r.clearValue = a.clearValue;
+                return r;
+            };
+
+            command::rendering_info info;
+            info.renderArea = {.offset = {.x = 0, .y = 0}, .extent = extent};
+            info.layerCount = 1;
+            info.viewMask = 0;
+            info.colorAttachments.emplace_back(to_attach(color0_clear));
+            info.colorAttachments.emplace_back(to_attach(color1_clear));
+            info.depthAttachment = to_attach(depth_clear);
+            if (hasStencil)
+                info.stencilAttachment = to_attach(depth_clear);
+            frame.begin_rendering(std::move(info));
+
+            // 3) 固定状态：pipeline / layout / descriptor / 视口 / 剪裁
+            const VkViewport full_vp{0.0F, 0.0F, W, H, 0.0F, 1.0F};
+            const VkRect2D full_scissor{{0, 0}, extent};
+            frame.setPipeline(*pipelineTransparentUI);
+            frame.setPipelineLayout(*pipelineLayout);
+            frame.setDescriptorSet(descriptorSet);
+            frame.setViewport(full_vp);
+            frame.setScissor(full_scissor);
+            frame.setCameraIndex(1);
+            frame.setDynamicUI(true);
+            // recorder 的索引几何来自 meshMap["quad"]（全屏 6 个顶点）
+            frame.setMesh(world.globalCtx.meshMap["quad"]);
+
+            // 4) 画一个矩形（位置与尺寸都在 draw 里）
+            frame.addInsteance(ui_dao::sdf_shape({200.0F, 150.0F, 400.0F, 300.0F}, view,
+                                                 16.0F,
+                                                 glm::vec4(0.95F, 0.40F, 0.25F, 1.0F)));
+
+            // 5) 结束：resolve 回读 → 交换链交付
+            auto &pickMouse = *fs.pickMouse;
+            frame.add_transition(my_render::image_info{
+                .image = resolveImage,
+                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                .dst = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
+            const std::int32_t px = std::clamp(pickMouse.pos.x, 0,
+                                               static_cast<std::int32_t>(extent.width) - 1);
+            const std::int32_t py = std::clamp(pickMouse.pos.y, 0,
+                                               static_cast<std::int32_t>(extent.height) - 1);
+            const VkBufferImageCopy region{.bufferOffset = 0,
+                                           .bufferRowLength = 0,
+                                           .bufferImageHeight = 0,
+                                           .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                           .imageOffset = {px, py, 0},
+                                           .imageExtent = {1, 1, 1}};
+            frame.add_copy_image_to_buffer(resolveImage,
+                                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                           pickingFrames[currentFrame].buffer(),
+                                           std::span{&region, 1});
+            frame.add_transition(my_render::image_info{
+                .image = resolveImage,
+                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .src = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT},
+                .dst = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT}});
+            frame.add_transition(my_render::image_info{
+                .image = image,
+                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .src = {.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        .access_mask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                        .stage_mask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
+                .dst = {.layout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                        .access_mask = VK_ACCESS_2_NONE,
+                        .stage_mask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT}});
+
+            const std::uint32_t renderVersion = 0;
+            frame.replay(commandBuffer, currentFrame, renderVersion);
+#endif
         }),
         method<"endRendering">([](world_type &, input_type &, data_type &) {}));
 
