@@ -4179,12 +4179,17 @@ constexpr auto &hoverPool() noexcept
     static shader_data::hover_pool hoverPool{};
     return hoverPool;
 }
+static auto &cmdBuilder()
+{
+    static command::record_builder builder{}; // 表直接往 builder 里录 UI 实例
+    return builder;
+}
 struct render_context
 {
-    command::record_builder &builder; // 表直接往 builder 里录 UI 实例
-    glfw_input &input;
-    FrameClock &clock;
-    FontSelect &fontSelect;
+    command::record_builder *cmdBuilder;
+    glfw_input *input;
+    FrameClock *clock;
+    FontSelect *fontSelect;
     ui_dao::view view; // 绘制目标尺寸（像素坐标 → NDC）
 };
 
@@ -4418,7 +4423,8 @@ namespace ui_new
         virtual constexpr void render(ScreenWidget *screen, Widget *owner,
                                       render_context &context) = 0;
         // 每帧一次，从树根往下传（ScreenWidget::tick → DFS）
-        virtual void tick(double /*now*/) {}
+        virtual void tick(ScreenWidget *screen, Widget *owner,
+                                      render_context &context) {}
         virtual ~RenderObject() = default;
     };
 
@@ -4505,13 +4511,23 @@ namespace ui_new
             }
         }
         // 每帧一次：从根 DFS，把 now 传给每个 renderObject
-        void tick(double now)
+        void tick(render_context &context)
         {
-            if (auto *p = root_.get())
-                p->visit([now](Widget &w) {
-                    if (w.renderObject)
-                        w.renderObject->tick(now);
-                });
+                Widget* root = root_.get();
+            if (root == nullptr) return;
+
+            const auto dfs = [&, screen = this](this auto &self, Widget *node) {
+                if (!node) return;
+
+                // 命中就提交渲染；没命中就"路过"这个节点
+                if (node->renderObject)
+                    node->renderObject->tick(screen, node, context);
+
+                // 无论有没有 renderObject，都继续下探子节点
+                for (auto& child : node->children())
+                    self(child.get());
+            };
+            dfs(root);
         }
         constexpr void updateSize(double width, double height) noexcept
         {
@@ -10363,10 +10379,10 @@ namespace render
             agg.template invoke<"render">(s, owner, ctx);
         }
 
-        void tick(double now) override
+        void tick(ui_new::ScreenWidget *screen, ui_new::Widget *owner,
+                  render_context &context) override
         {
-            if constexpr (requires { agg.template invoke<"tick">(now); })
-                agg.template invoke<"tick">(now);
+            agg.template invoke<"tick">(screen, owner, context);
         }
     };
 
@@ -10380,9 +10396,235 @@ namespace render
     }
 }; // namespace render
 //diff: [test_intent] end
+namespace app
+{
+    inline constexpr std::int64_t click_max_ms = 250;
+    inline constexpr std::int64_t dbl_gap_ms = 300;
+    inline constexpr std::int64_t triple_gap_ms = 250;
+    inline constexpr double drag_slop_px = 4.0;
+    using intent::time_point;
 
+    struct policy
+    {
+        struct click
+        {
+            static constexpr auto button = input_frame::MouseButton::eMOUSE_BUTTON_LEFT;
+            static constexpr std::int64_t tap_max_ms = click_max_ms;
+            static constexpr double slop_px = drag_slop_px;
+        };
+        struct multi
+        {
+            static constexpr auto button = input_frame::MouseButton::eMOUSE_BUTTON_LEFT;
+            static constexpr std::int64_t tap_max_ms = click_max_ms;
+            static constexpr double slop_px = drag_slop_px;
+            static constexpr int count = 2;
+            static constexpr std::int64_t gap_ms = dbl_gap_ms;
+        };
+        struct multi3
+        {
+            static constexpr auto button = input_frame::MouseButton::eMOUSE_BUTTON_LEFT;
+            static constexpr std::int64_t tap_max_ms = click_max_ms;
+            static constexpr double slop_px = drag_slop_px;
+            static constexpr int count = 3;
+            static constexpr std::int64_t gap_ms = triple_gap_ms;
+        };
+        struct drag
+        {
+            static constexpr auto button = input_frame::MouseButton::eMOUSE_BUTTON_LEFT;
+            static constexpr double slop_px = drag_slop_px;
+        };
+        struct hover
+        {
+        };
+        struct wheel
+        {
+        };
+        struct shortcut
+        {
+        };
+    };
+
+    inline time_point elapsed_ms() noexcept
+    {
+        static const auto t0 = std::chrono::steady_clock::now();
+        return std::chrono::duration_cast<time_point>(std::chrono::steady_clock::now() -
+                                                      t0);
+    }
+}; // namespace app
 namespace table_ui
 {
+    using app::time_point;
+    using app::policy;
+    namespace input
+    {
+        struct click_payload
+        {
+            double x{}, y{};
+            time_point at{};
+        };
+        struct Trait_click : gesture::trait_base<click_payload, static_string{"click"},
+                                                 static_string{"on_click"}, policy::click>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::click_event &e) noexcept
+            {
+                d = {e.x, e.y, e.at};
+            }
+        };
+        using click_template_recognizer = gesture::click_template<Trait_click>;
+
+        struct multi_click_payload
+        {
+            double x{}, y{};
+            int count{};
+            time_point at{};
+        };
+        struct Trait_double_click
+            : gesture::trait_base<multi_click_payload, static_string{"double_click"},
+                                  static_string{"on_double_click"}, policy::multi>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::multi_click_event &e) noexcept
+            {
+                d = {e.x, e.y, e.count, e.at};
+            }
+        };
+        struct Trait_triple_click
+            : gesture::trait_base<multi_click_payload, static_string{"triple_click"},
+                                  static_string{"on_triple_click"}, policy::multi3>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::multi_click_event &e) noexcept
+            {
+                d = {e.x, e.y, e.count, e.at};
+            }
+        };
+
+        struct drag_payload
+        {
+            gesture::drag_phase phase{};
+            double x{}, y{}, dx{}, dy{};
+            double total_dx{}, total_dy{};
+            ModifierKey modifier{};
+            time_point at{};
+        };
+        struct Trait_drag : gesture::trait_base<drag_payload, static_string{"drag"},
+                                                static_string{"on_drag"}, policy::drag>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::drag_event &e) noexcept
+            {
+                d = {e.phase,    e.x,        e.y,        e.dx, e.dy,
+                     e.total_dx, e.total_dy, e.modifier, e.at};
+            }
+        };
+
+        struct Trait_hover
+            : gesture::trait_base<gesture::none_payload, static_string{"hover"},
+                                  static_string{"on_hover"}, policy::hover>
+        {
+        };
+
+        struct wheel_payload
+        {
+            int delta{};
+            time_point at{};
+        };
+        struct Trait_wheel : gesture::trait_base<wheel_payload, static_string{"wheel"},
+                                                 static_string{"on_wheel"}, policy::wheel>
+        {
+            static void collect(time_point, payload_t &d,
+                                const gesture::wheel_event &e) noexcept
+            {
+                d = {e.delta, e.at};
+            }
+        };
+
+        using input_tree_path = intent::all_of<
+            intent::refines<
+                intent::leaf<click_template_recognizer>,
+                intent::all_of<intent::leaf<gesture::drag_template<Trait_drag>>,
+                               intent::refines<intent::leaf<gesture::multi_click_template<
+                                                   Trait_double_click>>,
+                                               intent::leaf<gesture::multi_click_template<
+                                                   Trait_triple_click>>>>>,
+            intent::leaf<gesture::hover_template<Trait_hover>>,
+            intent::leaf<gesture::wheel_template<Trait_wheel>>>;
+    }; // namespace input
+
+    auto make_table()
+    {
+        using input::Trait_click;
+        using input::Trait_double_click;
+        using input::Trait_triple_click;
+        using input::Trait_drag;
+        using input::Trait_wheel;
+
+        return make_aggregate<"table">(
+            // widget part start
+            field<"owner">(static_cast<ui_new::Widget *>(nullptr)),
+            method<"render">([](auto &&self, ui_new::ScreenWidget *screen,
+                                ui_new::Widget *owner, render_context &ctx) {}),
+            method<"tick">([](auto &&self, ui_new::ScreenWidget *screen,
+                              ui_new::Widget *owner, render_context &ctx) {}),
+            // widget part end
+
+            // input part start
+            // input 相关定义的数据段
+            field<"arbiter">(intent::debug_arbiter<input::input_tree_path>{}),
+            field<"input_state">(input_frame::event_context{}),
+            field<"input_binding">(glfw_input_translation::scoped_binding{}),
+            method<"input_event">([](auto &self, auto e) noexcept {
+                const auto now = app::elapsed_ms();
+                using frame_t = decltype(input_frame::build_change(self.input_state, e));
+                if constexpr (not std::is_void_v<frame_t>)
+                {
+                    auto f = input_frame::build_change(self.input_state, e);
+                    self.arbiter.feed(self, f, now);
+                    input_frame::apply_change(self.input_state, f);
+                }
+            }),
+            method<"on_click">([](auto &self, const Trait_click::payload_t &e) noexcept {
+                std::println("  >>> 单击    (x={:.1f}, y={:.1f})", e.x, e.y);
+            }),
+            method<"on_double_click">(
+                [](auto &self, const Trait_double_click::payload_t &e) noexcept {
+                    std::println("  >>> 双击    (x={:.1f}, y={:.1f}, count={})", e.x, e.y,
+                                 e.count);
+                }),
+            method<"on_triple_click">(
+                [](auto &self, const Trait_triple_click::payload_t &e) noexcept {
+                    std::println("  >>> 三击    (x={:.1f}, y={:.1f}, count={})", e.x, e.y,
+                                 e.count);
+                }),
+            method<"on_drag">([](auto &self, const Trait_drag::payload_t &e) noexcept {
+                self.drag = e;
+                switch (e.phase)
+                {
+                case gesture::drag_phase::begin:
+                    std::println("  >>> 拖拽·开始 (起点 {:.1f},{:.1f})", e.x, e.y);
+                    break;
+                case gesture::drag_phase::move:
+
+                    std::println("  >>> 拖拽·移动");
+                    break;
+                case gesture::drag_phase::end:
+                    std::println("  >>> 拖拽·释放");
+                    break;
+                }
+            }),
+            method<"on_hover">(
+                [](auto &self) noexcept { std::println("  >>> 悬停    进入窗口"); }),
+            method<"on_wheel">([](auto &self, const Trait_wheel::payload_t &e) noexcept {
+                std::println("  >>> 滚轮    (delta={})", e.delta);
+            })
+            // input part end
+        );
+    }
+    auto makeTableRenderObject()
+    {
+        return render::asRenderObject(std::move(make_table()));
+    }
 
 } // namespace table_ui
 
@@ -10659,7 +10901,9 @@ try
         make_aggregate_ref<"mainShaderCtx", "uniformBuffers", "descriptorSets">(
             uniformBuffers, descriptorSets);
 
-    ui_new::ScreenWidget screen{ui_new::Size{WIDTH, HEIGHT}, ui_new::Container("panel")};
+    ui_new::ScreenWidget screen{
+        ui_new::Size{WIDTH, HEIGHT},
+        ui_new::Container("panel").renderObject(table_ui::makeTableRenderObject())};
     shader_data::hover_manager hoverManager{.screen = &screen};
     // 新的 soaCtx 仅包含 uiRects 和 uiWireRects
     auto soaCtx = make_aggregate_ref<"soaCtx", "screen">(screen);
@@ -10993,61 +11237,6 @@ try
 
     // diff: [test_indirectdraw] end
     // diff: [test_dod5] start
-    // ═══════════════════════════════════════════════════════════════════════
-    // UI 命令层（C 风格）
-    //
-    //   一条 UI 命令 = 一个全屏三角形 + 一组推送常量：
-    //       setScissor    → 这条命令的裁剪
-    //       pushConstants → 这条命令的全部参数（mode/rect/颜色/几何）
-    //       draw(3)       → 全屏三角形，形状由片元着色器按 mode 求 SDF
-    //
-    //   能力全部在 test_ui_ability.frag 的 mode 表里（与下面的枚举一一对应），
-    //   这里只按顺序记录命令，不做批处理、不做间接绘制、没有后端对象。
-    //
-    //   按约定：除 draw 之外，mainPipeline.xxx 全部留空。
-    // ═══════════════════════════════════════════════════════════════════════
-    enum ui_mode : int
-    {
-        MODE_FILL = 0,        // 圆角矩形填充
-        MODE_LINEAR,          // 线性渐变
-        MODE_RADIAL,          // 径向渐变
-        MODE_CONIC,           // 圆锥渐变
-        MODE_ARC,             // 圆弧/环
-        MODE_OUTER_SHADOW,    // 外阴影
-        MODE_INNER_SHADOW,    // 内阴影
-        MODE_PERCORNER,       // 每角半径
-        MODE_ALPHA_MASK,      // alpha 遮罩
-        MODE_PATH_AA,         // 路径解析抗锯齿
-        MODE_DASH,            // 虚线描边
-        MODE_ROTATE,          // 旋转
-        MODE_SKEW,            // 斜切
-        MODE_NINE_SLICE,      // 九宫格
-        MODE_EVENODD,         // 奇偶填充
-        MODE_GLYPH,           // MSDF 字形
-        MODE_SRGB,            // sRGB / 线性渐变
-        MODE_BLUR,            // 模糊
-        MODE_BACKDROP,        // 背景模糊
-        MODE_GROUP,           // 组不透明度
-        MODE_MIPMAP,          // mipmap
-        MODE_PICKING,         // 拾取
-        MODE_BLEND,           // 混合模式
-        MODE_LAYER_BLUR,      // 离屏可分离模糊（y=方向 z=半径 w=源纹理 aux.x=源采样器）
-        MODE_LAYER_COMPOSITE, // 离屏合成（y=不透明度 z=源纹理 w=源采样器 aux.x=圆角）
-        MODE_CHECKER,         // 棋盘背景内容（背景模糊的来源）
-        MODE_NINE_SLICE_TEX,  // 纹理九宫格（y=源边框 z=源纹理 w=源采样器 aux.xy=源尺寸）
-        MODE_ALPHA_MASK_TEX,  // 纹理 alpha 遮罩（z=纹理 w=源采样器）
-        MODE_MIPMAP_TEX,      // 真 mip 采样（y=最大 lod z=纹理 w=源采样器）
-        MODE_CLIP_MASK,       // 模板裁剪遮罩（形状外 discard）
-        MODE_SOLID,           // 纯色覆盖（几何 / 模板覆盖 pass 用）
-        MODE_SOLID_GEOM,      // 几何覆盖（颜色写死）
-        MODE_PATH_STROKE,     // 路径描边：解析覆盖率 AA（y=半宽 z=1 开 AA）
-        MODE_GLYPH_BITMAP,    // 位图字形（emoji）：图集 RGBA，不走距离场
-    };
-
-    // 几何入口标记（PushData.geomEntry 是专用字段）：0 = 普通全屏三角形
-    constexpr uint32_t kGeomStroke = 1u;       // 描边批处理（段数据在 storage buffer）
-    constexpr uint32_t kGeomFan = 2u;          // 填充扇形批处理（顶点在 buffer 高位区）
-    constexpr uint32_t kFanVertexBase = 2048u; // 与 VS 里 kFanBase 一致
 
     // ──────────────────────────────────────────────────────────────────────
     // 填全局资源表：名字 -> 对象指针（表本身在 main 外部，见 named_resource）
@@ -11143,7 +11332,6 @@ try
 
             const ui_dao::view view{W, H};
 
-#if 0
             // 帧级：record_builder 代理一切；段由 begin/end 自动开闭。
             command::record_builder frame;
             frame.resources = &r;
@@ -11215,7 +11403,8 @@ try
                 .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
                 .clearValue = {.depthStencil = {.depth = 1.0F}}};
             if (hasStencil)
-                depth_clear.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                depth_clear.imageLayout =
+                    VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
             const auto to_attach = [](const VkRenderingAttachmentInfo &a) {
                 command::rendering_info::rendering_attachment r;
@@ -11270,20 +11459,20 @@ try
                 .dst = {.layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                         .access_mask = VK_ACCESS_2_TRANSFER_READ_BIT,
                         .stage_mask = VK_PIPELINE_STAGE_2_TRANSFER_BIT}});
-            const std::int32_t px = std::clamp(pickMouse.pos.x, 0,
-                                               static_cast<std::int32_t>(extent.width) - 1);
-            const std::int32_t py = std::clamp(pickMouse.pos.y, 0,
-                                               static_cast<std::int32_t>(extent.height) - 1);
-            const VkBufferImageCopy region{.bufferOffset = 0,
-                                           .bufferRowLength = 0,
-                                           .bufferImageHeight = 0,
-                                           .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                                           .imageOffset = {px, py, 0},
-                                           .imageExtent = {1, 1, 1}};
-            frame.add_copy_image_to_buffer(resolveImage,
-                                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                           pickingFrames[currentFrame].buffer(),
-                                           std::span{&region, 1});
+            const std::int32_t px = std::clamp(
+                pickMouse.pos.x, 0, static_cast<std::int32_t>(extent.width) - 1);
+            const std::int32_t py = std::clamp(
+                pickMouse.pos.y, 0, static_cast<std::int32_t>(extent.height) - 1);
+            const VkBufferImageCopy region{
+                .bufferOffset = 0,
+                .bufferRowLength = 0,
+                .bufferImageHeight = 0,
+                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                .imageOffset = {px, py, 0},
+                .imageExtent = {1, 1, 1}};
+            frame.add_copy_image_to_buffer(
+                resolveImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                pickingFrames[currentFrame].buffer(), std::span{&region, 1});
             frame.add_transition(my_render::image_info{
                 .image = resolveImage,
                 .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -11305,7 +11494,6 @@ try
 
             const std::uint32_t renderVersion = 0;
             frame.replay(commandBuffer, currentFrame, renderVersion);
-#endif
         }),
         method<"endRendering">([](world_type &, input_type &, data_type &) {}));
 
