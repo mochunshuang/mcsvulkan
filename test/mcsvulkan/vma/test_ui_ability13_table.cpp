@@ -4190,7 +4190,6 @@ struct render_context
     glfw_input *input;
     FrameClock *clock;
     FontSelect *fontSelect;
-    ui_dao::view view; // 绘制目标尺寸（像素坐标 → NDC）
 };
 
 //diff: [test_dod24.cpp] start
@@ -10379,20 +10378,26 @@ namespace render
             agg.template invoke<"render">(s, owner, ctx);
         }
 
-        void tick(ui_new::ScreenWidget *screen, ui_new::Widget *owner,
-                  render_context &context) override
+        constexpr void tick(ui_new::ScreenWidget *s, ui_new::Widget *owner,
+                            render_context &ctx) override
         {
-            agg.template invoke<"tick">(screen, owner, context);
+            agg.template invoke<"tick">(s, owner, ctx);
         }
     };
 
-    // A Table no longer attaches input itself: the window has exactly one host
-    // and it attaches once. No post handler, so no per-table input binding.
-    template <class Agg>
-    [[nodiscard]] constexpr auto asRenderObject(Agg &&a)
+    static constexpr auto postBindInputTranslation = [](auto &agg) {
+        inputTranslation().attach(agg.input_binding, agg);
+    };
+
+    template <class Agg, class Handler = decltype(postBindInputTranslation)>
+    [[nodiscard]] constexpr auto asRenderObject(
+        Agg &&a, Handler postHandler = postBindInputTranslation)
     {
         using D = std::decay_t<Agg>;
-        return std::make_unique<AggRenderObject<D>>(std::forward<Agg>(a));
+        auto renderObject = std::make_unique<AggRenderObject<D>>(std::forward<Agg>(a));
+        if constexpr (requires() { postHandler(renderObject->agg); })
+            postHandler(renderObject->agg);
+        return renderObject;
     }
 }; // namespace render
 //diff: [test_intent] end
@@ -10564,7 +10569,14 @@ namespace table_ui
             // widget part start
             field<"owner">(static_cast<ui_new::Widget *>(nullptr)),
             method<"render">([](auto &&self, ui_new::ScreenWidget *screen,
-                                ui_new::Widget *owner, render_context &ctx) {}),
+                                ui_new::Widget *owner, render_context &ctx) {
+                auto [W, H] = screen->size();
+                const ui_dao::view view{.w = static_cast<float>(W),
+                                        .h = static_cast<float>(H)};
+                ctx.cmdBuilder->addInsteance(
+                    ui_dao::sdf_shape({200.0F, 150.0F, 400.0F, 300.0F}, view, 16.0F,
+                                      glm::vec4(0.95F, 0.40F, 0.25F, 1.0F)));
+            }),
             method<"tick">([](auto &&self, ui_new::ScreenWidget *screen,
                               ui_new::Widget *owner, render_context &ctx) {}),
             // widget part end
@@ -10598,7 +10610,6 @@ namespace table_ui
                                  e.count);
                 }),
             method<"on_drag">([](auto &self, const Trait_drag::payload_t &e) noexcept {
-                self.drag = e;
                 switch (e.phase)
                 {
                 case gesture::drag_phase::begin:
@@ -11444,9 +11455,18 @@ try
             frame.setMesh(world.globalCtx.meshMap["quad"]);
 
             // 4) 画一个矩形（位置与尺寸都在 draw 里）
-            frame.addInsteance(ui_dao::sdf_shape({200.0F, 150.0F, 400.0F, 300.0F}, view,
-                                                 16.0F,
-                                                 glm::vec4(0.95F, 0.40F, 0.25F, 1.0F)));
+            {
+
+                auto &fontCtx = world.fontCtx;
+                render_context context{.cmdBuilder = &frame,
+                                       .input = &inputCtx.input,
+                                       .clock = &inputCtx.clock,
+                                       .fontSelect = &fontCtx.fontSelect};
+                auto &screen = soaCtx.screen;
+                screen.makeRenderDirty(
+                    currentFrame); //TODO: frame 不缓存；screen 缓存；兼容性零时解决
+                screen.recorderCmd(currentFrame, context);
+            }
 
             // 5) 结束：resolve 回读 → 交换链交付
             auto &pickMouse = *fs.pickMouse;
@@ -11683,13 +11703,55 @@ try
         },
         [] {
             return schedulable_task{
-                .task = {.name = "waitforfences_post_processing",
-                         .function =
-                             ^^decltype([](world_type &world, input_type &, data_type &) {
-                                 // picking 回读改到 submit 之后、同一帧 fence 之后做，
-                                 // 见 drawFrame 里的 TABLE_PICKCHECK 段。
-                                 (void)world;
-                             })},
+                .task =
+                    {.name = "waitforfences_post_processing",
+                     .function = ^^decltype([](world_type &world, input_type &inputCtx,
+                                               data_type &soaCtx) {
+                         auto &globalCtx = world.globalCtx;
+                         auto &pickCtx = world.pickCtx;
+
+                         auto &frameContext = globalCtx.frameContext;
+
+                         auto &pickMouse = pickCtx.mouse;
+                         auto &pickingFrames = pickCtx.frames;
+
+                         auto &currentFrame = frameContext.currentFrame;
+
+                         // 等待栅栏后，正式获取图像前
+                         // currentFrame == 0 时拾取回读未就绪，不当作"离开"
+                         if (currentFrame > 0)
+                         {
+                             uint32_t readIdx =
+                                 (currentFrame - 1 + MAX_FRAMES_IN_FLIGHT) %
+                                 MAX_FRAMES_IN_FLIGHT;
+                             //diff: [test_dod19] start: 全部逻辑交给 hover_manager（不耦合全局函数）
+                             auto *data = static_cast<picking_result *>(
+                                 pickingFrames[readIdx].mapPtr());
+                             picking_result r = *data;
+
+                             //  TODO: 这个该更好的处理一下
+                             //  // ★ 版本不匹配 → 旧世界的 picking，作废悬停状态，丢弃
+                             //  if (r.render_version() != soaCtx.screen.renderVersion())
+                             //  {
+                             //      world.hoverManager.resetPicking();
+                             //      return;
+                             //  }
+
+                             if (!pickMouse.valid)
+                                 r.key.object_type =
+                                     0xFFFFFFFF; // 光标不在窗口 = 无命中（自动 leave）
+
+                             // [PICKDBG] 定位用：每帧打印 GPU 回读原始值（可删）
+                             std::println("[PICKDBG] frame={} valid={} type={:#x} "
+                                          "entity={} primitive={} ver={} hover_fn={}",
+                                          currentFrame, pickMouse.valid,
+                                          r.key.object_type, r.key.entity_index,
+                                          r.primitive_id(), r.render_version(),
+                                          r.hover_fn);
+                             world.hoverManager.hover(r, world.hoverPool, inputCtx);
+                             //diff: [test_dod19] end
+                         }
+                     })},
                 .befores = {"after_waitForfences_start"},
                 .afters = {"after_waitForfences_end"},
             };
