@@ -63,6 +63,10 @@ namespace mcs::vulkan::ecs
         {
             return capacity() - size();
         }
+        [[nodiscard]] constexpr bool contains(size_type entity) const noexcept
+        {
+            return alive(entity);
+        }
 
         // 分配实体：返回稳定的外部 ID，不构造对象
         [[nodiscard]] constexpr std::optional<size_type> allocate() noexcept

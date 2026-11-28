@@ -607,7 +607,7 @@ struct picking_result
     object_key key; // outPicking.xy
     std::uint32_t
         packed; // outPicking.z：高 version_bits=版本，低 primitive_bits=primitive_id
-    std::uint32_t hover_fn; // outPicking.w
+    std::uint32_t object_entity; // outPicking.w
 
     // ── 读取 ────────────────────────────────────────────────
     [[nodiscard]] constexpr primitive_t primitive_id() const noexcept
@@ -3673,7 +3673,8 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
     // ========== 拾取资源 =========
     auto pickResourcesBuild = mcs::vulkan::memory::build_simple_resource(
         {.imageType = VK_IMAGE_TYPE_2D,
-         .format = VK_FORMAT_R32G32B32A32_UINT, // 128位：外键 + primitive_id + hover_fn
+         .format =
+             VK_FORMAT_R32G32B32A32_UINT, // 128位：外键 + primitive_id + object_entity
          .extent = {.width = WIDTH, .height = HEIGHT, .depth = 1},
          .mipLevels = 1,
          .arrayLayers = 1,
@@ -3855,7 +3856,7 @@ constexpr auto initPipeline(auto &hardwareCtx, auto &descriptorCtx)
                               },
                               //diff: [test_indirectdraw_no_pick] start
                               {
-                                  // location 1 (拾取：4 通道全写，zw = primitive_id + hover_fn)
+                                  // location 1 (拾取：4 通道全写，zw = primitive_id + object_entity)
                                   .blendEnable = VK_FALSE,
                                   .colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
                                                     VK_COLOR_COMPONENT_G_BIT |
@@ -4118,7 +4119,7 @@ namespace shader_data
 
     // ===================== hover  ?+   =====================
     //  ? ?  =  ?hover  ?
-    //  ?hover_fn over_fn = 0xFFFFFFFF  ?
+    //  ?object_entity over_fn = 0xFFFFFFFF  ?
     struct hover_pool
     {
         using hover_callback_t = void (*)(picking_result, bool, InputCtx &,
@@ -4138,7 +4139,7 @@ namespace shader_data
             if (entity == ~0U)
                 return;
             // 没有注册任何 hover 回调时（例如 ability3 的最小矩形），
-            // picking 里回读到的 hover_fn 可能是 0；这里直接忽略，不 assert。
+            // picking 里回读到的 object_entity 可能是 0；这里直接忽略，不 assert。
             if (entity >= hover_fns.size())
                 return;
             hover_fns[entity](r, enter, inputCtx, screen);
@@ -4164,11 +4165,11 @@ namespace shader_data
             static_assert(0xFFFFFFFF == uint32_t{~0U});
             if (cur.key == r.key)
                 return; //
-            if (cur.key.object_type != 0xFFFFFFFF && cur.hover_fn != ~0U)
-                pool.call(cur.hover_fn, cur, hover_leave, inputCtx, screen);
+            if (cur.key.object_type != 0xFFFFFFFF && cur.object_entity != ~0U)
+                pool.call(cur.object_entity, cur, hover_leave, inputCtx, screen);
             cur = r;
-            if (r.key.object_type != 0xFFFFFFFF && r.hover_fn != ~0U)
-                pool.call(r.hover_fn, r, hover_enter, inputCtx, screen);
+            if (r.key.object_type != 0xFFFFFFFF && r.object_entity != ~0U)
+                pool.call(r.object_entity, r, hover_enter, inputCtx, screen);
         }
     };
 
@@ -10362,6 +10363,40 @@ auto &inputTranslation()
     return input;
 }
 
+using hover_fn_t = void (*)(picking_result r, InputCtx &, ui_new::ScreenWidget *,
+                            void *obj) noexcept;
+struct object_info
+{
+    void *object{};
+    hover_fn_t hover_fn{};
+    object_info() = default;
+    object_info(const object_info &) = delete;
+    object_info &operator=(const object_info &) = delete;
+    constexpr object_info(object_info &&o) noexcept
+        : object{std::exchange(o.object, {})}, hover_fn{std::exchange(o.hover_fn, {})} {};
+    constexpr object_info &operator=(object_info &&o) noexcept
+    {
+        if (this != &o)
+        {
+            object = std::exchange(o.object, {});
+            hover_fn = std::exchange(o.hover_fn, {});
+        }
+        return *this;
+    };
+    constexpr ~object_info() noexcept
+    {
+        object = {};
+        hover_fn = {};
+    }
+};
+using ObjectPool = soa_vector<object_info>;
+using ProxyObject = proxy_value<ObjectPool>;
+auto &object_pool()
+{
+    static ObjectPool pool{};
+    return pool;
+}
+
 namespace render
 {
     // NOTE: 实现 RenderObject 的匿名实现类的效果
@@ -10397,9 +10432,17 @@ namespace render
         auto renderObject = std::make_unique<AggRenderObject<D>>(std::forward<Agg>(a));
         if constexpr (requires() { postHandler(renderObject->agg); })
             postHandler(renderObject->agg);
+        if constexpr (requires() { renderObject->agg.hover_fn; })
+        {
+            using hover_protocol = std::remove_pointer_t<
+                decltype(std::declval<D>().template invoke<"hover_protocol">())>;
+            renderObject->agg.hover_fn = object_pool().make_soa_value(
+                &renderObject->agg, hover_fn_t{&hover_protocol::hover_handler});
+        }
         return renderObject;
     }
 }; // namespace render
+
 //diff: [test_intent] end
 namespace app
 {
@@ -10557,6 +10600,19 @@ namespace table_ui
             intent::leaf<gesture::wheel_template<Trait_wheel>>>;
     }; // namespace input
 
+    template <class Self>
+    struct Protocol
+    {
+        static constexpr void hover_handler(picking_result r, InputCtx &inputCtx,
+                                            ui_new::ScreenWidget *screen,
+                                            void *obj) noexcept
+        {
+            assert(obj != nullptr);
+            static_cast<Self *>(obj)->template invoke<"hover_handler">(r, inputCtx,
+                                                                       screen);
+        }
+    };
+
     auto make_table()
     {
         using input::Trait_click;
@@ -10570,23 +10626,40 @@ namespace table_ui
             field<"owner">(static_cast<ui_new::Widget *>(nullptr)),
             method<"render">([](auto &&self, ui_new::ScreenWidget *screen,
                                 ui_new::Widget *owner, render_context &ctx) {
+                self.owner = owner;
                 auto [W, H] = screen->size();
                 const ui_dao::view view{.w = static_cast<float>(W),
                                         .h = static_cast<float>(H)};
-                ctx.cmdBuilder->addInsteance(
-                    ui_dao::sdf_shape({200.0F, 150.0F, 400.0F, 300.0F}, view, 16.0F,
-                                      glm::vec4(0.95F, 0.40F, 0.25F, 1.0F)));
+                auto shape = ui_dao::sdf_shape(
+                    {200.0F, 150.0F, 400.0F, 300.0F}, view, 16.0F,
+                    glm::vec4(0.95F, 0.40F, 0.25F, 1.0F), {}, 0.0F, 0.0F, 1.0F, 0U);
+                shape.entity_index = 0;
+                shape.hover_fn =
+                    self.hover_fn ? static_cast<uint32_t>(~0) : self.hover_fn.entity();
+                ctx.cmdBuilder->addInsteance(shape);
             }),
             method<"tick">([](auto &&self, ui_new::ScreenWidget *screen,
                               ui_new::Widget *owner, render_context &ctx) {}),
             // widget part end
+
+            // gpu callback start
+            field<"hover_fn">(ProxyObject{}),
+            method<"hover_protocol">([](auto &&self) consteval noexcept {
+                using Self = std::remove_cvref_t<decltype(self)>;
+                return static_cast<Protocol<Self> *>(nullptr);
+            }),
+            method<"hover_handler">([](auto &&self, picking_result r, InputCtx &input,
+                                       ui_new::ScreenWidget *screen) noexcept {
+                std::println("  hover_handler>>>>>>>>>>>>>>>.");
+            }),
+            // gpu callback end
 
             // input part start
             // input 相关定义的数据段
             field<"arbiter">(intent::debug_arbiter<input::input_tree_path>{}),
             field<"input_state">(input_frame::event_context{}),
             field<"input_binding">(glfw_input_translation::scoped_binding{}),
-            method<"input_event">([](auto &self, auto e) noexcept {
+            method<"input_event">([](auto &&self, auto e) noexcept {
                 const auto now = app::elapsed_ms();
                 using frame_t = decltype(input_frame::build_change(self.input_state, e));
                 if constexpr (not std::is_void_v<frame_t>)
@@ -10596,20 +10669,20 @@ namespace table_ui
                     input_frame::apply_change(self.input_state, f);
                 }
             }),
-            method<"on_click">([](auto &self, const Trait_click::payload_t &e) noexcept {
+            method<"on_click">([](auto &&self, const Trait_click::payload_t &e) noexcept {
                 std::println("  >>> 单击    (x={:.1f}, y={:.1f})", e.x, e.y);
             }),
             method<"on_double_click">(
-                [](auto &self, const Trait_double_click::payload_t &e) noexcept {
+                [](auto &&self, const Trait_double_click::payload_t &e) noexcept {
                     std::println("  >>> 双击    (x={:.1f}, y={:.1f}, count={})", e.x, e.y,
                                  e.count);
                 }),
             method<"on_triple_click">(
-                [](auto &self, const Trait_triple_click::payload_t &e) noexcept {
+                [](auto &&self, const Trait_triple_click::payload_t &e) noexcept {
                     std::println("  >>> 三击    (x={:.1f}, y={:.1f}, count={})", e.x, e.y,
                                  e.count);
                 }),
-            method<"on_drag">([](auto &self, const Trait_drag::payload_t &e) noexcept {
+            method<"on_drag">([](auto &&self, const Trait_drag::payload_t &e) noexcept {
                 switch (e.phase)
                 {
                 case gesture::drag_phase::begin:
@@ -10625,16 +10698,17 @@ namespace table_ui
                 }
             }),
             method<"on_hover">(
-                [](auto &self) noexcept { std::println("  >>> 悬停    进入窗口"); }),
-            method<"on_wheel">([](auto &self, const Trait_wheel::payload_t &e) noexcept {
+                [](auto &&self) noexcept { std::println("  >>> 悬停    进入窗口"); }),
+            method<"on_wheel">([](auto &&self, const Trait_wheel::payload_t &e) noexcept {
                 std::println("  >>> 滚轮    (delta={})", e.delta);
             })
             // input part end
         );
     }
+
     auto makeTableRenderObject()
     {
-        return render::asRenderObject(std::move(make_table()));
+        return render::asRenderObject(make_table());
     }
 
 } // namespace table_ui
@@ -11728,27 +11802,27 @@ try
                              auto *data = static_cast<picking_result *>(
                                  pickingFrames[readIdx].mapPtr());
                              picking_result r = *data;
-
-                             //  TODO: 这个该更好的处理一下
-                             //  // ★ 版本不匹配 → 旧世界的 picking，作废悬停状态，丢弃
-                             //  if (r.render_version() != soaCtx.screen.renderVersion())
-                             //  {
-                             //      world.hoverManager.resetPicking();
-                             //      return;
-                             //  }
-
                              if (!pickMouse.valid)
                                  r.key.object_type =
                                      0xFFFFFFFF; // 光标不在窗口 = 无命中（自动 leave）
 
                              // [PICKDBG] 定位用：每帧打印 GPU 回读原始值（可删）
-                             std::println("[PICKDBG] frame={} valid={} type={:#x} "
-                                          "entity={} primitive={} ver={} hover_fn={}",
-                                          currentFrame, pickMouse.valid,
-                                          r.key.object_type, r.key.entity_index,
-                                          r.primitive_id(), r.render_version(),
-                                          r.hover_fn);
-                             world.hoverManager.hover(r, world.hoverPool, inputCtx);
+                             std::println(
+                                 "[PICKDBG] frame={} valid={} type={:#x} "
+                                 "entity={} primitive={} ver={} object_entity={}",
+                                 currentFrame, pickMouse.valid, r.key.object_type,
+                                 r.key.entity_index, r.primitive_id(), r.render_version(),
+                                 r.object_entity);
+                             if (r.key.object_type != 0xFFFFFFFF)
+                             {
+                                 auto &pool = object_pool();
+                                 if (pool.contains(r.object_entity))
+                                 {
+                                     auto [object, hover_fn] = pool[r.object_entity];
+                                     if (hover_fn != nullptr && object != nullptr)
+                                         (hover_fn)(r, inputCtx, &soaCtx.screen, object);
+                                 }
+                             }
                              //diff: [test_dod19] end
                          }
                      })},

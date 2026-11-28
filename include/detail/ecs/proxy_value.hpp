@@ -13,6 +13,7 @@ namespace mcs::vulkan::ecs
         using value_type = Store::value_type;
         using id_type = Store::id_type;
 
+        constexpr proxy_value() noexcept : store_{}, entity_{static_cast<id_type>(~0)} {}
         constexpr proxy_value(Store &store, id_type id) noexcept
             : store_{&store}, entity_{id}
         {

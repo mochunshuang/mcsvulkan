@@ -145,6 +145,10 @@ namespace mcs::vulkan::ecs
         {
             return capacity() - size();
         }
+        [[nodiscard]] constexpr bool contains(size_type entity) const noexcept
+        {
+            return alive(entity);
+        }
 
         // 静态工具：释放 base_type 中所有字段的内存并置空
         template <typename Alloc>
