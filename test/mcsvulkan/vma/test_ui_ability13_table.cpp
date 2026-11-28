@@ -10634,8 +10634,10 @@ namespace table_ui
                     {200.0F, 150.0F, 400.0F, 300.0F}, view, 16.0F,
                     glm::vec4(0.95F, 0.40F, 0.25F, 1.0F), {}, 0.0F, 0.0F, 1.0F, 0U);
                 shape.entity_index = 0;
-                shape.hover_fn =
-                    self.hover_fn ? static_cast<uint32_t>(~0) : self.hover_fn.entity();
+                // hover_fn 是池下标，不是 bool 标志：绑定了就写 entity()，
+                // 没绑定才写 ~0（= 未绑定哨兵）。proxy_value::operator bool
+                // 只表示 store 非空，绑定时恒为 true。
+                shape.hover_fn = self.hover_fn ? self.hover_fn.entity() : ~0U;
                 ctx.cmdBuilder->addInsteance(shape);
             }),
             method<"tick">([](auto &&self, ui_new::ScreenWidget *screen,
